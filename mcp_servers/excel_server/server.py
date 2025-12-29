@@ -233,7 +233,7 @@ class ExcelMCPServer:
 
       worksheet = workbook[sheet_name]
 
-      # step 6: parse, and find out what from what row to col we need to write to
+      # step 5: parse, and find out what from what row to col we need to write to
       # if range string looks like A1:B3
       start = range_str.split(":")[0]
 
@@ -245,9 +245,9 @@ class ExcelMCPServer:
       for row_i, row in enumerate(values, start=start_row):
         for col_i, col in enumerate(row, start=start_col):
           # write to the row
-          worksheet.cell(row=row_i - 1, column=col_i - 1, value = col)
+          worksheet.cell(row=row_i, column=col_i, value = col)
 
-      # step 7 save the notebook
+      # step 6: save the notebook
       workbook.save(file_path)
 
       # success message
