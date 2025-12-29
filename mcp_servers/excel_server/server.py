@@ -8,7 +8,7 @@ import os
 import openpyxl
 import openpyxl.cell
 from openpyxl.utils import column_index_from_string
-from openpyxl.utils.cell import coordinate_from_string
+from openpyxl.utils.cell import coordinate_from_string, column_index_from_string
 from typing import Any, Dict, List
 
 class ExcelMCPServer:
@@ -157,7 +157,7 @@ class ExcelMCPServer:
           end_col_letter, end_row = coordinate_from_string(end_cell)
           start_col = column_index_from_string(start_col_letter)
           end_col = column_index_from_string(end_col_letter)
-          
+
           values = []
           for row in range(start_row, end_row + 1):
             row_values = []
@@ -171,10 +171,10 @@ class ExcelMCPServer:
           col_idx = column_index_from_string(col_letter)
           cell_value = worksheet.cell(row=row_num, column=col_idx).value
           values = [[cell_value if cell_value is not None else ""]]
-            
+
       except Exception as e:
         values = [[f"Error: {str(e)}"]]
-                
+
       # Step 7: Return structured success response
       return [TextContent(
         type="text",
@@ -201,17 +201,74 @@ class ExcelMCPServer:
       )]
 
   async def _write_range(self, args: Dict[str, Any]) -> List[TextContent]:
-    # TODO: Implement write functionality
-    return [TextContent(
-      type="text",
-      text=json.dumps({
-        "success": False,
-        "error": "write_range not implemented yet"
-      })
-    )]
+    try:
+      # step 1: get arguments
+      file_path = args["file_path"]
+      sheet_name = args.get("sheet_name", "Sheet1")
+      range_str = args["range"]
+      values = args["values"]
+
+      # step 2: make sure that the file path exists
+      if not os.path.exists(file_path):
+        return [TextContent(
+          type="text",
+          text=json.dumps({
+            "success": False,
+            "error": "File Path doesn't exists"
+          })
+        )]
+
+      # step 3: create the workbook
+      workbook = openpyxl.load_workbook(file_path, data_only=True)
+
+      # step 4: verify that the worksheet exists
+      if sheet_name not in workbook.sheetnames:
+        return [TextContent(
+          type="text",
+          text=json.dumps({
+            "success": False,
+            "error": "Unable to find sheet name"
+          })
+        )]
+
+      worksheet = workbook[sheet_name]
+
+      # step 6: parse, and find out what from what row to col we need to write to
+      # if range string looks like A1:B3
+      start = range_str.split(":")[0]
+
+      # covert to usable values for offset
+      col_letter, start_row = coordinate_from_string(start)
+      start_col = column_index_from_string(col_letter)
+
+      # write each value in values to each cell
+      for row_i, row in enumerate(values, start=1):
+        for col_i, col in enumerate(row, start=1):
+          # write to the row
+          worksheet.cell(row=row_i + start_row, column=col_i + start_col, value = col)
+
+      # step 7 save the notebook
+      workbook.save(file_path)
+
+      # success message
+      return [TextContent(
+        type='text',
+        text=json.dumps({
+          "success": True
+        })
+      )]
+    except Exception as e:
+      return [TextContent(
+        type="text",
+        text=json.dumps({
+          "sucess": False,
+          "error": "Failed to read excel file"
+        })
+      )]
+
 
   async def _get_workbook_info(self, args: Dict[str, Any]) -> List[TextContent]:
-    # TODO: Implement workbook info functionality  
+    # TODO: Implement workbook info functionality
     return [TextContent(
       type="text",
       text=json.dumps({
@@ -223,10 +280,10 @@ class ExcelMCPServer:
 async def main():
   import sys
   from mcp.server.stdio import stdio_server
-  
+
   server = ExcelMCPServer()
   print("Starting Excel MCP Server...", file=sys.stderr)
-  
+
   # Use stdio_server for proper MCP communication
   async with stdio_server() as (read_stream, write_stream):
     init_options = InitializationOptions(
