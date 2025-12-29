@@ -269,14 +269,62 @@ class ExcelMCPServer:
 
 
   async def _get_workbook_info(self, args: Dict[str, Any]) -> List[TextContent]:
-    # TODO: Implement workbook info functionality
-    return [TextContent(
-      type="text",
-      text=json.dumps({
-        "success": False,
-        "error": "get_workbook_info not implemented yet"
-      })
-    )]
+    try:
+      # step 1: validate args
+      file_path = args['file_path']
+
+      # step 2: verify workbook and worksheet exists
+      if not os.path.exists(file_path):
+        return [TextContent(
+          type="text",
+          text=json.dumps({
+            "success": False,
+            "error": "Failed to find file"
+          })
+        )]
+
+      workbook = openpyxl.load_workbook(file_path, data_only=True)
+
+      # step 3: parse workbook information
+      # maybe for each worksheet, we build a dict and append to list (worksheet_data)
+      worksheets = []
+      worksheet_names = workbook.sheetnames
+
+      for worksheet in worksheet_names:
+        try:
+          current_ws = workbook[worksheet]
+          worksheet_data = {
+            "name": worksheet,
+            "max_row": current_ws.max_row,
+            "max_column": current_ws.max_column,
+            "dimensions": current_ws.dimensions
+          }
+          worksheets.append(worksheet_data)
+
+        except Exception as e:
+          worksheets.append({
+            "name": worksheet,
+            "error": f"Could not read sheet: {str(e)}"
+          })
+
+
+      # step 4: return workbook info in TextContent
+      return [TextContent(
+        type="text",
+        text=json.dumps({
+          "success": True,
+          "worksheet_data": worksheets
+        })
+      )]
+
+    except Exception as e:
+      return [TextContent(
+        type="text",
+        text=json.dumps({
+          'success': False,
+          "error": "Failed to read file path"
+        })
+      )]
 
 async def main():
   import sys
