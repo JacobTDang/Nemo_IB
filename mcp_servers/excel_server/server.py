@@ -242,10 +242,10 @@ class ExcelMCPServer:
       start_col = column_index_from_string(col_letter)
 
       # write each value in values to each cell
-      for row_i, row in enumerate(values, start=1):
-        for col_i, col in enumerate(row, start=1):
+      for row_i, row in enumerate(values, start=start_row):
+        for col_i, col in enumerate(row, start=start_col):
           # write to the row
-          worksheet.cell(row=row_i + start_row, column=col_i + start_col, value = col)
+          worksheet.cell(row=row_i - 1, column=col_i - 1, value = col)
 
       # step 7 save the notebook
       workbook.save(file_path)
@@ -257,6 +257,7 @@ class ExcelMCPServer:
           "success": True
         })
       )]
+
     except Exception as e:
       return [TextContent(
         type="text",
