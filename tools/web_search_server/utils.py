@@ -4,7 +4,7 @@ from ddgs import DDGS
 import urllib.parse
 from typing import List, Dict, Optional
 
-def search_duckduckgo(query: str, max_results = 10) -> List[Dict]:
+def search_duckduckgo(query: str, max_results = 5) -> List[Dict]:
   try:
     search_results = []
 
@@ -19,8 +19,8 @@ def search_duckduckgo(query: str, max_results = 10) -> List[Dict]:
 
     return search_results
 
-  except:
-    print("Duckduckgo search failed")
+  except Exception as e:  # Catch the actual error
+    print(f"DuckDuckGo search failed: {e}")
     return []
 
 if __name__ == "__main__":
