@@ -57,18 +57,18 @@ class Financial_Analysis:
   async def comparable_company_analysis(self, args: Dict[str, Any]) -> List[TextContent]:
 
     # get the select universe of companies
-    companies = args["companies"]
+    comparables = args["companies"]
     company_information = []
     # gather fincnail information from public sources
     # yahoo finance?
 
-    for company in companies:
+    for company in comparables:
       # todo, look up information and place inside dict?
       pass
 
     # calculate multiples based on information
 
-    for company in companies:
+    for company in comparables:
       for company_name, company_data in company.items():
        # run calculations for each company
         pass
