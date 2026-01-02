@@ -37,7 +37,7 @@ async def get_data(ticker: str) -> Dict[str, Any]:
     income_statement = company.income_stmt
     key = await find_key(OPERATING_INCOME_KEYS, income_statement.index)
     operating_income = income_statement.loc[key].iloc[0]
-    data[key] = operating_income
+    data['EBIT'] = operating_income
 
   except Exception as e:
     print(f"Could not get the operating income from income statement for {ticker} : {str(e)}")
