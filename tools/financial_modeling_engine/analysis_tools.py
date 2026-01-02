@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 
+from utils import get_data, calculate_percentiles
 from mcp.server import Server
 from mcp.types import Tool, TextContent, ServerCapabilities
 from mcp.server.models import InitializationOptions
@@ -55,29 +56,38 @@ class Financial_Analysis:
         )]
 
   async def comparable_company_analysis(self, args: Dict[str, Any]) -> List[TextContent]:
-
     # get the select universe of companies
     comparables = args["companies"]
-    company_information = []
-    # gather fincnail information from public sources
-    # yahoo finance?
+    data = []
 
-    for company in comparables:
-      # todo, look up information and place inside dict?
-      pass
+    # create a list of coroutine tasks to run
+    tasks = [get_data(ticker) for ticker in comparables]
 
-    # calculate multiples based on information
+    # use asyncio gather to run all of the task concurrently
+    # '*' unpacks the list of tasks into arguments for gather to run
+    data = await asyncio.gather(*tasks)
 
-    for company in comparables:
-      for company_name, company_data in company.items():
-       # run calculations for each company
-        pass
+    # build list and sort before calculating percentiles
+    pe_data = await calculate_percentiles(data, 'pe_ratio')
+    pb_data = await calculate_percentiles(data, 'pb_ratio')
+    ev_revenue_data = await calculate_percentiles(data, 'ev_revenue')
+    ev_ebitda_data = await calculate_percentiles(data, 'ev_ebitda')
+    ev_ebit_data = await calculate_percentiles(data, 'ev_ebit')
 
-    # get multiples to value the company
 
     return [TextContent(
       type="text",
-      text="TODO: IMPLEMENT analysis function"
+      text=json.dumps({
+        'pe_ratio': pe_data,
+        'pb_data' : pb_data,
+        'ev_revenue_data' : ev_revenue_data,
+        'ev_ebitda_data' : ev_ebitda_data,
+        'ev_ebit_data' : ev_ebit_data
+      })
     )]
+
 if __name__ == "__main__":
-  pass
+  comparables = {'companies': ['AAPL', 'MSFT', 'GOOGL']}
+  f = Financial_Analysis()
+  res = asyncio.run(f.comparable_company_analysis(comparables))
+  print(res)
