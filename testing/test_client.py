@@ -48,7 +48,7 @@ class MCPTestClient:
         if ws is not None:
             ws.title = "TestFinancials"
         
-        # Sample financial data
+        # Sample financial data for first sheet
         data = [
             ["Item", "2023", "2024", "2025E"],
             ["Revenue", 1000000, 1200000, 1440000],
@@ -62,6 +62,35 @@ class MCPTestClient:
             for col_idx, value in enumerate(row_data, 1):
                 if ws is not None:
                     ws.cell(row=row_idx, column=col_idx, value=value)
+        
+        # Create a second worksheet with balance sheet data
+        ws2 = wb.create_sheet("BalanceSheet")
+        balance_data = [
+            ["Item", "2023", "2024"],
+            ["Cash", 50000, 75000],
+            ["Accounts Receivable", 100000, 120000],
+            ["Total Assets", 500000, 600000],
+            ["Debt", 200000, 250000],
+            ["Equity", 300000, 350000]
+        ]
+        
+        for row_idx, row_data in enumerate(balance_data, 1):
+            for col_idx, value in enumerate(row_data, 1):
+                ws2.cell(row=row_idx, column=col_idx, value=value)
+        
+        # Create a third worksheet with cash flow data  
+        ws3 = wb.create_sheet("CashFlow")
+        cashflow_data = [
+            ["Item", "2023", "2024"],
+            ["Operating CF", 120000, 150000],
+            ["Investing CF", -80000, -100000],
+            ["Financing CF", -20000, -30000],
+            ["Net Change in Cash", 20000, 20000]
+        ]
+        
+        for row_idx, row_data in enumerate(cashflow_data, 1):
+            for col_idx, value in enumerate(row_data, 1):
+                ws3.cell(row=row_idx, column=col_idx, value=value)
         
         test_file_path = self.output_dir / "test_data.xlsx"
         wb.save(test_file_path)
@@ -273,6 +302,128 @@ class MCPTestClient:
             print(f"Failed to parse error response: {e}")
             return False
     
+    def test_write_range(self, test_file_path: Path) -> bool:
+        """Test writing Excel range"""
+        print("\nTesting write_range...")
+        
+        # Test data to write
+        test_data = [
+            ["Updated", "2026E"],
+            [1600000, 1800000]  # Updated revenue projections
+        ]
+        
+        request = {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "write_range",
+                "arguments": {
+                    "file_path": str(test_file_path),
+                    "sheet_name": "TestFinancials",
+                    "range": "E1:F2",  # Write to columns E-F
+                    "values": test_data
+                }
+            }
+        }
+        
+        response = self.send_request(request)
+        if not response or "error" in response:
+            print(f"Write range failed: {response}")
+            return False
+            
+        # Parse the tool response
+        try:
+            content = response["result"]["content"][0]["text"]
+            data = json.loads(content)
+            
+            if data.get("success"):
+                print("Write operation successful!")
+                
+                # Now read back to verify
+                verify_request = {
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "read_range",
+                        "arguments": {
+                            "file_path": str(test_file_path),
+                            "sheet_name": "TestFinancials",
+                            "range": "E1:F2"
+                        }
+                    }
+                }
+                
+                verify_response = self.send_request(verify_request)
+                if verify_response:
+                    verify_content = verify_response["result"]["content"][0]["text"]
+                    verify_data = json.loads(verify_content)
+                    if verify_data.get("success"):
+                        written_data = verify_data["data"]
+                        print(f"Verified written data: {written_data}")
+                        return True
+                
+                return True
+            else:
+                print(f"Write failed: {data['error']}")
+                return False
+                
+        except Exception as e:
+            print(f"Failed to parse write response: {e}")
+            return False
+    
+    def test_workbook_info(self, test_file_path: Path) -> bool:
+        """Test getting workbook information"""
+        print("\nTesting get_workbook_info...")
+        
+        request = {
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "get_workbook_info",
+                "arguments": {
+                    "file_path": str(test_file_path)
+                }
+            }
+        }
+        
+        response = self.send_request(request)
+        if not response or "error" in response:
+            print(f"Get workbook info failed: {response}")
+            return False
+            
+        # Parse the tool response
+        try:
+            content = response["result"]["content"][0]["text"]
+            data = json.loads(content)
+            
+            if data.get("success"):
+                worksheet_data = data["worksheet_data"]
+                print(f"Found {len(worksheet_data)} worksheet(s):")
+                
+                for sheet in worksheet_data:
+                    if "error" in sheet:
+                        print(f"  {sheet['name']}: ERROR - {sheet['error']}")
+                    else:
+                        print(f"  {sheet['name']}: {sheet['max_row']} rows, {sheet['max_column']} cols, range: {sheet['dimensions']}")
+                
+                # Save workbook info to output
+                info_file = self.output_dir / "workbook_info.json"
+                with open(info_file, 'w') as f:
+                    json.dump(data, f, indent=2)
+                print(f"Workbook info saved to: {info_file}")
+                
+                return True
+            else:
+                print(f"Get workbook info failed: {data['error']}")
+                return False
+                
+        except Exception as e:
+            print(f"Failed to parse workbook info response: {e}")
+            return False
+    
     def cleanup(self):
         """Clean up resources"""
         if self.server_process:
@@ -314,6 +465,15 @@ class MCPTestClient:
                 
             if self.test_error_handling():
                 tests_passed += 1
+                
+            if self.test_write_range(test_file):
+                tests_passed += 1
+                
+            if self.test_workbook_info(test_file):
+                tests_passed += 1
+            
+            # Update total tests
+            total_tests = 5
             
             # Results
             print("\n" + "=" * 50)

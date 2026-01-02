@@ -3,10 +3,20 @@ import asyncio
 import json
 import os
 
-from utils import get_data, calculate_percentiles
+from agent import FinancialAnalysisAgent
+
+from .utils import get_data, calculate_percentiles
 from mcp.server import Server
 from mcp.types import Tool, TextContent, ServerCapabilities
 from mcp.server.models import InitializationOptions
+
+dcf_tool_description = """Calculates the intrinsic value of a company based on the present value of its future cash flows (Discounted Cash Flow analysis). This is a detailed, fundamental valuation method.
+Should use: When you have access to multi-year financial forecasts and want to determine a company's value based on its core cash-generating ability, independent of current market sentiment.
+Should NOT use: For companies with highly unpredictable cash flows (e.g., pre-revenue startups) or when detailed forecasts are unavailable. The valuation is very sensitive to assumptions about future growth and risk."""
+
+comps_tool_description = """Estimates a company's value by calculating valuation multiples (e.g., EV/EBITDA, P/E) for a set of comparable public companies and applying the median multiple to the target company.
+Should use: To get a quick valuation range based on current market sentiment and to see how a company is valued relative to its direct peers.
+Should NOT use: When there are no truly comparable public companies, or if the entire market sector is believed to be in a bubble or a crash. This method provides a relative value, not a fundamental intrinsic value."""
 
 class Financial_Analysis:
   def __init__(self, args= Dict):
@@ -22,14 +32,24 @@ class Financial_Analysis:
       return [
         Tool(
           name= "comparable_company_analysis",
-          description="method for valuing a company by looking at the prices and valuation mutiples of similar, publicly traded companies",
+          description=comps_tool_description,
           inputSchema={
             "type": "object",
             "properties": {
               "companies": {
-                "type": "array",
+                "type": "List",
                 "description": "List of comparable companies"
               }
+            }
+          }
+        ),
+        Tool(
+          name= 'discounted_cash_flow_analysis',
+          description=dcf_tool_description,
+          inputSchema={
+            "type": "object",
+            "properties": {
+
             }
           }
         )]
@@ -38,7 +58,7 @@ class Financial_Analysis:
     async def call_tool(name: str, args: Dict[str, Any]) -> List[TextContent]:
       try:
         if name == "comparable_company_analysis":
-          return await parent.comparable_company_analysis(args)
+          return await parent.comparable_company_analysis(args['companies'])
       except Exception as e:
         return [TextContent(
           type="text",
@@ -55,9 +75,9 @@ class Financial_Analysis:
           })
         )]
 
-  async def comparable_company_analysis(self, args: Dict[str, Any]) -> List[TextContent]:
+  async def comparable_company_analysis(self, args: List[str]) -> List[TextContent]:
     # get the select universe of companies
-    comparables = args["companies"]
+    comparables = args
     data = []
 
     # create a list of coroutine tasks to run
@@ -74,10 +94,10 @@ class Financial_Analysis:
     ev_ebitda_data = await calculate_percentiles(data, 'ev_ebitda')
     ev_ebit_data = await calculate_percentiles(data, 'ev_ebit')
 
-
     return [TextContent(
       type="text",
       text=json.dumps({
+        'comparables': comparables,
         'pe_ratio': pe_data,
         'pb_data' : pb_data,
         'ev_revenue_data' : ev_revenue_data,
@@ -86,8 +106,29 @@ class Financial_Analysis:
       })
     )]
 
+  async def discount_cash_flow(self, ticker: str) -> List[TextContent]:
+
+    # create assumptions with agent
+    dcf_analyst_agent = FinancialAnalysisAgent()
+    data = await get_data(ticker)
+    response = await dcf_analyst_agent.generate_assumptions(ticker,data)
+    print(response)
+
+    # forcast future free cash flow
+
+    # estimate the terminal value
+
+    # discount everything
+
+
+    # note to self dont forget to add function to tool
+    return [TextContent(
+      type='text',
+      text='TODO: Implement method'
+    )]
+
+
 if __name__ == "__main__":
-  comparables = {'companies': ['AAPL', 'MSFT', 'GOOGL']}
   f = Financial_Analysis()
-  res = asyncio.run(f.comparable_company_analysis(comparables))
+  res = asyncio.run(f.discount_cash_flow('MSFT'))
   print(res)
