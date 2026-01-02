@@ -1,7 +1,4 @@
-import requests
-import httpx
 from ddgs import DDGS
-import urllib.parse
 from typing import List, Dict, Optional
 
 def search_duckduckgo(query: str, max_results = 5) -> List[Dict]:
