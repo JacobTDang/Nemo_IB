@@ -2,6 +2,8 @@ import yfinance as yf
 import asyncio
 from typing import Dict, Any, List, Optional
 import pandas as pd
+import numpy as np
+
 async def get_data(ticker: str) -> Dict[str, Any]:
   data = {}
 
@@ -17,6 +19,7 @@ async def get_data(ticker: str) -> Dict[str, Any]:
 
   # get necessary information
   info = company.info
+  data['ticker'] = ticker
   data['marketCap'] = info.get('marketCap')
   data['revenue'] = info.get('totalRevenue') # gets the trailing revenue over the last 12 months
   data['EBITDA'] = info.get('ebitda', 'N/A')
@@ -85,6 +88,23 @@ async def find_key(possible_key : List[str], indexes: pd.Index) -> Optional[str]
   print('complete failure, key DNE')
   return None
 
+async def calculate_percentiles(data: List[Dict[str, Any]], key: str) -> Dict[str, Any]:
+  percentiles = {}
+  # build the list of values based on key
+  values = [d[key] for d in data if d.get(key) is not None]
+
+  if not values:
+    print(f'No valid data found for key: {str(key)}')
+
+  # calcaute statistics
+  percentiles['mean'] = np.mean(values)
+  percentiles['median'] = np.median(values)
+  percentiles['q1'] = np.percentile(values, 25)
+  percentiles['q3'] = np.percentile(values, 75)
+  percentiles['low'] = np.min(values)
+  percentiles['high'] = np.max(values)
+
+  return percentiles
 if __name__ == "__main__":
   data = asyncio.run(get_data("MSFT"))
   print(data.items())
