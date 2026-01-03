@@ -107,24 +107,77 @@ class Financial_Analysis:
     )]
 
   async def discount_cash_flow(self, ticker: str) -> List[TextContent]:
-
     # create assumptions with agent
     dcf_analyst_agent = FinancialAnalysisAgent()
     data = await get_data(ticker)
     response = await dcf_analyst_agent.generate_assumptions(ticker,data)
+
     print(response)
 
+    # parse response from model
+    revenue_base = response['revenue_base']
+    ebitda_margin = response['ebitda_margin']
+    capex_pct_revenue = response['capex_pct_revenue']
+    tax_rate = response['tax_rate']
+    revenue_growth = response['revenue_growth']
+    depreciation = response['depreciation']
+    terminal_growth = response['terminal_growth']
+    terminal_multiple = response['terminal_multiple']
+    wacc = response['wacc']
+    revenue_year5 = response['revenue_year5']
+
     # forcast future free cash flow
+    fcf_projections = []
+    for year, growth in enumerate(revenue_growth):
+      revenue = revenue_base * (1 + growth) ** (year + 1)
+      ebitda = revenue * ebitda_margin
+      ebit = ebitda - (revenue * depreciation) # depends on the depreciation, for now 0.02 is temp val
+      taxes = ebit * tax_rate
+      nopat = ebit - taxes
+      capex = revenue * capex_pct_revenue
+      fcf = nopat - capex
+      fcf_projections.append(fcf)
 
     # estimate the terminal value
+    # perpetuity growth
+    final_year_fcf = fcf_projections[-1]
+    terminal_fcf = final_year_fcf * (1 + terminal_growth)
+    terminal_value_growth = terminal_fcf / (wacc - terminal_growth)
 
-    # discount everything
+    # exit multiple
+    final_year_ebitda = revenue_year5 * ebitda_margin
+    terminal_value_multiple = final_year_ebitda * terminal_multiple
+    terminal_value = min(terminal_value_growth, terminal_value_multiple)
 
+    # present value calculation
+    pv_fcfs = []
+    for year, fcf in enumerate(fcf_projections):
+      pv = fcf / (1 + wacc) ** (year + 1)
+      pv_fcfs.append(pv)
+    pv_terminal = terminal_value / (1 + wacc) ** 5
+
+    enterprise_value = sum(pv_fcfs) + pv_terminal
+
+    # equity value bridge
+    cash = data['cash'] / 1_000_000
+    debt = data['totalDebt'] / 1_000_000
+    shares_outstanding = data['sharesOutstanding']
+
+    equity_value = enterprise_value + cash - debt
+    price_per_share = equity_value / shares_outstanding
 
     # note to self dont forget to add function to tool
     return [TextContent(
       type='text',
-      text='TODO: Implement method'
+      text=json.dumps({
+          'ticker': ticker,
+          'enterprise_value': enterprise_value,
+          'equity_value': equity_value,
+          'price_per_share': price_per_share,
+          'fcf_projections': fcf_projections,
+          'terminal_value': terminal_value,
+          'assumptions': response
+      })
     )]
 
 

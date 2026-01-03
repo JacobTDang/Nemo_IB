@@ -25,6 +25,9 @@ async def get_data(ticker: str) -> Dict[str, Any]:
   data['EBITDA'] = info.get('ebitda', 'N/A')
   data['netIncomeToCommon'] = info.get('netIncomeToCommon')
   data['enterpriseValue'] = info.get('enterpriseValue')
+  data['cash'] = info.get('totalCash', 0)
+  data['totalDebt'] = info.get('totalDebt', 0)
+  data['sharesOutstanding'] = info.get('sharesOutstanding')
 
   # safely get the balancesheet and book_value
   try:
@@ -107,4 +110,6 @@ async def calculate_percentiles(data: List[Dict[str, Any]], key: str) -> Dict[st
   return percentiles
 if __name__ == "__main__":
   data = asyncio.run(get_data("MSFT"))
-  print(data.items())
+  print(data['cash'])
+  print(data['totalDebt'])
+  print(data['sharesOutstanding'])
