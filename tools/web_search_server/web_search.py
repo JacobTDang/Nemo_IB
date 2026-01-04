@@ -3,7 +3,7 @@ import asyncio
 import json
 import os
 
-from utils import search_duckduckgo
+from utils import search_duckduckgo, _session_manager, batch_scrape, web_scrape
 from mcp.server import Server
 from mcp.types import Tool, TextContent, ServerCapabilities
 from mcp.server.models import InitializationOptions
@@ -11,9 +11,9 @@ from mcp.server.models import InitializationOptions
 class WebSearchServer:
   def __init__(self):
     self.server = Server("Web_Search")
-    self._setup_handers()
+    self._setup_handlers()
 
-  def _setup_handers(self):
+  def _setup_handlers(self):
     parent = self
 
     @self.server.list_tools()
@@ -38,6 +38,23 @@ class WebSearchServer:
               }
             },
             "required": ["ticker", "query"]
+          }
+        ),
+        Tool(
+          name="get_urls_content",
+          description="get content from list of urls",
+          inputSchema={
+            "type": "object",
+            'properties': {
+              'urls': {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "list of urls to gather information from"
+              }
+            },
+            "required": ["urls"]
           }
         )]
 
@@ -65,9 +82,8 @@ class WebSearchServer:
     # create corotines that will run sync functions in threads
     tasks = [asyncio.to_thread(search_duckduckgo, q, 5) for q in queries]
     result_list = await asyncio.gather(*tasks)
-
-
     search_results = []
+
     # flatten from [[dicts, ...]] to [dicts ...]
     for result in result_list:
       search_results.extend(result)
@@ -80,10 +96,21 @@ class WebSearchServer:
       })
     )]
 
+
+  async def get_urls_content(self, urls: List[str]) -> List[TextContent]:
+    # turn each url scrap into a corontine
+    tasks = [asyncio.to_thread(web_scrape, url, 3, 1) for url in urls]
+    results = await asyncio.gather(*tasks)
+
+    _session_manager.close_all # close session for good practice
+    return [TextContent(
+      type="text",
+      text=json.dumps({
+        "results": results
+      })
+    )]
+
 if __name__ == "__main__":
   w= WebSearchServer()
-  res = asyncio.run(w.search("MSFT",
-      {"earnings": "MSFT Q4 2024 earnings revenue",
-      "guidance": "MSFT 2025 outlook management",
-      "analyst": "MSFT price target upgrades"}))
+  res = asyncio.run(w.get_urls_content(["https://finance.yahoo.com/news/jpmorgan-backs-citigroup-c-russia-000607541.html", "https://finance.yahoo.com/news/td-synnex-corporation-snx-earnings-203223578.html"]))
   print(res)
