@@ -409,7 +409,7 @@ def get_ebitda_margin(ticker: str) -> Dict[str, Any]:
         'ebitda_margin_percent': float(ebitda_margin_percent),
         'ebitda_amount': float(ebitda_amount / 1_000_000),
         'operating_income': float(ebitda['operating_income'] / 1_000_000),
-        'd&a': float(ebitda['d&a'] / 1_000_000),  
+        'd&a': float(ebitda['d&a'] / 1_000_000),
         'revenue': float(revenue / 1_000_000)
       }
     else:
@@ -425,19 +425,83 @@ def get_ebitda_margin(ticker: str) -> Dict[str, Any]:
       'success': False
     }
 
+def get_capex_pct_revenue(ticker: str) -> Dict[str, Any]:
+  # function to get capital expenditures: Capex is the money that the company spends to buy, maintain, or upgrade physical assets
+  # this metric will show CapEX as percentage of revenue, it shows how much a company is reinvesting back into its assets
+  # CapEx % of revenue = capital expedeitures / total revenue
+  # can find it on cash flow statement under 'cash flow from investing activities'
+  try:
+    filing = get_latest_filing(ticker)
+
+    if filing and filing['xbrl_data']:
+      xbrl = filing['xbrl_data']
+
+      primary_capex_concepts = [
+      'us-gaap:PaymentsToAcquirePropertyPlantAndEquipment',  # Total PP&E (most common)
+      'us-gaap:PaymentsForCapitalExpenditures',              # Direct total CapEx
+      'PaymentsToAcquirePropertyPlantAndEquipment',          # Fallback
+      'CapitalExpenditures'                                  # Basic total
+      ]
+      total_capex = 0
+
+      for concept in primary_capex_concepts:
+        result = filter_annual_data(xbrl, concept)
+        if result:
+         total_capex = abs(result['value'])
+         capex_concept_used = result['concept_used']
+         break
+
+       # unable to find anything in the primary concepts, so we move to components
+       # thinking about this, there are many issues that can arise from this
+       # issue 1. could be more concepts outside of component concepts
+       # issue 2. could overlap when adding capital expenditures
+       # please fix in future, this will be just a place holder
+      if total_capex == 0:
+        component_concepts = [
+        'us-gaap:PaymentsToAcquireBuildings',
+        'us-gaap:PaymentsToAcquireMachineryAndEquipment',
+        'us-gaap:PaymentsToAcquireComputerSoftwareAndEquipment',
+        'us-gaap:PaymentsToAcquireOtherPropertyPlantAndEquipment'
+        ]
+        print(f'WARNING for {ticker}: Might not account for all capital expenditures. Possible overlap of capital expenditures. Using concepts: {component_concepts}')
+        for concept in component_concepts:
+          result = filter_annual_data(xbrl, concept)
+          if result:
+            total_capex += result['value']
+
+        if total_capex == 0:
+          return{
+            'error': f'Unable to find any concepts for {ticker}',
+            'success': False
+          }
+
+      # now that we have the capex value we can get the percentage
+      revenue_data = get_revenue_base(ticker)
+      if not revenue_data['success']:
+        return revenue_data # return the revenue error
+      revenue = get_revenue_base(ticker)['revenue_base'] * 1000000
+      capex_pct = (total_capex / revenue) * 100
+
+      return{
+        'error': None,
+        'success': True,
+        'total_capex': float(total_capex),
+        'revenue': float(revenue),
+        'capex_pct': float(capex_pct)
+      }
+    else:
+      return {
+        'error': f"Unable to get xbrl data for: {ticker}",
+        'success': False
+      }
+
+  except:
+    return{
+      'error': f'Unable to get filing for {ticker}',
+      'success': False
+    }
+
+
+
 if __name__ == "__main__":
-  filing = get_latest_filing('AAPL')
-  if filing and filing['xbrl_data']:
-    xbrl = filing['xbrl_data']
-
-    # Search for all revenue-related concepts
-    all_facts = xbrl.facts.query().to_dataframe()
-    revenue_facts = all_facts[all_facts['concept'].str.contains('evenue', case=False, na=False)]
-    revenue_concepts = revenue_facts['concept'].unique()
-    print("Available revenue concepts:")
-    for concept in sorted(revenue_concepts):
-      print(f"  {concept}")
-
-    print("\n" + "="*50 + "\n")
-
-  print(get_ebitda_margin('EOSE'))
+  print(get_capex_pct_revenue("AAPL"))
