@@ -10,10 +10,13 @@ import os
 NAME = os.getenv('NAME', 'Investment Analyst')
 SEC_EMAIL = os.getenv('SEC_EMAIL', 'analyst@example.com')
 
-def filter_annual_data(xbrl, concept: str) -> Optional[Dict[str, Any]]:
+def filter_annual_data(xbrl, concept: str, form_type: str = '10-K') -> Optional[Dict[str, Any]]:
   """
-  Helper function to filter XBRL facts for annual data
-  Returns latest annual data or None if not found
+  Helper function to filter XBRL facts for period data based on form type
+  Returns latest period data or None if not found
+  - 10-K: Annual data (350+ days)
+  - 10-Q: Quarterly data (80-95 days)
+  - Others: Most recent available
   """
   try:
     facts = xbrl.facts.query().by_concept(concept).to_dataframe()
@@ -21,30 +24,40 @@ def filter_annual_data(xbrl, concept: str) -> Optional[Dict[str, Any]]:
     if facts.empty:
       return None
 
-    # Filter for annual periods dynamically (350+ days for fiscal year variations)
+    # Filter for appropriate periods based on form type
     facts['period_start_dt'] = pd.to_datetime(facts['period_start'])
     facts['period_end_dt'] = pd.to_datetime(facts['period_end'])
     facts['duration_days'] = (facts['period_end_dt'] - facts['period_start_dt']).dt.days
 
-    # Get annual periods first, fallback to most recent
-    annual_periods = facts[facts['duration_days'] >= 350]
+    # Set period filters based on form type
+    if form_type == '10-K':
+      # Annual data (350+ days for fiscal year variations)
+      target_periods = facts[facts['duration_days'] >= 350]
+    elif form_type == '10-Q':
+      # Quarterly data (80-95 days typically)
+      target_periods = facts[(facts['duration_days'] >= 80) & (facts['duration_days'] <= 95)]
+    else:
+      # For other forms (8-K, S-1, etc.), get most recent regardless of duration
+      target_periods = facts
 
-    if not annual_periods.empty:
-      annual_data = annual_periods[annual_periods['period_end_dt'] == annual_periods['period_end_dt'].max()]
+    if not target_periods.empty:
+      period_data = target_periods[target_periods['period_end_dt'] == target_periods['period_end_dt'].max()]
       # For revenue, take the highest value (total revenue vs segment revenue)
       if 'evenue' in concept:
-        annual_data = annual_data.loc[annual_data['numeric_value'].idxmax()]
+        period_data = period_data.loc[period_data['numeric_value'].idxmax()]
       else:
-        annual_data = annual_data.iloc[0]
+        period_data = period_data.iloc[0]
     else:
-      annual_data = facts[facts['period_end_dt'] == facts['period_end_dt'].max()]
-      if 'evenue' in concept and len(annual_data) > 1:
-        annual_data = annual_data.loc[annual_data['numeric_value'].idxmax()]
+      # Fallback to most recent data if no target periods found
+      period_data = facts[facts['period_end_dt'] == facts['period_end_dt'].max()]
+      if 'evenue' in concept and len(period_data) > 1:
+        period_data = period_data.loc[period_data['numeric_value'].idxmax()]
       else:
-        annual_data = annual_data.iloc[0]
+        period_data = period_data.iloc[0]
 
-    if annual_data is not None and not (hasattr(annual_data, 'empty') and annual_data.empty):
-      latest_row = annual_data
+    if period_data is not None and not (hasattr(period_data, 'empty') and period_data.empty):
+      latest_row = period_data
+
       return {
         'value': latest_row['numeric_value'],
         'concept_used': concept,
@@ -96,10 +109,10 @@ def get_latest_filing(ticker: str, form_type: str = '10-K') -> Optional[Dict[str
   except Exception:
     return None
 
-def get_disclosures_names(ticker) -> Dict[str, Any]:
+def get_disclosures_names(ticker:str, form_type: str = '10-k') -> Dict[str, Any]:
   # get the disclosure name for agent to use
   try:
-    filing_data = get_latest_filing(ticker)
+    filing_data = get_latest_filing(ticker, form_type)
     if filing_data and filing_data['xbrl_data']:
       xbrl=filing_data['xbrl_data']
       disclosures = []
@@ -159,10 +172,10 @@ def get_disclosures_names(ticker) -> Dict[str, Any]:
     'disclosure_names': None
   }
 
-def extract_disclosure_data(ticker: str, disclosure_name: str) -> Dict[str, Any]:
+def extract_disclosure_data(ticker: str, disclosure_name: str, form_type: str = '10-K') -> Dict[str, Any]:
 
   try:
-    latest_filing = get_latest_filing(ticker)
+    latest_filing = get_latest_filing(ticker, form_type)
     if latest_filing and latest_filing['xbrl_data']:
       xbrl = latest_filing['xbrl_data']
 
@@ -268,31 +281,33 @@ def extract_disclosure_data(ticker: str, disclosure_name: str) -> Dict[str, Any]
 
   return {}
 
-def get_revenue_base(ticker: str) -> Dict[str, Any]:
+def get_revenue_base(ticker: str, form_type: str= "10-K") -> Dict[str, Any]:
   # this is the company's recurring revenue from its primary business operations. It will be the starting point for nearly all financial analysis
   try:
-    filing_data = get_latest_filing(ticker)
+    filing_data = get_latest_filing(ticker, form_type)
 
     if filing_data and filing_data['xbrl_data']:
       xbrl = filing_data['xbrl_data']
 
-      # Try different revenue concept names - prioritize total/comprehensive revenue
+
+      # Try different revenue concept names - prioritize Google's specific concepts
       revenue_concepts = [
+        'us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax',  # Google's main revenue concept
         'us-gaap:Revenues',  # Total revenues (most comprehensive)
         'us-gaap:SalesRevenueNet',
+        'RevenueFromContractWithCustomerExcludingAssessedTax',  # Without prefix
         'Revenues',
         'Revenue',
         'TotalRevenues',
-        'SalesRevenueNet',
-        'us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax'  # Move this to last (excludes components)
+        'SalesRevenueNet'
       ]
 
       for concept in revenue_concepts:
-        result = filter_annual_data(xbrl, concept)
+        result = filter_annual_data(xbrl, concept, form_type)
         if result:
           return {
             'ticker': ticker,
-            'revenue_base': float(result['value']) / 1_000_000,  # convert to millions
+            'revenue_base': float(result['value']),  # keep in raw dollars
             'concept_used': result['concept_used'],
             'period_end': result['period_end'],
             'filing_date': filing_data['filing_date'],
@@ -318,7 +333,7 @@ def get_revenue_base(ticker: str) -> Dict[str, Any]:
       'success': False
     }
 
-def get_ebitda_margin(ticker: str) -> Dict[str, Any]:
+def get_ebitda_margin(ticker: str, form_type: str = '10-k') -> Dict[str, Any]:
   # Ignores interst, taxes, and non-cash expenses, so it allows you to compare the underlying profit generation of a company from there core operations
   # how to ususally calculate it
   # 1. Find the operating income from income statement
@@ -326,7 +341,7 @@ def get_ebitda_margin(ticker: str) -> Dict[str, Any]:
   # 3. Calcualte ebitda = operating income + depreication & amorization, and then divide the sum by revenue
   try:
     ebitda = {} # use to store operating income and depreciation & amorization
-    filing = get_latest_filing(ticker)
+    filing = get_latest_filing(ticker, form_type)
     if filing and filing['xbrl_data']:
       xbrl = filing['xbrl_data']
 
@@ -338,7 +353,7 @@ def get_ebitda_margin(ticker: str) -> Dict[str, Any]:
       ]
 
       for concept in operating_income_concepts:
-        result = filter_annual_data(xbrl, concept)
+        result = filter_annual_data(xbrl, concept, form_type)
         if result:
           ebitda['operating_income'] = result['value']
           ebitda['operating_income_concept_used'] = result['concept_used']
@@ -355,7 +370,7 @@ def get_ebitda_margin(ticker: str) -> Dict[str, Any]:
 
 
       for concept in cashflow_statement_concepts:
-        result = filter_annual_data(xbrl, concept)
+        result = filter_annual_data(xbrl, concept, form_type)
         if result:
           ebitda['d&a'] = result['value']
           ebitda['d&a_concept_used'] = result['concept_used']
@@ -375,7 +390,7 @@ def get_ebitda_margin(ticker: str) -> Dict[str, Any]:
         period_end = None
 
         for concept in individual_concepts:
-          result = filter_annual_data(xbrl, concept)
+          result = filter_annual_data(xbrl, concept, form_type)
           if result:
             if 'Depreciation' in concept:
               depreciation_value = result['value']
@@ -392,11 +407,11 @@ def get_ebitda_margin(ticker: str) -> Dict[str, Any]:
           ebitda['d&a_period_end'] = period_end
 
       # Get revenue for margin calculation
-      revenue_data = get_revenue_base(ticker)
+      revenue_data = get_revenue_base(ticker, form_type)
       if not revenue_data['success']:
         return revenue_data  # Return the error from revenue function
 
-      revenue = revenue_data['revenue_base'] * 1_000_000  # Convert back to actual dollars
+      revenue = revenue_data['revenue_base']  # already in raw dollars
 
       # Calculate EBITDA and EBITDA margin
       ebitda_amount = ebitda['operating_income'] + ebitda['d&a']
@@ -407,10 +422,10 @@ def get_ebitda_margin(ticker: str) -> Dict[str, Any]:
         'success': True,
         'ticker': ticker,
         'ebitda_margin_percent': float(ebitda_margin_percent),
-        'ebitda_amount': float(ebitda_amount / 1_000_000),
-        'operating_income': float(ebitda['operating_income'] / 1_000_000),
-        'd&a': float(ebitda['d&a'] / 1_000_000),
-        'revenue': float(revenue / 1_000_000),
+        'ebitda_amount': float(ebitda_amount),
+        'operating_income': float(ebitda['operating_income']),
+        'd&a': float(ebitda['d&a']),
+        'revenue': float(revenue),
         'operating_income_concept_used': ebitda.get('operating_income_concept_used'),
         'd&a_concept_used': ebitda.get('d&a_concept_used'),
         'period_end': ebitda.get('operating_income_period_end')
@@ -428,13 +443,13 @@ def get_ebitda_margin(ticker: str) -> Dict[str, Any]:
       'success': False
     }
 
-def get_capex_pct_revenue(ticker: str) -> Dict[str, Any]:
+def get_capex_pct_revenue(ticker: str, form_type: str = '10-k') -> Dict[str, Any]:
   # function to get capital expenditures: Capex is the money that the company spends to buy, maintain, or upgrade physical assets
   # this metric will show CapEX as percentage of revenue, it shows how much a company is reinvesting back into its assets
   # CapEx % of revenue = capital expedeitures / total revenue
   # can find it on cash flow statement under 'cash flow from investing activities'
   try:
-    filing = get_latest_filing(ticker)
+    filing = get_latest_filing(ticker, form_type)
 
     if filing and filing['xbrl_data']:
       xbrl = filing['xbrl_data']
@@ -448,7 +463,7 @@ def get_capex_pct_revenue(ticker: str) -> Dict[str, Any]:
       total_capex = 0
 
       for concept in primary_capex_concepts:
-        result = filter_annual_data(xbrl, concept)
+        result = filter_annual_data(xbrl, concept, form_type)
         if result:
          total_capex = abs(result['value'])
          capex_concept_used = result['concept_used']
@@ -468,7 +483,7 @@ def get_capex_pct_revenue(ticker: str) -> Dict[str, Any]:
         ]
         print(f'WARNING for {ticker}: Might not account for all capital expenditures. Possible overlap of capital expenditures. Using concepts: {component_concepts}')
         for concept in component_concepts:
-          result = filter_annual_data(xbrl, concept)
+          result = filter_annual_data(xbrl, concept, form_type)
           if result:
             total_capex += result['value']
 
@@ -479,18 +494,18 @@ def get_capex_pct_revenue(ticker: str) -> Dict[str, Any]:
           }
 
       # now that we have the capex value we can get the percentage
-      revenue_data = get_revenue_base(ticker)
+      revenue_data = get_revenue_base(ticker, form_type)
       if not revenue_data['success']:
         return revenue_data # return the revenue error
-      revenue = get_revenue_base(ticker)['revenue_base'] * 1000000
+      revenue = revenue_data['revenue_base']  # already in raw dollars
       capex_pct = (total_capex / revenue) * 100
 
       return{
         'error': None,
         'success': True,
         'ticker': ticker,
-        'total_capex': float(total_capex / 1_000_000),  # Convert to millions
-        'revenue': float(revenue / 1_000_000),  # Convert to millions
+        'total_capex': float(total_capex),  # keep in raw dollars
+        'revenue': float(revenue),  # keep in raw dollars
         'capex_pct_revenue': float(capex_pct),
         'capex_concept_used': capex_concept_used,
         'period_end': revenue_data['period_end']
@@ -508,12 +523,12 @@ def get_capex_pct_revenue(ticker: str) -> Dict[str, Any]:
     }
 
 
-def get_tax_rate(ticker: str) -> Dict[str, Any]:
+def get_tax_rate(ticker: str, form_type: str = '10-k') -> Dict[str, Any]:
   # returns the effective/actual tax rate that the company pays on its profits
   # can find it on the income statement in 'income before provision for income taxes or similar wording' and 'provision for income taxes
   # formula: Effective tax rate = provision for income taxes / earnings before taxes
   try:
-    filing = get_latest_filing(ticker)
+    filing = get_latest_filing(ticker, form_type)
     if filing and filing['xbrl_data']:
       xbrl = filing['xbrl_data']
 
@@ -528,7 +543,7 @@ def get_tax_rate(ticker: str) -> Dict[str, Any]:
       ]
       tax_expense = 0.0 # bc panda dataframe return np.float64
       for concept in tax_expense_concepts:
-        result = filter_annual_data(xbrl, concept)
+        result = filter_annual_data(xbrl, concept, form_type)
         if result:
           tax_expense = float(result['value'])
           tax_concept_used = concept
@@ -545,7 +560,7 @@ def get_tax_rate(ticker: str) -> Dict[str, Any]:
 
       pretax_income = 0.0
       for concept in pretax_income_concepts:
-        result = filter_annual_data(xbrl, concept)
+        result = filter_annual_data(xbrl, concept, form_type)
         if result:
           pretax_income = float(result['value'])
           pretax_concept_used = concept
@@ -582,13 +597,13 @@ def get_tax_rate(ticker: str) -> Dict[str, Any]:
     }
 
 
-def get_depreciation(ticker: str) -> Dict[str, Any]:
+def get_depreciation(ticker: str, form_type: str = '10-k') -> Dict[str, Any]:
   # this is the accounting method of allocating the cost of a physical asset over its uselife. It is a non cash expense is will be expressed as a percentage of revenue
   # formula: depreication % of revenue = depreication & amorization / total revenue
   # this will be helpful beacuse it helps us find the age and cost structure of a company's assets
   # find it on the cash flow statement, usually under "cash flow from operating activities"
   try:
-    filing = get_latest_filing(ticker)
+    filing = get_latest_filing(ticker, form_type)
     if filing and filing['xbrl_data']:
       xbrl = filing['xbrl_data']
 
@@ -605,7 +620,7 @@ def get_depreciation(ticker: str) -> Dict[str, Any]:
 
       d_a_value = 0.0
       for concept in depreciation_concepts:
-        results = filter_annual_data(xbrl, concept)
+        results = filter_annual_data(xbrl, concept, form_type)
         if results:
           d_a_value = float(results['value'])
           d_a_concept = concept
@@ -617,12 +632,12 @@ def get_depreciation(ticker: str) -> Dict[str, Any]:
           'success': False
         }
 
-      revenue_data = get_revenue_base(ticker)
+      revenue_data = get_revenue_base(ticker, form_type)
 
       if not revenue_data['success']:
         return revenue_data # just return revenue error
 
-      revenue = revenue_data['revenue_base'] * 1_000_000
+      revenue = revenue_data['revenue_base']  # already in raw dollars
 
       # now we have the d_a value and revenue so we can calulate deprceication %
       d_a_pct = (d_a_value / revenue) * 100
@@ -648,4 +663,4 @@ def get_depreciation(ticker: str) -> Dict[str, Any]:
       'success':False
     }
 if __name__ == "__main__":
-  print(get_depreciation("MSFT"))
+  pass
