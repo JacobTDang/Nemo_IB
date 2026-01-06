@@ -410,7 +410,10 @@ def get_ebitda_margin(ticker: str) -> Dict[str, Any]:
         'ebitda_amount': float(ebitda_amount / 1_000_000),
         'operating_income': float(ebitda['operating_income'] / 1_000_000),
         'd&a': float(ebitda['d&a'] / 1_000_000),
-        'revenue': float(revenue / 1_000_000)
+        'revenue': float(revenue / 1_000_000),
+        'operating_income_concept_used': ebitda.get('operating_income_concept_used'),
+        'd&a_concept_used': ebitda.get('d&a_concept_used'),
+        'period_end': ebitda.get('operating_income_period_end')
       }
     else:
       return {
@@ -485,9 +488,12 @@ def get_capex_pct_revenue(ticker: str) -> Dict[str, Any]:
       return{
         'error': None,
         'success': True,
-        'total_capex': float(total_capex),
-        'revenue': float(revenue),
-        'capex_pct': float(capex_pct)
+        'ticker': ticker,
+        'total_capex': float(total_capex / 1_000_000),  # Convert to millions
+        'revenue': float(revenue / 1_000_000),  # Convert to millions
+        'capex_pct_revenue': float(capex_pct),
+        'capex_concept_used': capex_concept_used,
+        'period_end': revenue_data['period_end']
       }
     else:
       return {
@@ -502,6 +508,79 @@ def get_capex_pct_revenue(ticker: str) -> Dict[str, Any]:
     }
 
 
+def get_tax_rate(ticker: str) -> Dict[str, Any]:
+  # returns the effective/actual tax rate that the company pays on its profits
+  # can find it on the income statement in 'income before provision for income taxes or similar wording' and 'provision for income taxes
+  # formula: Effective tax rate = provision for income taxes / earnings before taxes
+  try:
+    filing = get_latest_filing(ticker)
+    if filing and filing['xbrl_data']:
+      xbrl = filing['xbrl_data']
+
+      tax_expense_concepts = [
+      'us-gaap:IncomeTaxExpenseBenefit',                           # Most common - total tax expense
+      'us-gaap:ProvisionForIncomeTaxes',                           # Alternative provision concept
+      'us-gaap:IncomeTaxesPaid',                                   # Cash taxes paid
+      'us-gaap:CurrentIncomeTaxExpense',                           # Current year tax expense
+      'IncomeTaxExpenseBenefit',                                   # Without prefix
+      'ProvisionForIncomeTaxes',                                   # Without prefix
+      'IncomeTaxExpense'                                           # Basic form
+      ]
+      tax_expense = 0.0 # bc panda dataframe return np.float64
+      for concept in tax_expense_concepts:
+        result = filter_annual_data(xbrl, concept)
+        if result:
+          tax_expense = float(result['value'])
+          tax_concept_used = concept
+          break
+
+      pretax_income_concepts = [
+        'us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest',  # Full concept
+        'us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxes',                                          # Most common
+        'us-gaap:EarningsBeforeIncomeTaxes',                                                                    # Alternative
+        'IncomeLossFromContinuingOperationsBeforeIncomeTaxes',                                                  # Without prefix
+        'EarningsBeforeIncomeTaxes',                                                                            # Without prefix
+        'IncomeBeforeTaxes'                                                                                     # Basic form
+      ]
+
+      pretax_income = 0.0
+      for concept in pretax_income_concepts:
+        result = filter_annual_data(xbrl, concept)
+        if result:
+          pretax_income = float(result['value'])
+          pretax_concept_used = concept
+          break
+
+      # calulate the effective tax rate: Effective tax rate = provision for income taxes / earnings before taxes
+      if tax_expense != 0: # prevent divide by 0 error
+        effective_tax_rate = (tax_expense / pretax_income) * 100
+      else:
+        return{
+          'error': f"tax expense is 0, unable to divide by 0",
+          'success': False
+        }
+
+      return{
+        'error': None,
+        'success': True,
+        'effective_tax_rate': effective_tax_rate,
+        'tax_expense': tax_expense,
+        'tax_concept_used': tax_concept_used,
+        'pretax_income': pretax_income,
+        'pretax_concept_used': pretax_concept_used
+      }
+
+    else:
+      return{
+        'error': f'Unable to get xbrl data',
+        'success': False
+      }
+  except Exception as e:
+    return{
+      'error': f'Unable to get filing for {ticker}',
+      'success': False
+    }
+
 
 if __name__ == "__main__":
-  print(get_capex_pct_revenue("AAPL"))
+  print(get_tax_rate("AAPL"))
