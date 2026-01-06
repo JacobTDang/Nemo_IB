@@ -292,7 +292,7 @@ def get_revenue_base(ticker: str) -> Dict[str, Any]:
         if result:
           return {
             'ticker': ticker,
-            'revenue_base': result['value'] / 1_000_000,  # convert to millions
+            'revenue_base': float(result['value']) / 1_000_000,  # convert to millions
             'concept_used': result['concept_used'],
             'period_end': result['period_end'],
             'filing_date': filing_data['filing_date'],
@@ -577,10 +577,75 @@ def get_tax_rate(ticker: str) -> Dict[str, Any]:
       }
   except Exception as e:
     return{
-      'error': f'Unable to get filing for {ticker}',
+      'error': f'Unable to get filing for {ticker}: {str(e)}',
       'success': False
     }
 
 
+def get_depreciation(ticker: str) -> Dict[str, Any]:
+  # this is the accounting method of allocating the cost of a physical asset over its uselife. It is a non cash expense is will be expressed as a percentage of revenue
+  # formula: depreication % of revenue = depreication & amorization / total revenue
+  # this will be helpful beacuse it helps us find the age and cost structure of a company's assets
+  # find it on the cash flow statement, usually under "cash flow from operating activities"
+  try:
+    filing = get_latest_filing(ticker)
+    if filing and filing['xbrl_data']:
+      xbrl = filing['xbrl_data']
+
+      depreciation_concepts = [
+      'us-gaap:DepreciationDepletionAndAmortization',           # Combined D&A (most common)
+      'us-gaap:Depreciation',                                   # Depreciation only
+      'us-gaap:DepreciationAndAmortization',                    # Alternative combined
+      'us-gaap:DepreciationAmortizationAndAccretionNet',        # With accretion
+      'us-gaap:DepreciationDepletionAndAmortizationExcludingAmortizationOfDebtIssuanceCosts',  # Excluding debt costs
+      'DepreciationDepletionAndAmortization',                   # Without prefix
+      'Depreciation',                                           # Basic depreciation
+      'DepreciationAndAmortization'                            # Basic combined
+      ]
+
+      d_a_value = 0.0
+      for concept in depreciation_concepts:
+        results = filter_annual_data(xbrl, concept)
+        if results:
+          d_a_value = float(results['value'])
+          d_a_concept = concept
+          break
+
+      if d_a_value == 0.0:
+        return{
+          'error': f"Unable to find concept for {ticker}: Concepts used = {depreciation_concepts}",
+          'success': False
+        }
+
+      revenue_data = get_revenue_base(ticker)
+
+      if not revenue_data['success']:
+        return revenue_data # just return revenue error
+
+      revenue = revenue_data['revenue_base'] * 1_000_000
+
+      # now we have the d_a value and revenue so we can calulate deprceication %
+      d_a_pct = (d_a_value / revenue) * 100
+
+      return{
+        'error': None,
+        'success': True,
+        'd&a_pct': d_a_pct,
+        'concept': d_a_concept,
+        'd&a': d_a_value,
+        'revenue': revenue
+      }
+
+    else:
+      return{
+        'error': f"Unable to get filing for {ticker}",
+        'success': False
+      }
+
+  except Exception as e:
+    return{
+      'error': f"Unable to get filing for {ticker}",
+      'success':False
+    }
 if __name__ == "__main__":
-  print(get_tax_rate("AAPL"))
+  print(get_depreciation("MSFT"))
