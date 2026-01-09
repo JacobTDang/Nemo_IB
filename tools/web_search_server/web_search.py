@@ -3,7 +3,30 @@ import asyncio
 import json
 import os
 
-from utils import search_duckduckgo, _session_manager, batch_scrape, web_scrape
+from tools.web_search_server.webscraper_utils import search_duckduckgo, _session_manager, batch_scrape, web_scrape
+from tools.web_search_server.sec_utils import (
+    get_revenue_base, get_ebitda_margin, get_capex_pct_revenue,
+    get_tax_rate, get_depreciation, get_disclosures_names,
+    extract_disclosure_data, get_latest_filing
+)
+import importlib.util
+import sys
+
+# mmport module with number in name
+try:
+    spec = importlib.util.spec_from_file_location(
+        "filing_parser",
+        "tools/web_search_server/8K_and_DEF14A_utils.py"
+    )
+    if spec and spec.loader:
+        filing_parser = importlib.util.module_from_spec(spec)
+        sys.modules["filing_parser"] = filing_parser
+        spec.loader.exec_module(filing_parser)
+    else:
+        raise ImportError("Could not load filing parser module")
+except Exception:
+    # fallback - set filing_parser to None and handle in methods
+    filing_parser = None
 from mcp.server import Server
 from mcp.types import Tool, TextContent, ServerCapabilities
 from mcp.server.models import InitializationOptions
@@ -56,6 +79,142 @@ class WebSearchServer:
             },
             "required": ["urls"]
           }
+        ),
+        # SEC XBRL Tools
+        Tool(
+          name="get_revenue_base",
+          description="Get company's primary revenue from SEC filings (10-K/10-Q)",
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Stock symbol"},
+              "form_type": {"type": "string", "description": "SEC form type", "default": "10-K"}
+            },
+            "required": ["ticker"]
+          }
+        ),
+        Tool(
+          name="get_ebitda_margin",
+          description="Calculate EBITDA margin from SEC filings",
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Stock symbol"},
+              "form_type": {"type": "string", "description": "SEC form type", "default": "10-K"}
+            },
+            "required": ["ticker"]
+          }
+        ),
+        Tool(
+          name="get_capex_pct_revenue",
+          description="Get capital expenditures as percentage of revenue",
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Stock symbol"},
+              "form_type": {"type": "string", "description": "SEC form type", "default": "10-K"}
+            },
+            "required": ["ticker"]
+          }
+        ),
+        Tool(
+          name="get_tax_rate",
+          description="Get effective tax rate from SEC filings",
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Stock symbol"},
+              "form_type": {"type": "string", "description": "SEC form type", "default": "10-K"}
+            },
+            "required": ["ticker"]
+          }
+        ),
+        Tool(
+          name="get_depreciation",
+          description="Get depreciation & amortization as percentage of revenue",
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Stock symbol"},
+              "form_type": {"type": "string", "description": "SEC form type", "default": "10-K"}
+            },
+            "required": ["ticker"]
+          }
+        ),
+        Tool(
+          name="get_disclosures_names",
+          description="Get list of available disclosure names from SEC filings",
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Stock symbol"},
+              "form_type": {"type": "string", "description": "SEC form type", "default": "10-K"}
+            },
+            "required": ["ticker"]
+          }
+        ),
+        Tool(
+          name="extract_disclosure_data",
+          description="Extract specific disclosure data from SEC filings",
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Stock symbol"},
+              "disclosure_name": {"type": "string", "description": "Name of disclosure to extract"},
+              "form_type": {"type": "string", "description": "SEC form type", "default": "10-K"}
+            },
+            "required": ["ticker", "disclosure_name"]
+          }
+        ),
+        Tool(
+          name="get_latest_filing",
+          description="Get metadata and raw access to latest SEC filing",
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Stock symbol"},
+              "form_type": {"type": "string", "description": "SEC form type", "default": "10-K"}
+            },
+            "required": ["ticker"]
+          }
+        ),
+        # SEC Filing Parser Tools (8-K and Proxy Analysis)
+        Tool(
+          name="extract_8k_events",
+          description="Extract material corporate events from 8-K filings for due diligence",
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Stock symbol"},
+              "limit": {"type": "integer", "description": "Max filings to process", "default": 10},
+              "debug": {"type": "boolean", "description": "Print debug output", "default": False}
+            },
+            "required": ["ticker"]
+          }
+        ),
+        Tool(
+          name="extract_proxy_compensation",
+          description="Analyze executive compensation from proxy filings (DEF 14A)",
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Stock symbol"},
+              "debug": {"type": "boolean", "description": "Print debug output", "default": False}
+            },
+            "required": ["ticker"]
+          }
+        ),
+        Tool(
+          name="extract_governance_data",
+          description="Extract board composition and independence from proxy filings",
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Stock symbol"},
+              "debug": {"type": "boolean", "description": "Print debug output", "default": False}
+            },
+            "required": ["ticker"]
+          }
         )]
 
     @self.server.call_tool()
@@ -63,15 +222,43 @@ class WebSearchServer:
       try:
         if name == 'search':
           return await parent.search(args['ticker'], args['query'])
+        elif name == 'get_urls_content':
+          return await parent.get_urls_content(args['urls'])
+
+        # SEC XBRL Tools
+        elif name == 'get_revenue_base':
+          return await parent.get_revenue_base(args['ticker'], args.get('form_type', '10-K'))
+        elif name == 'get_ebitda_margin':
+          return await parent.get_ebitda_margin(args['ticker'], args.get('form_type', '10-K'))
+        elif name == 'get_capex_pct_revenue':
+          return await parent.get_capex_pct_revenue(args['ticker'], args.get('form_type', '10-K'))
+        elif name == 'get_tax_rate':
+          return await parent.get_tax_rate(args['ticker'], args.get('form_type', '10-K'))
+        elif name == 'get_depreciation':
+          return await parent.get_depreciation(args['ticker'], args.get('form_type', '10-K'))
+        elif name == 'get_disclosures_names':
+          return await parent.get_disclosures_names(args['ticker'], args.get('form_type', '10-K'))
+        elif name == 'extract_disclosure_data':
+          return await parent.extract_disclosure_data(args['ticker'], args['disclosure_name'], args.get('form_type', '10-K'))
+        elif name == 'get_latest_filing':
+          return await parent.get_latest_filing(args['ticker'], args.get('form_type', '10-K'))
+
+        # SEC Filing Parser Tools
+        elif name == 'extract_8k_events':
+          return await parent.extract_8k_events(args['ticker'], args.get('limit', 10), args.get('debug', False))
+        elif name == 'extract_proxy_compensation':
+          return await parent.extract_proxy_compensation(args['ticker'], args.get('debug', False))
+        elif name == 'extract_governance_data':
+          return await parent.extract_governance_data(args['ticker'], args.get('debug', False))
         else:
           return [TextContent(
-            type ='text',
-            text ='Failed to find tool'
+            type='text',
+            text=f'Unknown tool: {name}'
           )]
       except Exception as e:
         return [TextContent(
-          type = 'text',
-          text = f'Failed to search: {str(e)}'
+          type='text',
+          text=f'Failed to execute {name}: {str(e)}'
         )]
 
 
@@ -109,6 +296,77 @@ class WebSearchServer:
         "results": results
       })
     )]
+
+  # SEC XBRL Tools
+  async def get_revenue_base(self, ticker: str, form_type: str = '10-K') -> List[TextContent]:
+    result = await asyncio.to_thread(get_revenue_base, ticker, form_type)
+    return [TextContent(type="text", text=json.dumps(result))]
+
+  async def get_ebitda_margin(self, ticker: str, form_type: str = '10-K') -> List[TextContent]:
+    result = await asyncio.to_thread(get_ebitda_margin, ticker, form_type)
+    return [TextContent(type="text", text=json.dumps(result))]
+
+  async def get_capex_pct_revenue(self, ticker: str, form_type: str = '10-K') -> List[TextContent]:
+    result = await asyncio.to_thread(get_capex_pct_revenue, ticker, form_type)
+    return [TextContent(type="text", text=json.dumps(result))]
+
+  async def get_tax_rate(self, ticker: str, form_type: str = '10-K') -> List[TextContent]:
+    result = await asyncio.to_thread(get_tax_rate, ticker, form_type)
+    return [TextContent(type="text", text=json.dumps(result))]
+
+  async def get_depreciation(self, ticker: str, form_type: str = '10-K') -> List[TextContent]:
+    result = await asyncio.to_thread(get_depreciation, ticker, form_type)
+    return [TextContent(type="text", text=json.dumps(result))]
+
+  async def get_disclosures_names(self, ticker: str, form_type: str = '10-K') -> List[TextContent]:
+    result = await asyncio.to_thread(get_disclosures_names, ticker, form_type)
+    return [TextContent(type="text", text=json.dumps(result))]
+
+  async def extract_disclosure_data(self, ticker: str, disclosure_name: str, form_type: str = '10-K') -> List[TextContent]:
+    result = await asyncio.to_thread(extract_disclosure_data, ticker, disclosure_name, form_type)
+    return [TextContent(type="text", text=json.dumps(result))]
+
+  async def get_latest_filing(self, ticker: str, form_type: str = '10-K') -> List[TextContent]:
+    # Note: This returns filing metadata, not the full filing object (which isn't JSON serializable)
+    result = await asyncio.to_thread(get_latest_filing, ticker, form_type)
+    if result:
+      # Convert to JSON-serializable format
+      json_result = {
+        'ticker': ticker,
+        'form_type': form_type,
+        'filing_date': str(result.get('filing_date')),
+        'url': result.get('url'),
+        'accession_number': result.get('accession_number'),
+        'has_xbrl_data': result.get('xbrl_data') is not None,
+        'success': True
+      }
+    else:
+      json_result = {
+        'ticker': ticker,
+        'form_type': form_type,
+        'error': 'No filing found',
+        'success': False
+      }
+    return [TextContent(type="text", text=json.dumps(json_result))]
+
+  # SEC Filing Parser Tools
+  async def extract_8k_events(self, ticker: str, limit: int = 10, debug: bool = False) -> List[TextContent]:
+    if filing_parser is None:
+      return [TextContent(type="text", text=json.dumps({"error": "Filing parser not available", "success": False}))]
+    result = await asyncio.to_thread(filing_parser.extract_8k_events, ticker, limit, debug)
+    return [TextContent(type="text", text=json.dumps(result))]
+
+  async def extract_proxy_compensation(self, ticker: str, debug: bool = False) -> List[TextContent]:
+    if filing_parser is None:
+      return [TextContent(type="text", text=json.dumps({"error": "Filing parser not available", "success": False}))]
+    result = await asyncio.to_thread(filing_parser.extract_proxy_compensation, ticker, debug)
+    return [TextContent(type="text", text=json.dumps(result))]
+
+  async def extract_governance_data(self, ticker: str, debug: bool = False) -> List[TextContent]:
+    if filing_parser is None:
+      return [TextContent(type="text", text=json.dumps({"error": "Filing parser not available", "success": False}))]
+    result = await asyncio.to_thread(filing_parser.extract_governance_data, ticker, debug)
+    return [TextContent(type="text", text=json.dumps(result))]
 
 if __name__ == "__main__":
   w= WebSearchServer()
