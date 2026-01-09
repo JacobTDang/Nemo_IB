@@ -1,12 +1,38 @@
 from typing import Dict, Any, Optional
 from mcp import StdioServerParameters
 from mcp.client.stdio import stdio_client
-import ollama
+from ollama import chat, ChatResponse
 import asyncio
 import sys
 import os
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, TextStreamer
+
+
+class OllamaModel():
+  # ollama they could never make me hate you
+  def __init__(self, model_name:str):
+    self.model_name = model_name
+    self.conversatoin_history = []
+
+  def generate_response(self, prompt:str, system_prompt:str = "You are a professional Investment Banker from wallstreet"):
+    messages = [
+      {'role': 'system', 'content': system_prompt},
+      {'role': 'user', 'content': prompt}
+      ]
+    stream = chat(
+      model=self.model_name,
+      messages=messages,
+      stream=True,
+      options={
+        'num_gpu': -1,
+        'gpu_memory_utilization': 0.9
+      }
+    )
+
+    for chunk in stream:
+      print(chunk['message']['content'], end='', flush=True)
+
 
 class HuggingFaceModel():
   """this class was made specifically for Hugging Face Models to load in"""
@@ -141,11 +167,11 @@ class Financial_Analysis_Agent():
     pass
 
 if __name__ == "__main__":
-  h=HuggingFaceModel()
-  while True:
-    user_input = input("You: ")
-    if user_input.lower() == "exit":
-      print("Exiting...")
-      break
+  o = OllamaModel("nemotron-nano")
 
-    print(h.generate_response(prompt=user_input))
+  while True:
+    uinput = input('\nYou: ')
+
+    if uinput == "exit":
+      break
+    o.generate_response(uinput)
