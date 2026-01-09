@@ -12,13 +12,7 @@ class HuggingFaceModel():
   """this class was made specifically for Hugging Face Models to load in"""
   def __init__(self,cuda: bool = torch.cuda.is_available(),
               model_name = 'nvidia/Llama-3.1-Nemotron-Nano-8B-v1',
-              quantization_yeaconfig: BitsAndBytesConfig =
-                BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_compute_dtype=torch.bfloat16,
-                llm_int8_enable_fp32_cpu_offload=True)):
+              quantization_yeaconfig: Optional[BitsAndBytesConfig] = None):
 
     self.model_name = model_name
     self.quantization_config = quantization_yeaconfig
@@ -58,7 +52,16 @@ class HuggingFaceModel():
         self.model=None
         print(f"Error loading model {e}")
     else:
-      self.model = AutoModelForCausalLM.from_pretrained(self.model_name, cache_dir=cache_dir)
+      # Load without quantization but with aggressive CPU delegation
+      self.model = AutoModelForCausalLM.from_pretrained(
+        self.model_name,
+        cache_dir=cache_dir,
+        device_map='auto',
+        dtype=torch.float16,  # Half precision to save memory
+        trust_remote_code=True,
+        low_cpu_mem_usage=True,  # Reduce memory usage during loading
+        max_memory={0: "5.5GB", "cpu": "8GB"}  # Use 4GB GPU, leave 2GB buffer
+      )
 
 
   def generate_response(self, prompt: str) -> Optional[str]:
