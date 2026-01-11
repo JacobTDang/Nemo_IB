@@ -289,7 +289,7 @@ class WebSearchServer:
     queries = list(query.values())
 
     # create corotines that will run sync functions in threads
-    tasks = [asyncio.to_thread(search_duckduckgo, q, 5) for q in queries]
+    tasks = [asyncio.to_thread(search_duckduckgo, f"{ticker} {q}", 5) for q in queries]
     result_list = await asyncio.gather(*tasks)
     search_results = []
 
