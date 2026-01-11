@@ -9,7 +9,7 @@ import re
 from collections import Counter
 import hashlib
 from datetime import datetime
-
+import sys
 class SessionManager:
   """Manages persistent HTTP sessions for improved performance"""
 
@@ -87,7 +87,7 @@ def search_duckduckgo(query: str, max_results = 5) -> List[Dict]:
     return unique_results[:max_results]
 
   except Exception as e:
-    print(f"DuckDuckGo search failed: {e}")
+    print(f"DuckDuckGo search failed: {e}", file=sys.stderr, flush=True)
     return []
 
 def is_valid_url(url: str) -> bool:
@@ -296,11 +296,11 @@ def web_scrape(url: str, max_retries: int = 3, retry_delay: float = 1.0, verbose
       if attempt > 0:
         time.sleep(retry_delay * attempt)  # Exponential backoff
         if verbose:
-          print(f"  Retry attempt {attempt + 1}/{max_retries}")
+          print(f"  Retry attempt {attempt + 1}/{max_retries}", file=sys.stderr, flush=True)
 
       # Make request with timeout
       if verbose:
-        print(f"  Fetching URL...")
+        print(f"  Fetching URL...", file=sys.stderr, flush=True)
 
       response = session.get(
         url,
@@ -319,7 +319,7 @@ def web_scrape(url: str, max_retries: int = 3, retry_delay: float = 1.0, verbose
       response.raise_for_status()  # Raise exception for bad status codes
 
       if verbose:
-        print(f"  Response received: {response.status_code} ({len(response.content)} bytes)")
+        print(f"  Response received: {response.status_code} ({len(response.content)} bytes)", file=sys.stderr, flush=True)
 
       # Check if content is HTML
       content_type = response.headers.get('content-type', '').lower()
@@ -334,7 +334,7 @@ def web_scrape(url: str, max_retries: int = 3, retry_delay: float = 1.0, verbose
       encoding = response.encoding if response.encoding else 'utf-8'
 
       if verbose:
-        print(f"  Parsing HTML (encoding: {encoding})...")
+        print(f"  Parsing HTML (encoding: {encoding})...", file=sys.stderr, flush=True)
 
       # Parse HTML content
       soup = BeautifulSoup(response.content, 'html.parser', from_encoding=encoding)
@@ -349,8 +349,8 @@ def web_scrape(url: str, max_retries: int = 3, retry_delay: float = 1.0, verbose
         removed_elements += 1
 
       if verbose:
-        print(f"  Removed {removed_elements} non-content elements")
-        print(f"  Extracting main content...")
+        print(f"  Removed {removed_elements} non-content elements", file=sys.stderr, flush=True)
+        print(f"  Extracting main content...", file=sys.stderr, flush=True)
 
       # Extract main content based on site type
       main_content, extraction_method = extract_financial_content_advanced(soup, url, verbose=verbose)
@@ -362,17 +362,17 @@ def web_scrape(url: str, max_retries: int = 3, retry_delay: float = 1.0, verbose
       quality_info = calculate_content_quality_score(main_content)
 
       if verbose:
-        print(f"  Extraction method: {extraction_method}")
-        print(f"  Content quality: {quality_info['quality']} (score: {quality_info['score']}/100)")
-        print(f"  Words: {quality_info['metrics']['word_count']}, Sentences: {quality_info['metrics']['sentence_count']}")
-        print(f"  Financial keywords found: {quality_info['metrics']['financial_keywords']}")
+        print(f"  Extraction method: {extraction_method}", file=sys.stderr, flush=True)
+        print(f"  Content quality: {quality_info['quality']} (score: {quality_info['score']}/100)", file=sys.stderr, flush=True)
+        print(f"  Words: {quality_info['metrics']['word_count']}, Sentences: {quality_info['metrics']['sentence_count']}", file=sys.stderr, flush=True)
+        print(f"  Financial keywords found: {quality_info['metrics']['financial_keywords']}", file=sys.stderr, flush=True)
 
       # Basic content validation
       if len(main_content) < 100:
         if attempt < max_retries - 1:
           last_error = 'Content too short, retrying...'
           if verbose:
-            print(f"  WARNING: Content too short ({len(main_content)} chars), retrying...")
+            print(f"  WARNING: Content too short ({len(main_content)} chars), retrying...", file=sys.stderr, flush=True)
           continue
         return {
           'success': False,
@@ -383,9 +383,9 @@ def web_scrape(url: str, max_retries: int = 3, retry_delay: float = 1.0, verbose
 
       # Show content preview
       if verbose:
-        print(f"\n  --- Content Preview (first 500 chars) ---")
-        print(f"  {main_content[:500]}...")
-        print(f"  --- End Preview ---\n")
+        print(f"\n  --- Content Preview (first 500 chars) ---", file=sys.stderr, flush=True)
+        print(f"  {main_content[:500]}...", file=sys.stderr, flush=True)
+        print(f"  --- End Preview ---\n", file=sys.stderr, flush=True)
 
       # Success!
       return {
@@ -406,26 +406,26 @@ def web_scrape(url: str, max_retries: int = 3, retry_delay: float = 1.0, verbose
     except requests.exceptions.Timeout:
       last_error = f'Request timeout (attempt {attempt + 1}/{max_retries})'
       if verbose:
-        print(f"  ERROR: {last_error}")
+        print(f"  ERROR: {last_error}", file=sys.stderr, flush=True)
       if attempt == max_retries - 1:
         return {'success': False, 'error': 'Request timeout after retries', 'url': url}
 
     except requests.exceptions.TooManyRedirects:
       if verbose:
-        print(f"  ERROR: Too many redirects")
+        print(f"  ERROR: Too many redirects", file=sys.stderr, flush=True)
       return {'success': False, 'error': 'Too many redirects', 'url': url}
 
     except requests.exceptions.SSLError as e:
       last_error = f'SSL Error: {str(e)}'
       if verbose:
-        print(f"  ERROR: {last_error}")
+        print(f"  ERROR: {last_error}", file=sys.stderr, flush=True)
       if attempt == max_retries - 1:
         return {'success': False, 'error': f'SSL Error: {str(e)}', 'url': url}
 
     except requests.exceptions.ConnectionError as e:
       last_error = f'Connection error: {str(e)}'
       if verbose:
-        print(f"  ERROR: {last_error}")
+        print(f"  ERROR: {last_error}", file=sys.stderr, flush=True)
       if attempt == max_retries - 1:
         return {'success': False, 'error': f'Connection error: {str(e)}', 'url': url}
 
@@ -433,7 +433,7 @@ def web_scrape(url: str, max_retries: int = 3, retry_delay: float = 1.0, verbose
       status_code = e.response.status_code if hasattr(e, 'response') else 'unknown'
       last_error = f'HTTP {status_code}: {str(e)}'
       if verbose:
-        print(f"  ERROR: {last_error}")
+        print(f"  ERROR: {last_error}", file=sys.stderr, flush=True)
 
       # Don't retry on certain error codes
       if status_code in [404, 410, 451]:  # Not Found, Gone, Unavailable for Legal Reasons
@@ -445,14 +445,14 @@ def web_scrape(url: str, max_retries: int = 3, retry_delay: float = 1.0, verbose
     except requests.exceptions.RequestException as e:
       last_error = f'Request failed: {str(e)}'
       if verbose:
-        print(f"  ERROR: {last_error}")
+        print(f"  ERROR: {last_error}", file=sys.stderr, flush=True)
       if attempt == max_retries - 1:
         return {'success': False, 'error': f'Request failed: {str(e)}', 'url': url}
 
     except Exception as e:
       last_error = f'Parsing failed: {str(e)}'
       if verbose:
-        print(f"  ERROR: {last_error}")
+        print(f"  ERROR: {last_error}", file=sys.stderr, flush=True)
       if attempt == max_retries - 1:
         return {'success': False, 'error': f'Parsing failed: {str(e)}', 'url': url}
 
@@ -473,7 +473,7 @@ def extract_financial_content_advanced(soup, url: str, verbose: bool = False) ->
     score = score_content(site_specific_content)
     extraction_results.append(('site_specific_selectors', site_specific_content, score))
     if verbose:
-      print(f"    Site-specific selectors: {len(site_specific_content)} chars (score: {score})")
+      print(f"    Site-specific selectors: {len(site_specific_content)} chars (score: {score})", file=sys.stderr, flush=True)
 
   # Method 2: Semantic HTML5 elements
   semantic_content = extract_with_semantic_html(soup)
@@ -481,7 +481,7 @@ def extract_financial_content_advanced(soup, url: str, verbose: bool = False) ->
     score = score_content(semantic_content)
     extraction_results.append(('semantic_html5', semantic_content, score))
     if verbose:
-      print(f"    Semantic HTML5: {len(semantic_content)} chars (score: {score})")
+      print(f"    Semantic HTML5: {len(semantic_content)} chars (score: {score})", file=sys.stderr, flush=True)
 
   # Method 3: Common content classes
   class_based_content = extract_with_common_classes(soup)
@@ -489,7 +489,7 @@ def extract_financial_content_advanced(soup, url: str, verbose: bool = False) ->
     score = score_content(class_based_content)
     extraction_results.append(('common_classes', class_based_content, score))
     if verbose:
-      print(f"    Common classes: {len(class_based_content)} chars (score: {score})")
+      print(f"    Common classes: {len(class_based_content)} chars (score: {score})", file=sys.stderr, flush=True)
 
   # Method 4: Longest text block heuristic
   longest_block_content = extract_longest_text_blocks(soup)
@@ -497,7 +497,7 @@ def extract_financial_content_advanced(soup, url: str, verbose: bool = False) ->
     score = score_content(longest_block_content)
     extraction_results.append(('longest_blocks', longest_block_content, score))
     if verbose:
-      print(f"    Longest blocks: {len(longest_block_content)} chars (score: {score})")
+      print(f"    Longest blocks: {len(longest_block_content)} chars (score: {score})", file=sys.stderr, flush=True)
 
   # Method 5: Paragraph density analysis
   density_content = extract_by_paragraph_density(soup)
@@ -505,7 +505,7 @@ def extract_financial_content_advanced(soup, url: str, verbose: bool = False) ->
     score = score_content(density_content)
     extraction_results.append(('paragraph_density', density_content, score))
     if verbose:
-      print(f"    Paragraph density: {len(density_content)} chars (score: {score})")
+      print(f"    Paragraph density: {len(density_content)} chars (score: {score})", file=sys.stderr, flush=True)
 
   # Pick the best result
   if extraction_results:
@@ -513,13 +513,13 @@ def extract_financial_content_advanced(soup, url: str, verbose: bool = False) ->
     best_method, best_content, best_score = extraction_results[0]
 
     if verbose:
-      print(f"    BEST: {best_method} (score: {best_score})")
+      print(f"    BEST: {best_method} (score: {best_score})", file=sys.stderr, flush=True)
 
     return best_content, best_method
 
   # Absolute fallback
   if verbose:
-    print(f"    WARNING: All methods failed, using raw text fallback")
+    print(f"    WARNING: All methods failed, using raw text fallback", file=sys.stderr, flush=True)
   return extract_raw_text_fallback(soup), 'raw_fallback'
 
 def score_content(content: str) -> int:
@@ -749,12 +749,12 @@ def batch_scrape(urls: List[str], delay: float = 0.5, max_retries: int = 3, verb
   """
   results = []
 
-  print(f"\nStarting batch scrape of {len(urls)} URLs...")
-  print(f"Settings: delay={delay}s, max_retries={max_retries}, verbose={verbose}")
-  print("=" * 80)
+  print(f"\nStarting batch scrape of {len(urls)} URLs...", file=sys.stderr, flush=True)
+  print(f"Settings: delay={delay}s, max_retries={max_retries}, verbose={verbose}", file=sys.stderr, flush=True)
+  print("=" * 80, file=sys.stderr, flush=True)
 
   for i, url in enumerate(urls):
-    print(f"\n[{i+1}/{len(urls)}] {url}")
+    print(f"\n[{i+1}/{len(urls)}] {url}", file=sys.stderr, flush=True)
 
     # Add delay between requests (except for first)
     if i > 0:
@@ -765,9 +765,9 @@ def batch_scrape(urls: List[str], delay: float = 0.5, max_retries: int = 3, verb
 
     # Print summary
     if result['success']:
-      print(f"SUCCESS - {result['word_count']} words, quality: {result['quality_level']} ({result['quality_score']}/100)")
+      print(f"SUCCESS - {result['word_count']} words, quality: {result['quality_level']} ({result['quality_score']}/100)", file=sys.stderr, flush=True)
     else:
-      print(f"FAILED - {result['error']}")
+      print(f"FAILED - {result['error']}", file=sys.stderr, flush=True)
 
   return results
 
@@ -822,113 +822,113 @@ def get_scraping_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
   }
 
 if __name__ == "__main__":
-  print("=" * 80)
-  print("ADVANCED WEB SCRAPING TOOL - TEST SUITE")
-  print("=" * 80)
+  print("=" * 80, file=sys.stderr, flush=True)
+  print("ADVANCED WEB SCRAPING TOOL - TEST SUITE", file=sys.stderr, flush=True)
+  print("=" * 80, file=sys.stderr, flush=True)
 
   # Test search functionality
-  print("\n" + "=" * 80)
-  print("PHASE 1: SEARCH")
-  print("=" * 80)
+  print("\n" + "=" * 80, file=sys.stderr, flush=True)
+  print("PHASE 1: SEARCH", file=sys.stderr, flush=True)
+  print("=" * 80, file=sys.stderr, flush=True)
 
   query = "MSFT earnings guidance"
-  print(f"\nSearching for: '{query}'")
+  print(f"\nSearching for: '{query}'", file=sys.stderr, flush=True)
 
   search_results = search_duckduckgo(query, 10)
-  print(f"\nFound {len(search_results)} search results")
+  print(f"\nFound {len(search_results)} search results", file=sys.stderr, flush=True)
 
   if search_results:
-    print("\nSearch Results Summary:")
-    print("-" * 80)
+    print("\nSearch Results Summary:", file=sys.stderr, flush=True)
+    print("-" * 80, file=sys.stderr, flush=True)
     for i, result in enumerate(search_results, 1):
-      print(f"{i}. {result['title']}")
-      print(f"   URL: {result['link']}")
-      print(f"   Query Type: {result['query_type']}")
-      print(f"   Snippet: {result['snippet'][:100]}...")
-      print()
+      print(f"{i}. {result['title']}", file=sys.stderr, flush=True)
+      print(f"   URL: {result['link']}", file=sys.stderr, flush=True)
+      print(f"   Query Type: {result['query_type']}", file=sys.stderr, flush=True)
+      print(f"   Snippet: {result['snippet'][:100]}...", file=sys.stderr, flush=True)
+      print(file=sys.stderr, flush=True)
 
   # Test scraping with verbose output
-  print("\n" + "=" * 80)
-  print("PHASE 2: CONTENT EXTRACTION")
-  print("=" * 80)
+  print("\n" + "=" * 80, file=sys.stderr, flush=True)
+  print("PHASE 2: CONTENT EXTRACTION", file=sys.stderr, flush=True)
+  print("=" * 80, file=sys.stderr, flush=True)
 
   urls_to_test = [result['link'] for result in search_results[:5]]  # Test first 5
   scrape_results = batch_scrape(urls_to_test, delay=1.0, max_retries=3, verbose=True)
 
   # Generate and display comprehensive summary
-  print("\n" + "=" * 80)
-  print("PHASE 3: ANALYSIS & STATISTICS")
-  print("=" * 80)
+  print("\n" + "=" * 80, file=sys.stderr, flush=True)
+  print("PHASE 3: ANALYSIS & STATISTICS", file=sys.stderr, flush=True)
+  print("=" * 80, file=sys.stderr, flush=True)
 
   summary = get_scraping_summary(scrape_results)
 
-  print("\nOVERALL STATISTICS:")
-  print("-" * 80)
-  print(f"Total URLs Attempted:      {summary['total_urls']}")
-  print(f"Successful Scrapes:        {summary['successful']}")
-  print(f"Failed Scrapes:            {summary['failed']}")
-  print(f"Success Rate:              {summary['success_rate']:.1%}")
-  print(f"Average Retries per URL:   {summary['avg_retries']:.1f}")
+  print("\nOVERALL STATISTICS:", file=sys.stderr, flush=True)
+  print("-" * 80, file=sys.stderr, flush=True)
+  print(f"Total URLs Attempted:      {summary['total_urls']}", file=sys.stderr, flush=True)
+  print(f"Successful Scrapes:        {summary['successful']}", file=sys.stderr, flush=True)
+  print(f"Failed Scrapes:            {summary['failed']}", file=sys.stderr, flush=True)
+  print(f"Success Rate:              {summary['success_rate']:.1%}", file=sys.stderr, flush=True)
+  print(f"Average Retries per URL:   {summary['avg_retries']:.1f}", file=sys.stderr, flush=True)
 
-  print("\nCONTENT STATISTICS:")
-  print("-" * 80)
-  print(f"Total Words Extracted:     {summary['total_words']:,}")
-  print(f"Total Characters:          {summary['total_chars']:,}")
-  print(f"Average Words per Page:    {summary['avg_words_per_page']:.0f}")
-  print(f"Average Characters/Page:   {summary['avg_chars_per_page']:.0f}")
+  print("\nCONTENT STATISTICS:", file=sys.stderr, flush=True)
+  print("-" * 80, file=sys.stderr, flush=True)
+  print(f"Total Words Extracted:     {summary['total_words']:,}", file=sys.stderr, flush=True)
+  print(f"Total Characters:          {summary['total_chars']:,}", file=sys.stderr, flush=True)
+  print(f"Average Words per Page:    {summary['avg_words_per_page']:.0f}", file=sys.stderr, flush=True)
+  print(f"Average Characters/Page:   {summary['avg_chars_per_page']:.0f}", file=sys.stderr, flush=True)
 
-  print("\nQUALITY ANALYSIS:")
-  print("-" * 80)
-  print(f"Average Quality Score:     {summary['avg_quality_score']:.1f}/100")
-  print(f"Financial Keywords Found:  {summary['total_financial_keywords']}")
+  print("\nQUALITY ANALYSIS:", file=sys.stderr, flush=True)
+  print("-" * 80, file=sys.stderr, flush=True)
+  print(f"Average Quality Score:     {summary['avg_quality_score']:.1f}/100", file=sys.stderr, flush=True)
+  print(f"Financial Keywords Found:  {summary['total_financial_keywords']}", file=sys.stderr, flush=True)
 
   if summary['quality_distribution']:
-    print("\nQuality Distribution:")
+    print("\nQuality Distribution:", file=sys.stderr, flush=True)
     for quality, count in sorted(summary['quality_distribution'].items()):
-      print(f"  {quality.ljust(15)}: {count} pages")
+      print(f"  {quality.ljust(15)}: {count} pages", file=sys.stderr, flush=True)
 
   if summary['extraction_methods']:
-    print("\nExtraction Methods Used:")
+    print("\nExtraction Methods Used:", file=sys.stderr, flush=True)
     for method, count in sorted(summary['extraction_methods'].items()):
-      print(f"  {method.ljust(25)}: {count} pages")
+      print(f"  {method.ljust(25)}: {count} pages", file=sys.stderr, flush=True)
 
   if summary['error_breakdown']:
-    print("\nError Breakdown:")
+    print("\nError Breakdown:", file=sys.stderr, flush=True)
     for error_type, count in summary['error_breakdown'].items():
-      print(f"  {error_type[:50]}: {count}")
+      print(f"  {error_type[:50]}: {count}", file=sys.stderr, flush=True)
 
   # Display detailed content from successful scrapes
   successful_scrapes = [r for r in scrape_results if r.get('success', False)]
   if successful_scrapes:
-    print("\n" + "=" * 80)
-    print("PHASE 4: EXTRACTED CONTENT SAMPLES")
-    print("=" * 80)
+    print("\n" + "=" * 80, file=sys.stderr, flush=True)
+    print("PHASE 4: EXTRACTED CONTENT SAMPLES", file=sys.stderr, flush=True)
+    print("=" * 80, file=sys.stderr, flush=True)
 
     for i, sample in enumerate(successful_scrapes[:3], 1):  # Show first 3
-      print(f"\n--- SAMPLE {i} ---")
-      print(f"Title:             {sample['title']}")
-      print(f"URL:               {sample['url']}")
-      print(f"Word Count:        {sample['word_count']:,}")
-      print(f"Quality Score:     {sample['quality_score']}/100 ({sample['quality_level']})")
-      print(f"Extraction Method: {sample['extraction_method']}")
-      print(f"Financial Keywords: {sample['financial_keywords']}")
-      print(f"Attempts:          {sample['attempts']}")
-      print(f"\nContent Preview (first 800 characters):")
-      print("-" * 80)
-      print(sample['content'][:800])
+      print(f"\n--- SAMPLE {i} ---", file=sys.stderr, flush=True)
+      print(f"Title:             {sample['title']}", file=sys.stderr, flush=True)
+      print(f"URL:               {sample['url']}", file=sys.stderr, flush=True)
+      print(f"Word Count:        {sample['word_count']:,}", file=sys.stderr, flush=True)
+      print(f"Quality Score:     {sample['quality_score']}/100 ({sample['quality_level']})", file=sys.stderr, flush=True)
+      print(f"Extraction Method: {sample['extraction_method']}", file=sys.stderr, flush=True)
+      print(f"Financial Keywords: {sample['financial_keywords']}", file=sys.stderr, flush=True)
+      print(f"Attempts:          {sample['attempts']}", file=sys.stderr, flush=True)
+      print(f"\nContent Preview (first 800 characters):", file=sys.stderr, flush=True)
+      print("-" * 80, file=sys.stderr, flush=True)
+      print(sample['content'][:800], file=sys.stderr, flush=True)
       if len(sample['content']) > 800:
-        print(f"... [{len(sample['content']) - 800:,} more characters]")
-      print("-" * 80)
+        print(f"... [{len(sample['content']) - 800:,} more characters]", file=sys.stderr, flush=True)
+      print("-" * 80, file=sys.stderr, flush=True)
 
   # Final summary
-  print("\n" + "=" * 80)
-  print("TEST COMPLETE")
-  print("=" * 80)
-  print(f"\nResults: {summary['successful']}/{summary['total_urls']} successful ({summary['success_rate']:.1%})")
-  print(f"Total content extracted: {summary['total_words']:,} words")
-  print(f"Average quality: {summary['avg_quality_score']:.1f}/100")
+  print("\n" + "=" * 80, file=sys.stderr, flush=True)
+  print("TEST COMPLETE", file=sys.stderr, flush=True)
+  print("=" * 80, file=sys.stderr, flush=True)
+  print(f"\nResults: {summary['successful']}/{summary['total_urls']} successful ({summary['success_rate']:.1%})", file=sys.stderr, flush=True)
+  print(f"Total content extracted: {summary['total_words']:,} words", file=sys.stderr, flush=True)
+  print(f"Average quality: {summary['avg_quality_score']:.1f}/100", file=sys.stderr, flush=True)
 
   # Close sessions
   _session_manager.close_all()
-  print("\nAll sessions closed. Test suite finished successfully.")
-  print("=" * 80)
+  print("\nAll sessions closed. Test suite finished successfully.", file=sys.stderr, flush=True)
+  print("=" * 80, file=sys.stderr, flush=True)
