@@ -1,17 +1,23 @@
-from typing import Dict, Any, Optional
-from mcp import StdioServerParameters
+from typing import Dict, Any, Optional, Self
+from mcp import StdioServerParameters, ClientSession, stdio_server
 from mcp.client.stdio import stdio_client
-from ollama import chat, ChatResponse
+from ollama import chat
 import asyncio
 import sys
 import os
 import torch
+import json
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, TextStreamer
+
+# Add project root to Python path for imports
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 
 class OllamaModel():
   # ollama they could never make me hate you
-  def __init__(self, model_name:str):
+  def __init__(self, model_name:str='DeepSeek-R1-Distill-Llama-8B:latest'):
     self.model_name = model_name
     self.conversatoin_history = []
 
@@ -32,7 +38,6 @@ class OllamaModel():
 
     for chunk in stream:
       print(chunk['message']['content'], end='', flush=True)
-
 
 class HuggingFaceModel():
   """this class was made specifically for Hugging Face Models to load in"""
@@ -129,49 +134,105 @@ class HuggingFaceModel():
       print("Tokenizer not loaded")
       return None
 
-
-class Financial_Analysis_Agent():
+class Financial_Analysis_Agent(OllamaModel):
   """this is the mcp tool setup and logic handling for the inherited model"""
-  def __init__(self, model_name:str='nvidia/Llama-3.1-Nemotron-Nano-8B-v1'):
+  def __init__(self, model_name:str='DeepSeek-R1-Distill-Llama-8B:latest'):
     # runs on ollama model
-    self.model_name = model_name
-    self.model = None
+    super().__init__(model_name)
+
+    self.web_client_connection=None
+    self.web_client_tools= set()
 
     self.financial_client = None
     self.web_client = None
     self.excel_client = None
 
+  # using context manager pattern
+  async def __aenter__(self) -> Self:
+    await self.connect_to_servers()
+    return self
+
+  async def __aexit__(self,
+                      exec_type: Optional[type[BaseException]],
+                      exc_val: Optional[BaseException],
+                      exc_tb: Optional[object]
+                      ):
+    await self.disconnect_from_servers()
+
+  def __parse_CallToolResult(self, response):
+    if hasattr(response, 'content'):
+      text_content = response.content[0]
+      json_string = text_content.text
+      data = json.loads(json_string)
+      if isinstance(data, dict):
+        return data
+      else:
+        raise TypeError("Error converting json -> dict")
+    else:
+      raise AttributeError("Unable to find 'content' attribute in response")
+
+
   async def connect_to_servers(self):
+    # Add project root to PYTHONPATH so subprocess can find modules
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env_with_path = {**os.environ}
+    if 'PYTHONPATH' in env_with_path:
+      env_with_path['PYTHONPATH'] = f"{project_root}{os.pathsep}{env_with_path['PYTHONPATH']}"
+    else:
+      env_with_path['PYTHONPATH'] = project_root
+    env_with_path['PYTHONUNBUFFERED'] = '1'
+
     financial_params = StdioServerParameters(
       command=sys.executable,
-      args=["-m", "tools.financial_modeling_engine.analysis_tools"]
+      args=["-m", "tools.financial_modeling_engine.analysis_tools", "server"],
+      env=env_with_path
     )
 
     web_params = StdioServerParameters(
       command=sys.executable,
-      args=['-m', "tools.web_search_server.web_search"]
+      args=['-m', "tools.web_search_server.web_search", "server"],
+      env=env_with_path
     )
 
     excel_params = StdioServerParameters(
       command=sys.executable,
-      args=['-m', "tools.excel_server.excel_tools"]
+      args=['-m', "tools.excel_server.excel_tools", 'server'],
+      env=env_with_path
     )
 
-    # connect to the actual servers
-    self.financial_client = stdio_client(financial_params)
-    self.web_client = stdio_client(web_params)
-    self.excel_client = stdio_client(excel_params)
+    try:
+      self.web_client = stdio_client(web_params)
+      self.web_client_connection = await self.web_client.__aenter__()
+      # NOTE: Don't create ClientSession here - it closes resources that can't be reused
+      # Tools will be discovered on first use or via list_tools() method
+    except Exception as e:
+      print(f"Unable to start servers: {str(e)}", file=sys.stderr, flush=True)
+      import traceback
+      traceback.print_exc()
+      raise
+    #self.excel_client = stdio_client(excel_params)
+    #self.financial_client = stdio_client(financial_params)
 
-  async def generate_dcf_assumptions(self, query: str):
-    # get all the assumptions from our websearch server
-    pass
+  async def disconnect_from_servers(self):
+    if self.web_client:
+      await self.web_client.__aexit__(None, None, None)
+
+
+  async def call_tool(self, tool_name: str, args: Dict[str, Any]):
+    if self.web_client_connection is None:
+      raise RuntimeError("Not connected! Please connect to server first")
+
+    async with ClientSession(*self.web_client_connection) as session:
+      await session.initialize()
+      response = await session.call_tool(tool_name, args)
+      res = self.__parse_CallToolResult(response)
+
+    return res
 
 if __name__ == "__main__":
-  o = OllamaModel("nemotron-nano")
+  async def main():
+    async with Financial_Analysis_Agent() as agent:
+      res = await agent.call_tool('get_revenue_base', {'ticker': 'AAPL'})
+      print(res, file=sys.stderr, flush = True)
 
-  while True:
-    uinput = input('\nYou: ')
-
-    if uinput == "exit":
-      break
-    o.generate_response(uinput)
+  asyncio.run(main())
