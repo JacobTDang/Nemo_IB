@@ -141,7 +141,7 @@ class Financial_Analysis_Agent(OllamaModel):
     super().__init__(model_name)
 
     self.web_client_connection=None
-    self.web_client_tools= set()
+    self.web_session = None  # Keep a single session alive
 
     self.financial_client = None
     self.web_client = None
@@ -162,12 +162,13 @@ class Financial_Analysis_Agent(OllamaModel):
   def __parse_CallToolResult(self, response):
     if hasattr(response, 'content'):
       text_content = response.content[0]
-      json_string = text_content.text
-      data = json.loads(json_string)
-      if isinstance(data, dict):
+      try:
+        json_string = text_content.text
+        data = json.loads(json_string)
         return data
-      else:
-        raise TypeError("Error converting json -> dict")
+      except json.JSONDecodeError as e:
+        print(f"Error: {str(e)}", file=sys.stderr, flush=True)
+        return text_content
     else:
       raise AttributeError("Unable to find 'content' attribute in response")
 
@@ -203,8 +204,11 @@ class Financial_Analysis_Agent(OllamaModel):
     try:
       self.web_client = stdio_client(web_params)
       self.web_client_connection = await self.web_client.__aenter__()
-      # NOTE: Don't create ClientSession here - it closes resources that can't be reused
-      # Tools will be discovered on first use or via list_tools() method
+
+      # Create a single ClientSession that stays alive for the agent's lifetime
+      self.web_session = ClientSession(*self.web_client_connection)
+      await self.web_session.__aenter__()
+      await self.web_session.initialize()
     except Exception as e:
       print(f"Unable to start servers: {str(e)}", file=sys.stderr, flush=True)
       import traceback
@@ -214,25 +218,54 @@ class Financial_Analysis_Agent(OllamaModel):
     #self.financial_client = stdio_client(financial_params)
 
   async def disconnect_from_servers(self):
+    if self.web_session:
+      await self.web_session.__aexit__(None, None, None)
     if self.web_client:
       await self.web_client.__aexit__(None, None, None)
 
 
   async def call_tool(self, tool_name: str, args: Dict[str, Any]):
-    if self.web_client_connection is None:
+    if self.web_session is None:
       raise RuntimeError("Not connected! Please connect to server first")
 
-    async with ClientSession(*self.web_client_connection) as session:
-      await session.initialize()
-      response = await session.call_tool(tool_name, args)
-      res = self.__parse_CallToolResult(response)
+    response = await self.web_session.call_tool(tool_name, args)
+    res = self.__parse_CallToolResult(response)
 
     return res
 
+  async def list_tool(self) -> Dict[str, str]:
+    if self.web_session is None:
+      raise RuntimeError("Not connected! Please connect to the server first")
+
+    web_response = await self.web_session.list_tools()
+
+    tools = {}
+    for tool in web_response.tools:
+      tools[tool.name] = str(tool.description)
+    return tools
+
 if __name__ == "__main__":
   async def main():
+    ticker = "AAPL"
     async with Financial_Analysis_Agent() as agent:
-      res = await agent.call_tool('get_revenue_base', {'ticker': 'AAPL'})
-      print(res, file=sys.stderr, flush = True)
+
+    #   # List available tools
+    #   print(await agent.list_tool(), file=sys.stderr, flush=True)
+
+    #   print(await agent.call_tool('search', {"ticker" :ticker, "query": {
+    #   "earnings": "Latest Earnings Report",
+    #   "financial": "Q4 2024"
+    # }}), file=sys.stderr, flush=True)
+
+      # print(f'REVENUE DATA: {await agent.call_tool('get_revenue_base', {'ticker': ticker})}', file=sys.stderr, flush=True)
+      # print(f'EBITDA MARGIN: {await agent.call_tool('get_ebitda_margin', {'ticker': ticker, 'form_type': '10-K'})}', file=sys.stderr, flush=True)
+      # print(f'CAPEX REVENUE PCT: {await agent.call_tool('get_capex_pct_revenue', {'ticker': ticker, 'form_type': '10-K'})}', file=sys.stderr, flush=True)
+      # print(f'TAX RATE: {await agent.call_tool('get_tax_rate', {'ticker': ticker, 'form_type': '10-K'})}', file=sys.stderr, flush=True)
+      # print(f'DEPRECIATION: {await agent.call_tool('get_depreciation', {'ticker': ticker, 'form_type': '10-K'})}', file=sys.stderr, flush=True)
+
+      response = await agent.call_tool('get_disclosures_names', {'ticker': ticker, 'form_type': '10-K'})
+
+      for disclosure in response['disclosure_names']:
+        print(await agent.call_tool('extract_disclosure_data', {'ticker': ticker,'disclosure_name': disclosure, 'form_type':'10-K'}))
 
   asyncio.run(main())
