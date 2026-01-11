@@ -2,7 +2,9 @@ from typing import Any, Dict, List
 import asyncio
 import json
 import os
-
+from datetime import date, datetime
+import os
+# NOTE: ClientSession, StdioServerParameters, stdio_client are imported only in client mode below
 from tools.web_search_server.webscraper_utils import search_duckduckgo, _session_manager, batch_scrape, web_scrape
 from tools.web_search_server.sec_utils import (
     get_revenue_base, get_ebitda_margin, get_capex_pct_revenue,
@@ -12,7 +14,7 @@ from tools.web_search_server.sec_utils import (
 import importlib.util
 import sys
 
-# mmport module with number in name
+# import module with number in name
 try:
     spec = importlib.util.spec_from_file_location(
         "filing_parser",
@@ -27,13 +29,25 @@ try:
 except Exception:
     # fallback - set filing_parser to None and handle in methods
     filing_parser = None
+
 from mcp.server import Server
+from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent, ServerCapabilities
 from mcp.server.models import InitializationOptions
 
+def json_serializer(obj):
+  """JSON serializer for objects not serializable by default json code"""
+  if isinstance(obj, (date, datetime)):
+    return obj.isoformat()
+  raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
+
+def safe_json_dumps(obj):
+  """Safely serialize objects to JSON, handling dates and other non-serializable types"""
+  return json.dumps(obj, default=json_serializer)
+
 class WebSearchServer:
   def __init__(self):
-    self.server = Server("Web_Search")
+    self.server = Server("web_client")
     self._setup_handlers()
 
   def _setup_handlers(self):
@@ -221,19 +235,24 @@ class WebSearchServer:
     async def call_tool(name: str, args: Dict[str, Any]) -> List[TextContent]:
       try:
         if name == 'search':
-          return await parent.search(args['ticker'], args['query'])
+          result = await parent.search(args['ticker'], args['query'])
+          return result
         elif name == 'get_urls_content':
           return await parent.get_urls_content(args['urls'])
 
         # SEC XBRL Tools
         elif name == 'get_revenue_base':
-          return await parent.get_revenue_base(args['ticker'], args.get('form_type', '10-K'))
+          result = await parent.get_revenue_base(args['ticker'], args.get('form_type', '10-K'))
+          return result
         elif name == 'get_ebitda_margin':
-          return await parent.get_ebitda_margin(args['ticker'], args.get('form_type', '10-K'))
+          result = await parent.get_ebitda_margin(args['ticker'], args.get('form_type', '10-K'))
+          return result
         elif name == 'get_capex_pct_revenue':
-          return await parent.get_capex_pct_revenue(args['ticker'], args.get('form_type', '10-K'))
+          result = await parent.get_capex_pct_revenue(args['ticker'], args.get('form_type', '10-K'))
+          return result
         elif name == 'get_tax_rate':
-          return await parent.get_tax_rate(args['ticker'], args.get('form_type', '10-K'))
+          result = await parent.get_tax_rate(args['ticker'], args.get('form_type', '10-K'))
+          return result
         elif name == 'get_depreciation':
           return await parent.get_depreciation(args['ticker'], args.get('form_type', '10-K'))
         elif name == 'get_disclosures_names':
@@ -241,7 +260,8 @@ class WebSearchServer:
         elif name == 'extract_disclosure_data':
           return await parent.extract_disclosure_data(args['ticker'], args['disclosure_name'], args.get('form_type', '10-K'))
         elif name == 'get_latest_filing':
-          return await parent.get_latest_filing(args['ticker'], args.get('form_type', '10-K'))
+          result = await parent.get_latest_filing(args['ticker'], args.get('form_type', '10-K'))
+          return result
 
         # SEC Filing Parser Tools
         elif name == 'extract_8k_events':
@@ -256,6 +276,8 @@ class WebSearchServer:
             text=f'Unknown tool: {name}'
           )]
       except Exception as e:
+        import traceback
+        traceback.print_exc(file=sys.stderr)
         return [TextContent(
           type='text',
           text=f'Failed to execute {name}: {str(e)}'
@@ -277,7 +299,7 @@ class WebSearchServer:
 
     return [TextContent(
       type = 'text',
-      text = json.dumps({
+      text = safe_json_dumps({
         'ticker': ticker,
         'search_result' : search_results
       })
@@ -292,7 +314,7 @@ class WebSearchServer:
     _session_manager.close_all # close session for good practice
     return [TextContent(
       type="text",
-      text=json.dumps({
+      text=safe_json_dumps({
         "results": results
       })
     )]
@@ -300,31 +322,31 @@ class WebSearchServer:
   # SEC XBRL Tools
   async def get_revenue_base(self, ticker: str, form_type: str = '10-K') -> List[TextContent]:
     result = await asyncio.to_thread(get_revenue_base, ticker, form_type)
-    return [TextContent(type="text", text=json.dumps(result))]
+    return [TextContent(type="text", text=safe_json_dumps(result))]
 
   async def get_ebitda_margin(self, ticker: str, form_type: str = '10-K') -> List[TextContent]:
     result = await asyncio.to_thread(get_ebitda_margin, ticker, form_type)
-    return [TextContent(type="text", text=json.dumps(result))]
+    return [TextContent(type="text", text=safe_json_dumps(result))]
 
   async def get_capex_pct_revenue(self, ticker: str, form_type: str = '10-K') -> List[TextContent]:
     result = await asyncio.to_thread(get_capex_pct_revenue, ticker, form_type)
-    return [TextContent(type="text", text=json.dumps(result))]
+    return [TextContent(type="text", text=safe_json_dumps(result))]
 
   async def get_tax_rate(self, ticker: str, form_type: str = '10-K') -> List[TextContent]:
     result = await asyncio.to_thread(get_tax_rate, ticker, form_type)
-    return [TextContent(type="text", text=json.dumps(result))]
+    return [TextContent(type="text", text=safe_json_dumps(result))]
 
   async def get_depreciation(self, ticker: str, form_type: str = '10-K') -> List[TextContent]:
     result = await asyncio.to_thread(get_depreciation, ticker, form_type)
-    return [TextContent(type="text", text=json.dumps(result))]
+    return [TextContent(type="text", text=safe_json_dumps(result))]
 
   async def get_disclosures_names(self, ticker: str, form_type: str = '10-K') -> List[TextContent]:
     result = await asyncio.to_thread(get_disclosures_names, ticker, form_type)
-    return [TextContent(type="text", text=json.dumps(result))]
+    return [TextContent(type="text", text=safe_json_dumps(result))]
 
   async def extract_disclosure_data(self, ticker: str, disclosure_name: str, form_type: str = '10-K') -> List[TextContent]:
     result = await asyncio.to_thread(extract_disclosure_data, ticker, disclosure_name, form_type)
-    return [TextContent(type="text", text=json.dumps(result))]
+    return [TextContent(type="text", text=safe_json_dumps(result))]
 
   async def get_latest_filing(self, ticker: str, form_type: str = '10-K') -> List[TextContent]:
     # Note: This returns filing metadata, not the full filing object (which isn't JSON serializable)
@@ -347,28 +369,59 @@ class WebSearchServer:
         'error': 'No filing found',
         'success': False
       }
-    return [TextContent(type="text", text=json.dumps(json_result))]
+    return [TextContent(type="text", text=safe_json_dumps(json_result))]
 
   # SEC Filing Parser Tools
   async def extract_8k_events(self, ticker: str, limit: int = 10, debug: bool = False) -> List[TextContent]:
     if filing_parser is None:
-      return [TextContent(type="text", text=json.dumps({"error": "Filing parser not available", "success": False}))]
+      return [TextContent(type="text", text=safe_json_dumps({"error": "Filing parser not available", "success": False}))]
     result = await asyncio.to_thread(filing_parser.extract_8k_events, ticker, limit, debug)
-    return [TextContent(type="text", text=json.dumps(result))]
+    return [TextContent(type="text", text=safe_json_dumps(result))]
 
   async def extract_proxy_compensation(self, ticker: str, debug: bool = False) -> List[TextContent]:
     if filing_parser is None:
-      return [TextContent(type="text", text=json.dumps({"error": "Filing parser not available", "success": False}))]
+      return [TextContent(type="text", text=safe_json_dumps({"error": "Filing parser not available", "success": False}))]
     result = await asyncio.to_thread(filing_parser.extract_proxy_compensation, ticker, debug)
-    return [TextContent(type="text", text=json.dumps(result))]
+    return [TextContent(type="text", text=safe_json_dumps(result))]
 
   async def extract_governance_data(self, ticker: str, debug: bool = False) -> List[TextContent]:
     if filing_parser is None:
-      return [TextContent(type="text", text=json.dumps({"error": "Filing parser not available", "success": False}))]
+      return [TextContent(type="text", text=safe_json_dumps({"error": "Filing parser not available", "success": False}))]
     result = await asyncio.to_thread(filing_parser.extract_governance_data, ticker, debug)
-    return [TextContent(type="text", text=json.dumps(result))]
+    return [TextContent(type="text", text=safe_json_dumps(result))]
+
+  async def run_server(self):
+    try:
+      async with stdio_server() as (read_stream, write_stream):
+        await self.server.run(read_stream, write_stream, InitializationOptions(
+          server_name="web_client",
+          server_version='1.0.0',
+          capabilities=ServerCapabilities()
+        ))
+        print("Successfully created web_client process", file=sys.stderr, flush=True)
+    except Exception as e:
+      import traceback
+      traceback.print_exc(file=sys.stderr)
+      raise
 
 if __name__ == "__main__":
-  w= WebSearchServer()
-  res = asyncio.run(w.get_urls_content(["https://finance.yahoo.com/news/jpmorgan-backs-citigroup-c-russia-000607541.html", "https://finance.yahoo.com/news/td-synnex-corporation-snx-earnings-203223578.html"]))
-  print(res)
+  if len(sys.argv) < 2:
+    print("Usage: python -m tools.web_search_server.web_search server", file=sys.stderr)
+    sys.exit(1)
+
+  system_args = sys.argv[1]
+
+  if system_args == "server":
+    print("Starting web_client process", file=sys.stderr, flush=True)
+    try:
+      server = WebSearchServer()
+      asyncio.run(server.run_server())
+    except Exception as e:
+      print(f"SERVER: Exception in main: {e}", file=sys.stderr, flush=True)
+      import traceback
+      traceback.print_exc(file=sys.stderr)
+      sys.exit(1)
+  else:
+    print(f"Unknown argument: {system_args}", file=sys.stderr, flush=True)
+    print("Usage: python -m tools.web_search_server.web_search server", file=sys.stderr)
+    sys.exit(1)
