@@ -233,7 +233,7 @@ class Financial_Analysis_Agent(OllamaModel):
 
     return res
 
-  async def list_tool(self) -> Dict[str, str]:
+  async def list_tools(self) -> Dict[str, Any]:
     if self.web_session is None:
       raise RuntimeError("Not connected! Please connect to the server first")
 
@@ -241,16 +241,41 @@ class Financial_Analysis_Agent(OllamaModel):
 
     tools = {}
     for tool in web_response.tools:
-      tools[tool.name] = str(tool.description)
+      tools[tool.name] = {"description":tool.description,
+                          "parameters" :tool.inputSchema}
+
     return tools
+
+  async def build_system_tool_prompt(self) -> str:
+    """builds the system prompt using the list of tools"""
+    tool_list = await self.list_tools()
+    system_prompt = "\nRespond with JSON: {\"tool\": \"name\", \"arguments\": {...}}\n"
+    for tool_name, tool_info in tool_list.items(): # {name : {description: ..., parameter: ...}}
+      # build the function signarture
+      schema = tool_info['parameters']
+      params = []
+      if 'properties' in schema:
+        required = set(schema.get('required', []))
+        for param_name, param_info in schema['properties'].items():
+          param_type = param_info.get('type' ,'any')
+          if param_name in required:
+            params.append(f'{param_name}: {param_type} ')
+          else:
+            params.append(f'{param_name}?, {param_type} ')
+      params_str = ", ".join(params)
+      system_prompt+= f'TOOL NAME: {tool_name} | DESCRIPTION: {tool_info['description']} | PARAMETERS: {params_str} \n'
+
+
+    return system_prompt
+
 
 if __name__ == "__main__":
   async def main():
     ticker = "AAPL"
     async with Financial_Analysis_Agent() as agent:
 
-    #   # List available tools
-    #   print(await agent.list_tool(), file=sys.stderr, flush=True)
+      # List available tools
+      print(await agent.build_system_tool_prompt(), file=sys.stderr, flush=True)
 
     #   print(await agent.call_tool('search', {"ticker" :ticker, "query": {
     #   "earnings": "Latest Earnings Report",
@@ -263,9 +288,9 @@ if __name__ == "__main__":
       # print(f'TAX RATE: {await agent.call_tool('get_tax_rate', {'ticker': ticker, 'form_type': '10-K'})}', file=sys.stderr, flush=True)
       # print(f'DEPRECIATION: {await agent.call_tool('get_depreciation', {'ticker': ticker, 'form_type': '10-K'})}', file=sys.stderr, flush=True)
 
-      response = await agent.call_tool('get_disclosures_names', {'ticker': ticker, 'form_type': '10-K'})
+      # response = await agent.call_tool('get_disclosures_names', {'ticker': ticker, 'form_type': '10-K'})
 
-      for disclosure in response['disclosure_names']:
-        print(await agent.call_tool('extract_disclosure_data', {'ticker': ticker,'disclosure_name': disclosure, 'form_type':'10-K'}))
+      # for disclosure in response['disclosure_names']:
+      #   print(await agent.call_tool('extract_disclosure_data', {'ticker': ticker,'disclosure_name': disclosure, 'form_type':'10-K'}))
 
   asyncio.run(main())
