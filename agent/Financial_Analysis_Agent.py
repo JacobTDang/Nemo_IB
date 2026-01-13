@@ -31,9 +31,10 @@ class OllamaModel():
       model=self.model_name,
       messages=messages,
       stream=True,
+      keep_alive=0,
       options={
         'num_gpu': -1,
-        'gpu_memory_utilization': 0.9
+        'gpu_memory_utilization': 0.9,
       }
     )
     assistant_response = ""
