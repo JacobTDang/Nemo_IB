@@ -5,7 +5,7 @@ from langgraph.graph import StateGraph, END
 from agent_state import AgentState
 from ..Financial_Analysis_Agent import Financial_Analysis_Agent
 from ..Orchestrator_Agent import Orchestrator_Agent
-from .. Probing_Agent import Probing_Agent
+from ..Probing_Agent import Probing_Agent
 from ..Plan_Validator_Agent import Plan_Validator_Agent
 from ..Verification_Agent import Verification_Agent
 from ..MCP_manager import MCPConnectionManager
@@ -48,7 +48,7 @@ class WorkFlow:
     actions = ['approve', 'revise', 'reject', 'clarify']
     been_reviewed = True if state.get('action', None) in actions else False
     # we only want to bring use probing questions prompt once, should not if plan needs revising or reject
-    probing_questions = state.get('questions', []) if not been_reviewed else []
+    probing_questions = state.get('research_questions', []) if not been_reviewed else []
 
     # need to check the state
     tool_list = await self.mcp.list_tools()
@@ -58,18 +58,16 @@ class WorkFlow:
     if not plan: raise RuntimeError(f"Plan results is None: {plan}")
 
     return{
-      'exexution_plan': plan['tools_sequence'],
+      'execution_plan': plan['tools_sequence'],
       'plan_reasoning': plan['reasoning']
     }
 
   async def plan_validate_node(self, state: AgentState):
-
     user_query = state['user_query']
     execution_plan = state['execution_plan']
     plan_reasoning = state['plan_reasoning']
 
-    validator = Plan_Validator_Agent()
-    result = validator.validate_plan(user_query=user_query, execution_plan=execution_plan, plan_reasoning=plan_reasoning)
+    result = self.plan_validator.validate_plan(user_query=user_query, execution_plan=execution_plan, plan_reasoning=plan_reasoning)
 
     return{
       'is_clear': result['request_clarity']['is_clear'],
