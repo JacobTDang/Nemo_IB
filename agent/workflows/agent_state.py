@@ -11,7 +11,7 @@ class AgentState(TypedDict):
   critical_assumptions: str
   potential_data_gaps: str
 
-  action: bool
+  action: List[str]
 
   execution_plan: Dict[str, Any]
   plan_reasoning: str
@@ -19,10 +19,12 @@ class AgentState(TypedDict):
 
   tools_results : List[Dict[str, Any]]
 
-  is_clear: str
+  is_clear: bool | str
   plan_validation: Dict[str, Any]
 
-  data_sufficent: bool
+  tool_output: List[Any]
+  data_sufficient: bool
+
   missing_data: List
   return_count: int
 
