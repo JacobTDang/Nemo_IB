@@ -74,6 +74,17 @@ class WorkFlow:
       'plan_validation': result
     }
 
+  async def excution_node(self, state: AgentState):
+    execution_plan = state['execution_plan']
+    tool_sequence = execution_plan['tool_sequence']
+
+    for tool in tool_sequence:
+      if tool['tool'] and tool['arguments']:
+        tool_name = tool['tool']
+        arguments = tool['arguments']
+        await self.mcp.call_tool(tool_name, arguments)
+      else:
+        raise KeyError("Unable to find tool and argumetns")
 
 if __name__ == "__main__":
   async def main():
