@@ -90,6 +90,18 @@ class WorkFlow:
       'tool_output': result
     }
 
+  async def final_analysis(self, state:AgentState):
+    user_query = state['user_query']
+    tool_output = state['tool_output']
+    execution_plan = state['execution_plan']
+    research_questions = state['research_questions']
+
+    result = self.financial_analyst.analyze(user_query=user_query, execution_plan=execution_plan, tools_results=tool_output, research_questions=research_questions)
+
+    return{
+      'analysis_report': result
+    }
+
 if __name__ == "__main__":
   async def main():
     async with MCPConnectionManager() as mcp:

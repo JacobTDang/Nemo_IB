@@ -28,6 +28,6 @@ class AgentState(TypedDict):
   missing_data: List
   return_count: int
 
-  final_analysis: str
+  analysis_report: str
 
   token_count: int
