@@ -102,6 +102,17 @@ class WorkFlow:
       'analysis_report': result
     }
 
+  async def add_nodes(self):
+    # add all workflows
+    self.workflow.add_node('probe', self.probe_node)
+    self.workflow.add_node('orchestrade', self.orchestrate_node)
+    self.workflow.add_node('plan_validaton', self.plan_validate_node)
+    self.workflow.add_node('execution', self.excution_node)
+    self.workflow.add_node('final_analysis', self.final_analysis)
+
+    # start at prob
+    self.workflow.set_entry_point("probe")
+
 if __name__ == "__main__":
   async def main():
     async with MCPConnectionManager() as mcp:
