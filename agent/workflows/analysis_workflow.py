@@ -14,15 +14,17 @@ from typing import Any, Dict, Optional
 import asyncio
 
 class WorkFlow:
-  def __init__(self, mcp: MCPConnectionManager):
+  async def __init__(self, mcp: MCPConnectionManager):
     self.prober = Probing_Agent("llama3.1:8b")
     self.orchestrator = Orchestrator_Agent("orchestrator:latest")
     self.plan_validator = Plan_Validator_Agent("llama3.1:8b")
     self.financial_analyst = Financial_Analysis_Agent("DeepSeek-R1-Distill-Llama-8B:latest")
     self.final_approval = Verification_Agent("")
-
     self.workflow = StateGraph(AgentState)
     self.mcp = mcp
+
+    await self.setup_graph()
+
 
   def probe_node(self, state: AgentState):
     # what if the user doesn't mention ticker? -> model should automatically handle that
@@ -102,16 +104,35 @@ class WorkFlow:
       'analysis_report': result
     }
 
-  async def add_nodes(self):
-    # add all workflows
+  async def setup_graph(self):
+    # --- initializing node keys---
     self.workflow.add_node('probe', self.probe_node)
-    self.workflow.add_node('orchestrade', self.orchestrate_node)
+    self.workflow.add_node('orchestrate', self.orchestrate_node)
     self.workflow.add_node('plan_validaton', self.plan_validate_node)
     self.workflow.add_node('execution', self.excution_node)
     self.workflow.add_node('final_analysis', self.final_analysis)
 
-    # start at prob
+    # set starting point at probe node to first develop research questoins
     self.workflow.set_entry_point("probe")
+
+    # --- connecting nodes with edges ---
+    self.workflow.add_edge('probe', 'orchestrate')
+    self.workflow.add_edge('orchestrate', 'plan_validatoin')
+
+    def check_plan(state: AgentState):
+      # check state to cheak if clear is valid
+      plan_action = state['plan_validation']['action']
+      is_clear = 'Accept' if plan_action == 'approve' else 'Reject'
+      return is_clear
+
+    self.workflow.add_conditional_edges('plan_validation', check_plan,
+                                        {'Accept': 'execution', # if plan is clear then continue to execution node
+                                        'Reject': 'orchestrate'})
+
+    self.workflow.add_edge('execution', 'final_analysis')
+
+    self.workflow.compile()
+
 
 if __name__ == "__main__":
   async def main():
