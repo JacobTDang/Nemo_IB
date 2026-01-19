@@ -72,7 +72,6 @@ class WorkFlow:
     result = self.plan_validator.validate_plan(user_query=user_query, execution_plan=execution_plan, plan_reasoning=plan_reasoning)
 
     return{
-      'is_clear': result['request_clarity']['is_clear'],
       'plan_validation': result
     }
 

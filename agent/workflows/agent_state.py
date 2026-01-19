@@ -19,7 +19,6 @@ class AgentState(TypedDict):
 
   tools_results : List[Dict[str, Any]]
 
-  is_clear: bool | str
   plan_validation: Dict[str, Any]
 
   tool_output: List[Any]
