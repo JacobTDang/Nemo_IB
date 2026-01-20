@@ -1,4 +1,4 @@
-from ollama_template import OllamaModel
+from .ollama_template import OllamaModel
 from typing import Dict, Optional
 import sys
 import datetime
@@ -104,7 +104,7 @@ class Plan_Validator_Agent(OllamaModel):
               Output ONLY valid JSON with this structure:
               {
                 "request_clarity": {
-                  "is_clear": true or false,
+                  "is_clear": True or False,
                   "ambiguities": ["What's ambiguous about the request"],
                   "clarifying_questions": ["Questions to ask user"]
                 },
@@ -154,7 +154,7 @@ class Plan_Validator_Agent(OllamaModel):
 
     return prompt
 
-  def validate_plan(self, user_query: str, execution_plan: Dict) -> Dict:
+  def validate_plan(self, user_query: str, execution_plan: Dict, plan_reasoning: str) -> Dict:
     """
     Validate execution plan against user query
 
@@ -178,6 +178,9 @@ class Plan_Validator_Agent(OllamaModel):
 
                   Execution Plan:
                   {plan_str}
+
+                  Plan Reasoning:
+                  {plan_reasoning}
 
                   Validate this plan. Will it successfully answer the user's request?
 

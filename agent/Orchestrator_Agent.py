@@ -1,4 +1,4 @@
-from ollama_template import OllamaModel
+from .ollama_template import OllamaModel
 from typing import Dict, Optional, List, Any
 import sys
 

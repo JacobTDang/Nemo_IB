@@ -1,7 +1,9 @@
-from ollama_template import OllamaModel
+from .ollama_template import OllamaModel
 from typing import Dict, Optional
 import sys
 import datetime
+import json
+import re
 
 class Probing_Agent(OllamaModel):
   def __init__(self, model_name = 'llama3.1:8b'):
@@ -171,9 +173,6 @@ class Probing_Agent(OllamaModel):
     )
 
     # Parse JSON response
-    import json
-    import re
-
     # Strip markdown code blocks if present
     response = response.strip()
     response = response.replace('```json', '').replace('```', '')
@@ -263,7 +262,7 @@ if __name__ == "__main__":
 
         print(f"\n\nPOTENTIAL DATA GAPS:")
         for gap in result.get('potential_data_gaps', []):
-            print(f"  • {gap}")
+            print(f" | {gap}")
 
         print(f"\n\nRECOMMENDED APPROACH:")
         print(f"  {result.get('recommended_approach', 'N/A')}")
