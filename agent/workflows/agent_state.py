@@ -16,6 +16,7 @@ class AgentState(TypedDict):
   execution_plan: Dict[str, Any]
   plan_reasoning: str
 
+  return_count: int
 
   tools_results : List[Dict[str, Any]]
 

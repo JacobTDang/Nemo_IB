@@ -46,21 +46,64 @@ class WorkFlow:
   async def orchestrate_node(self, state: AgentState):
     user_query = state['user_query']
 
-    actions = ['approve', 'revise', 'reject', 'clarify']
-    been_reviewed = True if state.get('action', None) in actions else False
-    # we only want to bring use probing questions prompt once, should not if plan needs revising or reject
-    probing_questions = state.get('research_questions', []) if not been_reviewed else []
-
-    # need to check the state
+    # check if we're coming back from validation
+    plan_validation = state.get('plan_validation')
     tool_list = await self.mcp.list_tools()
-    plan = self.orchestrator.create_plan(user_query=user_query, tool_list=tool_list, previous_node=probing_questions)
 
-    # stop the program if plan result is none
-    if not plan: raise RuntimeError(f"Plan results is None: {plan}")
+    if plan_validation:
+      action = plan_validation.get('action', '').lower()
 
-    return{
+      if action == 'revise':
+        # pass validator feedback to orchestrator for revision
+        feedback = {
+          "previous_plan": state.get('execution_plan'),
+          "issues": plan_validation.get('issues', []),
+          "missing_data": plan_validation.get('missing_critical_data', []),
+          "recommendations": plan_validation.get('recommendations', []),
+          "reasoning": plan_validation.get('action_reasoning', '')
+        }
+
+        plan = self.orchestrator.create_plan(
+          user_query=user_query,
+          tool_list=tool_list,
+          revision_feedback=feedback
+        )
+
+      elif action == 'clarify':
+        # handle the unclear request, use clarifying questions as context
+        clarifications = {
+          "ambiguities": plan_validation.get('request_clarity', {}).get('ambiguities', []),
+          "questions": plan_validation.get('request_clarity', {}).get('clarifying_questions', []),
+        }
+
+        plan = self.orchestrator.create_plan(
+          user_query=user_query,
+          tool_list=tool_list,
+          clarification_context=clarifications
+        )
+      else:
+        # shouldn't reach here if conditional edges work correctly
+        raise RuntimeError(f"Unexpected action in orchestrate_node: {action}")
+    else:
+      # first run, use probing questions
+      probing_questions = state.get('research_questions', [])
+
+      plan = self.orchestrator.create_plan(
+        user_query=user_query,
+        tool_list=tool_list,
+        previous_node=probing_questions
+      )
+
+    if not plan:
+      raise RuntimeError(f"Plan result is None: {plan}")
+
+    # increment revision counter to prevent infinite loops
+    return_count = state.get('return_count', 0) + 1
+
+    return {
       'execution_plan': plan['tools_sequence'],
-      'plan_reasoning': plan['reasoning']
+      'plan_reasoning': plan['reasoning'],
+      'return_count': return_count
     }
 
   async def plan_validate_node(self, state: AgentState):
@@ -118,14 +161,28 @@ class WorkFlow:
     self.workflow.add_edge('orchestrate', 'plan_validation')
 
     def check_plan(state: AgentState):
+      # iteration, from plan_validation to orchestration node, check to prevent infinite loops
+      iteration_num = state.get('return_count', 0)
+      if iteration_num >= 10:
+        return "Reject"
+
       # check state to cheak if clear is valid
       plan_action = state['plan_validation']['action']
-      is_clear = 'Accept' if plan_action == 'approve' else 'Reject'
-      return is_clear
+      if plan_action.lower() == 'approve':
+        return 'Accept'
+      elif plan_action.lower() == "revise":
+        return 'Revise'
+      elif plan_action.lower() == "reject":
+        return "Reject"
+      else:
+        return "Clarify"
 
     self.workflow.add_conditional_edges('plan_validation', check_plan,
                                         {'Accept': 'execution', # if plan is clear then continue to execution node
-                                        'Reject': 'orchestrate'})
+                                        'Revise': 'orchestrate',
+                                        'Clarify': 'orchestrate',
+                                        'Reject': END
+                                        })
 
     self.workflow.add_edge('execution', 'final_analysis')
 
