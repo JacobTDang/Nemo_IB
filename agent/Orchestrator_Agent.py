@@ -1,5 +1,5 @@
 from ollama_template import OllamaModel
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Any
 import sys
 
 class Orchestrator_Agent(OllamaModel):
@@ -7,7 +7,11 @@ class Orchestrator_Agent(OllamaModel):
   def __init__(self, model_name: str = 'orchestrator:latest'):
     super().__init__(model_name=model_name)
 
-  def build_orchestrator_prompt(self, tool_list: Dict[str, Dict]) -> str:
+  def build_orchestrator_prompt(self,
+                                  tool_list: Dict[str, Dict],
+                                  previous_node: List[Dict[str, Any]] = None,
+                                  revision_feedback: Dict[str, Any] = None,
+                                  clarification_context: Dict[str, Any] = None) -> str:
     """Build complete system prompt with reasoning framework and available tools"""
     from datetime import datetime
     current_date = datetime.now().strftime("%B %d, %Y")
@@ -86,6 +90,63 @@ class Orchestrator_Agent(OllamaModel):
       params_str = ", ".join(params)
       prompt += f"- {tool_name}({params_str}): {tool_info['description']}\n"
 
+    # Add probing questions from first run
+    if previous_node and len(previous_node) > 0:
+      prompt += "\n\nPROBING QUESTIONS TO CONSIDER:\n"
+      for question in previous_node:
+        if isinstance(question, dict):
+          prompt += f"- {question.get('category', '')}: {question.get('question', '')} ({question.get('rationale', '')})\n"
+        else:
+          prompt += f"- {question}\n"
+
+    # Add revision feedback if this is a plan revision
+    if revision_feedback:
+      import json
+      prompt += f"""
+
+REVISION REQUIRED:
+Your previous plan was reviewed and needs improvement.
+
+Previous Plan:
+{json.dumps(revision_feedback.get('previous_plan', []), indent=2)}
+
+Issues Identified:
+{json.dumps(revision_feedback.get('issues', []), indent=2)}
+
+Missing Critical Data:
+{json.dumps(revision_feedback.get('missing_data', []), indent=2)}
+
+Recommendations:
+{json.dumps(revision_feedback.get('recommendations', []), indent=2)}
+
+Validator Feedback:
+{revision_feedback.get('reasoning', 'No additional feedback')}
+
+Create an IMPROVED plan that addresses ALL of these issues.
+Add the missing tools, fix the identified problems, and follow the recommendations.
+"""
+
+    # Add clarification context if request was unclear
+    if clarification_context:
+      import json
+      prompt += f"""
+
+REQUEST NEEDS INTERPRETATION:
+The user's request has ambiguities. You must make reasonable assumptions and proceed.
+
+Ambiguities in the Request:
+{json.dumps(clarification_context.get('ambiguities', []), indent=2)}
+
+Questions to Consider:
+{json.dumps(clarification_context.get('questions', []), indent=2)}
+
+Create a plan based on the MOST REASONABLE interpretation of the request.
+- If analysis type is unclear, default to comprehensive analysis
+- If timeframe is unclear, use most recent data
+- If scope is unclear, focus on the primary subject
+Document your assumptions clearly in the "reasoning" field.
+"""
+
     prompt += """
 
       SPECIAL TOOL FORMATS:
@@ -128,23 +189,49 @@ class Orchestrator_Agent(OllamaModel):
 
     return prompt
 
-  def create_plan(self, user_query: str, tool_list: Dict[str, Dict]):
+  def create_plan(self,
+                   user_query: str,
+                   tool_list: Dict[str, Dict],
+                   previous_node: List[Dict[str, Any]] = None,
+                   revision_feedback: Dict[str, Any] = None,
+                   clarification_context: Dict[str, Any] = None):
     """
     Create execution plan for user query
 
     Args:
       user_query: User's request (e.g., "Run a DCF on AAPL")
       tool_list: Dict of available tools with descriptions and parameters
+      previous_node: Probing questions from first run (optional)
+      revision_feedback: Feedback from validator if plan needs revision (optional)
+      clarification_context: Clarification info if request was unclear (optional)
 
     Returns:
       dict: Execution plan with task_type, ticker, reasoning, tools_sequence
       or None if planning fails
     """
-    # Build system prompt with tools
-    system_prompt = self.build_orchestrator_prompt(tool_list)
+    # Determine mode for logging
+    if revision_feedback:
+      mode = "REVISING PLAN"
+    elif clarification_context:
+      mode = "PLANNING (with clarifications)"
+    else:
+      mode = "CREATING INITIAL PLAN"
+
+    print(f"\n{'='*60}", file=sys.stderr, flush=True)
+    print(f"Orchestrator: {mode}", file=sys.stderr, flush=True)
+    print(f"{'='*60}\n", file=sys.stderr, flush=True)
+
+    # Build system prompt with tools and any feedback
+    system_prompt = self.build_orchestrator_prompt(
+      tool_list=tool_list,
+      previous_node=previous_node,
+      revision_feedback=revision_feedback,
+      clarification_context=clarification_context
+    )
+
     # Get plan from orchestrator model
-    print(f"\nOrchestrator planning...\n", file=sys.stderr, flush=True)
     response = self.generate_response(prompt=user_query, system_prompt=system_prompt)
+
     # Parse the plan
     plan = self._parse_plan_response(response)
 
