@@ -14,7 +14,7 @@ from typing import Any, Dict, Optional
 import asyncio
 
 class WorkFlow:
-  async def __init__(self, mcp: MCPConnectionManager):
+  def __init__(self, mcp: MCPConnectionManager):
     self.prober = Probing_Agent("llama3.1:8b")
     self.orchestrator = Orchestrator_Agent("orchestrator:latest")
     self.plan_validator = Plan_Validator_Agent("llama3.1:8b")
@@ -23,8 +23,7 @@ class WorkFlow:
     self.workflow = StateGraph(AgentState)
     self.mcp = mcp
 
-    await self.setup_graph()
-
+    self.setup_graph()
 
   def probe_node(self, state: AgentState):
     # what if the user doesn't mention ticker? -> model should automatically handle that
@@ -103,11 +102,11 @@ class WorkFlow:
       'analysis_report': result
     }
 
-  async def setup_graph(self):
+  def setup_graph(self):
     # --- initializing node keys---
     self.workflow.add_node('probe', self.probe_node)
     self.workflow.add_node('orchestrate', self.orchestrate_node)
-    self.workflow.add_node('plan_validaton', self.plan_validate_node)
+    self.workflow.add_node('plan_validation', self.plan_validate_node)
     self.workflow.add_node('execution', self.excution_node)
     self.workflow.add_node('final_analysis', self.final_analysis)
 
@@ -116,7 +115,7 @@ class WorkFlow:
 
     # --- connecting nodes with edges ---
     self.workflow.add_edge('probe', 'orchestrate')
-    self.workflow.add_edge('orchestrate', 'plan_validatoin')
+    self.workflow.add_edge('orchestrate', 'plan_validation')
 
     def check_plan(state: AgentState):
       # check state to cheak if clear is valid
@@ -130,7 +129,7 @@ class WorkFlow:
 
     self.workflow.add_edge('execution', 'final_analysis')
 
-    self.workflow.compile()
+    self.app = self.workflow.compile()
 
 
 if __name__ == "__main__":
