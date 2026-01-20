@@ -2,7 +2,7 @@
 this is going to be the main workflow for financial analysis work
 """
 from langgraph.graph import StateGraph, END
-from agent_state import AgentState
+from .agent_state import AgentState
 from ..Financial_Analysis_Agent import Financial_Analysis_Agent
 from ..Orchestrator_Agent import Orchestrator_Agent
 from ..Probing_Agent import Probing_Agent
@@ -10,8 +10,9 @@ from ..Plan_Validator_Agent import Plan_Validator_Agent
 from ..Verification_Agent import Verification_Agent
 from ..MCP_manager import MCPConnectionManager
 from langchain_core.runnables import RunnableConfig
-from typing import Any, Dict, Optional
+from typing import cast
 import asyncio
+
 
 class WorkFlow:
   def __init__(self, mcp: MCPConnectionManager):
@@ -23,7 +24,7 @@ class WorkFlow:
     self.workflow = StateGraph(AgentState)
     self.mcp = mcp
 
-    self.setup_graph()
+    self.app = self.setup_graph()
 
   def probe_node(self, state: AgentState):
     # what if the user doesn't mention ticker? -> model should automatically handle that
@@ -101,7 +102,7 @@ class WorkFlow:
     return_count = state.get('return_count', 0) + 1
 
     return {
-      'execution_plan': plan['tools_sequence'],
+      'execution_plan': plan,
       'plan_reasoning': plan['reasoning'],
       'return_count': return_count
     }
@@ -117,20 +118,29 @@ class WorkFlow:
       'plan_validation': result
     }
 
-  async def excution_node(self, state: AgentState):
+  async def execution_node(self, state: AgentState):
     execution_plan = state['execution_plan']
-    tool_sequence = execution_plan['tool_sequence']
-    result = []
-    for tool in tool_sequence:
-      if tool['tool'] and tool['arguments']:
+    tool_sequence = execution_plan['tools_sequence']
+    results = []
+
+    for idx, tool in enumerate(tool_sequence, 1):
+      if tool.get('tool') and tool.get('arguments'):
         tool_name = tool['tool']
         arguments = tool['arguments']
-        result.append(await self.mcp.call_tool(tool_name, arguments))
-      else:
-        raise KeyError("Unable to find tool and argumetns")
+        print(f"[Step {idx}/{len(tool_sequence)}] Executing: {tool_name}", flush=True)
 
-    return{
-      'tool_output': result
+        tool_result = await self.mcp.call_tool(tool_name, arguments)
+        results.append({
+          'tool': tool_name,
+          'arguments': arguments,
+          'result': tool_result,
+          'success': True
+        })
+      else:
+        raise KeyError(f"Unable to find tool and arguments in step {idx}: {tool}")
+
+    return {
+      'tool_output': results
     }
 
   async def final_analysis(self, state:AgentState):
@@ -150,7 +160,7 @@ class WorkFlow:
     self.workflow.add_node('probe', self.probe_node)
     self.workflow.add_node('orchestrate', self.orchestrate_node)
     self.workflow.add_node('plan_validation', self.plan_validate_node)
-    self.workflow.add_node('execution', self.excution_node)
+    self.workflow.add_node('execution', self.execution_node)  # Fixed method name
     self.workflow.add_node('final_analysis', self.final_analysis)
 
     # set starting point at probe node to first develop research questoins
@@ -179,20 +189,33 @@ class WorkFlow:
 
     self.workflow.add_conditional_edges('plan_validation', check_plan,
                                         {'Accept': 'execution', # if plan is clear then continue to execution node
-                                        'Revise': 'orchestrate',
+                                        'Revise': 'orchestrate', # else ...
                                         'Clarify': 'orchestrate',
                                         'Reject': END
                                         })
 
     self.workflow.add_edge('execution', 'final_analysis')
+    self.workflow.add_edge('final_analysis', END)
 
-    self.app = self.workflow.compile()
+    return self.workflow.compile()
 
 
 if __name__ == "__main__":
   async def main():
     async with MCPConnectionManager() as mcp:
-
+      # Create workflow
       w = WorkFlow(mcp=mcp)
+
+      # Run the workflow
+      result = await w.app.ainvoke(cast(AgentState,{
+        "user_query": "Run DCF on AAPL",
+        "ticker": "AAPL"
+      }))
+
+      # Print the final analysis
+      print("\n" + "="*80)
+      print("FINAL ANALYSIS")
+      print("="*80)
+      print(result.get("analysis_report", "No analysis generated"))
 
   asyncio.run(main())
