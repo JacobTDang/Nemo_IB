@@ -100,12 +100,12 @@ class WorkFlow:
       raise RuntimeError(f"Plan result is None: {plan}")
 
     # increment revision counter to prevent infinite loops
-    return_count = state.get('return_count', 0) + 1
+    return_count = state.get('orchestrate_return_count', 0) + 1
 
     return {
       'execution_plan': plan,
       'plan_reasoning': plan['reasoning'],
-      'return_count': return_count
+      'orchestrate_return_count': return_count
     }
 
   async def plan_validate_node(self, state: AgentState):
@@ -198,10 +198,14 @@ class WorkFlow:
     execution_plan = state['execution_plan']
     research_questions = state['research_questions']
 
+    # increment the final_analysis count
+    final_analysis_iteration = state.get('final_analysis_return_count', 0) + 1
+
     result = self.financial_analyst.analyze(user_query=user_query, execution_plan=execution_plan, tools_results=tool_output, research_questions=research_questions)
 
     return{
-      'analysis_report': result
+      'analysis_report': result,
+      "final_analysis_return_count": final_analysis_iteration
     }
 
   def setup_graph(self):
@@ -211,6 +215,7 @@ class WorkFlow:
     self.workflow.add_node('plan_validation', self.plan_validate_node)
     self.workflow.add_node('execution', self.execution_node)  # Fixed method name
     self.workflow.add_node('final_analysis', self.final_analysis)
+    self.workflow.add_node('final_verification', self.verification_node)
 
     # set starting point at probe node to first develop research questoins
     self.workflow.set_entry_point("probe")
@@ -221,7 +226,7 @@ class WorkFlow:
 
     def check_plan(state: AgentState):
       # iteration, from plan_validation to orchestration node, check to prevent infinite loops
-      iteration_num = state.get('return_count', 0)
+      iteration_num = state.get('orchestrate_return_count', 0)
       if iteration_num >= 10:
         return "Reject"
 
@@ -244,7 +249,33 @@ class WorkFlow:
                                         })
 
     self.workflow.add_edge('execution', 'final_analysis')
-    self.workflow.add_edge('final_analysis', END)
+
+    def check_final_analysis(state: AgentState):
+      # iteration check
+      final_iteration_num = state.get('final_analysis_return_count', 0)
+      if final_iteration_num >= 5:
+        return 'END'
+
+      # check the action in verification result
+      if state['verification_result']['action'].lower() == "approve":
+        return 'approve'
+      elif state['verification_result']['action'].lower() == "revise":
+        return 'revise'
+      else:
+        return "reject"
+
+
+    self.workflow.add_edge('final_analysis', 'final_verification')
+
+    self.workflow.add_conditional_edges(
+      'final_verification', check_final_analysis,
+      {
+        'END': END,
+        'revise': 'final_analysis',
+        'reject': 'final_analysis'
+
+      }
+    )
 
     return self.workflow.compile()
 
