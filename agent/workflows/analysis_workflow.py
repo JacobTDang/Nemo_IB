@@ -12,7 +12,7 @@ from ..MCP_manager import MCPConnectionManager
 from langchain_core.runnables import RunnableConfig
 from typing import cast
 import asyncio
-
+import json
 
 class WorkFlow:
   def __init__(self, mcp: MCPConnectionManager):
@@ -20,7 +20,7 @@ class WorkFlow:
     self.orchestrator = Orchestrator_Agent("orchestrator:latest")
     self.plan_validator = Plan_Validator_Agent("llama3.1:8b")
     self.financial_analyst = Financial_Analysis_Agent("DeepSeek-R1-Distill-Llama-8B:latest")
-    self.final_approval = Verification_Agent("")
+    self.verification_agent = Verification_Agent("")
     self.workflow = StateGraph(AgentState)
     self.mcp = mcp
 
@@ -92,7 +92,8 @@ class WorkFlow:
       plan = self.orchestrator.create_plan(
         user_query=user_query,
         tool_list=tool_list,
-        previous_node=probing_questions
+        previous_node=probing_questions,
+        clarification_context={} # there arent any
       )
 
     if not plan:
@@ -123,24 +124,72 @@ class WorkFlow:
     tool_sequence = execution_plan['tools_sequence']
     results = []
 
+    print(f"\n{'='*60}", flush=True)
+    print(f"EXECUTION PHASE - Running {len(tool_sequence)} tools", flush=True)
+    print(f"{'='*60}\n", flush=True)
+
     for idx, tool in enumerate(tool_sequence, 1):
       if tool.get('tool') and tool.get('arguments'):
         tool_name = tool['tool']
         arguments = tool['arguments']
         print(f"[Step {idx}/{len(tool_sequence)}] Executing: {tool_name}", flush=True)
+        print(f"  Arguments: {json.dumps(arguments, indent=2)}", flush=True)
 
         tool_result = await self.mcp.call_tool(tool_name, arguments)
+
+        # Debug: Print what the tool returned
+        print(f"  Result preview: {str(tool_result)[:500]}...\n", flush=True)
+
         results.append({
           'tool': tool_name,
           'arguments': arguments,
           'result': tool_result,
           'success': True
         })
+
+        # AUTO-INJECT: If this was a search, automatically scrape the URLs
+        if tool_name == 'search' and tool_result.get('search_result'):
+          search_results = tool_result.get('search_result', [])
+          urls = [item['link'] for item in search_results[:3] if item.get('link')]  # Top 3 URLs
+
+          if urls:
+            print(f"  [Auto-inject] Scraping {len(urls)} URLs from search results...", flush=True)
+            try:
+              scrape_result = await self.mcp.call_tool('get_urls_content', {'urls': urls})
+              print(f"  [Auto-inject] Scraped content preview: {str(scrape_result)[:300]}...\n", flush=True)
+
+              results.append({
+                'tool': 'get_urls_content (auto-injected)',
+                'arguments': {'urls': urls},
+                'result': scrape_result,
+                'success': True
+              })
+            except Exception as e:
+              print(f"  [Auto-inject] Failed to scrape URLs: {e}\n", flush=True)
+
       else:
         raise KeyError(f"Unable to find tool and arguments in step {idx}: {tool}")
 
+    print(f"\n{'='*60}", flush=True)
+    print(f"EXECUTION COMPLETE - {len(results)} tools executed", flush=True)
+    print(f"{'='*60}\n", flush=True)
+
     return {
       'tool_output': results
+    }
+
+
+  async def verification_node(self, state: AgentState):
+    # need to get the final analysis output and return it. compare it against the user request?
+    # what other context do I need?
+    user_query = state['user_query']
+    analysis_report = state['analysis_report']
+    execution_plan = state['execution_plan']
+
+    result = self.verification_agent.verify(user_query=user_query, analysis_output=analysis_report, execution_plan=execution_plan)
+
+    return{
+      "verification_result": result
     }
 
   async def final_analysis(self, state:AgentState):
