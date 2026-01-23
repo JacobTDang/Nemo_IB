@@ -8,19 +8,21 @@ from ..Orchestrator_Agent import Orchestrator_Agent
 from ..Probing_Agent import Probing_Agent
 from ..Plan_Validator_Agent import Plan_Validator_Agent
 from ..Verification_Agent import Verification_Agent
+from ..Search_Summarizer_Agent import Search_Summarizer_Agent
 from ..MCP_manager import MCPConnectionManager
 from langchain_core.runnables import RunnableConfig
 from typing import cast
 import asyncio
-import json
+import json, sys
 
 class WorkFlow:
   def __init__(self, mcp: MCPConnectionManager):
     self.prober = Probing_Agent("llama3.1:8b")
     self.orchestrator = Orchestrator_Agent("orchestrator:latest")
     self.plan_validator = Plan_Validator_Agent("llama3.1:8b")
+    self.search_summarizer = Search_Summarizer_Agent("qwen3:8b")
     self.financial_analyst = Financial_Analysis_Agent("DeepSeek-R1-Distill-Llama-8B:latest")
-    self.verification_agent = Verification_Agent("")
+    self.verification_agent = Verification_Agent("DeepSeek-R1-Distill-Llama-8B:latest")
     self.workflow = StateGraph(AgentState)
     self.mcp = mcp
 
@@ -178,6 +180,17 @@ class WorkFlow:
       'tool_output': results
     }
 
+  def summarize_node(self, state: AgentState):
+    """Summarize and filter tool outputs to reduce context bloat before analysis"""
+    tool_output = state['tool_output']
+    ticker = state.get('ticker', 'UNKNOWN')
+
+    # Run the summarizer
+    summarized = self.search_summarizer.summarize_tool_outputs(tool_output, ticker)
+
+    return {
+      'summarized_output': summarized
+    }
 
   async def verification_node(self, state: AgentState):
     # need to get the final analysis output and return it. compare it against the user request?
@@ -194,14 +207,24 @@ class WorkFlow:
 
   async def final_analysis(self, state:AgentState):
     user_query = state['user_query']
-    tool_output = state['tool_output']
+    summarized_output = state['summarized_output']
+
+    print(f"\n[DEBUG: SUMMARIZED OUTPUT]:", file=sys.stderr, flush=True)
+    print(json.dumps(summarized_output, indent=2, default=str)[:2000], file=sys.stderr, flush=True)
+
     execution_plan = state['execution_plan']
     research_questions = state['research_questions']
 
     # increment the final_analysis count
     final_analysis_iteration = state.get('final_analysis_return_count', 0) + 1
 
-    result = self.financial_analyst.analyze(user_query=user_query, execution_plan=execution_plan, tools_results=tool_output, research_questions=research_questions)
+    # Pass summarized data instead of raw tool output
+    result = self.financial_analyst.analyze(
+      user_query=user_query,
+      execution_plan=execution_plan,
+      tools_results=summarized_output,
+      research_questions=research_questions
+    )
 
     return{
       'analysis_report': result,
@@ -213,7 +236,8 @@ class WorkFlow:
     self.workflow.add_node('probe', self.probe_node)
     self.workflow.add_node('orchestrate', self.orchestrate_node)
     self.workflow.add_node('plan_validation', self.plan_validate_node)
-    self.workflow.add_node('execution', self.execution_node)  # Fixed method name
+    self.workflow.add_node('execution', self.execution_node)
+    self.workflow.add_node('summarize', self.summarize_node)
     self.workflow.add_node('final_analysis', self.final_analysis)
     self.workflow.add_node('final_verification', self.verification_node)
 
@@ -248,34 +272,35 @@ class WorkFlow:
                                         'Reject': END
                                         })
 
-    self.workflow.add_edge('execution', 'final_analysis')
+    # execution → summarize → final_analysis → verification
+    self.workflow.add_edge('execution', 'summarize')
+    self.workflow.add_edge('summarize', 'final_analysis')
+    self.workflow.add_edge('final_analysis', 'final_verification')
 
     def check_final_analysis(state: AgentState):
       # iteration check
       final_iteration_num = state.get('final_analysis_return_count', 0)
       if final_iteration_num >= 5:
-        return 'END'
+        return 'approve'  # Force end after 5 iterations
 
       # check the action in verification result
-      if state['verification_result']['action'].lower() == "approve":
+      action = state['verification_result']['action'].lower()
+      if action == "approve":
         return 'approve'
-      elif state['verification_result']['action'].lower() == "revise":
+      elif action == "revise":
         return 'revise'
       else:
         return "reject"
 
-
-    self.workflow.add_edge('final_analysis', 'final_verification')
-
     self.workflow.add_conditional_edges(
       'final_verification', check_final_analysis,
       {
-        'END': END,
+        'approve': END,
         'revise': 'final_analysis',
-        'reject': 'final_analysis'
-
+        'reject': END  
       }
     )
+
 
     return self.workflow.compile()
 
