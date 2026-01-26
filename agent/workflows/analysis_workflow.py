@@ -20,7 +20,7 @@ class WorkFlow:
     self.prober = Probing_Agent("llama3.1:8b")
     self.orchestrator = Orchestrator_Agent("orchestrator:latest")
     self.plan_validator = Plan_Validator_Agent("llama3.1:8b")
-    self.search_summarizer = Search_Summarizer_Agent("qwen3:8b")
+    self.search_summarizer = Search_Summarizer_Agent("llama3.1:8b")
     self.financial_analyst = Financial_Analysis_Agent("DeepSeek-R1-Distill-Llama-8B:latest")
     self.verification_agent = Verification_Agent("DeepSeek-R1-Distill-Llama-8B:latest")
     self.workflow = StateGraph(AgentState)
@@ -231,6 +231,17 @@ class WorkFlow:
       "final_analysis_return_count": final_analysis_iteration
     }
 
+
+  def setup_graph_orchestrator(self):
+
+    # use a main orchestrator node, and connect it to sub agents
+    
+
+
+    # final compile
+    self.workflow.compile()
+
+
   def setup_graph(self):
     # --- initializing node keys---
     self.workflow.add_node('probe', self.probe_node)
@@ -283,8 +294,14 @@ class WorkFlow:
       if final_iteration_num >= 5:
         return 'approve'  # Force end after 5 iterations
 
+      # Handle case where verification failed to parse JSON
+      verification = state.get('verification_result', {})
+      if 'error' in verification or 'action' not in verification:
+        print(f"Warning: Verification parse failed, approving by default", file=sys.stderr)
+        return 'approve'  # Default to approve if verification failed
+
       # check the action in verification result
-      action = state['verification_result']['action'].lower()
+      action = verification['action'].lower()
       if action == "approve":
         return 'approve'
       elif action == "revise":
@@ -297,7 +314,7 @@ class WorkFlow:
       {
         'approve': END,
         'revise': 'final_analysis',
-        'reject': END  
+        'reject': END
       }
     )
 
