@@ -4,7 +4,7 @@ import json
 import sys
 
 class Search_Summarizer_Agent(OllamaModel):
-  def __init__(self, model_name: str = "qwen3-embedding:8b "):
+  def __init__(self, model_name: str = "llama3.1:8b"):
     super().__init__(model_name=model_name)
 
   def build_system_prompt(self) -> str:
@@ -134,35 +134,34 @@ Output ONLY valid JSON."""
           "data": output.get('result', {})
         })
 
-      # Search results - extract relevant snippets only
+      # Search results - keep top snippets (don't filter by ticker - context might be useful)
       elif tool_name == 'search':
         search_results = output.get('result', {}).get('search_result', [])
         query_info = output.get('arguments', {}).get('query', {})
 
-        relevant_snippets = []
-        for item in search_results:
+        # Keep top 5 snippets regardless of ticker mention
+        # Snippets are small, better to have more context
+        snippets = []
+        for item in search_results[:5]:
           title = item.get('title', '')
           snippet = item.get('snippet', '')
-          combined = (title + ' ' + snippet).upper()
-
-          # Only keep if ticker is mentioned
-          if ticker.upper() in combined:
-            relevant_snippets.append({
+          if title or snippet:  # Skip empty results
+            snippets.append({
               "title": title,
               "snippet": snippet,
               "link": item.get('link', '')
             })
 
-        if relevant_snippets:
-          print(f"  [Search] Kept {len(relevant_snippets)}/{len(search_results)} relevant snippets", file=sys.stderr, flush=True)
+        if snippets:
+          print(f"  [Search] Kept {len(snippets)}/{len(search_results)} snippets", file=sys.stderr, flush=True)
           summarized.append({
             "type": "search_snippets",
             "ticker": ticker,
             "queries": query_info,
-            "results": relevant_snippets[:5]  # Keep top 5 relevant
+            "results": snippets
           })
         else:
-          print(f"  [Search] No relevant snippets found for {ticker}", file=sys.stderr, flush=True)
+          print(f"  [Search] No snippets found", file=sys.stderr, flush=True)
 
       # Scraped URL content - summarize each with LLM
       elif 'get_urls_content' in tool_name:
@@ -177,16 +176,16 @@ Output ONLY valid JSON."""
             summary = self.summarize_single(item, ticker, search_intent)
 
             if summary.get('relevant', False):
-              print(f"    ✓ Relevant: {item.get('title', 'unknown')[:50]}", file=sys.stderr, flush=True)
+              print(f"    [OK] Relevant: {item.get('title', 'unknown')[:50]}", file=sys.stderr, flush=True)
               summarized.append({
                 "type": "web_content",
                 **summary
               })
             else:
               reason = summary.get('reason', summary.get('error', 'not relevant'))
-              print(f"    ✗ Filtered: {reason[:50]}", file=sys.stderr, flush=True)
+              print(f"    [X] Filtered: {reason[:50]}", file=sys.stderr, flush=True)
           else:
-            print(f"    ✗ Failed: {item.get('error', 'unknown error')[:50]}", file=sys.stderr, flush=True)
+            print(f"    [X] Failed: {item.get('error', 'unknown error')[:50]}", file=sys.stderr, flush=True)
 
       # Unknown tool - pass through
       else:
