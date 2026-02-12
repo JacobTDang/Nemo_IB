@@ -1,11 +1,11 @@
-from .ollama_template import OllamaModel
+from .gemini_template import GeminiModel
 from typing import Dict, Any, List, Optional
 import json
 import sys
 from datetime import datetime
 
 
-class Financial_Analysis_Agent(OllamaModel):
+class Financial_Analysis_Agent(GeminiModel):
     """
     Senior Investment Banker AI that performs institutional-grade financial analysis.
 
@@ -17,14 +17,14 @@ class Financial_Analysis_Agent(OllamaModel):
     - Risk factors (business, financial, market risks)
     """
 
-    def __init__(self, model_name: str = 'DeepSeek-R1-Distill-Llama-8B:latest'):
+    def __init__(self, model_name: str = 'gemini-2.5-flash'):
         super().__init__(model_name)
 
     def analyze(self,
                 user_query: str,
                 execution_plan: Dict[str, Any],
                 tools_results: List[Dict[str, Any]],
-                research_questions: Optional[List[str]] = None,
+                analytical_considerations: Optional[List[Dict[str, str]]] = None,
                 variables: Optional[Dict[str, Any]] = None) -> str:
         """
         Generate comprehensive financial analysis based on gathered data.
@@ -33,7 +33,7 @@ class Financial_Analysis_Agent(OllamaModel):
             user_query: The user's original question
             execution_plan: The plan that was executed (provides context for what data was gathered)
             tools_results: Results from all tool executions
-            research_questions: Optional strategic questions from probing phase
+            analytical_considerations: Strategic guidance from probing phase (topics + guidance)
             variables: Shared variable store - flat key-value pairs from all tool results
 
         Returns:
@@ -48,7 +48,7 @@ class Financial_Analysis_Agent(OllamaModel):
             user_query,
             execution_plan,
             tools_results,
-            research_questions,
+            analytical_considerations,
             variables or {}
         )
 
@@ -185,7 +185,7 @@ COMMON MISTAKES TO AVOID:
                                user_query: str,
                                execution_plan: Dict[str, Any],
                                tools_results: List[Dict[str, Any]],
-                               research_questions: Optional[List[str]] = None,
+                               analytical_considerations: Optional[List[Dict[str, str]]] = None,
                                variables: Dict[str, Any] = None) -> str:
         """Build the analysis prompt with all context.
 
@@ -234,18 +234,18 @@ TICKER: {execution_plan.get('ticker', flat_vars.get('ticker', 'N/A'))}
 
 """
 
-        # Add strategic context from probing phase
-        if research_questions:
+        # Add analytical guidance from probing phase
+        if analytical_considerations:
             prompt += f"""
 ################################################################################
-#                    STRATEGIC QUESTIONS TO ADDRESS                             #
+#                    ANALYTICAL GUIDANCE                                        #
 ################################################################################
 """
-            for idx, question in enumerate(research_questions[:5], 1):
-                if isinstance(question, dict):
-                    prompt += f"{idx}. {question.get('question', question)}\n"
+            for idx, item in enumerate(analytical_considerations, 1):
+                if isinstance(item, dict):
+                    prompt += f"{idx}. [{item.get('topic', 'General')}] {item.get('guidance', '')}\n"
                 else:
-                    prompt += f"{idx}. {question}\n"
+                    prompt += f"{idx}. {item}\n"
             prompt += "\n"
 
         # Add execution context

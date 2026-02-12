@@ -1,4 +1,4 @@
-from .ollama_template import OllamaModel
+from .gemini_template import GeminiModel
 from pydantic import BaseModel
 from typing import Dict, Optional, List
 import sys
@@ -15,10 +15,10 @@ class VerificationResult(BaseModel):
   missing_components: List[str]
 
 
-class Verification_Agent(OllamaModel):
+class Verification_Agent(GeminiModel):
   response_schema = VerificationResult
 
-  def __init__(self, model_name: str = 'llama3.1:8b'):
+  def __init__(self, model_name: str = 'gemini-2.5-flash'):
     super().__init__(model_name=model_name)
 
   def build_prompt(self) -> str:
