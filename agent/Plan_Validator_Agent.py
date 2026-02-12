@@ -1,8 +1,6 @@
 from .ollama_template import OllamaModel
-from typing import Dict, Optional
+from typing import Dict
 import sys
-import datetime
-import re
 
 class Plan_Validator_Agent(OllamaModel):
   def __init__(self, model_name:str = 'llama3.1:8b'):

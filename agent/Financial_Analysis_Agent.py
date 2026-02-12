@@ -4,6 +4,7 @@ import json
 import sys
 from datetime import datetime
 
+
 class Financial_Analysis_Agent(OllamaModel):
     """
     Senior Investment Banker AI that performs institutional-grade financial analysis.
@@ -23,7 +24,8 @@ class Financial_Analysis_Agent(OllamaModel):
                 user_query: str,
                 execution_plan: Dict[str, Any],
                 tools_results: List[Dict[str, Any]],
-                research_questions: Optional[List[str]] = None) -> str:
+                research_questions: Optional[List[str]] = None,
+                variables: Optional[Dict[str, Any]] = None) -> str:
         """
         Generate comprehensive financial analysis based on gathered data.
 
@@ -32,6 +34,7 @@ class Financial_Analysis_Agent(OllamaModel):
             execution_plan: The plan that was executed (provides context for what data was gathered)
             tools_results: Results from all tool executions
             research_questions: Optional strategic questions from probing phase
+            variables: Shared variable store - flat key-value pairs from all tool results
 
         Returns:
             Comprehensive analysis as a string
@@ -45,7 +48,8 @@ class Financial_Analysis_Agent(OllamaModel):
             user_query,
             execution_plan,
             tools_results,
-            research_questions
+            research_questions,
+            variables or {}
         )
 
         print(f"\n{'='*60}", file=sys.stderr, flush=True)
@@ -134,36 +138,6 @@ CRITICAL ANALYSIS FRAMEWORK:
    - Structure clearly with headers/sections
    - Be balanced and objective (not promotional)
 
-ANALYSIS TYPES (adapt based on question):
-
-DCF VALUATION:
-- Calculate Free Cash Flow (Revenue - OpEx - CapEx - Taxes + D&A - Change in NWC)
-- Apply WACC to discount FCFs
-- Calculate terminal value (perpetuity growth + exit multiple methods)
-- Derive equity value and price per share
-- Provide valuation range with sensitivities
-- Compare to current price and analyst consensus
-
-COMPARABLE COMPANY ANALYSIS:
-- Identify relevant peer group and rationale
-- Calculate key multiples (EV/Revenue, EV/EBITDA, P/E, P/B)
-- Analyze premium/discount vs peers
-- Consider quality differences (growth, margins, ROIC)
-- Derive implied valuation range
-
-INVESTMENT DECISION:
-- Synthesize valuation, momentum, sentiment, risks
-- Provide clear recommendation (Buy/Hold/Sell or equivalent)
-- State price target and timeframe
-- Identify key catalysts and risks
-- Define what would change the thesis
-
-SECTOR/COMPANY RESEARCH:
-- Provide comprehensive overview
-- Highlight key trends and dynamics
-- Identify winners and losers
-- Assess opportunities and threats
-
 OUTPUT REQUIREMENTS:
 - Start with executive summary (2-3 sentences)
 - Use clear section headers
@@ -173,29 +147,89 @@ OUTPUT REQUIREMENTS:
 - Acknowledge data gaps and their impact on confidence
 - Be concise but thorough - quality over quantity
 
-REMEMBER:
-- You're advising sophisticated institutional investors
-- Your analysis must be defensible and data-driven
-- Consider the current date ({current_date}) for all market context
-- Never make up data - only use what was provided
-- If critical data is missing, state what else would be needed
+CRITICAL RULES - VIOLATIONS ARE UNACCEPTABLE:
+1. NEVER invent or hallucinate numbers - use ONLY data provided in the prompt
+2. If a metric is not in the data, say "NOT PROVIDED IN DATA" or "ASSUMPTION: [your assumption]"
+3. You're advising sophisticated institutional investors who will verify your numbers
+4. Your analysis must be defensible - every number must trace to a data source
+5. Today's date is {current_date} - use this year for all context
+6. If critical data is missing, clearly state it's missing and what assumption you're using
+7. Cite the source for each key number (e.g., "Revenue of $X per SEC filing")
+
+COMMON MISTAKES TO AVOID:
+- Using a different number than what's in the provided data
+- Making up metrics that weren't provided (invent nothing!)
+- Referencing outdated years when data shows a different fiscal period
+- Providing valuations without showing the calculation steps
+- Ignoring the actual data and generating generic analysis
 """
 
         return prompt
+
+    def _format_variable(self, key: str, value: Any) -> str:
+        """Format a single variable for display. Handles numbers, strings, dicts, lists."""
+        if isinstance(value, dict):
+            # Nested result (e.g. DCF yearly projections) - compact JSON
+            return f"{key}: {json.dumps(value, separators=(',', ':'), default=str)}"
+        if isinstance(value, list):
+            return f"{key}: {json.dumps(value, separators=(',', ':'), default=str)}"
+        if isinstance(value, float):
+            if abs(value) >= 1e9:
+                return f"{key}: {value/1e9:.2f}B"
+            if abs(value) >= 1e6:
+                return f"{key}: {value/1e6:.2f}M"
+            return f"{key}: {value:,.4f}" if abs(value) < 1 else f"{key}: {value:,.2f}"
+        return f"{key}: {value}"
 
     def _build_analysis_prompt(self,
                                user_query: str,
                                execution_plan: Dict[str, Any],
                                tools_results: List[Dict[str, Any]],
-                               research_questions: Optional[List[str]] = None) -> str:
-        """Build the analysis prompt with all context"""
+                               research_questions: Optional[List[str]] = None,
+                               variables: Dict[str, Any] = None) -> str:
+        """Build the analysis prompt with all context.
+
+        Uses the shared variable store as the primary data source.
+        Variables contain all flat key-value pairs accumulated from tool results.
+        Supplementary data shows unstructured content (search results, web scrapes).
+        """
         current_date = datetime.now().strftime("%B %d, %Y")
+        variables = variables or {}
 
-        prompt = f"""CURRENT DATE: {current_date}
+        # Split variables: flat keys (primary data) vs namespaced keys (dupes, skip)
+        flat_vars = {k: v for k, v in variables.items() if '.' not in k}
 
-{'='*80}
-CLIENT REQUEST
-{'='*80}
+        # Build the gathered data display from variables
+        if flat_vars:
+            var_lines = [self._format_variable(k, v) for k, v in flat_vars.items()]
+            gathered_display = "\n".join(var_lines)
+        else:
+            gathered_display = "(No structured data gathered)"
+
+        prompt = f"""
+################################################################################
+#                           CRITICAL INSTRUCTIONS                               #
+################################################################################
+
+TODAY'S DATE: {current_date}
+CURRENT YEAR: {datetime.now().year}
+TICKER: {execution_plan.get('ticker', flat_vars.get('ticker', 'N/A'))}
+
+>>> THE CURRENT YEAR IS {datetime.now().year}. ALL PROJECTIONS START FROM {datetime.now().year}. <<<
+>>> MANDATORY: USE ONLY THE DATA PROVIDED BELOW <<<
+>>> DO NOT MAKE UP OR HALLUCINATE ANY NUMBERS <<<
+>>> IF DATA IS MISSING, SAY "ASSUMPTION: [value]" <<<
+
+################################################################################
+#                         GATHERED DATA                                        #
+################################################################################
+
+{gathered_display}
+
+################################################################################
+#                           CLIENT REQUEST                                      #
+################################################################################
+
 {user_query}
 
 """
@@ -203,11 +237,11 @@ CLIENT REQUEST
         # Add strategic context from probing phase
         if research_questions:
             prompt += f"""
-{'='*80}
-STRATEGIC QUESTIONS TO ADDRESS
-{'='*80}
+################################################################################
+#                    STRATEGIC QUESTIONS TO ADDRESS                             #
+################################################################################
 """
-            for idx, question in enumerate(research_questions[:5], 1):  # Top 5
+            for idx, question in enumerate(research_questions[:5], 1):
                 if isinstance(question, dict):
                     prompt += f"{idx}. {question.get('question', question)}\n"
                 else:
@@ -216,76 +250,86 @@ STRATEGIC QUESTIONS TO ADDRESS
 
         # Add execution context
         prompt += f"""
-{'='*80}
-ANALYSIS CONTEXT
-{'='*80}
+################################################################################
+#                         ANALYSIS CONTEXT                                      #
+################################################################################
 Task Type: {execution_plan.get('task_type', 'N/A')}
-Ticker: {execution_plan.get('ticker', 'N/A')}
+Current Date: {current_date}
 """
 
         if 'reasoning' in execution_plan:
             prompt += f"Data Gathering Strategy: {execution_plan['reasoning']}\n"
 
-        prompt += f"\n"
+        # Add tool results that contain nested data (lists, dicts) that
+        # _flatten_result skips. These are full outputs like DCF projections,
+        # comp tables, disclosure data, etc.
+        detailed_parts = []
+        for result in tools_results:
+            result_type = result.get('type', '')
+            tool_name = result.get('tool', '')
+            data = result.get('data', {})
 
-        # Add all tool results
-        prompt += f"""
-{'='*80}
-DATA GATHERED ({len(tools_results)} data sources)
-{'='*80}
+            if result_type in ('sec_data', 'financial_data') and isinstance(data, dict):
+                # Check if there's nested data that variables missed
+                nested = {k: v for k, v in data.items() if isinstance(v, (dict, list)) and v}
+                if nested:
+                    detailed_parts.append(f"[{tool_name}] {json.dumps(nested, indent=1, default=str)}\n")
 
+        if detailed_parts:
+            prompt += f"""
+################################################################################
+#                    DETAILED TOOL OUTPUT                                       #
+################################################################################
+
+{"".join(detailed_parts)}
 """
 
-        for idx, result in enumerate(tools_results, 1):
-            if result.get('success', True):
-                tool_name = result.get('tool', f'Tool {idx}')
-                tool_data = result.get('result', {})
+        # Add unstructured data (search results, web content) as supplementary
+        # The search summarizer already filters irrelevant content, so show everything
+        supp_parts = []
 
-                prompt += f"""
---- DATA SOURCE {idx}: {tool_name} ---
-{json.dumps(tool_data, indent=2)}
+        for result in tools_results:
+            result_type = result.get('type', '')
 
-"""
-            else:
-                tool_name = result.get('tool', f'Tool {idx}')
-                error = result.get('error', 'Unknown error')
-                prompt += f"""
---- DATA SOURCE {idx}: {tool_name} (FAILED) ---
-Error: {error}
-Note: Proceed with analysis using available data, acknowledge this limitation
+            if result_type == 'search_snippets':
+                lines = [f"  {s.get('title','')}: {s.get('snippet','')}" for s in result.get('results', [])]
+                part = f"[SEARCH] {result.get('queries', {})}\n" + "\n".join(lines) + "\n"
+                supp_parts.append(part)
+            elif result_type == 'web_content':
+                dp_lines = [f"  {dp.get('metric','')}: {dp.get('value','')}" for dp in (result.get('data_points') or [])]
+                fact_lines = [f"  {f}" for f in (result.get('key_facts') or [])]
+                part = f"[WEB: {result.get('source_title', 'Unknown')}]\n" + "\n".join(dp_lines + fact_lines) + "\n"
+                supp_parts.append(part)
 
+        if supp_parts:
+            prompt += f"""
+################################################################################
+#                    SUPPLEMENTARY RESEARCH ({len(supp_parts)} sources)          #
+################################################################################
+
+{"".join(supp_parts)}
 """
 
         # Final instructions
         prompt += f"""
-{'='*80}
-YOUR TASK
-{'='*80}
+################################################################################
+#                              YOUR TASK                                        #
+################################################################################
 
-Analyze the data gathered above to answer the client's question: "{user_query}"
+Analyze the data above to answer: "{user_query}"
 
-Apply your full analytical framework:
-1. Assess what data was gathered and its relevance
-2. Consider company-specific, market, macro, and valuation factors
-3. Perform quantitative analysis where appropriate (calculate metrics, ratios, valuations)
-4. Synthesize insights across all data sources
-5. Provide clear, actionable conclusions
-6. Acknowledge any limitations due to data availability
+RULES:
+1. Use ONLY the data provided above. Do not invent numbers.
+2. If data is missing, write "ASSUMPTION: [value]" and justify it.
+3. Show calculations step-by-step where applicable.
+4. Do not confuse millions, billions, and trillions.
 
-Structure your analysis professionally:
-- Executive Summary (key findings in 2-3 sentences)
-- Main Analysis (with clear sections and headers)
-- Quantitative Analysis (calculations, if applicable)
-- Risks & Considerations
-- Conclusion & Recommendations
-
-Remember:
-- Today is {current_date} - use this for all market context
-- Support every claim with specific data from the sources above
-- Be precise with numbers and sources
-- Provide ranges where appropriate
-- Be balanced and objective
-- Acknowledge uncertainties
+STRUCTURE:
+1. Executive Summary (2-3 sentences)
+2. Key Data Points (cite exact figures from the data)
+3. Analysis (show your work)
+4. Risks & Considerations
+5. Conclusion
 
 Begin your analysis:
 """
