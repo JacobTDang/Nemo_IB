@@ -1,12 +1,17 @@
-from typing import Dict, Any, Optional, Self
+from typing import Dict, Any, Self
 from mcp import StdioServerParameters, ClientSession
 from mcp.client.stdio import stdio_client
 import sys
 import os
 import json
+import asyncio
 
 class MCPConnectionManager:
-  """Manages connections to MCP servers and tool execution"""
+  """Manages connections to MCP servers and tool execution.
+
+  Builds a tool registry at connect time so call_tool routes directly
+  to the correct server without trial-and-error.
+  """
   def __init__(self):
       self.web_client = None
       self.web_client_connection = None
@@ -15,8 +20,10 @@ class MCPConnectionManager:
       self.financial_client = None
       self.financial_session = None
 
-      self.excel_client = None
-      self.excel_session = None
+      # Maps server_name -> ClientSession
+      self._sessions: Dict[str, ClientSession] = {}
+      # Maps tool_name -> server_name (built at connect time)
+      self._tool_registry: Dict[str, str] = {}
 
   async def __aenter__(self) -> Self:
       await self.connect_to_servers()
@@ -36,12 +43,12 @@ class MCPConnectionManager:
       env_with_path['PYTHONUNBUFFERED'] = '1'
       return env_with_path
 
-  async def connect_to_servers(self, servers=['web', 'financial', 'excel']):
+  async def connect_to_servers(self, servers=['web', 'financial']):
       """
-      Connect to specified MCP servers
+      Connect to specified MCP servers and build tool registry.
 
       Args:
-          servers: List of server names to connect to ('web', 'financial', 'excel')
+          servers: List of server names to connect to ('web', 'financial')
       """
       env = self._get_env_with_pythonpath()
 
@@ -58,35 +65,23 @@ class MCPConnectionManager:
               self.web_session = ClientSession(*self.web_client_connection)
               await self.web_session.__aenter__()
               await self.web_session.initialize()
+              self._sessions['web'] = self.web_session
               print("Connected to Web Search Server", file=sys.stderr, flush=True)
 
-          # # Financial Analysis Server
-          # if 'financial' in servers:
-          #     financial_params = StdioServerParameters(
-          #         command=sys.executable,
-          #         args=["-m", "tools.financial_modeling_engine.analysis_tools", "server"],
-          #         env=env
-          #     )
-          #     self.financial_client = stdio_client(financial_params)
-          #     financial_connection = await self.financial_client.__aenter__()
-          #     self.financial_session = ClientSession(*financial_connection)
-          #     await self.financial_session.__aenter__()
-          #     await self.financial_session.initialize()
-          #     print("Connected to Financial Analysis Server", file=sys.stderr, flush=True)
-
-          # # Excel Server
-          # if 'excel' in servers:
-          #     excel_params = StdioServerParameters(
-          #         command=sys.executable,
-          #         args=['-m', "tools.excel_server.excel_tools", 'server'],
-          #         env=env
-          #     )
-          #     self.excel_client = stdio_client(excel_params)
-          #     excel_connection = await self.excel_client.__aenter__()
-          #     self.excel_session = ClientSession(*excel_connection)
-          #     await self.excel_session.__aenter__()
-          #     await self.excel_session.initialize()
-          #     print("Connected to Excel Server", file=sys.stderr, flush=True)
+          # Financial Analysis Server
+          if 'financial' in servers:
+              financial_params = StdioServerParameters(
+                  command=sys.executable,
+                  args=["-m", "tools.financial_modeling_engine.analysis_tools", "server"],
+                  env=env
+              )
+              self.financial_client = stdio_client(financial_params)
+              financial_connection = await self.financial_client.__aenter__()
+              self.financial_session = ClientSession(*financial_connection)
+              await self.financial_session.__aenter__()
+              await self.financial_session.initialize()
+              self._sessions['financial'] = self.financial_session
+              print("Connected to Financial Analysis Server", file=sys.stderr, flush=True)
 
       except Exception as e:
           print(f"Unable to start servers: {str(e)}", file=sys.stderr, flush=True)
@@ -94,22 +89,46 @@ class MCPConnectionManager:
           traceback.print_exc()
           raise
 
+      # Build tool registry from all connected servers
+      await self._build_tool_registry()
+
+  async def _build_tool_registry(self):
+      """Query each server for its tools and build name -> server mapping."""
+      self._tool_registry = {}
+
+      for server_name, session in self._sessions.items():
+          try:
+              response = await session.list_tools()
+              for tool in response.tools:
+                  self._tool_registry[tool.name] = server_name
+          except Exception as e:
+              print(f"Warning: Could not list tools from {server_name}: {e}",
+                    file=sys.stderr, flush=True)
+
+      print(f"Tool registry: {len(self._tool_registry)} tools across {len(self._sessions)} servers",
+            file=sys.stderr, flush=True)
+
   async def disconnect_from_servers(self):
       """Disconnect from all connected MCP servers"""
-      if self.web_session:
-          await self.web_session.__aexit__(None, None, None)
-      if self.web_client:
-          await self.web_client.__aexit__(None, None, None)
+      servers = [
+          ("web", self.web_session, self.web_client),
+          ("financial", self.financial_session, self.financial_client),
+      ]
 
-      # if self.financial_session:
-      #     await self.financial_session.__aexit__(None, None, None)
-      # if self.financial_client:
-      #     await self.financial_client.__aexit__(None, None, None)
-
-      # if self.excel_session:
-      #     await self.excel_session.__aexit__(None, None, None)
-      # if self.excel_client:
-      #     await self.excel_client.__aexit__(None, None, None)
+      for name, session, client in servers:
+          try:
+              if session:
+                  await session.__aexit__(None, None, None)
+          except Exception as e:
+              print(f"Warning: {name} session cleanup failed: {e}", file=sys.stderr, flush=True)
+          try:
+              if client:
+                  # Timeout the client cleanup - anyio's process.wait() can hang
+                  await asyncio.wait_for(client.__aexit__(None, None, None), timeout=3.0)
+          except (asyncio.TimeoutError, asyncio.CancelledError):
+              print(f"Warning: {name} client cleanup timed out, forcing shutdown", file=sys.stderr, flush=True)
+          except Exception as e:
+              print(f"Warning: {name} client cleanup failed: {e}", file=sys.stderr, flush=True)
 
       print("Disconnected from all MCP servers", file=sys.stderr, flush=True)
 
@@ -129,7 +148,7 @@ class MCPConnectionManager:
 
   async def call_tool(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
       """
-      Call a tool on any connected server
+      Call a tool using the registry to route to the correct server.
 
       Args:
           tool_name: Name of the tool to call
@@ -138,49 +157,30 @@ class MCPConnectionManager:
       Returns:
           Parsed tool result
       """
-      # Try each session until we find the tool
-      sessions = [
-          ("web", self.web_session),
-          ("financial", self.financial_session),
-          ("excel", self.excel_session)
-      ]
+      server_name = self._tool_registry.get(tool_name)
 
-      for server_name, session in sessions:
-          if session is None:
-              continue
+      if server_name is None:
+          # Log what we know for debugging
+          print(f"Tool {tool_name} not listed by server, cannot validate any structured content", flush=True)
+          raise RuntimeError(f"Tool '{tool_name}' not found in registry. Available: {list(self._tool_registry.keys())}")
 
-          try:
-              response = await session.call_tool(tool_name, args)
-              return self._parse_call_tool_result(response)
-          except Exception as e:
-              # Tool not found in this server, try next
-              if "Unknown tool" in str(e) or "not found" in str(e).lower():
-                  continue
-              else:
-                  # Real error, propagate it
-                  raise
+      session = self._sessions.get(server_name)
+      if session is None:
+          raise RuntimeError(f"Server '{server_name}' for tool '{tool_name}' is not connected")
 
-      raise RuntimeError(f"Tool '{tool_name}' not found in any connected server")
+      response = await session.call_tool(tool_name, args)
+      return self._parse_call_tool_result(response)
 
   async def list_tools(self) -> Dict[str, Any]:
       """
-      List all tools from all connected servers
+      List all tools from all connected servers.
 
       Returns:
           Dict mapping tool names to their descriptions and schemas
       """
       tools = {}
 
-      sessions = [
-          ("web", self.web_session),
-          ("financial", self.financial_session),
-          ("excel", self.excel_session)
-      ]
-
-      for server_name, session in sessions:
-          if session is None:
-              continue
-
+      for server_name, session in self._sessions.items():
           try:
               response = await session.list_tools()
               for tool in response.tools:
