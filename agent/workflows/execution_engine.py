@@ -21,9 +21,18 @@ FINANCIAL_TOOLS = {
   'get_market_data', 'calculate_dcf', 'calculate_wacc', 'comparable_company_analysis'
 }
 
+# Market intelligence tools -- Finnhub forward-looking data, pass through
+MARKET_INTEL_TOOLS = {
+  'get_company_news', 'get_market_news', 'get_insider_transactions',
+  'get_earnings_calendar', 'get_analyst_recommendations', 'get_company_peers',
+  'get_basic_financials'
+}
+
+# News tools -- unstructured text that needs LLM summarization
+NEWS_TOOLS = {'get_company_news', 'get_market_news'}
 
 # Tools safe to cache (deterministic, don't change within a session)
-CACHEABLE_TOOLS = SEC_TOOLS | FINANCIAL_TOOLS
+CACHEABLE_TOOLS = SEC_TOOLS | FINANCIAL_TOOLS | MARKET_INTEL_TOOLS
 
 # Tools whose results get flattened into the shared variable store
 FLATTENABLE_TOOLS = SEC_TOOLS | FINANCIAL_TOOLS
@@ -51,14 +60,10 @@ ARGUMENT_ALIASES = {
   'shares_outstanding': 'sharesOutstanding',
 }
 
-# Fallback values when no data source exists
-DEFAULTS = {
-  'revenue_growth': [0.08, 0.07, 0.06, 0.05, 0.04],
-  'terminal_growth': 0.025,
-  'terminal_multiple': 15.0,
-  'risk_free_rate': 0.04,
-  'equity_risk_premium': 0.055,
-}
+# No hardcoded defaults -- all values must come from tools or the LLM's plan.
+# If an argument can't be resolved, it stays as-is and the tool will error,
+# which is better than silently using a wrong assumption.
+DEFAULTS = {}
 
 
 def _flatten_result(variables: Dict[str, Any], tool_name: str, result: Dict[str, Any]):
@@ -77,6 +82,9 @@ def _flatten_result(variables: Dict[str, Any], tool_name: str, result: Dict[str,
       continue
     if value is None:
       continue
+    # Skip NaN values (e.g. interestExpense when not reported)
+    if isinstance(value, float) and value != value:
+      continue
     variables[f"{tool_name}.{key}"] = value
     variables[key] = value
 
@@ -89,8 +97,18 @@ def _has_value(v) -> bool:
     return False
   if v == [] or v == [0]:
     return False
-  # LLM placeholder strings like "FROM_SEARCH", "FROM_PREVIOUS", "FROM_MARKET_DATA"
-  if isinstance(v, str) and v.startswith("FROM_"):
+  if isinstance(v, str):
+    # LLM placeholder strings like "FROM_SEARCH", "FROM_PREVIOUS", "FROM_MARKET_DATA"
+    if v.startswith("FROM_"):
+      return False
+    # LLM outputs "0" or "0.0" as strings instead of numbers
+    try:
+      if float(v) == 0:
+        return False
+    except ValueError:
+      pass
+  # List of all zeros (e.g. revenue_growth: [0, 0, 0, 0, 0])
+  if isinstance(v, list) and len(v) > 0 and all(x == 0 for x in v):
     return False
   return True
 
@@ -101,10 +119,10 @@ def _resolve_args(arguments: Dict[str, Any], variables: Dict[str, Any]) -> Dict[
   For each argument with a falsy value:
     1. Direct key match in variables
     2. Alias match via ARGUMENT_ALIASES
-    3. Default from DEFAULTS
+    3. Derived values (e.g. cost_of_debt from interestExpense / totalDebt)
 
+  No hardcoded fallbacks -- if a value can't be resolved, it stays as-is.
   Applies /100 conversion for PERCENT_FIELDS.
-  Special-cases cost_of_debt as derived from interestExpense / totalDebt.
   """
   if not variables:
     return arguments
@@ -207,8 +225,8 @@ async def run_tools(
       print(f"  [CACHE HIT] Skipped MCP call", flush=True)
     else:
       tool_result = await mcp.call_tool(tool_name, arguments)
-      # Store in cache if cacheable
-      if cache and tool_name in CACHEABLE_TOOLS:
+      # Store in cache if cacheable and not an error result
+      if cache and tool_name in CACHEABLE_TOOLS and 'error' not in tool_result:
         cache.put(tool_name, arguments, tool_result)
       print(f"  Result preview: {str(tool_result)[:500]}...\n", flush=True)
 
@@ -220,6 +238,11 @@ async def run_tools(
       results.append(_process_sec(tool_name, tool_result))
     elif tool_name in FINANCIAL_TOOLS:
       results.append(_process_financial(tool_name, tool_result))
+    elif tool_name in MARKET_INTEL_TOOLS:
+      if tool_name in NEWS_TOOLS:
+        _process_news(tool_name, tool_result, ticker, summarizer, results)
+      else:
+        results.append(_process_market_intel(tool_name, tool_result))
     elif tool_name == 'search':
       await _process_search(tool_result, arguments, ticker, mcp, summarizer, results)
     elif 'get_urls_content' in tool_name:
@@ -276,8 +299,10 @@ async def _process_search(
     try:
       scrape_result = await mcp.call_tool('get_urls_content', {'urls': urls})
       scrape_items = scrape_result.get('results', [])
+      # Build search intent from actual queries so summarizer knows what to look for
+      search_intent = ", ".join(query_info.values()) if isinstance(query_info, dict) else str(query_info)
       print(f"  [Auto-inject] Summarizing {len(scrape_items)} scraped pages...", flush=True)
-      _summarize_scraped_items(scrape_items, ticker, summarizer, results)
+      _summarize_scraped_items(scrape_items, ticker, summarizer, results, search_intent)
     except Exception as e:
       print(f"  [Auto-inject] Failed to scrape URLs: {e}\n", flush=True)
 
@@ -290,12 +315,41 @@ async def _process_scrape(
 ):
   scrape_items = tool_result.get('results', [])
   print(f"  [Scrape] Summarizing {len(scrape_items)} pages...", flush=True)
-  _summarize_scraped_items(scrape_items, ticker, summarizer, results)
+  _summarize_scraped_items(scrape_items, ticker, summarizer, results, "financial data, metrics, analyst opinions")
 
 
 def _process_financial(tool_name: str, tool_result: Dict) -> Dict[str, Any]:
   print(f"  [Pass-through] {tool_name}: financial modeling data", flush=True)
   return {"type": "financial_data", "tool": tool_name, "data": tool_result}
+
+
+def _process_market_intel(tool_name: str, tool_result: Dict) -> Dict[str, Any]:
+  print(f"  [Pass-through] {tool_name}: market intelligence data", flush=True)
+  return {"type": "market_intel", "tool": tool_name, "data": tool_result}
+
+
+def _process_news(
+  tool_name: str,
+  tool_result: Dict,
+  ticker: str,
+  summarizer: Search_Summarizer_Agent,
+  results: List[Dict[str, Any]]
+):
+  """Route news tool results through the LLM summarizer for theme extraction."""
+  articles = tool_result.get("data", [])
+  if not articles or not isinstance(articles, list):
+    print(f"  [Pass-through] {tool_name}: no articles to summarize", flush=True)
+    results.append({"type": "market_intel", "tool": tool_name, "data": tool_result})
+    return
+
+  print(f"  [News] Summarizing {len(articles)} articles via LLM...", flush=True)
+  summary = summarizer.summarize_news(articles, ticker)
+  results.append({
+    "type": "news_summary",
+    "tool": tool_name,
+    "article_count": len(articles),
+    **summary
+  })
 
 
 def _process_other(tool_name: str, tool_result: Dict) -> Dict[str, Any]:
@@ -308,14 +362,15 @@ def _summarize_scraped_items(
   items: List[Dict],
   ticker: str,
   summarizer: Search_Summarizer_Agent,
-  results: List[Dict[str, Any]]
+  results: List[Dict[str, Any]],
+  search_intent: str = "financial data, metrics, analyst opinions"
 ):
   for item in items:
     if not (item.get('success') and item.get('content')):
       print(f"    [X] Failed: {item.get('error', 'unknown error')[:50]}", flush=True)
       continue
 
-    summary = summarizer.summarize_single(item, ticker, "financial data, metrics, analyst opinions")
+    summary = summarizer.summarize_single(item, ticker, search_intent)
     if summary.get('relevant', False):
       print(f"    [OK] Relevant: {item.get('title', 'unknown')[:50]}", flush=True)
       results.append({"type": "web_content", **summary})
