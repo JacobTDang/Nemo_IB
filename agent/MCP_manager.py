@@ -1,6 +1,7 @@
 from typing import Dict, Any, Self
 from mcp import StdioServerParameters, ClientSession
 from mcp.client.stdio import stdio_client
+from .cache import Session_Cache
 import sys
 import os
 import json
@@ -11,6 +12,7 @@ class MCPConnectionManager:
 
   Builds a tool registry at connect time so call_tool routes directly
   to the correct server without trial-and-error.
+  Owns the session cache -- clears it on connect and disconnect.
   """
   def __init__(self):
       self.web_client = None
@@ -20,17 +22,26 @@ class MCPConnectionManager:
       self.financial_client = None
       self.financial_session = None
 
+      self.finnhub_client = None
+      self.finnhub_session = None
+
       # Maps server_name -> ClientSession
       self._sessions: Dict[str, ClientSession] = {}
       # Maps tool_name -> server_name (built at connect time)
       self._tool_registry: Dict[str, str] = {}
+      # Session cache for deterministic tool results
+      self.cache = Session_Cache()
 
   async def __aenter__(self) -> Self:
+      self.cache.clear()
+      print("Session cache cleared (start of session)", file=sys.stderr, flush=True)
       await self.connect_to_servers()
       return self
 
   async def __aexit__(self, exc_type = None, exc_val=None, exc_tb=None):
       await self.disconnect_from_servers()
+      self.cache.clear()
+      print("Session cache cleared (end of session)", file=sys.stderr, flush=True)
 
   def _get_env_with_pythonpath(self):
       """Prepare environment with PYTHONPATH for subprocess"""
@@ -43,7 +54,7 @@ class MCPConnectionManager:
       env_with_path['PYTHONUNBUFFERED'] = '1'
       return env_with_path
 
-  async def connect_to_servers(self, servers=['web', 'financial']):
+  async def connect_to_servers(self, servers=['web', 'financial', 'finnhub']):
       """
       Connect to specified MCP servers and build tool registry.
 
@@ -83,6 +94,21 @@ class MCPConnectionManager:
               self._sessions['financial'] = self.financial_session
               print("Connected to Financial Analysis Server", file=sys.stderr, flush=True)
 
+          # Finnhub Market Intel Server
+          if 'finnhub' in servers:
+              finnhub_params = StdioServerParameters(
+                  command=sys.executable,
+                  args=["-m", "tools.news_agregator.finnhub_server", "server"],
+                  env=env
+              )
+              self.finnhub_client = stdio_client(finnhub_params)
+              finnhub_connection = await self.finnhub_client.__aenter__()
+              self.finnhub_session = ClientSession(*finnhub_connection)
+              await self.finnhub_session.__aenter__()
+              await self.finnhub_session.initialize()
+              self._sessions['finnhub'] = self.finnhub_session
+              print("Connected to Finnhub Market Intel Server", file=sys.stderr, flush=True)
+
       except Exception as e:
           print(f"Unable to start servers: {str(e)}", file=sys.stderr, flush=True)
           import traceback
@@ -113,6 +139,7 @@ class MCPConnectionManager:
       servers = [
           ("web", self.web_session, self.web_client),
           ("financial", self.financial_session, self.financial_client),
+          ("finnhub", self.finnhub_session, self.finnhub_client),
       ]
 
       for name, session, client in servers:
