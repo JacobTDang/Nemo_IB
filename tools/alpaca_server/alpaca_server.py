@@ -1,7 +1,7 @@
 import os
 from alpaca.common import requests
 from dotenv import load_dotenv
-from alpaca.trading.models import TradeAccount
+from alpaca.trading.models import TradeAccount, Position
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest
@@ -9,6 +9,9 @@ from alpaca.data.requests import StockLatestQuoteRequest, StockLatestTradeReques
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.enums import DataFeed
 from typing import Dict, List, Optional
+
+from datetime import datetime
+
 
 class alpaca_client:
     def __init__(self):
@@ -51,13 +54,35 @@ class alpaca_client:
 
     def get_account_metrics(self):
         account: TradeAccount = self.trading_client.get_account()
-        
-
+        positions = self.get_holdings()
         return{
+        "holdings": positions,
         "equity": account.equity,
-        "buying_power": account.buying_power
+        "buying_power": account.buying_power,
+        "date_accessed": str(datetime.now())
         }
 
+    def get_holdings(self):
+        positions = self.trading_client.get_all_positions()
+        holdings = []
+
+        for p in positions:
+            try:
+                if not isinstance(p, Position):
+                    print(f"Unexpected position type")
+                    continue
+                holdings.append({
+                    "symbol": p.symbol,
+                    "qty": p.qty,
+                    "market_value": p.market_value,
+                    "avg_entry_price": p.avg_entry_price,
+                    "unrealized_pl": p.unrealized_pl,
+                    "unrealized_plpc": p.unrealized_plpc,
+                    "side": p.side,
+                }) 
+            except Exception as e:
+                print(f"Error: {str(e)}")
+        return holdings
 
 if __name__ == "__main__":
     a = alpaca_client()
