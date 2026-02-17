@@ -26,7 +26,8 @@ class ProbingResult(BaseModel):
 
 class Probing_Agent(OpenRouterModel):
   response_schema = ProbingResult
-  REASONING_EFFORT = None  # No reasoning -- just output structured data requirements
+  MAX_OUTPUT_TOKENS = 4096  # Large JSON: 10+ data requirements + considerations + approach
+  REASONING_EFFORT = None   # No reasoning -- just output structured data requirements
 
   def __init__(self, model_name: str = 'nvidia/nemotron-3-nano-30b-a3b:free'):
     super().__init__(model_name=model_name, api_key_env="OPENROUTER_NEMOTRON")

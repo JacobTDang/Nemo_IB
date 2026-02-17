@@ -1,7 +1,6 @@
-from .ollama_template import OllamaModel
+from .groq_template import GroqModel
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
-from ollama import chat
 import sys
 
 
@@ -25,10 +24,10 @@ class NewsAnalysisResult(BaseModel):
 IMPACT_WEIGHTS = {"high": 0.3, "medium": 0.15, "low": 0.05}
 
 
-class News_Processing_Agent(OllamaModel):
+class News_Processing_Agent(GroqModel):
   response_schema = ArticleAssessment
 
-  def __init__(self, model_name: str = "llama3.1:8b"):
+  def __init__(self, model_name: str = "llama-3.1-8b-instant"):
     super().__init__(model_name=model_name)
 
   def _build_company_prompt(self, ticker: str) -> str:
@@ -83,32 +82,10 @@ Assess this article."""
     # Clear history -- each article is independent
     self.conversatoin_history = []
 
-    # Call LLM with keep_alive to avoid model reload per article
-    self.conversatoin_history.append({'role': 'user', 'content': user_prompt})
-    messages = [
-      {'role': 'system', 'content': system_prompt},
-      *self.conversatoin_history
-    ]
-
-    stream = chat(
-      model=self.model_name,
-      messages=messages,
-      stream=True,
-      keep_alive="5m",
-      format=ArticleAssessment.model_json_schema(),
-      options={
-        'num_gpu': -1,
-        'gpu_memory_utilization': 0.9,
-      }
-    )
-
-    response = ""
-    for chunk in stream:
-      content = chunk['message']['content']
-      response += content
+    response = self.generate_response(prompt=user_prompt, system_prompt=system_prompt)
 
     try:
-      result = ArticleAssessment.model_validate_json(response)
+      result = self.parse_response(response)
       return result
     except Exception as e:
       print(f"    [X] Parse failed for '{headline[:50]}': {e}", file=sys.stderr, flush=True)

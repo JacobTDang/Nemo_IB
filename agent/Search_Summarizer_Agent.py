@@ -1,4 +1,4 @@
-from .ollama_template import OllamaModel
+from .groq_template import GroqModel
 from pydantic import BaseModel
 from typing import Dict, Optional, List, Any
 import json
@@ -22,10 +22,10 @@ class SummaryResult(BaseModel):
   reason: Optional[str] = None
 
 
-class Search_Summarizer_Agent(OllamaModel):
+class Search_Summarizer_Agent(GroqModel):
   response_schema = SummaryResult
 
-  def __init__(self, model_name: str = "llama3.1:8b"):
+  def __init__(self, model_name: str = "llama-3.1-8b-instant"):
     super().__init__(model_name=model_name)
 
   def build_system_prompt(self) -> str:
