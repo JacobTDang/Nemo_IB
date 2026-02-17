@@ -19,7 +19,7 @@ class Financial_Analysis_Agent(OpenRouterModel):
     MAX_OUTPUT_TOKENS = 4096  # R1 needs room for thinking + actual analysis output
 
     def __init__(self, model_name: str = 'deepseek/deepseek-r1-0528:free'):
-        super().__init__(model_name)
+        super().__init__(model_name=model_name)
 
     def analyze(self,
                 user_query: str,
