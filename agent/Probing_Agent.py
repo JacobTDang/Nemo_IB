@@ -1,72 +1,102 @@
-from .ollama_template import OllamaModel
+from .openrouter_template import OpenRouterModel
 from pydantic import BaseModel
 from typing import Dict, Optional, List
 import sys
-import datetime
+from datetime import datetime
 
 
-class ProbingQuestion(BaseModel):
-  category: str
-  question: str
+class DataRequirement(BaseModel):
+  data_needed: str
+  tool_hint: str
   rationale: str
+
+
+class AnalyticalConsideration(BaseModel):
+  topic: str
+  guidance: str
 
 
 class ProbingResult(BaseModel):
   analysis_type: str
   ticker: Optional[str] = None
-  probing_questions: List[ProbingQuestion]
-  critical_assumptions_to_validate: List[str]
-  potential_data_gaps: List[str]
+  data_requirements: List[DataRequirement]
+  analytical_considerations: List[AnalyticalConsideration]
   recommended_approach: str
 
 
-class Probing_Agent(OllamaModel):
+class Probing_Agent(OpenRouterModel):
   response_schema = ProbingResult
+  REASONING_EFFORT = None  # No reasoning -- just output structured data requirements
 
-  def __init__(self, model_name = 'llama3.1:8b'):
-    super().__init__(model_name = model_name)
+  def __init__(self, model_name: str = 'nvidia/nemotron-3-nano-30b-a3b:free'):
+    super().__init__(model_name=model_name, api_key_env="OPENROUTER_NEMOTRON")
 
   def build_prompt(self, user_query: str) -> str:
     """build specialized system prompt for strategic probing"""
-    current_date = datetime.datetime.now().strftime("%B %d, %Y")
+    current_date = datetime.now().strftime("%B %d, %Y")
 
     prompt = f"""You are a Senior Research Analyst at Goldman Sachs with 15+ years of experience. Today is {current_date}.
 
 YOUR ROLE:
-Before any financial analysis begins, you conduct thorough pre-analysis probing to ensure the analysis is comprehensive, well-founded, and answers the right questions. Think like the best investment bankers - leave no stone unturned.
+Before any financial analysis begins, you identify what DATA needs to be fetched and what ANALYTICAL CONSIDERATIONS the analysis agent should reason about. These are two distinct outputs.
 
-PROBING FRAMEWORK (9 Categories):
+OUTPUT 1: DATA REQUIREMENTS (what tools need to fetch)
+These are concrete, fetchable data points. Each one should map to a tool or data source.
 
-1. CLARIFICATION - What decision does this support? Time horizon? Audience?
-2. COMPANY UNDERSTANDING - Business model, revenue drivers, competitive position, growth stage
-3. SECTOR & MARKET CONTEXT - Sector trends, competitors, TAM, regulatory, macro conditions
-4. RECENT EVENTS - Earnings surprises, 8-K filings, management changes, M&A, guidance
-5. DATA REQUIREMENTS - Historical financials needed, forward estimates, WACC components, data sources
-6. METHODOLOGY SELECTION - Appropriate valuation method, multiple methods for triangulation
-7. KEY ASSUMPTIONS & SENSITIVITIES - Critical assumptions, sensitivity analysis, scenarios (base/bull/bear)
-8. RISKS & LIMITATIONS - Business/financial/market risks, what we're NOT considering
-9. OUTPUT REQUIREMENTS - Format, supporting materials, confidence level
+Tool categories available:
+- SEC filing tools: revenue, EBITDA margin, tax rate, capex, depreciation, disclosures, 8-K events
+- Financial tools: market data (beta, market cap, debt, cash), WACC calculation, DCF, comparable company analysis
+- Macro tools (FRED): interest rates, inflation, GDP, unemployment, yield curve (get_macro_snapshot, get_treasury_yields, get_fred_series, search_fred)
+- Market intelligence tools (Finnhub): news articles (get_company_news, get_market_news), insider transactions (get_insider_transactions), analyst recommendations (get_analyst_recommendations), key financials (get_basic_financials), peer companies (get_company_peers), earnings calendar (get_earnings_calendar)
+- Web search: LAST RESORT only -- use for qualitative research, specific analyst reports, or data not available from the above tools
 
-EXAMPLES OF GOOD PROBING QUESTIONS:
-
-For "Run a DCF on AAPL":
-- "How should we model the hardware vs services revenue split given their different growth trajectories?"
-- "Given Apple's mature market position, what terminal growth rate is appropriate?"
+EXAMPLES OF GOOD DATA REQUIREMENTS:
+For "Run a DCF on AAPL" (DCF needs ALL of these):
+- data_needed: "Revenue base from latest 10-K", tool_hint: "SEC (get_revenue_base)"
+- data_needed: "EBITDA margin", tool_hint: "SEC (get_ebitda_margin)"
+- data_needed: "CapEx as % of revenue", tool_hint: "SEC (get_capex_pct_revenue)"
+- data_needed: "Effective tax rate", tool_hint: "SEC (get_tax_rate)"
+- data_needed: "Depreciation & amortization as % of revenue", tool_hint: "SEC (get_depreciation)"
+- data_needed: "Beta, market cap, total debt, cash, shares outstanding", tool_hint: "financial (get_market_data)"
+- data_needed: "Risk-free rate and macro context", tool_hint: "macro (get_treasury_yields)"
+- data_needed: "WACC calculation", tool_hint: "financial (calculate_wacc) -- needs beta, risk-free rate, ERP, cost of debt, tax rate, market cap, total debt"
+- data_needed: "DCF valuation", tool_hint: "financial (calculate_dcf) -- needs revenue, margins, growth, wacc, cash, debt, shares"
 
 For "Is TSLA a good buy?":
-- "What's the investment horizon - trading opportunity or long-term hold?"
-- "How sensitive is the thesis to autonomous vehicle timeline assumptions?"
+- data_needed: "Recent 8-K material events", tool_hint: "SEC (extract_8k_events)"
+- data_needed: "Revenue and profitability", tool_hint: "SEC (get_revenue_base, get_ebitda_margin)"
+- data_needed: "Peer valuation multiples", tool_hint: "financial (comparable_company_analysis)"
+- data_needed: "Current analyst ratings", tool_hint: "market_intel (get_analyst_recommendations)"
+- data_needed: "Key financial metrics", tool_hint: "market_intel (get_basic_financials)"
 
-BAD PROBING QUESTIONS (Too Generic):
-- "What's Apple's revenue?" (data gathering, not probing)
-- "Is Tesla profitable?" (too basic)
+For "What is the news sentiment for AAPL?":
+- data_needed: "Recent company news articles", tool_hint: "market_intel (get_company_news)"
+- data_needed: "Broad market news", tool_hint: "market_intel (get_market_news)"
+- data_needed: "Insider buying/selling activity", tool_hint: "market_intel (get_insider_transactions)"
+
+BAD DATA REQUIREMENTS (too vague):
+- "What's the company's financial health?" (not a specific data point)
+- "Market conditions" (what specifically?)
+
+OUTPUT 2: ANALYTICAL CONSIDERATIONS (for the analysis agent to reason about)
+These are strategic questions and framing guidance that the ANALYSIS AGENT should think about when synthesizing data. These do NOT require tool calls -- they guide interpretation.
+
+EXAMPLES:
+For "Run a DCF on AAPL":
+- topic: "Revenue mix", guidance: "Model hardware vs services separately -- services has higher margins and growth"
+- topic: "Terminal growth", guidance: "Mature mega-cap; terminal growth should reflect GDP-like rates (2-3%)"
+
+For "Is TSLA a good buy?":
+- topic: "Valuation framework", guidance: "Traditional auto multiples vs tech/growth multiples -- justify which to use"
+- topic: "Optionality", guidance: "Consider autonomous driving and energy as call options on the base business"
 
 RULES:
-1. Generate 5-10 strategic probing questions
-2. Cover at least 5 different categories
-3. Questions must be specific to the company/situation, not generic
-4. Focus on what could materially change the analysis outcome
-5. Questions should guide what tools to use and what data to gather"""
+1. Generate 5-10 data requirements -- be thorough, list EVERY data point needed
+2. Generate 3-5 analytical considerations -- strategic framing, not data fetching
+3. Prioritize SEC and financial tools over search in data requirements
+4. Only include search requirements when structured tools genuinely cannot provide the data
+5. Data requirements must be concrete and fetchable, not analytical questions
+6. For valuation analyses (DCF, comps), include the CALCULATION tools (calculate_wacc, calculate_dcf, comparable_company_analysis) as data requirements -- not just the inputs"""
 
     return prompt
 
@@ -77,6 +107,7 @@ RULES:
     Returns:
         Dict containing probing questions and recommendations
     """
+    self.conversatoin_history = []
     system_prompt = self.build_prompt(user_query)
 
     user_prompt = f"""User Request: {user_query}"""
@@ -99,7 +130,8 @@ RULES:
       print(f"\n{'='*60}", file=sys.stderr, flush=True)
       print(f"PROBING COMPLETE", file=sys.stderr, flush=True)
       print(f"{'='*60}", file=sys.stderr, flush=True)
-      print(f"Generated {len(parsed.get('probing_questions', []))} strategic questions", file=sys.stderr, flush=True)
+      print(f"Data requirements: {len(parsed.get('data_requirements', []))}", file=sys.stderr, flush=True)
+      print(f"Analytical considerations: {len(parsed.get('analytical_considerations', []))}", file=sys.stderr, flush=True)
       print(f"Analysis type: {parsed.get('analysis_type', 'N/A')}", file=sys.stderr, flush=True)
       print(f"{'='*60}\n", file=sys.stderr, flush=True)
 
@@ -136,20 +168,18 @@ if __name__ == "__main__":
         print(f"Analysis Type: {result.get('analysis_type', 'N/A')}")
         print(f"Ticker: {result.get('ticker', 'N/A')}")
 
-        print(f"\n\nSTRATEGIC PROBING QUESTIONS:")
+        print(f"\n\nDATA REQUIREMENTS:")
         print(f"{'-'*80}")
-        for idx, q in enumerate(result.get('probing_questions', []), 1):
-            print(f"\n{idx}. [{q['category'].upper()}]")
-            print(f"   Q: {q['question']}")
-            print(f"   Why: {q['rationale']}")
+        for idx, req in enumerate(result.get('data_requirements', []), 1):
+            print(f"\n{idx}. {req['data_needed']}")
+            print(f"   Tool hint: {req['tool_hint']}")
+            print(f"   Why: {req['rationale']}")
 
-        print(f"\n\nCRITICAL ASSUMPTIONS TO VALIDATE:")
-        for assumption in result.get('critical_assumptions_to_validate', []):
-            print(f"  - {assumption}")
-
-        print(f"\n\nPOTENTIAL DATA GAPS:")
-        for gap in result.get('potential_data_gaps', []):
-            print(f"  - {gap}")
+        print(f"\n\nANALYTICAL CONSIDERATIONS:")
+        print(f"{'-'*80}")
+        for idx, con in enumerate(result.get('analytical_considerations', []), 1):
+            print(f"\n{idx}. [{con['topic']}]")
+            print(f"   {con['guidance']}")
 
         print(f"\n\nRECOMMENDED APPROACH:")
         print(f"  {result.get('recommended_approach', 'N/A')}")

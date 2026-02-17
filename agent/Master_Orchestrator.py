@@ -1,4 +1,4 @@
-from .ollama_template import OllamaModel
+from .openrouter_template import OpenRouterModel
 from .workflows.agent_state import AgentState
 from pydantic import BaseModel
 from typing import Dict, Any, Optional
@@ -14,16 +14,17 @@ class MasterDecision(BaseModel):
   notes: Optional[str] = None
 
 
-class Master_Orchestrator(OllamaModel):
+class Master_Orchestrator(OpenRouterModel):
   """
   Hub orchestrator for the hub-and-spoke workflow architecture.
   Reads full state, decides which spoke to route to next.
   Stateless per invocation -- clears conversation history each call.
   """
   response_schema = MasterDecision
+  REASONING_EFFORT = None  # No reasoning -- just output the routing decision JSON
 
-  def __init__(self, model_name: str = "orchestrator:latest"):
-    super().__init__(model_name=model_name)
+  def __init__(self, model_name: str = "nvidia/nemotron-3-nano-30b-a3b:free"):
+    super().__init__(model_name=model_name, api_key_env="OPENROUTER_NEMOTRON")
 
   def _build_state_summary(self, state: AgentState) -> str:
     """Build a concise summary of current state for the LLM prompt."""
@@ -42,9 +43,10 @@ class Master_Orchestrator(OllamaModel):
 """
 
     # Add what data is available based on phase
-    if state.get('research_questions'):
-      questions = state['research_questions']
-      summary += f"- Probing Questions: {len(questions)} generated\n"
+    if state.get('data_requirements'):
+      summary += f"- Data Requirements: {len(state['data_requirements'])} identified\n"
+    if state.get('analytical_considerations'):
+      summary += f"- Analytical Considerations: {len(state['analytical_considerations'])} for analysis agent\n"
 
     if state.get('execution_plan'):
       plan = state['execution_plan']
@@ -54,10 +56,28 @@ class Master_Orchestrator(OllamaModel):
     if state.get('summarized_output'):
       output_count = len(state['summarized_output'])
       summary += f"- Execution Results: {output_count} data items collected\n"
+      stats = state.get('execution_stats', {})
+      if stats:
+        summary += f"  Successes: {stats.get('successes', '?')}, Errors: {stats.get('errors', '?')}\n"
+        error_rate = stats.get('errors', 0) / max(stats.get('total', 1), 1)
+        if error_rate > 0.5:
+          summary += f"  WARNING: {error_rate:.0%} tool failure rate. Data likely insufficient.\n"
 
     if state.get('analysis_report'):
-      report_len = len(state['analysis_report'])
-      summary += f"- Analysis Report: generated ({report_len} chars)\n"
+      report = state['analysis_report']
+      variables = state.get('variables', {})
+      summary += f"- Analysis Report: generated ({len(report)} chars)\n"
+      # Show structured analysis metadata from variable store
+      signal = variables.get('analysis.signal', '')
+      if signal:
+        summary += f"  Signal: {signal}\n"
+      conclusion = variables.get('analysis.conclusion', '')
+      if conclusion:
+        summary += f"  Conclusion: {conclusion[:200]}\n"
+      data_gaps = variables.get('analysis.data_gaps', [])
+      if data_gaps:
+        summary += f"  DATA GAPS ({len(data_gaps)}): {data_gaps}\n"
+        summary += f"  WARNING: Analysis flagged missing data. Consider routing to plan/execute before verify.\n"
 
     if state.get('verification_result'):
       verification = state['verification_result']
@@ -125,7 +145,7 @@ ROUTING LOGIC:
 - Phase "probed" -> route to plan
 - Phase "planned" -> route to execute
 - Phase "executed" -> route to analyze (standard/complex) or done (simple, if query is answered by data alone)
-- Phase "analyzed" -> route to verify (standard/complex) or done (simple)
+- Phase "analyzed" -> IF analysis flags critical missing data (e.g. "NOT PROVIDED IN DATA" for something the user asked for) -> route to plan with revision_context to fetch it. ELSE -> route to verify (standard/complex) or done (simple)
 - Phase "verified" + action "approve" -> done
 - Phase "verified" + action "revise" -> look at weaknesses:
     - Missing data/components -> route to plan (create new tool sequence for gaps)
