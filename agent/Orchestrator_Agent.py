@@ -1,4 +1,4 @@
-from .ollama_template import OllamaModel
+from .openrouter_template import OpenRouterModel
 from pydantic import BaseModel
 from typing import Dict, Optional, List, Any
 import sys
@@ -17,18 +17,19 @@ class ExecutionPlan(BaseModel):
   tools_sequence: List[ToolCall]
 
 
-class Orchestrator_Agent(OllamaModel):
+class Orchestrator_Agent(OpenRouterModel):
   """Creates execution plans -- which MCP tools to call and in what order."""
   response_schema = ExecutionPlan
+  MAX_OUTPUT_TOKENS = 4096  # Large prompt (28 tools) needs room for the plan JSON
+  REASONING_EFFORT = None   # No reasoning -- just output the structured plan
 
-  def __init__(self, model_name: str = 'orchestrator:latest'):
-    super().__init__(model_name=model_name)
+  def __init__(self, model_name: str = 'nvidia/nemotron-3-nano-30b-a3b:free'):
+    super().__init__(model_name=model_name, api_key_env="OPENROUTER_NEMOTRON")
 
   def build_orchestrator_prompt(self,
                                   tool_list: Dict[str, Dict],
-                                  previous_node: Optional[List[Dict[str, Any]]] = None,
+                                  data_requirements: Optional[List[Dict[str, str]]] = None,
                                   revision_feedback: Optional[Dict[str, Any]] = None,
-                                  clarification_context: Optional[Dict[str, Any]] = None,
                                   gathered_variables: Optional[Dict[str, Any]] = None) -> str:
     """Build complete system prompt with reasoning framework and available tools"""
     from datetime import datetime
@@ -37,48 +38,39 @@ class Orchestrator_Agent(OllamaModel):
     prompt = f"""You are an AI Task Orchestrator for financial analysis. Today: {current_date}
 
 YOUR ROLE:
-Given a user's request and available tools, create an execution plan by reasoning about:
-1. What information is needed to answer the question?
-2. Which tools can provide that information?
-3. What's missing or unclear? (Use web search for current data, context, or missing pieces)
-4. Do tools depend on each other? (Some tools output data needed by other tools)
+Given a user's request and available tools, create an execution plan. You receive DATA REQUIREMENTS from the probing agent telling you exactly what data to fetch and which tool category to use.
 
-REASONING FRAMEWORK:
-- Historical financial data -> Use SEC filing tools (revenue, margins, etc.)
-- Current market data (beta, shares, market cap, debt) -> Use get_market_data
-- WACC calculation -> Use get_market_data (beta, market cap, debt) + get_tax_rate + search (risk-free rate, ERP) + calculate_wacc
-- DCF valuation -> Gather all inputs first, then use calculate_dcf
-- Current market context, analyst opinions -> Use search
-- Company strategy/decisions unclear -> Use disclosures or search
-- Tool output contains IDs/names/URLs -> Next tool might need those as input
+TOOL PRIORITY (STRICT ORDER):
+1. SEC filing tools FIRST -- for historical financial data (revenue, margins, tax, capex, depreciation, disclosures, 8-K)
+2. Financial tools SECOND -- for market data (beta, market cap, debt, cash) and calculations (WACC, DCF, comps)
+3. Macro tools THIRD -- for interest rates, inflation, GDP, unemployment, yield curve (FRED data)
+   - get_macro_snapshot for broad macro context (includes risk-free rate, inflation, employment, GDP)
+   - get_treasury_yields for full yield curve (3M-30Y) with spreads and curve shape
+   - get_fred_series for any specific FRED series by ID
+   - search_fred to discover FRED series IDs
+4. Market intelligence tools FOURTH -- for news sentiment, insider activity, analyst ratings, earnings calendar, peer comparison, key financials
+   - get_company_news / get_market_news for news articles (NOT search)
+   - get_insider_transactions for insider buying/selling
+   - get_analyst_recommendations for consensus ratings
+   - get_basic_financials for key financial metrics
+   - get_company_peers for peer comparison
+   - get_earnings_calendar for upcoming earnings
+5. Search LAST -- ONLY when the above tools cannot provide the data (e.g. qualitative research, specific analyst reports)
 
-EXAMPLES OF DYNAMIC THINKING:
+DO NOT plan search tools for data that SEC, financial, macro, or market intelligence tools can provide.
+DO NOT use search for news -- use get_company_news or get_market_news instead.
+DO NOT use search for risk-free rate, Treasury yields, inflation, or GDP -- use macro tools instead.
 
-"Run a DCF on AAPL":
-- Need: Revenue (get_revenue_base)
-- Need: Profitability (get_ebitda_margin, get_tax_rate)
-- Need: CapEx & D&A (get_capex_pct_revenue, get_depreciation)
-- Need: Market data (get_market_data -> beta, cash, debt, shares outstanding, interest expense)
-- Need: WACC inputs (search "10-year Treasury yield {datetime.now().year}", search "equity risk premium {datetime.now().year}")
-- Compute: calculate_wacc(beta, risk_free_rate, erp, cost_of_debt, tax_rate, market_cap, total_debt)
-- Compute: calculate_dcf(revenue, margins, growth, wacc, cash, debt, shares)
-
-"Is TSLA a good buy right now?":
-- Need: Current valuation multiples (search "TSLA P/E ratio")
-- Need: Recent financial performance (get_revenue_base, get_ebitda_margin)
-- Need: Market sentiment (search "TSLA analyst ratings {datetime.now().year}")
-- Need: Recent material events (extract_8k_events)
-- Need: Peer comparison (comparable_company_analysis)
+TOOL DEPENDENCIES:
+- get_market_data provides: beta, market cap, debt, cash, shares, interest expense
+- get_macro_snapshot / get_treasury_yields provides: risk_free_rate (auto-resolved into calculate_wacc)
+- calculate_wacc needs: beta, risk_free_rate, equity_risk_premium, cost_of_debt, tax_rate, market_cap, total_debt
+- calculate_dcf needs: revenue, ebitda_margin, capex, depreciation, tax_rate, wacc, cash, debt, shares
+- The execution engine auto-resolves values between tools. Use 0 as placeholder for values that will come from earlier tools.
 
 TWO-PART TOOLS (output -> input):
 - search gives URLs -> get_urls_content needs those URLs (use placeholder "FROM_SEARCH")
 - get_disclosures_names gives list -> extract_disclosure_data needs specific name
-
-PRINCIPLES:
-- Be flexible and adaptive
-- Use search liberally when you need current/contextual data
-- Chain tools when outputs feed inputs
-- Don't rigidly follow patterns - reason about the actual need
 
 Available tools:
 
@@ -101,14 +93,14 @@ Available tools:
       params_str = ", ".join(params)
       prompt += f"- {tool_name}({params_str}): {tool_info['description']}\n"
 
-    # Add probing questions from first run
-    if previous_node and len(previous_node) > 0:
-      prompt += "\n\nPROBING QUESTIONS TO CONSIDER:\n"
-      for question in previous_node:
-        if isinstance(question, dict):
-          prompt += f"- {question.get('category', '')}: {question.get('question', '')} ({question.get('rationale', '')})\n"
+    # Add data requirements from probing agent
+    if data_requirements and len(data_requirements) > 0:
+      prompt += "\n\nDATA REQUIREMENTS (from probing agent -- plan tools to fetch these):\n"
+      for req in data_requirements:
+        if isinstance(req, dict):
+          prompt += f"- {req.get('data_needed', '')} -> {req.get('tool_hint', '')} ({req.get('rationale', '')})\n"
         else:
-          prompt += f"- {question}\n"
+          prompt += f"- {req}\n"
 
     # Add revision feedback if this is a plan revision
     if revision_feedback:
@@ -142,20 +134,6 @@ Create an IMPROVED plan that addresses ALL of these issues.
         prompt += f"- {key}: {value}\n"
       prompt += "\nOnly plan tools for data you DON'T already have.\n"
 
-    # Add clarification context if request was unclear
-    if clarification_context:
-      prompt += f"""
-
-REQUEST NEEDS INTERPRETATION:
-The user's request has ambiguities. Make reasonable assumptions and proceed.
-
-Ambiguities: {json.dumps(clarification_context.get('ambiguities', []), indent=2)}
-Questions: {json.dumps(clarification_context.get('questions', []), indent=2)}
-
-Create a plan based on the most reasonable interpretation.
-Document your assumptions in the "reasoning" field.
-"""
-
     prompt += """
 
 SPECIAL TOOL FORMATS:
@@ -179,9 +157,8 @@ RULES:
   def create_plan(self,
                    user_query: str,
                    tool_list: Dict[str, Dict],
-                   previous_node: Optional[List[Dict[str, Any]]] = None,
+                   data_requirements: Optional[List[Dict[str, str]]] = None,
                    revision_feedback: Optional[Dict[str, Any]] = None,
-                   clarification_context: Optional[Dict[str, Any]] = None,
                    gathered_variables: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     """
     Create execution plan for user query.
@@ -190,12 +167,8 @@ RULES:
       dict: Execution plan with task_type, ticker, reasoning, tools_sequence
       or None if planning fails
     """
-    if revision_feedback:
-      mode = "REVISING PLAN"
-    elif clarification_context:
-      mode = "PLANNING (with clarifications)"
-    else:
-      mode = "CREATING INITIAL PLAN"
+    self.conversatoin_history = []
+    mode = "REVISING PLAN" if revision_feedback else "CREATING INITIAL PLAN"
 
     print(f"\n{'='*60}", file=sys.stderr, flush=True)
     print(f"Orchestrator: {mode}", file=sys.stderr, flush=True)
@@ -203,9 +176,8 @@ RULES:
 
     system_prompt = self.build_orchestrator_prompt(
       tool_list=tool_list,
-      previous_node=previous_node,
+      data_requirements=data_requirements,
       revision_feedback=revision_feedback,
-      clarification_context=clarification_context,
       gathered_variables=gathered_variables
     )
 
