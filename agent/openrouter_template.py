@@ -19,17 +19,18 @@ class OpenRouterModel:
   """
   response_schema = None
 
-  MAX_RETRIES = 2
+  MAX_RETRIES = 5
   RETRY_BASE_DELAY = 1  # seconds — OpenRouter allows 120 req/min, no need to wait long
   CLIENT_TIMEOUT = 120.0  # 2 minutes — enough for streaming; drops are connection errors not timeouts
   FALLBACK_MODEL = 'z-ai/glm-4.5-air:free'
   MAX_OUTPUT_TOKENS = 2048  # Subclasses can override (e.g., verifier needs more room after thinking)
+  REASONING_EFFORT = "low"  # Subclasses can set to None to disable reasoning (e.g., orchestrator just needs JSON)
 
-  def __init__(self, model_name: str = 'deepseek/deepseek-r1-0528:free'):
+  def __init__(self, model_name: str = 'deepseek/deepseek-r1-0528:free', api_key_env: str = "OPENROUTER_API_KEY"):
     load_dotenv()
-    api_key = os.getenv("OPENROUTER_API_KEY")
+    api_key = os.getenv(api_key_env)
     if not api_key:
-      raise ValueError("OPENROUTER_API_KEY not found in environment. Add it to your .env file.")
+      raise ValueError(f"{api_key_env} not found in environment. Add it to your .env file.")
     self.client = OpenAI(
       api_key=api_key,
       base_url="https://openrouter.ai/api/v1",
@@ -78,16 +79,15 @@ class OpenRouterModel:
       "max_tokens": self.MAX_OUTPUT_TOKENS,
     }
 
-    # Build extra_body: provider routing + reasoning budget control
+    # Build extra_body: provider routing + optional reasoning budget control
     extra_body = {
       "provider": {
         "allow_fallbacks": True,
         "sort": "throughput",
       },
-      "reasoning": {
-        "effort": "low",
-      }
     }
+    if self.REASONING_EFFORT:
+      extra_body["reasoning"] = {"effort": self.REASONING_EFFORT}
     kwargs["extra_body"] = extra_body
 
     # If a Pydantic schema is set, request structured JSON output
