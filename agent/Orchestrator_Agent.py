@@ -20,7 +20,7 @@ class ExecutionPlan(BaseModel):
 class Orchestrator_Agent(OpenRouterModel):
   """Creates execution plans -- which MCP tools to call and in what order."""
   response_schema = ExecutionPlan
-  MAX_OUTPUT_TOKENS = 4096  # Large prompt (28 tools) needs room for the plan JSON
+  MAX_OUTPUT_TOKENS = 8192  # Large prompt (28 tools) + reasoning overhead needs room
   REASONING_EFFORT = None   # No reasoning -- just output the structured plan
 
   def __init__(self, model_name: str = 'nvidia/nemotron-3-nano-30b-a3b:free'):
