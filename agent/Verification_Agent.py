@@ -1,4 +1,4 @@
-from .gemini_template import GeminiModel
+from .openrouter_template import OpenRouterModel
 from pydantic import BaseModel
 from typing import Dict, Optional, List
 import sys
@@ -15,16 +15,22 @@ class VerificationResult(BaseModel):
   missing_components: List[str]
 
 
-class Verification_Agent(GeminiModel):
+class Verification_Agent(OpenRouterModel):
   response_schema = VerificationResult
+  MAX_OUTPUT_TOKENS = 4096  # Needs room for thinking + JSON output
 
-  def __init__(self, model_name: str = 'gemini-2.5-flash'):
+  def __init__(self, model_name: str = 'deepseek/deepseek-r1-0528:free'):
     super().__init__(model_name=model_name)
 
   def build_prompt(self) -> str:
     """Build specialized system prompt for analysis verification"""
+    from datetime import datetime
+    current_date = datetime.now().strftime("%B %d, %Y")
 
-    prompt = """You are a Quality Control Specialist at Goldman Sachs. You verify financial analyses before delivery to clients.
+    prompt = f"""You are a Quality Control Specialist at Goldman Sachs. You verify financial analyses before delivery to clients.
+
+TODAY'S DATE: {current_date}
+IMPORTANT: Dates in {datetime.now().year} are CURRENT, not future dates. Do NOT flag them as invalid.
 
 CHECK THESE 5 THINGS:
 1. Does it answer what the user asked? (DCF needs a valuation, "good buy?" needs a recommendation)
@@ -44,9 +50,21 @@ User: "Run DCF on AAPL" -> Analysis describes business but no valuation -> REJEC
 User: "Is MSFT a good buy?" -> PE analysis with price target -> APPROVE
 
 RULES:
-- The "action" field is REQUIRED. It must be "approve", "revise", or "reject".
-- quality_score ranges from 0.0 (terrible) to 1.0 (perfect)
-- Be specific in weaknesses and missing_components -- vague feedback is useless"""
+- BIAS TOWARD APPROVE: If the analysis answers the question and the data is reasonable, APPROVE it. Minor stylistic issues, rounding differences, or data that shows "top N" instead of all entries are NOT reasons to revise. Only revise for material errors that would mislead an investor.
+- Do NOT flag data as invalid just because you cannot verify the source. The data was gathered by automated tools and is presumed correct.
+
+OUTPUT FORMAT:
+You MUST respond with ONLY valid JSON matching this exact schema. No text before or after the JSON.
+{{
+  "action": "approve" | "revise" | "reject",
+  "action_reasoning": "string explaining why you chose this action",
+  "quality_score": 0.0 to 1.0,
+  "answers_question": true or false,
+  "strengths": ["list", "of", "strengths"],
+  "weaknesses": ["list", "of", "weaknesses"],
+  "missing_components": ["list", "of", "missing", "items"]
+}}
+ALL 7 fields are REQUIRED. Do not add or omit any fields."""
 
     return prompt
 
