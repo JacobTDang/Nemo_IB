@@ -21,7 +21,7 @@ class Orchestrator_Agent(OpenRouterModel):
   """Creates execution plans -- which MCP tools to call and in what order."""
   response_schema = ExecutionPlan
   MAX_OUTPUT_TOKENS = 8192  # Large prompt (37 tools) + reasoning overhead needs room
-  REASONING_EFFORT = "high"
+  REASONING_EFFORT = "high"  # Enabled: Nemotron needs reasoning to select tools correctly
 
   def __init__(self, model_name: str = 'nvidia/nemotron-3-nano-30b-a3b:free'):
     super().__init__(model_name=model_name, api_key_env="OPENROUTER_NEMOTRON")
