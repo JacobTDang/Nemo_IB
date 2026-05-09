@@ -6,8 +6,6 @@ from mcp.types import Tool, TextContent, ServerCapabilities
 from mcp.server.models import InitializationOptions
 import os
 import openpyxl
-import openpyxl.cell
-from openpyxl.utils import column_index_from_string
 from openpyxl.utils.cell import coordinate_from_string, column_index_from_string
 from typing import Any, Dict, List
 
@@ -219,7 +217,7 @@ class ExcelMCPServer:
         )]
 
       # step 3: create the workbook
-      workbook = openpyxl.load_workbook(file_path, data_only=True)
+      workbook = openpyxl.load_workbook(file_path)
 
       # step 4: verify that the worksheet exists
       if sheet_name not in workbook.sheetnames:
@@ -262,8 +260,8 @@ class ExcelMCPServer:
       return [TextContent(
         type="text",
         text=json.dumps({
-          "sucess": False,
-          "error": "Failed to read excel file"
+          "success": False,
+          "error": f"Failed to write excel file: {str(e)}"
         })
       )]
 
