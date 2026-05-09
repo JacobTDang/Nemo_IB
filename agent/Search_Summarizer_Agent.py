@@ -7,7 +7,7 @@ import sys
 
 class DataPoint(BaseModel):
   metric: str
-  value: str
+  value: Optional[str] = None  # LLM sometimes returns null when value not found in content
   source: Optional[str] = None
   date: Optional[str] = None
 
@@ -55,6 +55,7 @@ EXTRACT PRIORITY:
 
   def summarize_single(self, content: Dict[str, Any], ticker: str, search_intent: str) -> Dict[str, Any]:
     """Summarize a single scraped content result"""
+    self.conversatoin_history = []  # Each URL is independent — don't bleed prior content into context
 
     if not content.get('success', False):
       return {
@@ -65,10 +66,10 @@ EXTRACT PRIORITY:
 
     raw_content = content.get('content', '')
 
-    if isinstance(raw_content, str) and len(raw_content) > 4000:
-      raw_content = raw_content[:4000] + "... [truncated]"
+    if isinstance(raw_content, str) and len(raw_content) > 10000:
+      raw_content = raw_content[:10000] + "... [truncated]"
     elif isinstance(raw_content, dict):
-      raw_content = json.dumps(raw_content)[:4000]
+      raw_content = json.dumps(raw_content)[:10000]
 
     user_prompt = f"""Ticker: {ticker}
 Search Intent: {search_intent}

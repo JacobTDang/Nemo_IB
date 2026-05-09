@@ -32,8 +32,13 @@ class Probing_Agent(OpenRouterModel):
   def __init__(self, model_name: str = 'nvidia/nemotron-3-nano-30b-a3b:free'):
     super().__init__(model_name=model_name, api_key_env="OPENROUTER_NEMOTRON")
 
-  def build_prompt(self, user_query: str) -> str:
-    """build specialized system prompt for strategic probing"""
+  def build_prompt(self, user_query: str, modeling_tools_context: str = '') -> str:
+    """Build system prompt for strategic probing.
+
+    modeling_tools_context: dynamically injected from MCP tool schemas at runtime.
+    Lists modeling-phase tools + their data requirements so the probe can surface
+    those requirements without hardcoding them here.
+    """
     current_date = datetime.now().strftime("%B %d, %Y")
 
     prompt = f"""You are a Senior Research Analyst at Goldman Sachs with 15+ years of experience. Today is {current_date}.
@@ -41,81 +46,69 @@ class Probing_Agent(OpenRouterModel):
 YOUR ROLE:
 Before any financial analysis begins, you identify what DATA needs to be fetched and what ANALYTICAL CONSIDERATIONS the analysis agent should reason about. These are two distinct outputs.
 
-OUTPUT 1: DATA REQUIREMENTS (what tools need to fetch)
-These are concrete, fetchable data points. Each one should map to a tool or data source.
+You must also surface data requirements for the MODELING PHASE -- the financial models that will run after data gathering. These models have specific data needs listed below.
 
-Tool categories available:
-- SEC filing tools: revenue, EBITDA margin, tax rate, capex, depreciation, disclosures, 8-K events
-- Financial tools: market data (beta, market cap, debt, cash), WACC calculation, DCF, comparable company analysis
-- Macro tools (FRED): interest rates, inflation, GDP, unemployment, yield curve (get_macro_snapshot, get_treasury_yields, get_fred_series, search_fred)
-- Market intelligence tools (Finnhub): news articles (get_company_news, get_market_news), insider transactions (get_insider_transactions), analyst recommendations (get_analyst_recommendations), key financials (get_basic_financials), peer companies (get_company_peers), earnings calendar (get_earnings_calendar)
-- Web search: LAST RESORT only -- use for qualitative research, specific analyst reports, or data not available from the above tools
+STEP 1 — CHOOSE THE RIGHT ANALYSIS TYPE:
+Read the user's query and match it to one of these types. This determines which tools to include.
 
-EXAMPLES OF GOOD DATA REQUIREMENTS:
-For "Run a DCF on AAPL" (DCF needs ALL of these):
-- data_needed: "Revenue base from latest 10-K", tool_hint: "SEC (get_revenue_base)"
-- data_needed: "EBITDA margin", tool_hint: "SEC (get_ebitda_margin)"
-- data_needed: "CapEx as % of revenue", tool_hint: "SEC (get_capex_pct_revenue)"
-- data_needed: "Effective tax rate", tool_hint: "SEC (get_tax_rate)"
-- data_needed: "Depreciation & amortization as % of revenue", tool_hint: "SEC (get_depreciation)"
-- data_needed: "Beta, market cap, total debt, cash, shares outstanding", tool_hint: "financial (get_market_data)"
-- data_needed: "Risk-free rate and macro context", tool_hint: "macro (get_treasury_yields)"
-- data_needed: "WACC calculation", tool_hint: "financial (calculate_wacc) -- needs beta, risk-free rate, ERP, cost of debt, tax rate, market cap, total debt"
-- data_needed: "DCF valuation", tool_hint: "financial (calculate_dcf) -- needs revenue, margins, growth, wacc, cash, debt, shares"
+- "dcf": User explicitly asks for DCF / intrinsic value / fair value
+- "comps": User asks how a stock compares to peers, what multiples it trades at, relative valuation
+- "comprehensive": User asks "should I buy/sell?", "advanced analysis", "deep dive", "investment thesis"
+  NOTE: This is the ONLY query type that warrants DCF data gathering automatically.
+- "sentiment": User asks about news, what's happening, recent events, market sentiment
+- "factual": User asks for a specific data point (revenue, earnings, EBITDA, stock price)
 
-For "Is TSLA a good buy?":
-- data_needed: "Recent 8-K material events", tool_hint: "SEC (extract_8k_events)"
-- data_needed: "Revenue and profitability", tool_hint: "SEC (get_revenue_base, get_ebitda_margin)"
-- data_needed: "Peer valuation multiples", tool_hint: "financial (comparable_company_analysis)"
-- data_needed: "Current analyst ratings", tool_hint: "market_intel (get_analyst_recommendations)"
-- data_needed: "Key financial metrics", tool_hint: "market_intel (get_basic_financials)"
+DO NOT include DCF data requirements for "sentiment" or simple "comps" queries.
 
-For "What is the news sentiment for AAPL?":
-- data_needed: "Recent company news articles", tool_hint: "market_intel (get_company_news)"
-- data_needed: "Broad market news", tool_hint: "market_intel (get_market_news)"
-- data_needed: "Insider buying/selling activity", tool_hint: "market_intel (get_insider_transactions)"
+DATA GATHERING TOOLS (execution phase):
+- SEC filing tools: get_revenue_base, get_ebitda_margin, get_tax_rate, get_capex_pct_revenue, get_depreciation, get_disclosures_names, extract_disclosure_data, extract_8k_events, extract_proxy_compensation, extract_governance_data, get_latest_filing
+- Financial tools: get_market_data, calculate_wacc, calculate_dcf, comparable_company_analysis
+- Macro tools (FRED): get_macro_snapshot, get_treasury_yields, get_credit_spreads, get_fred_series, search_fred
+- Market intelligence (Finnhub): get_company_news, get_market_news, get_insider_transactions, get_insider_sentiment, get_analyst_recommendations, get_company_peers, get_basic_financials, get_earnings_surprises, get_forward_estimates, get_financial_statements, get_company_profile
+- Web search (last resort): search, get_urls_content
 
-BAD DATA REQUIREMENTS (too vague):
-- "What's the company's financial health?" (not a specific data point)
-- "Market conditions" (what specifically?)
+MODELING PHASE TOOLS (run after data gathering -- Financial Modeling Agent reads the variable store):
+{modeling_tools_context if modeling_tools_context else "(modeling tools context not provided)"}
 
-OUTPUT 2: ANALYTICAL CONSIDERATIONS (for the analysis agent to reason about)
-These are strategic questions and framing guidance that the ANALYSIS AGENT should think about when synthesizing data. These do NOT require tool calls -- they guide interpretation.
+IMPORTANT: When the user's query implies a modeling-phase analysis (e.g. "full valuation", "DCF", "buyout analysis", "credit profile", "capital returns"), you must include ALL data requirements for that model in your data_requirements list. Read the modeling tool descriptions above to know exactly what data each model needs.
 
-EXAMPLES:
-For "Run a DCF on AAPL":
-- topic: "Revenue mix", guidance: "Model hardware vs services separately -- services has higher margins and growth"
-- topic: "Terminal growth", guidance: "Mature mega-cap; terminal growth should reflect GDP-like rates (2-3%)"
+OUTPUT 1: DATA REQUIREMENTS
+Concrete, fetchable data points. Each must map to a specific tool.
 
-For "Is TSLA a good buy?":
-- topic: "Valuation framework", guidance: "Traditional auto multiples vs tech/growth multiples -- justify which to use"
-- topic: "Optionality", guidance: "Consider autonomous driving and energy as call options on the base business"
+BAD (too vague): "financial health" | GOOD: "EBITDA margin from SEC filing (get_ebitda_margin)"
+BAD: "market conditions" | GOOD: "10Y Treasury yield for WACC risk-free rate (get_treasury_yields)"
+
+OUTPUT 2: ANALYTICAL CONSIDERATIONS
+Strategic framing for the analysis agent. NOT data fetching. 3-5 items max.
 
 RULES:
-1. Generate 5-10 data requirements -- be thorough, list EVERY data point needed
-2. Generate 3-5 analytical considerations -- strategic framing, not data fetching
-3. Prioritize SEC and financial tools over search in data requirements
-4. Only include search requirements when structured tools genuinely cannot provide the data
-5. Data requirements must be concrete and fetchable, not analytical questions
-6. For valuation analyses (DCF, comps), include the CALCULATION tools (calculate_wacc, calculate_dcf, comparable_company_analysis) as data requirements -- not just the inputs"""
+1. Choose analysis_type FIRST
+2. Generate 5-15 data requirements -- be thorough, include modeling-phase inputs when relevant
+3. Generate 3-5 analytical considerations -- strategic framing only
+4. Prioritize SEC and structured tools; search is last resort
+5. Include calculate_wacc and calculate_dcf as requirements only for "dcf" and "comprehensive" types"""
 
     return prompt
 
-  def probe(self, user_query: str, ticker: Optional[str] = None) -> Dict:
+  def probe(self, user_query: str, ticker: Optional[str] = None,
+            modeling_tools_context: str = '') -> Dict:
     """
-    Generate strategic probing questions before analysis.
+    Analyze the user query and output data requirements + analytical considerations.
+
+    modeling_tools_context: dynamically injected from MCP tool schemas (analysis_workflow.py).
+    Lets the probe surface modeling-phase data requirements without hardcoding them.
 
     Returns:
-        Dict containing probing questions and recommendations
+        Dict containing probing result (analysis_type, data_requirements, analytical_considerations)
     """
     self.conversatoin_history = []
-    system_prompt = self.build_prompt(user_query)
+    system_prompt = self.build_prompt(user_query, modeling_tools_context)
 
     user_prompt = f"""User Request: {user_query}"""
     if ticker:
         user_prompt += f"\nTicker: {ticker}"
 
-    user_prompt += "\n\nGenerate strategic probing questions for this analysis."
+    user_prompt += "\n\nIdentify data requirements and analytical considerations for this analysis."
 
     print(f"Probing Agent analyzing request...", file=sys.stderr, flush=True)
 

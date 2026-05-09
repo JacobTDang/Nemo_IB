@@ -48,20 +48,21 @@ For this article, determine:
 Be precise. Echo back the exact headline."""
 
   def _build_market_prompt(self, ticker: str = "") -> str:
-    ticker_context = f" Consider implications for {ticker} if applicable." if ticker and ticker != "UNKNOWN" else ""
     return f"""You are a Financial News Analyst assessing a single market/macro news article.
 
 For this article, determine:
 1. RELEVANT: Is this article relevant to equity markets or the broader economy? Default to true -- the orchestrator specifically requested market news. Only mark irrelevant if the article is a duplicate, paywall notice, or completely non-financial.
-2. SENTIMENT: What is the directional signal for equity markets?
+2. SENTIMENT: What is the directional signal for equity markets broadly?
    - "bullish" = dovish Fed, strong economic data, trade deal, stimulus, rate cuts
    - "bearish" = hawkish Fed, weak economic data, trade war, inflation spike, geopolitical risk
-   - "neutral" = mixed signals or purely informational
-3. IMPACT: How material is this for markets?
+   - "neutral" = mixed signals, company-specific news with no macro read-through, or purely informational
+3. IMPACT: How material is this for the BROAD MARKET (not a single stock)?
    - "high" = Fed decision, CPI/jobs data, tariff announcement, major geopolitical event
-   - "medium" = sector rotation, earnings season trends, commodity moves
-   - "low" = routine reports, minor policy updates
-4. REASON: 1-2 sentences explaining your assessment.{ticker_context}
+   - "medium" = sector-wide trends, earnings season signals, commodity moves, credit spreads
+   - "low" = single company earnings, routine reports, minor policy updates
+4. REASON: 1-2 sentences on the MACRO signal only. Do NOT force a connection to any specific stock.
+
+IMPORTANT: Assess macro/market impact only. If an article is purely about one company (DoorDash earnings, Berkshire trades) with no broad market read-through, mark it as low impact neutral.
 
 Be precise. Echo back the exact headline."""
 
