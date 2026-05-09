@@ -11,7 +11,6 @@ class MasterDecision(BaseModel):
   reasoning: str
   query_complexity: str
   revision_context: Optional[Dict[str, Any]] = None
-  notes: Optional[str] = None
 
 
 class Master_Orchestrator(OpenRouterModel):
@@ -38,7 +37,6 @@ class Master_Orchestrator(OpenRouterModel):
 - Ticker: {ticker}
 - Current Phase: {current_phase}
 - Query Complexity: {query_complexity or 'NOT SET (you must classify this)'}
-- Global Iteration: {state.get('global_iteration', 0)}
 - Phase History: {state.get('phase_history', [])}
 """
 
@@ -63,11 +61,29 @@ class Master_Orchestrator(OpenRouterModel):
         if error_rate > 0.5:
           summary += f"  WARNING: {error_rate:.0%} tool failure rate. Data likely insufficient.\n"
 
+    model_outputs = state.get('model_outputs', {})
+    if model_outputs and model_outputs.get('models_run'):
+      models_run = model_outputs.get('models_run', [])
+      summary += f"- Model Outputs: {models_run}\n"
+      if 'scenario_dcf' in model_outputs:
+        pr = model_outputs['scenario_dcf'].get('price_range', {})
+        summary += (f"  Scenario DCF: Bear=${pr.get('low', 0):.2f} | "
+                    f"Base=${pr.get('mid', 0):.2f} | Bull=${pr.get('high', 0):.2f}\n")
+      if 'credit_profile' in model_outputs:
+        cp = model_outputs['credit_profile']
+        summary += (f"  Credit Profile: {cp.get('credit_label', 'N/A')} | "
+                    f"Net Debt/EBITDA: {cp.get('net_debt_ebitda', 0):.1f}x\n")
+      if 'capital_returns' in model_outputs:
+        cr = model_outputs['capital_returns']
+        summary += f"  Total Shareholder Yield: {cr.get('total_shareholder_yield_pct', 0):.1f}%\n"
+      if 'lbo' in model_outputs:
+        lb = model_outputs['lbo']
+        summary += f"  LBO: IRR={lb.get('irr_pct', 0):.1f}% | MOIC={lb.get('moic', 0):.2f}x\n"
+
     if state.get('analysis_report'):
       report = state['analysis_report']
       variables = state.get('variables', {})
       summary += f"- Analysis Report: generated ({len(report)} chars)\n"
-      # Show structured analysis metadata from variable store
       signal = variables.get('analysis.signal', '')
       if signal:
         summary += f"  Signal: {signal}\n"
@@ -77,34 +93,27 @@ class Master_Orchestrator(OpenRouterModel):
       data_gaps = variables.get('analysis.data_gaps', [])
       if data_gaps:
         summary += f"  DATA GAPS ({len(data_gaps)}): {data_gaps}\n"
-        summary += f"  WARNING: Analysis flagged missing data. Consider routing to plan/execute before verify.\n"
 
-    if state.get('verification_result'):
-      verification = state['verification_result']
-
-      if 'error' in verification:
-        parse_failures = state.get('verify_parse_failures', 0)
-        raw = verification.get('raw_response', '')[:400]
-        summary += f"- Verification: PARSE FAILED ({parse_failures} consecutive failures) - verifier output was not valid JSON\n"
-        summary += f"  Raw verifier feedback: {raw}\n"
-      else:
-        action = verification.get('action', 'unknown')
-        score = verification.get('quality_score', 'N/A')
-        summary += f"- Verification: action={action}, quality_score={score}\n"
-        summary += f"  Reasoning: {verification.get('action_reasoning', 'N/A')}\n"
-
-        if action == 'revise' or action == 'reject':
-          weaknesses = verification.get('weaknesses', [])
-          missing = verification.get('missing_components', [])
-          summary += f"  Weaknesses: {weaknesses}\n"
-          summary += f"  Missing Components: {missing}\n"
+    plan_verification = state.get('plan_verification', {})
+    if plan_verification:
+      complete = plan_verification.get('complete', True)
+      pv_summary = plan_verification.get('summary', '')
+      gaps = plan_verification.get('gaps', [])
+      critical = [g for g in gaps if g.get('priority') == 'critical']
+      status_str = "COMPLETE" if complete else f"INCOMPLETE ({len(critical)} critical gaps)"
+      summary += f"- Plan Verification: {status_str}\n"
+      if pv_summary:
+        summary += f"  {pv_summary}\n"
+      for g in critical:
+        summary += f"  - [CRITICAL] {g['description']} -> {g['recommended_tool']}\n"
 
     if state.get('revision_context'):
       summary += f"- Revision Context: {json.dumps(state['revision_context'], default=str)[:300]}\n"
 
-    # Per-phase counters
-    summary += f"- Execution Count: {state.get('execution_count', 0)}\n"
-    summary += f"- Analysis Count: {state.get('analysis_count', 0)}\n"
+    # Per-phase counters (shown against limits so model knows remaining budget)
+    summary += f"- Execution Count: {state.get('execution_count', 0)} / 15 max\n"
+    summary += f"- Analysis Count: {state.get('analysis_count', 0)} / 6 max\n"
+    summary += f"- Global Iteration: {state.get('global_iteration', 0)} / 50 max\n"
 
     # Show gathered variables (flat keys only, skip namespaced)
     variables = state.get('variables', {})
@@ -130,51 +139,60 @@ class Master_Orchestrator(OpenRouterModel):
 
 AVAILABLE SUB-AGENTS:
 1. probe - Generates strategic research questions before analysis. USE when: first pass on standard/complex queries. SKIP when: simple queries, already probed.
-2. plan - Creates a tool execution plan (which MCP tools to call and in what order). USE when: need to gather data, or need a revised plan after verification feedback. SKIP when: plan already exists and no revision needed.
-3. execute - Runs the tools from the execution plan. USE when: plan exists and needs execution, or re-execution with additional tools. SKIP when: no plan exists.
-4. analyze - Performs financial analysis on gathered data. USE when: data has been collected and needs analysis, or re-analysis with verifier feedback. SKIP when: no data collected.
-5. verify - Quality checks the analysis output. USE when: analysis is complete and needs verification. SKIP when: simple queries, already verified and approved.
+2. plan - Creates a tool execution plan (which MCP tools to call and in what order). USE when: need to gather data, or need a revised plan after plan_verification flagged critical gaps. SKIP when: plan already exists and no revision needed.
+3. execute - Runs the tools from the execution plan. USE when: plan exists and needs execution. SKIP when: no plan exists.
+4. model - Runs financial models (scenario DCF, credit profile, capital returns, LBO) using the gathered variable store. USE when: plan_verification says COMPLETE and data has been collected. Runs between execute and analyze.
+5. analyze - Performs financial analysis on gathered data + model outputs. USE when: model phase is complete (phase is "modeled"). SKIP when: model phase hasn't run yet.
+6. done - Return the analysis to the user. USE when: analysis is complete.
+
+NOTE: After every execution, Plan Verification runs automatically (DeepSeek R1). It checks if all
+critical data is present. If INCOMPLETE, the system guardrails will re-route to plan automatically.
+You should route to model only when Plan Verification shows COMPLETE.
 
 QUERY COMPLEXITY RULES (classify on first pass, then persist):
-- "simple": Factual lookups ("what is AAPL revenue?") -> plan -> execute -> done (skip probe, verify)
-- "standard": Standard analysis ("run DCF on AAPL") -> probe -> plan -> execute -> analyze -> verify -> done
-- "complex": Multi-faceted analysis ("compare AAPL vs MSFT valuation with sensitivity") -> probe -> plan -> execute -> analyze -> verify -> done (may need multiple revision loops)
+- "simple": Factual lookups ("what is AAPL revenue?") -> plan -> execute -> done (skip probe)
+- "standard": Standard analysis ("run DCF on AAPL") -> probe -> plan -> execute -> model -> analyze -> done
+- "complex": Multi-faceted analysis ("compare AAPL vs MSFT valuation with sensitivity") -> probe -> plan -> execute -> model -> analyze -> done (may need multiple data-gathering loops before model)
 
 ROUTING LOGIC:
 - Phase "init" + no complexity set -> classify query, then route to probe (standard/complex) or plan (simple)
 - Phase "probed" -> route to plan
 - Phase "planned" -> route to execute
-- Phase "executed" -> route to analyze (standard/complex) or done (simple, if query is answered by data alone)
-- Phase "analyzed" -> IF analysis flags critical missing data (e.g. "NOT PROVIDED IN DATA" for something the user asked for) -> route to plan with revision_context to fetch it. ELSE -> route to verify (standard/complex) or done (simple)
-- Phase "verified" + action "approve" -> done
-- Phase "verified" + action "revise" -> look at weaknesses:
-    - Missing data/components -> route to plan (create new tool sequence for gaps)
-    - Poor analysis quality -> route to analyze (same data, with feedback)
-    - Both -> route to plan first
+- Phase "executed" -> route to model (standard/complex) or done (simple, if query answered by data alone)
+  Note: Plan Verification guardrails will intercept and re-route to plan if critical gaps remain.
+- Phase "modeled" -> route to analyze
+- Phase "analyzed" -> done (analysis is the final output, no separate verification step)
+  Exception: route to plan with revision_context if data gaps in analysis are severe and execution budget remains.
 
 REVISION HANDLING:
-When routing after a failed verification, you MUST populate revision_context with:
-- For plan: {"type": "missing_data", "feedback": <verifier weaknesses and missing components>}
-- For analyze: {"type": "poor_analysis", "feedback": <verifier weaknesses and improvement instructions>}
+When routing to plan for data gaps, populate revision_context:
+- {"type": "missing_data", "feedback": <description of what is missing and which tools to use>}
 
 GUARDRAILS (you cannot override these, the system enforces them):
-- Must verify before done for standard/complex queries
-- Maximum 12 global iterations
-- Maximum 3 executions
-- Maximum 3 analyses
-
-NOTES (scratchpad for yourself):
-- The "notes" field lets you leave a message for your future self.
-- Each invocation clears your conversation history, but notes persist in state.
-- Use notes to record observations, flag concerns, or track decisions across iterations.
-- Example: "WACC came back unusually high (18%), may need to verify inputs" or "Revenue data only goes back 2 years, used shorter history"
-- Keep notes concise (1-2 sentences). Leave null if nothing noteworthy.
+- Maximum 50 global iterations
+- Maximum 15 executions
+- Maximum 6 analyses
 
 RULES:
-- next_action must be one of: probe, plan, execute, analyze, verify, done
+- next_action must be one of: probe, plan, execute, model, analyze, done
 - query_complexity must be set on every call (persist the same value after first classification)
-- revision_context is null unless routing after a failed verification
-- notes is optional -- use it when you have observations worth preserving"""
+- revision_context is null unless routing to plan for data gaps
+
+OUTPUT FORMAT - you must output exactly this JSON structure, no other fields:
+{
+  "next_action": "<one of: probe, plan, execute, model, analyze, done>",
+  "reasoning": "<1-2 sentence explanation of why you chose this action>",
+  "query_complexity": "<simple, standard, or complex>",
+  "revision_context": null
+}
+
+Example when re-planning for gaps:
+{
+  "next_action": "plan",
+  "reasoning": "Analysis missing WACC inputs. Fetching market data and macro rates before re-running DCF.",
+  "query_complexity": "standard",
+  "revision_context": {"type": "missing_data", "feedback": "WACC inputs missing: fetch get_market_data and get_macro_snapshot"}
+}"""
 
   def decide(self, state: AgentState) -> Dict[str, Any]:
     """
@@ -183,9 +201,6 @@ RULES:
 
     Returns:
       Dict with keys: next_action, reasoning, query_complexity, revision_context
-
-    Raises:
-      RuntimeError: If LLM fails to produce valid output after retry.
     """
     # Stateless: clear history each invocation
     self.conversatoin_history = []
@@ -202,7 +217,7 @@ Based on the current state above, decide what should happen next."""
     print(f"Current phase: {state.get('current_phase', 'init')}", file=sys.stderr, flush=True)
     print(f"{'='*60}\n", file=sys.stderr, flush=True)
 
-    # First attempt -- structured output guarantees valid JSON
+    # First attempt
     response = self.generate_response(prompt=user_prompt, system_prompt=system_prompt)
 
     try:
@@ -210,7 +225,7 @@ Based on the current state above, decide what should happen next."""
       result = decision.model_dump()
 
       # Validate next_action
-      valid_actions = {'probe', 'plan', 'execute', 'analyze', 'verify', 'done'}
+      valid_actions = {'probe', 'plan', 'execute', 'model', 'analyze', 'done'}
       if result['next_action'] not in valid_actions:
         raise ValueError(f"Invalid next_action: {result['next_action']}")
 
@@ -236,20 +251,30 @@ Decide the next action."""
       self._log_decision(result)
       return result
     except Exception as e:
-      error_context = {
-        "error": "Master Orchestrator failed to produce valid output after 2 attempts",
-        "last_error": str(e),
-        "raw_response": response[:500],
-        "current_phase": state.get('current_phase', 'init'),
-        "user_query": state.get('user_query', ''),
-        "global_iteration": state.get('global_iteration', 0),
-        "phase_history": state.get('phase_history', [])
+      # Both attempts failed -- use a deterministic phase-based fallback rather than crashing.
+      phase = state.get('current_phase', 'init')
+      fallback_map = {
+        'init': 'probe',
+        'probed': 'plan',
+        'planned': 'execute',
+        'executed': 'model',
+        'modeled': 'analyze',
+        'analyzed': 'done',
       }
-      raise RuntimeError(
-        f"Master Orchestrator LLM parse failure. The workflow cannot continue without a valid routing decision.\n"
-        f"Context: {json.dumps(error_context, indent=2, default=str)}\n"
-        f"To recover: manually specify the next action or abort the workflow."
+      fallback_action = fallback_map.get(phase, 'analyze')
+      print(
+        f"\nWARNING: Master Orchestrator LLM failed twice (phase={phase}, error={e}). "
+        f"Using deterministic fallback: {fallback_action}",
+        file=sys.stderr, flush=True
       )
+      result = {
+        'next_action': fallback_action,
+        'reasoning': f'LLM parse failure after 2 attempts. Deterministic fallback for phase={phase}.',
+        'query_complexity': state.get('query_complexity', 'standard'),
+        'revision_context': None,
+      }
+      self._log_decision(result)
+      return result
 
   def _log_decision(self, decision: Dict[str, Any]):
     """Log the master's routing decision to stderr."""
