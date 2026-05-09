@@ -31,12 +31,14 @@ class Plan_Verifier_Agent(OpenRouterModel):
   recommendations so the orchestrator can fill them in a targeted re-plan.
 
   Primary: GLM-4.5 Air (fast, low latency).
-  Parse-failure fallback: DeepSeek R1 (slower but more reliable JSON).
+  Stream-failure fallback: GLM-4.5 Air (OpenRouterModel base class default).
+  Parse-failure fallback: DeepSeek R1 (manually retried in verify()).
   """
   response_schema = PlanVerificationResult
   MAX_OUTPUT_TOKENS = 4096
   REASONING_EFFORT = "low"   # GLM Air is fast; deep thinking not needed for a checklist task
-  FALLBACK_MODEL = _DEEPSEEK_MODEL
+  # FALLBACK_MODEL intentionally not set: stream failures fall back to GLM (base class default).
+  # parse failures fall back to DeepSeek manually in verify() below.
 
   def __init__(self, model_name: str = 'z-ai/glm-4.5-air:free'):
     super().__init__(model_name=model_name)
