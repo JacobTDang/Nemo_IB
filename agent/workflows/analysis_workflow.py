@@ -13,17 +13,14 @@ from ..Plan_Verifier_Agent import Plan_Verifier_Agent
 from ..Search_Summarizer_Agent import Search_Summarizer_Agent
 from ..Master_Orchestrator import Master_Orchestrator
 from ..News_Processing_Agent import News_Processing_Agent
+from ..Verification_Agent import Verification_Agent
 from ..MCP_manager import MCPConnectionManager
 from .execution_engine import run_tools
+from .constants import MAX_ITERATIONS, MAX_EXECUTIONS, MAX_ANALYSES
 from tools.financial_modeling_engine.analysis_tools import MODELING_PHASE_TOOLS
 from typing import cast
 import asyncio
 import json, sys
-
-# Guardrail constants
-MAX_ITERATIONS = 50   # Hard cap on total master invocations
-MAX_EXECUTIONS = 15   # Max times execution_node can run
-MAX_ANALYSES = 6      # Max times analyze_node can run
 
 
 class WorkFlow:
@@ -36,12 +33,14 @@ class WorkFlow:
     self.modeling_agent = Financial_Modeling_Agent()
     self.plan_verifier = Plan_Verifier_Agent()
     self.news_agent = News_Processing_Agent()
+    self.verification_agent = Verification_Agent()
     self.workflow = StateGraph(AgentState)
     self.mcp = mcp
 
     self.app = self.setup_graph()
 
   def master_node(self, state: AgentState):
+    print(f"\n[Routing] Phase: {state.get('current_phase', 'init')} -> deciding...", flush=True)
     global_iteration = state.get('global_iteration', 0) + 1
     phase_history = list(state.get('phase_history', []))
 
@@ -182,6 +181,7 @@ class WorkFlow:
       return "(modeling tools context unavailable)"
 
   async def probe_node(self, state: AgentState):
+    print("\n[1/6] Probing: analyzing query and identifying data requirements...", flush=True)
     user_query = state['user_query']
     ticker = state.get("ticker")
 
@@ -199,7 +199,7 @@ class WorkFlow:
     detected_ticker = result.get('ticker')
 
     return {
-      "ticker": detected_ticker or state.get('ticker'),
+      "ticker": state.get('ticker') or detected_ticker,
       "data_requirements": result.get('data_requirements', []),
       "analytical_considerations": result.get('analytical_considerations', []),
       "recommended_approach": result.get('recommended_approach', ''),
@@ -207,6 +207,7 @@ class WorkFlow:
     }
 
   async def plan_node(self, state: AgentState):
+    print("\n[2/6] Planning: selecting tools and building execution plan...", flush=True)
     user_query = state['user_query']
     # Filter out modeling-phase tools so the orchestrator never plans them.
     tool_list = {k: v for k, v in (await self.mcp.list_tools()).items()
@@ -426,6 +427,27 @@ class WorkFlow:
           injected.append(f"search (fallback for missing DCF inputs)")
           break
 
+    # Fix 6: Inject get_financial_statements(cf) when capital returns data is needed
+    cf_keywords = ['capital return', 'dividend', 'buyback', 'shareholder yield',
+                   'comprehensive', 'advanced', 'deep dive', 'investment',
+                   'good time to buy', 'should i buy']
+    cf_tools_planned = (
+      'get_financial_statements' in planned_tools or
+      'get_financial_statements' in already_run
+    )
+    cf_data_present = (
+      variables.get('cf.dividendsPaid') is not None or
+      variables.get('dividendsPaid') is not None or
+      variables.get('cf.repurchaseOfCapitalStock') is not None
+    )
+    if any(kw in query_lower for kw in cf_keywords) and not cf_tools_planned and not cf_data_present:
+      plan['tools_sequence'].append({
+        'tool': 'get_financial_statements',
+        'arguments': {'ticker': ticker, 'statement': 'cf', 'freq': 'annual'}
+      })
+      planned_tools.add('get_financial_statements')
+      injected.append('get_financial_statements (cf, for capital returns)')
+
     if injected:
       print(f"  [Plan Inject] Added missing tools: {injected}", file=sys.stderr, flush=True)
 
@@ -486,6 +508,8 @@ class WorkFlow:
     return meta
 
   async def execution_node(self, state: AgentState):
+    tool_count = len((state.get('execution_plan') or {}).get('tools_sequence', []))
+    print(f"\n[3/6] Executing: running {tool_count} tools to gather financial data...", flush=True)
     execution_plan = state['execution_plan']
     tool_sequence = list(execution_plan['tools_sequence'])
     ticker = state.get('ticker', 'UNKNOWN')
@@ -515,6 +539,7 @@ class WorkFlow:
     }
 
   async def plan_verify_node(self, state: AgentState) -> dict:
+    print("\n[4/6] Verifying: checking data completeness...", flush=True)
     """LLM-based pre-analysis data completeness check.
 
     Runs automatically after every execution_node, before master routes to
@@ -557,6 +582,7 @@ class WorkFlow:
     return {'plan_verification': pv}
 
   async def model_node(self, state: AgentState) -> dict:
+    print("\n[5/6] Modeling: running financial calculations (scenario DCF, credit profile, etc.)...", flush=True)
     """Financial modeling spoke.
 
     Runs after plan_verify confirms data is complete. Uses Financial_Modeling_Agent
@@ -585,6 +611,7 @@ class WorkFlow:
     }
 
   async def analyze_node(self, state: AgentState):
+    print("\n[6/6] Analyzing: generating investment analysis...", flush=True)
     user_query = state['user_query']
     summarized_output = state['summarized_output']
     execution_plan = state['execution_plan']
@@ -598,7 +625,8 @@ class WorkFlow:
     if len(flat_vars) < 5:
       print(f"[Analyze] Aborting: only {len(flat_vars)} variables gathered. Re-routing to plan.", file=sys.stderr, flush=True)
       return {
-        'current_phase': 'executed',
+        'current_phase': 'planned',
+        'execution_plan': None,
         'revision_context': {
           'type': 'missing_data',
           'feedback': (
@@ -629,6 +657,25 @@ class WorkFlow:
       data_gaps=data_gaps if data_gaps else None,
       model_outputs=state.get('model_outputs')
     )
+
+    # Non-blocking QC: append note to report if verifier flags a critical issue
+    try:
+      verification = await asyncio.to_thread(
+        self.verification_agent.verify,
+        user_query,
+        result,
+        execution_plan
+      )
+      action = verification.get('action', 'approve') if isinstance(verification, dict) else 'approve'
+      feedback = verification.get('feedback', '') if isinstance(verification, dict) else ''
+      if action == 'revise' and feedback:
+        result = result + f"\n\n---\nQC NOTE: {feedback}"
+        print(f"[QC] Appended verifier note: {feedback[:100]}", file=sys.stderr, flush=True)
+      else:
+        score = verification.get('quality_score', 0) if isinstance(verification, dict) else 0
+        print(f"[QC] Verification: {action} (score={score})", file=sys.stderr, flush=True)
+    except Exception as e:
+      print(f"[QC] Verification failed (non-critical): {e}", file=sys.stderr, flush=True)
 
     analysis_count = state.get('analysis_count', 0) + 1
 
@@ -707,14 +754,13 @@ class WorkFlow:
 
 if __name__ == "__main__":
   async def main():
-    ticker = input("TICKER: ")
     user_query = input("You: ")
     async with MCPConnectionManager() as mcp:
       w = WorkFlow(mcp=mcp)
 
       report = await w.run(
         user_query=user_query,
-        ticker=ticker
+        ticker=''
       )
 
       print("\n" + "="*80)
