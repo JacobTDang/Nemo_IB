@@ -1,2 +1,24 @@
 .env
 __pycache__
+CLAUDE.md
+.pytest_cache
+.CLAUDE
+.vscode
+rules
+db_cache/
+
+# Model weight files (large binaries - never commit)
+*.gguf
+*.ggml
+agent/models/
+agent/agent/
+
+# Runtime test output
+testing/output/
+
+# Python version file (local)
+.python-version
+
+# Notes and scratch files
+notes.txt
+NUL
