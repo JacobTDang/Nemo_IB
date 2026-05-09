@@ -20,6 +20,14 @@ class Session_Cache():
                             result_json TEXT,
                             created_at TIMESTAMP
                             )""")
+
+        self.cursor.execute("""CREATE TABLE IF NOT EXISTS news_cache(
+                            article_name TEXT,
+                            args_hash TEXT,
+                            args_json TEXT,
+                            result_article TEXT,
+                            created_at TIMESTAMP
+        )""")
         self.connection.commit()
 
     def get(self, tool_name: str, args: Dict[str, str]) -> Optional[Dict[str, str]]:
@@ -55,11 +63,64 @@ class Session_Cache():
                             (tool_name, args_hash, args_json, result_json, created_at)
                             )
         self.connection.commit()
+    
+    @staticmethod
+    def _articles_hash(articles: list) -> str:
+        """Hash news by article headline + datetime, not by query args.
+
+        Same set of articles always produces the same hash regardless of the
+        from_date/to_date used to fetch them. This prevents stale cache misses
+        when run dates shift by one day but the article set hasn't changed.
+        """
+        keys = sorted(
+            f"{a.get('headline', '')}|{a.get('datetime', '')}"
+            for a in articles
+            if isinstance(a, dict)
+        )
+        return hashlib.sha256(json.dumps(keys).encode()).hexdigest()
+
+    def get_news(self, tool_name: str, articles: list) -> Optional[Dict[str, Any]]:
+        """Retrieve a cached news analysis result keyed by article content.
+
+        Returns None on cache miss. Pass the raw article list returned by
+        Finnhub -- the hash is derived from article headlines and datetimes
+        so the same articles always return the same cached analysis.
+        """
+        articles_hash = self._articles_hash(articles)
+        self.cursor.execute("""
+                            SELECT result_article FROM news_cache WHERE article_name = ? AND args_hash = ?
+                            """,
+                            (tool_name, articles_hash))
+        row = self.cursor.fetchone()
+        if row is None:
+            return None
+        return json.loads(row[0])
+
+    def put_news(self, tool_name: str, articles: list, result: Dict[str, Any]) -> None:
+        """Cache a news analysis result keyed by article content hash."""
+        articles_hash = self._articles_hash(articles)
+        # Store a compact summary of what was hashed for human inspection
+        articles_json = json.dumps(sorted(
+            f"{a.get('headline', '')}|{a.get('datetime', '')}"
+            for a in articles
+            if isinstance(a, dict)
+        ))
+        result_json = json.dumps(result, sort_keys=True)
+        created_at = datetime.now().isoformat()
+
+        self.cursor.execute("""
+                            INSERT INTO news_cache (article_name, args_hash, args_json, result_article, created_at) VALUES (?,?,?,?,?)
+                            """,
+                            (tool_name, articles_hash, articles_json, result_json, created_at))
+        self.connection.commit()
+
 
     def clear(self):
         self.cursor.execute("""
                             DELETE FROM tool_cache
-
+                            """)
+        self.cursor.execute("""
+                            DELETE FROM news_cache
                             """)
         self.connection.commit()
 
