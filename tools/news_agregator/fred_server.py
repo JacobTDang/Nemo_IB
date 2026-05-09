@@ -38,7 +38,9 @@ SNAPSHOT_SERIES = {
   "DGS2": "2Y Treasury Yield",
   "FEDFUNDS": "Federal Funds Rate",
   "T10Y2Y": "10Y-2Y Treasury Spread",
+  # Credit spreads
   "BAMLH0A0HYM2": "HY OAS Spread",
+  "BAMLC0A4CBBB": "BBB IG OAS Spread",
   # Inflation
   "CPIAUCSL": "CPI (All Urban Consumers)",
   "PCEPILFE": "Core PCE Price Index",
@@ -48,6 +50,9 @@ SNAPSHOT_SERIES = {
   "ICSA": "Initial Jobless Claims",
   # Growth
   "A191RL1Q225SBEA": "Real GDP Growth (QoQ Annualized)",
+  # Financial conditions and sentiment
+  "NFCI": "National Financial Conditions Index",
+  "UMCSENT": "UMich Consumer Sentiment",
 }
 
 YIELD_CURVE_SERIES = {
@@ -61,6 +66,14 @@ YIELD_CURVE_SERIES = {
   "DGS10": "10Y",
   "DGS20": "20Y",
   "DGS30": "30Y",
+}
+
+# Credit spread series: HY, IG aggregate, BBB tier, Baa-Treasury classic
+CREDIT_SPREAD_SERIES = {
+  "BAMLH0A0HYM2": "HY OAS (High Yield)",
+  "BAMLC0A0CM":   "IG OAS (Investment Grade Aggregate)",
+  "BAMLC0A4CBBB": "BBB OAS (Lowest Investment Grade)",
+  "BAA10Y":       "Baa-Treasury Spread (Moody's)",
 }
 
 # Series where YoY% change is more meaningful than the raw index level
@@ -82,6 +95,12 @@ fred_series_description = """Retrieves observations for any FRED series by its s
 FRED has 800,000+ series covering economics, finance, demographics, and more.
 Should use: When you need a specific FRED series not covered by get_macro_snapshot or get_treasury_yields (e.g. M2 money supply, housing starts, consumer sentiment).
 Should NOT use: For standard macro indicators (use get_macro_snapshot) or yield curve (use get_treasury_yields)."""
+
+credit_spreads_description = """Retrieves a curated bundle of credit spread indicators from FRED.
+Includes: HY OAS (BAMLH0A0HYM2), IG aggregate OAS (BAMLC0A0CM), BBB OAS (BAMLC0A4CBBB), and Baa-Treasury spread (BAA10Y).
+Shows current spread, 3-month change, and 1-year change for each.
+Should use: When calibrating cost of debt for WACC, assessing credit market conditions, or analyzing spread widening/tightening for risk scenarios.
+Should NOT use: For risk-free Treasury rates (use get_treasury_yields) or broad macro (use get_macro_snapshot)."""
 
 search_fred_description = """Searches across 800,000+ FRED series by keyword to find relevant series IDs.
 Returns: top 20 results with series_id, title, frequency, units, and popularity score.
@@ -330,6 +349,15 @@ class FredServer:
           }
         ),
         Tool(
+          name="get_credit_spreads",
+          description=credit_spreads_description,
+          inputSchema={
+            "type": "object",
+            "properties": {},
+            "required": []
+          }
+        ),
+        Tool(
           name="search_fred",
           description=search_fred_description,
           inputSchema={
@@ -359,6 +387,8 @@ class FredServer:
             arguments.get("end"),
             arguments.get("frequency")
           )
+        case "get_credit_spreads":
+          return await parent.get_credit_spreads()
         case "search_fred":
           return await parent.search_fred(arguments["search_text"])
         case _:
@@ -414,6 +444,46 @@ class FredServer:
     condensed = _condense_yield_curve(series_data)
     envelope = build_envelope(condensed, "treasury_yields", "get_treasury_yields",
                               api_calls_made=len(YIELD_CURVE_SERIES), errors=errors)
+    return [TextContent(type="text", text=safe_json_dumps(envelope))]
+
+  async def get_credit_spreads(self) -> List[TextContent]:
+    """Fetch all credit spread series concurrently and condense into one snapshot."""
+    tasks = {sid: self._fetch_series(sid, lookback_months=18) for sid in CREDIT_SPREAD_SERIES}
+    results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+    # Reuse the snapshot condenser with our credit spread labels
+    spread_labels = CREDIT_SPREAD_SERIES
+    series_data = {}
+    errors = []
+    for sid, result in zip(tasks.keys(), results):
+      if isinstance(result, Exception):
+        series_data[sid] = {"error": str(result)}
+        errors.append(str(result))
+      else:
+        series_data[sid] = result
+
+    # Build condensed output using the same logic as snapshot (all are rate/spread series)
+    condensed = {}
+    for sid, raw in series_data.items():
+      label = spread_labels.get(sid, sid)
+      if "error" in raw:
+        condensed[sid] = {"label": label, "error": raw["error"]}
+        continue
+      observations = raw.get("observations", [])
+      valid = [o for o in observations if o.get("value") not in (".", "", None)]
+      latest = _parse_float(valid[-1]["value"]) if valid else None
+      three_mo = _parse_float(valid[-4]["value"]) if len(valid) >= 4 else None
+      one_yr = _parse_float(valid[-13]["value"]) if len(valid) >= 13 else None
+
+      entry = {"label": label, "current_bps": latest, "as_of": _get_observation_date(observations)}
+      if three_mo is not None and latest is not None:
+        entry["3m_change_bps"] = round((latest - three_mo) * 100, 1)
+      if one_yr is not None and latest is not None:
+        entry["1y_change_bps"] = round((latest - one_yr) * 100, 1)
+      condensed[sid] = entry
+
+    envelope = build_envelope(condensed, "credit_spreads", "get_credit_spreads",
+                              api_calls_made=len(CREDIT_SPREAD_SERIES), errors=errors)
     return [TextContent(type="text", text=safe_json_dumps(envelope))]
 
   async def get_fred_series(self, series_id: str, start: Optional[str] = None,
