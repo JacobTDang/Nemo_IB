@@ -16,7 +16,6 @@ class MCPConnectionManager:
   """
   def __init__(self):
       self.web_client = None
-      self.web_client_connection = None
       self.web_session = None
 
       self.financial_client = None
@@ -24,6 +23,9 @@ class MCPConnectionManager:
 
       self.finnhub_client = None
       self.finnhub_session = None
+
+      self.fred_client = None
+      self.fred_session = None
 
       # Maps server_name -> ClientSession
       self._sessions: Dict[str, ClientSession] = {}
@@ -54,7 +56,7 @@ class MCPConnectionManager:
       env_with_path['PYTHONUNBUFFERED'] = '1'
       return env_with_path
 
-  async def connect_to_servers(self, servers=['web', 'financial', 'finnhub']):
+  async def connect_to_servers(self, servers=['web', 'financial', 'finnhub', 'fred']):
       """
       Connect to specified MCP servers and build tool registry.
 
@@ -72,8 +74,8 @@ class MCPConnectionManager:
                   env=env
               )
               self.web_client = stdio_client(web_params)
-              self.web_client_connection = await self.web_client.__aenter__()
-              self.web_session = ClientSession(*self.web_client_connection)
+              web_connection = await self.web_client.__aenter__()
+              self.web_session = ClientSession(*web_connection)
               await self.web_session.__aenter__()
               await self.web_session.initialize()
               self._sessions['web'] = self.web_session
@@ -109,6 +111,21 @@ class MCPConnectionManager:
               self._sessions['finnhub'] = self.finnhub_session
               print("Connected to Finnhub Market Intel Server", file=sys.stderr, flush=True)
 
+          # FRED Macro Data Server
+          if 'fred' in servers:
+              fred_params = StdioServerParameters(
+                  command=sys.executable,
+                  args=["-m", "tools.news_agregator.fred_server", "server"],
+                  env=env
+              )
+              self.fred_client = stdio_client(fred_params)
+              fred_connection = await self.fred_client.__aenter__()
+              self.fred_session = ClientSession(*fred_connection)
+              await self.fred_session.__aenter__()
+              await self.fred_session.initialize()
+              self._sessions['fred'] = self.fred_session
+              print("Connected to FRED Macro Data Server", file=sys.stderr, flush=True)
+
       except Exception as e:
           print(f"Unable to start servers: {str(e)}", file=sys.stderr, flush=True)
           import traceback
@@ -140,6 +157,7 @@ class MCPConnectionManager:
           ("web", self.web_session, self.web_client),
           ("financial", self.financial_session, self.financial_client),
           ("finnhub", self.finnhub_session, self.finnhub_client),
+          ("fred", self.fred_session, self.fred_client),
       ]
 
       for name, session, client in servers:
