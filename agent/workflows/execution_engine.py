@@ -86,6 +86,9 @@ _WACC_ARG_TEMPLATE: Dict[str, Any] = {
   'total_debt':           0,
 }
 
+# Cap concurrent MCP API calls. Finnhub free tier 429s above ~5 req/sec.
+_MCP_SEMAPHORE = asyncio.Semaphore(4)
+
 # Maps tool argument names to variable store keys when they differ
 ARGUMENT_ALIASES = {
   'ebitda_margin': 'ebitda_margin_percent',
@@ -177,6 +180,19 @@ def _flatten_market_intel(variables: Dict[str, Any], tool_name: str, data: Dict[
       if key in data and data[key] is not None:
         variables[f"insider_sentiment.{key}"] = data[key]
         variables[f"insider_mspr_{key}"] = data[key]
+
+  elif tool_name == 'get_financial_statements':
+    # data is already unwrapped by _process_market_intel (envelope stripped)
+    # Shape: {"statement": "cf", "freq": "annual", "periods": [{...}, ...]}
+    stmt = data.get('statement', '')
+    periods = data.get('periods', [])
+    if stmt == 'cf' and periods and isinstance(periods, list):
+      latest = periods[0]  # most recent annual period
+      for field in ('dividendsPaid', 'repurchaseOfCapitalStock', 'operatingCashFlow',
+                    'capitalExpenditures', 'freeCashFlow'):
+        if field in latest and latest[field] is not None:
+          variables[f"cf.{field}"] = latest[field]
+          variables[field] = latest[field]
 
 
 def _flatten_news_analysis(variables: Dict[str, Any], tool_name: str, analysis: Dict[str, Any]):
@@ -410,6 +426,7 @@ async def _call_single_tool(
   mcp: MCPConnectionManager,
   cache: Session_Cache,
   variables: Dict[str, Any],
+  semaphore: asyncio.Semaphore = None,
 ) -> tuple:
   """Execute one tool and return (tool_name, arguments, tool_result)."""
   tool_name = tool['tool']
@@ -441,11 +458,13 @@ async def _call_single_tool(
       else:
         print(f"  [CACHE SKIP] {tool_name}: cached result was an error, retrying fresh...", flush=True)
 
-  try:
-    tool_result = await mcp.call_tool(tool_name, arguments)
-  except RuntimeError as e:
-    print(f"  [SKIP] {e}", flush=True)
-    return tool_name, arguments, {"error": str(e)}
+  _sem = semaphore or _MCP_SEMAPHORE
+  async with _sem:
+    try:
+      tool_result = await mcp.call_tool(tool_name, arguments)
+    except RuntimeError as e:
+      print(f"  [SKIP] {e}", flush=True)
+      return tool_name, arguments, {"error": str(e)}
 
   _result_inner = tool_result.get('data', tool_result) if isinstance(tool_result, dict) else tool_result
   _result_errored = isinstance(tool_result, dict) and (
@@ -532,7 +551,8 @@ async def run_tools(
   if parallel_batch:
     print(f"[Parallel] Launching {len(parallel_batch)} tools concurrently...", flush=True)
     coros = [
-      _call_single_tool(tool, f"[P{i+1}/{len(parallel_batch)}]", mcp, cache, variables)
+      _call_single_tool(tool, f"[P{i+1}/{len(parallel_batch)}]", mcp, cache, variables,
+                        semaphore=_MCP_SEMAPHORE)
       for i, tool in enumerate(parallel_batch)
     ]
     parallel_results = await asyncio.gather(*coros, return_exceptions=True)
