@@ -1,7 +1,18 @@
-from openai import OpenAI, APIError, RateLimitError, APIConnectionError, APITimeoutError
+from openai import OpenAI, APIError, AuthenticationError, RateLimitError, APIConnectionError, APITimeoutError
 import httpx
 import os, sys, json, re, time
+
+def _strip_non_ascii(text: str) -> str:
+  """Remove non-ASCII characters from a streaming chunk before printing.
+  Same logic as Financial_Analysis_Agent._strip_unicode_artifacts but applied
+  per-chunk so the terminal output is clean even before the full response is assembled."""
+  return re.sub(r'[^\x00-\x7F]+', '', text)
 from dotenv import load_dotenv
+try:
+  from ollama import chat as ollama_chat
+  _OLLAMA_AVAILABLE = True
+except ImportError:
+  _OLLAMA_AVAILABLE = False
 
 # Fix Windows console encoding — always use 'replace' to handle emojis/unicode
 if hasattr(sys.stdout, 'reconfigure'):
@@ -23,14 +34,18 @@ class OpenRouterModel:
   RETRY_BASE_DELAY = 1  # seconds — OpenRouter allows 120 req/min, no need to wait long
   CLIENT_TIMEOUT = 120.0  # 2 minutes — enough for streaming; drops are connection errors not timeouts
   FALLBACK_MODEL = 'z-ai/glm-4.5-air:free'
+  OLLAMA_FALLBACK_MODEL = 'llama3.1:8b'
   MAX_OUTPUT_TOKENS = 2048  # Subclasses can override (e.g., verifier needs more room after thinking)
   REASONING_EFFORT = "low"  # Subclasses can set to None to disable reasoning (e.g., orchestrator just needs JSON)
 
   def __init__(self, model_name: str = 'deepseek/deepseek-r1-0528:free', api_key_env: str = "OPENROUTER_API_KEY"):
     load_dotenv()
-    api_key = os.getenv(api_key_env)
+    # Try the requested env var first, then fall back to the main key.
+    # This means a single OPENROUTER_API_KEY is always enough to run the system --
+    # model-specific keys (OPENROUTER_NEMOTRON, OPENROUTER_GLM) are optional extras.
+    api_key = os.getenv(api_key_env) or os.getenv("OPENROUTER_API_KEY")
     if not api_key:
-      raise ValueError(f"{api_key_env} not found in environment. Add it to your .env file.")
+      raise ValueError(f"No API key found. Set OPENROUTER_API_KEY (or {api_key_env}) in your .env file.")
     self.client = OpenAI(
       api_key=api_key,
       base_url="https://openrouter.ai/api/v1",
@@ -39,16 +54,14 @@ class OpenRouterModel:
     self.model_name = model_name
     self.conversatoin_history = []
 
-    # Fallback client uses a separate API key for GLM-4.5-Air
-    fallback_key = os.getenv("OPENROUTER_GLM")
-    if fallback_key:
-      self.fallback_client = OpenAI(
-        api_key=fallback_key,
-        base_url="https://openrouter.ai/api/v1",
-        timeout=self.CLIENT_TIMEOUT
-      )
-    else:
-      self.fallback_client = None
+    # Fallback client: prefer OPENROUTER_GLM, otherwise reuse the main key.
+    # Reusing the main key is fine -- fallback only triggers if primary model fails.
+    fallback_key = os.getenv("OPENROUTER_GLM") or api_key
+    self.fallback_client = OpenAI(
+      api_key=fallback_key,
+      base_url="https://openrouter.ai/api/v1",
+      timeout=self.CLIENT_TIMEOUT
+    )
 
   @staticmethod
   def _strip_thinking(text: str) -> str:
@@ -143,12 +156,16 @@ class OpenRouterModel:
               print("\n[Output]", file=sys.stderr, flush=True)
               thinking_started = False
             assistant_response += delta.content
-            print(delta.content, end='', flush=True)
+            print(_strip_non_ascii(delta.content), end='', flush=True)
         return assistant_response
 
-      except (RateLimitError, APIConnectionError, APITimeoutError, APIError, httpx.ReadError, httpx.RemoteProtocolError) as e:
+      except (AuthenticationError, RateLimitError, APIConnectionError, APITimeoutError, APIError, httpx.ReadError, httpx.RemoteProtocolError) as e:
         last_error = e
         error_type = type(e).__name__
+        # 401 auth errors will never recover with retries -- skip straight to fallback
+        if isinstance(e, AuthenticationError):
+          print(f"\n[Auth error] {e}. Skipping retries, switching to fallback.", file=sys.stderr, flush=True)
+          break
         # If we got thinking or content before the drop, retrying the same model
         # will likely produce the same result. Skip to fallback immediately.
         if assistant_response or thinking_started:
@@ -193,12 +210,12 @@ class OpenRouterModel:
                 print("\n[Fallback Output]", file=sys.stderr, flush=True)
                 thinking_started = False
               assistant_response += delta.content
-              print(delta.content, end='', flush=True)
+              print(_strip_non_ascii(delta.content), end='', flush=True)
           return assistant_response
 
-        except (RateLimitError, APIConnectionError, APITimeoutError, APIError, httpx.ReadError, httpx.RemoteProtocolError) as e:
+        except (AuthenticationError, RateLimitError, APIConnectionError, APITimeoutError, APIError, httpx.ReadError, httpx.RemoteProtocolError) as e:
           last_error = e
-          if attempt == self.MAX_RETRIES:
+          if isinstance(e, AuthenticationError) or attempt == self.MAX_RETRIES:
             break
           delay = self.RETRY_BASE_DELAY * (2 ** (attempt - 1))
           error_type = type(e).__name__
@@ -206,13 +223,58 @@ class OpenRouterModel:
                 f"Retrying in {delay}s...", file=sys.stderr, flush=True)
           time.sleep(delay)
 
+    # Both OpenRouter tiers exhausted -- try local Ollama as last resort
+    if _OLLAMA_AVAILABLE:
+      print(f"\n[Ollama fallback] OpenRouter unavailable. Trying local {self.OLLAMA_FALLBACK_MODEL}...",
+            file=sys.stderr, flush=True)
+      try:
+        ollama_kwargs = {
+          'model': self.OLLAMA_FALLBACK_MODEL,
+          'messages': kwargs['messages'],
+          'stream': True,
+          'keep_alive': 0,
+          'options': {'num_gpu': -1, 'gpu_memory_utilization': 0.9},
+        }
+        # Pass structured output schema if one is set
+        active_schema = self.response_schema
+        if active_schema:
+          ollama_kwargs['format'] = active_schema.model_json_schema()
+        assistant_response = ""
+        stream = ollama_chat(**ollama_kwargs)
+        for chunk in stream:
+          content = chunk['message']['content']
+          assistant_response += content
+          print(_strip_non_ascii(content), end='', flush=True)
+        return assistant_response
+      except Exception as ollama_error:
+        print(f"\n[Ollama fallback] Failed: {ollama_error}", file=sys.stderr, flush=True)
+
     raise last_error
 
   def parse_response(self, response: str, schema=None):
-    """Parse a response using the active schema. Returns a validated Pydantic model instance."""
+    """Parse a response using the active schema. Returns a validated Pydantic model instance.
+
+    Applies several repair passes before validation to handle common LLM JSON defects:
+    - Non-ASCII bleed (CJK, Cyrillic, Arabic characters mid-output)
+    - Trailing commas before ] or } (invalid in strict JSON)
+    - JSON embedded in prose or markdown code fences
+    """
     active_schema = schema or self.response_schema
     if not active_schema:
       raise ValueError("No schema set. Set response_schema on the class or pass schema= argument.")
-    # Strip thinking tags in case they weren't already removed
+
+    # 1. Strip thinking tags
     clean = self._strip_thinking(response)
+
+    # 2. Strip non-ASCII artifacts (CJK, Cyrillic, Arabic, etc. that bleed from multilingual models)
+    clean = re.sub(r'[^\x00-\x7F]+', '', clean)
+
+    # 3. Fix trailing commas before closing brackets/braces (e.g. ["a", "b",] -> ["a", "b"])
+    clean = re.sub(r',(\s*[}\]])', r'\1', clean)
+
+    # 4. Extract the first complete JSON object in case the response has surrounding prose
+    json_match = re.search(r'\{.*\}', clean, re.DOTALL)
+    if json_match:
+      clean = json_match.group(0)
+
     return active_schema.model_validate_json(clean)

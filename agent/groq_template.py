@@ -1,4 +1,5 @@
-from openai import OpenAI, APIError, RateLimitError, APIConnectionError, APITimeoutError
+from openai import OpenAI, APIError, APIStatusError, RateLimitError, APIConnectionError, APITimeoutError
+from ollama import chat as ollama_chat
 import httpx
 import os, sys, json, re, time
 from dotenv import load_dotenv
@@ -17,8 +18,9 @@ class GroqModel:
   Subclasses set response_schema to a Pydantic BaseModel for structured JSON output.
   Uses Groq's chat completions API with streaming.
 
-  Primary: deepseek-r1-distill-llama-70b (reasoning model, outputs <think> tags)
-  Fallback: llama-3.3-70b-versatile (fast, no reasoning overhead)
+  Primary: llama-3.3-70b-versatile (fast, reliable)
+  Fallback: qwen/qwen3-32b (Groq alternate)
+  Last resort: Ollama local (llama3.1:8b) when Groq is rate-limited
   """
   response_schema = None
 
@@ -26,6 +28,7 @@ class GroqModel:
   RETRY_BASE_DELAY = 2  # seconds — Groq free tier: 30 req/min, need slightly longer backoff
   CLIENT_TIMEOUT = 120.0
   FALLBACK_MODEL = 'qwen/qwen3-32b'
+  OLLAMA_FALLBACK_MODEL = 'llama3.1:8b'  # Local last-resort when Groq is rate-limited
   MAX_OUTPUT_TOKENS = 2048
   REASONING_EFFORT = None  # Groq doesn't support reasoning effort param; R1 reasons via <think> tags
 
@@ -88,9 +91,8 @@ class GroqModel:
     return self._strip_thinking(assistant_response)
 
   def _stream_with_retry(self, kwargs: dict) -> str:
-    """Stream a chat completion with exponential backoff retry on transient errors.
-    Tries primary model first, then falls back to Llama 3.3 70B.
-    Same client (same API key) for both — just swaps model name."""
+    """Stream with 3-tier fallback: Groq primary -> Groq fallback -> Ollama local.
+    Exponential backoff retry on each tier. Ollama is last resort for rate limiting."""
     last_error = None
 
     # Try primary model
@@ -142,6 +144,10 @@ class GroqModel:
       except (RateLimitError, APIConnectionError, APITimeoutError, APIError, httpx.ReadError, httpx.RemoteProtocolError) as e:
         last_error = e
         error_type = type(e).__name__
+        # 413 = request too large for Groq TPM limit — no Groq model will handle it
+        if isinstance(e, APIStatusError) and e.status_code == 413:
+          print(f"\n[Request too large for Groq] {e}. Skipping to Ollama.", file=sys.stderr, flush=True)
+          break  # Falls through Groq fallback to Ollama
         # Partial stream: skip retries, go to fallback
         if assistant_response or thinking_started:
           print(f"\n[Partial stream drop] {error_type} after receiving content. "
@@ -155,34 +161,71 @@ class GroqModel:
         time.sleep(delay)
 
     # Primary exhausted — try fallback (same client, different model)
-    print(f"\n[Fallback] Primary model failed after {self.MAX_RETRIES} attempts. "
-          f"Switching to {self.FALLBACK_MODEL}...", file=sys.stderr, flush=True)
-    fallback_kwargs = {**kwargs, "model": self.FALLBACK_MODEL}
+    # Skip Groq fallback entirely if request is too large for any Groq model
+    _skip_groq_fallback = isinstance(last_error, APIStatusError) and last_error.status_code == 413
+    if not _skip_groq_fallback:
+      print(f"\n[Fallback] Primary model failed after {self.MAX_RETRIES} attempts. "
+            f"Switching to {self.FALLBACK_MODEL}...", file=sys.stderr, flush=True)
+      fallback_kwargs = {**kwargs, "model": self.FALLBACK_MODEL}
 
-    for attempt in range(1, self.MAX_RETRIES + 1):
-      try:
-        assistant_response = ""
-        stream = self.client.chat.completions.create(**fallback_kwargs)
-        for chunk in stream:
-          delta = chunk.choices[0].delta if chunk.choices else None
-          if not delta:
-            continue
-          if delta.content:
-            assistant_response += delta.content
-            print(delta.content, end='', flush=True)
-        return assistant_response
+      for attempt in range(1, self.MAX_RETRIES + 1):
+        try:
+          assistant_response = ""
+          stream = self.client.chat.completions.create(**fallback_kwargs)
+          for chunk in stream:
+            delta = chunk.choices[0].delta if chunk.choices else None
+            if not delta:
+              continue
+            if delta.content:
+              assistant_response += delta.content
+              print(delta.content, end='', flush=True)
+          return assistant_response
 
-      except (RateLimitError, APIConnectionError, APITimeoutError, APIError, httpx.ReadError, httpx.RemoteProtocolError) as e:
-        last_error = e
-        if attempt == self.MAX_RETRIES:
-          break
-        delay = self.RETRY_BASE_DELAY * (2 ** (attempt - 1))
-        error_type = type(e).__name__
-        print(f"\n[Fallback retry {attempt}/{self.MAX_RETRIES}] {error_type}: {e}. "
-              f"Retrying in {delay}s...", file=sys.stderr, flush=True)
-        time.sleep(delay)
+        except (RateLimitError, APIConnectionError, APITimeoutError, APIError, httpx.ReadError, httpx.RemoteProtocolError) as e:
+          last_error = e
+          if attempt == self.MAX_RETRIES:
+            break
+          delay = self.RETRY_BASE_DELAY * (2 ** (attempt - 1))
+          error_type = type(e).__name__
+          print(f"\n[Fallback retry {attempt}/{self.MAX_RETRIES}] {error_type}: {e}. "
+                f"Retrying in {delay}s...", file=sys.stderr, flush=True)
+          time.sleep(delay)
 
-    raise last_error
+    # Both Groq models exhausted — try Ollama local as last resort
+    print(f"\n[Ollama Fallback] Groq exhausted. Trying local {self.OLLAMA_FALLBACK_MODEL}...",
+          file=sys.stderr, flush=True)
+    try:
+      # Convert OpenAI-format kwargs to Ollama format
+      ollama_kwargs = {
+        'model': self.OLLAMA_FALLBACK_MODEL,
+        'messages': kwargs['messages'],
+        'stream': True,
+        'keep_alive': 0,
+        'options': {
+          'num_gpu': -1,
+          'gpu_memory_utilization': 0.9,
+        }
+      }
+
+      # Ollama uses 'format' with the raw JSON schema dict, not response_format
+      if 'response_format' in kwargs:
+        active_schema = self.response_schema
+        if active_schema:
+          ollama_kwargs['format'] = active_schema.model_json_schema()
+
+      assistant_response = ""
+      stream = ollama_chat(**ollama_kwargs)
+      for chunk in stream:
+        content = chunk['message']['content']
+        assistant_response += content
+        print(content, end='', flush=True)
+      return assistant_response
+
+    except Exception as ollama_error:
+      print(f"\n[Ollama Fallback Failed] {type(ollama_error).__name__}: {ollama_error}",
+            file=sys.stderr, flush=True)
+      # Raise the original Groq error — Ollama is just a bonus attempt
+      raise last_error
 
   def parse_response(self, response: str, schema=None):
     """Parse a response using the active schema. Returns a validated Pydantic model instance."""
