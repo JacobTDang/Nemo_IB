@@ -1,1 +1,1 @@
-from .llama3_1_8B import FinancialAnalysisAgent
+from .News_Processing_Agent import News_Processing_Agent
