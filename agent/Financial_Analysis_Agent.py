@@ -16,7 +16,7 @@ class Financial_Analysis_Agent(OpenRouterModel):
     - Macro factors (interest rates, economic growth, regulation)
     - Risk factors (business, financial, market risks)
     """
-    MAX_OUTPUT_TOKENS = 4096  # R1 needs room for thinking + actual analysis output
+    MAX_OUTPUT_TOKENS = 8192  # R1 thinking + full analysis; also reduces stream drops by finishing faster
 
     def __init__(self, model_name: str = 'deepseek/deepseek-r1-0528:free'):
         super().__init__(model_name=model_name)
@@ -26,7 +26,11 @@ class Financial_Analysis_Agent(OpenRouterModel):
                 execution_plan: Dict[str, Any],
                 tools_results: List[Dict[str, Any]],
                 analytical_considerations: Optional[List[Dict[str, str]]] = None,
-                variables: Optional[Dict[str, Any]] = None) -> str:
+                variables: Optional[Dict[str, Any]] = None,
+                previous_analysis: Optional[str] = None,
+                revision_feedback: Optional[str] = None,
+                data_gaps: Optional[List[Dict[str, Any]]] = None,
+                model_outputs: Optional[Dict[str, Any]] = None) -> str:
         """
         Generate comprehensive financial analysis based on gathered data.
 
@@ -50,7 +54,11 @@ class Financial_Analysis_Agent(OpenRouterModel):
             execution_plan,
             tools_results,
             analytical_considerations,
-            variables or {}
+            variables or {},
+            previous_analysis=previous_analysis,
+            revision_feedback=revision_feedback,
+            data_gaps=data_gaps,
+            model_outputs=model_outputs
         )
 
         print(f"\n{'='*60}", file=sys.stderr, flush=True)
@@ -64,7 +72,24 @@ class Financial_Analysis_Agent(OpenRouterModel):
             system_prompt=system_prompt
         )
 
-        return analysis
+        return self._strip_unicode_artifacts(analysis)
+
+    @staticmethod
+    def _strip_unicode_artifacts(text: str) -> str:
+        """Remove non-ASCII characters that DeepSeek and other multilingual models
+        occasionally bleed into English output (CJK, Cyrillic, Arabic, etc.).
+
+        Examples of artifacts this fixes:
+          "9цами.64%"  ->  "9.64%"
+          "للحالة"     ->  "" (whole garbled section header removed)
+          "ンダ発売"    ->  ""
+        """
+        import re
+        # Drop every non-ASCII character
+        cleaned = re.sub(r'[^\x00-\x7F]+', '', text)
+        # Collapse multiple spaces left behind by removed runs
+        cleaned = re.sub(r'  +', ' ', cleaned)
+        return cleaned
 
     def _build_system_prompt(self) -> str:
         """Build specialized system prompt for financial analysis"""
@@ -113,11 +138,27 @@ CRITICAL ANALYSIS FRAMEWORK:
    - Regulatory environment
    - Geopolitical considerations
 
-   VALUATION FACTORS:
-   - Intrinsic value vs market price
-   - Multiple methodologies (DCF, comps, precedents)
-   - Key assumptions and their sensitivities
-   - Risk-adjusted returns
+   VALUATION FACTORS — METHODOLOGY HIERARCHY:
+   PRIMARY SIGNALS (drive the conclusion):
+   - Relative valuation: P/E vs peers and sector, EV/EBITDA vs peers, PEG ratio
+   - Analyst consensus: direction, conviction, and recent trend changes
+   - Price momentum: 52-week range positioning, recent trend
+   - Insider activity: net buying/selling, insider sentiment MSPR score
+   - Forward estimates: consensus EPS/Revenue growth expectations
+
+   SECONDARY SIGNALS (context and confirmation):
+   - Macro environment: rate environment impact on multiples, sector tailwinds/headwinds
+   - News sentiment: recent catalysts, management guidance, material events
+   - Quality indicators: ROIC vs WACC, FCF conversion, balance sheet health
+
+   DCF — STRESS TEST ONLY (never the primary conclusion driver):
+   - DCF shows what growth rate the CURRENT PRICE implies, not what the price "should be"
+   - A large DCF-to-market gap on a high-quality business (strong ROIC, low PEG, analyst buy) means
+     REVISIT TERMINAL ASSUMPTIONS first, not call overvaluation
+   - DCF is one data point among many — do not anchor your conclusion on it alone
+   - Always contextualize: "DCF implies X% growth embedded in price vs consensus of Y%"
+   - If DCF is significantly below market but: analysts are bullish, earnings beats are consistent,
+     and ROIC > WACC — the market is pricing in growth the DCF assumptions don't capture
 
    RISK FACTORS:
    - Business risks (execution, competition, disruption)
@@ -149,6 +190,8 @@ OUTPUT REQUIREMENTS:
 - State assumptions explicitly with label "ASSUMPTION:" and justification
 - List data gaps and how they affect your confidence
 - End with a clear, actionable conclusion
+- For DCF: always frame as "DCF implies X% embedded growth vs Y% consensus" NOT as a target price verdict
+- Conclusion must weigh ALL signals: relative valuation, analyst consensus, momentum, quality, then DCF context
 
 CRITICAL RULES - VIOLATIONS ARE UNACCEPTABLE:
 1. NEVER invent or hallucinate numbers - use ONLY data provided in the prompt
@@ -165,12 +208,20 @@ COMMON MISTAKES TO AVOID:
 - Referencing outdated years when data shows a different fiscal period
 - Providing valuations without showing the calculation steps
 - Ignoring the actual data and generating generic analysis
+- Treating DCF as the primary or dominant valuation signal — it is a STRESS TEST
+- Recommending SHORT on a quality business solely because DCF < market price
+  (market prices in growth that DCF conservative assumptions miss; that is not overvaluation)
+- Ignoring analyst consensus, PEG, and earnings beat rate when DCF disagrees with market
+- Giving a definitive BUY/SELL on the basis of DCF alone without referencing relative valuation
 """
 
         return prompt
 
     def _format_variable(self, key: str, value: Any) -> str:
         """Format a single variable for display. Handles numbers, strings, dicts, lists."""
+        if isinstance(value, bool):
+            # Must check bool before int/float — bool is a subclass of int in Python
+            return f"{key}: {value}"
         if isinstance(value, dict):
             # Nested result (e.g. DCF yearly projections) - compact JSON
             return f"{key}: {json.dumps(value, separators=(',', ':'), default=str)}"
@@ -286,6 +337,143 @@ COMMON MISTAKES TO AVOID:
 
             return "\n".join(lines) + "\n\n"
 
+        elif tool_name == 'get_earnings_surprises':
+            if not isinstance(data, dict):
+                return f"[EARNINGS SURPRISES] {data}\n\n"
+            lines = [
+                f"[EARNINGS SURPRISES] {data.get('total_periods', 0)} quarters | "
+                f"Beat rate: {data.get('beat_rate_pct', 'N/A')}% | "
+                f"Avg surprise: {data.get('avg_surprise_pct', 'N/A')}%"
+            ]
+            for q in data.get('quarters', [])[:8]:
+                result = q.get('result', '?').upper()
+                surprise = f"{q.get('surprise_pct', 0):+.1f}%" if 'surprise_pct' in q else ''
+                lines.append(f"  {q.get('period', '')} Q{q.get('quarter', '')}: "
+                             f"Actual={q.get('actual_eps', 'N/A')} vs Est={q.get('estimate_eps', 'N/A')} "
+                             f"{surprise} [{result}]")
+            return "\n".join(lines) + "\n\n"
+
+        elif tool_name == 'get_forward_estimates':
+            if not isinstance(data, dict):
+                return f"[FORWARD ESTIMATES] {data}\n\n"
+            lines = ["[FORWARD CONSENSUS ESTIMATES]"]
+            for label, unit_note in [('eps', 'USD/share'), ('revenue_B', 'USD B'), ('ebitda_B', 'USD B')]:
+                section = data.get(label, {})
+                if 'error' in section:
+                    continue
+                lines.append(f"  {label.replace('_B', '').upper()} ({unit_note}):")
+                for p in section.get('periods', [])[:4]:
+                    avg = p.get('avg', 'N/A')
+                    high = p.get('high', '')
+                    low = p.get('low', '')
+                    n = p.get('analysts', '')
+                    range_str = f" (range: {low}-{high})" if low and high else ''
+                    analysts_str = f" [{n} analysts]" if n else ''
+                    lines.append(f"    {p.get('period', '')}: {avg}{range_str}{analysts_str}")
+            return "\n".join(lines) + "\n\n"
+
+        elif tool_name == 'get_price_target':
+            if not isinstance(data, dict):
+                return f"[PRICE TARGET] {data}\n\n"
+            mean = data.get('targetMean', 'N/A')
+            median = data.get('targetMedian', 'N/A')
+            high = data.get('targetHigh', 'N/A')
+            low = data.get('targetLow', 'N/A')
+            n = data.get('numberOfAnalysts', 'N/A')
+            updated = data.get('lastUpdated', '')
+            lines = [
+                f"[PRICE TARGET] Mean: ${mean} | Median: ${median} | "
+                f"Range: ${low}-${high} | {n} analysts | Updated: {updated}"
+            ]
+            return "\n".join(lines) + "\n\n"
+
+        elif tool_name == 'get_financial_statements':
+            if not isinstance(data, dict):
+                return f"[FINANCIAL STATEMENTS] {data}\n\n"
+            stmt = data.get('statement', '?').upper()
+            freq = data.get('freq', '')
+            periods = data.get('periods', [])
+            lines = [f"[FINANCIAL STATEMENTS - {stmt} {freq.upper()}] {len(periods)} periods"]
+            for p in periods[:5]:
+                period_label = p.get('period', p.get('endDate', '?'))
+                fields = {k: v for k, v in p.items() if k != 'period' and v is not None}
+                # Format large numbers in billions
+                formatted = []
+                for k, v in list(fields.items())[:10]:
+                    if isinstance(v, (int, float)) and abs(v) >= 1e6:
+                        formatted.append(f"{k}: ${v/1e9:.2f}B")
+                    else:
+                        formatted.append(f"{k}: {v}")
+                lines.append(f"  {period_label}: {' | '.join(formatted)}")
+            return "\n".join(lines) + "\n\n"
+
+        elif tool_name == 'get_company_profile':
+            if not isinstance(data, dict):
+                return f"[COMPANY PROFILE] {data}\n\n"
+            name = data.get('name', 'N/A')
+            industry = data.get('finnhubIndustry', data.get('gics', 'N/A'))
+            country = data.get('country', 'N/A')
+            employees = data.get('employeeTotal', 'N/A')
+            ipo = data.get('ipo', 'N/A')
+            lines = [
+                f"[COMPANY PROFILE] {name} | Industry: {industry} | Country: {country}",
+                f"  Employees: {employees} | IPO: {ipo}",
+            ]
+            return "\n".join(lines) + "\n\n"
+
+        elif tool_name == 'get_upgrade_downgrades':
+            if not isinstance(data, dict):
+                return f"[ANALYST RATING CHANGES] {data}\n\n"
+            upgrades = data.get('upgrade_count', 0)
+            downgrades = data.get('downgrade_count', 0)
+            initiations = data.get('initiation_count', 0)
+            events = data.get('events', [])
+            lines = [
+                f"[ANALYST RATING CHANGES] Upgrades: {upgrades} | Downgrades: {downgrades} | Initiations: {initiations}"
+            ]
+            for ev in events[:10]:
+                date = ev.get('date', '')
+                firm = ev.get('firm', 'Unknown')
+                action = ev.get('action', '').title()
+                from_g = ev.get('from', '')
+                to_g = ev.get('to', '')
+                if from_g and to_g:
+                    lines.append(f"  {date} | {firm}: {action} ({from_g} -> {to_g})")
+                else:
+                    lines.append(f"  {date} | {firm}: {action}")
+            return "\n".join(lines) + "\n\n"
+
+        elif tool_name == 'get_insider_sentiment':
+            if not isinstance(data, dict):
+                return f"[INSIDER SENTIMENT (MSPR)] {data}\n\n"
+            signal = data.get('signal', 'neutral').upper()
+            avg_mspr = data.get('avg_mspr')
+            months = data.get('months', [])
+            lines = [f"[INSIDER SENTIMENT (MSPR)] Signal: {signal} | Avg MSPR (6M): {avg_mspr}"]
+            if months:
+                month_parts = []
+                for m in months[:6]:
+                    mspr = m.get('mspr')
+                    if mspr is not None:
+                        month_parts.append(f"{m.get('year')}-{m.get('month', 0):02d}:{mspr:+.3f}")
+                if month_parts:
+                    lines.append(f"  Monthly: {' | '.join(month_parts)}")
+            return "\n".join(lines) + "\n\n"
+
+        elif tool_name == 'get_sector_metrics':
+            # data may be a dict or list after flattening
+            entry = data if isinstance(data, dict) else (data[0] if isinstance(data, list) and data else {})
+            if not entry:
+                return f"[SECTOR METRICS] No data\n\n"
+            sector = entry.get('sector', 'Sector')
+            parts = []
+            for key, label in [('pe', 'P/E'), ('pb', 'P/B'), ('pc', 'P/C'),
+                                ('pfcf', 'P/FCF'), ('dividendYield', 'Div Yield')]:
+                val = entry.get(key)
+                if val is not None:
+                    parts.append(f"{label}: {val:.2f}")
+            return f"[SECTOR METRICS: {sector}] {' | '.join(parts)}\n\n"
+
         else:
             return f"[{tool_name.upper()}] {json.dumps(data, indent=1, default=str)[:500]}\n\n"
 
@@ -358,6 +546,25 @@ COMMON MISTAKES TO AVOID:
                 lines.append(f"  Spreads: {', '.join(spread_parts)}")
             return "\n".join(lines) + "\n\n"
 
+        elif tool_name == 'get_credit_spreads':
+            if not isinstance(data, dict):
+                return f"[CREDIT SPREADS] {data}\n\n"
+            lines = ["[CREDIT SPREADS (OAS in bps)]"]
+            for sid, entry in data.items():
+                if not isinstance(entry, dict):
+                    continue
+                label = entry.get('label', sid)
+                bps = entry.get('current_bps', 'N/A')
+                chg_3m = entry.get('3m_change_bps')
+                chg_1y = entry.get('1y_change_bps')
+                parts = [f"  {label}: {bps}bps"]
+                if chg_3m is not None:
+                    parts.append(f"3M: {chg_3m:+.1f}bps")
+                if chg_1y is not None:
+                    parts.append(f"1Y: {chg_1y:+.1f}bps")
+                lines.append(' | '.join(parts))
+            return "\n".join(lines) + "\n\n"
+
         elif tool_name == 'get_fred_series':
             if not isinstance(data, dict):
                 return f"[FRED SERIES] {data}\n\n"
@@ -419,12 +626,74 @@ COMMON MISTAKES TO AVOID:
         else:
             return f"[{source_label.upper()}] Unrecognized news format\n\n"
 
+    def _format_model_outputs(self, model_outputs: Dict[str, Any]) -> str:
+        """Format Financial_Modeling_Agent results as a labeled prompt section."""
+        models_run = model_outputs.get('models_run', [])
+        if not models_run:
+            return ""
+
+        lines = ["--- FINANCIAL MODELING OUTPUTS (Python math, verified calculations) ---\n"]
+
+        if 'scenario_dcf' in model_outputs:
+            s = model_outputs['scenario_dcf']
+            pr = s.get('price_range', {})
+            assumptions = s.get('scenario_assumptions', {})
+            lines.append("SCENARIO DCF (5-year FCF, three-case):")
+            lines.append(f"  Bear (low growth / margin compression): ${pr.get('low', 0):.2f}/share")
+            lines.append(f"  Base (consensus anchored):              ${pr.get('mid', 0):.2f}/share")
+            lines.append(f"  Bull (strong growth / margin expansion): ${pr.get('high', 0):.2f}/share")
+            lines.append(f"  Price range: ${pr.get('low', 0):.2f} - ${pr.get('high', 0):.2f}")
+            if assumptions:
+                bg1 = assumptions.get('base_growth_y1', 0) * 100
+                bgl = assumptions.get('base_growth_long_run', 0) * 100
+                bma = assumptions.get('bear_margin_adj', 0) * 100
+                bua = assumptions.get('bull_margin_adj', 0) * 100
+                lines.append(f"  Base growth Y1={bg1:.1f}% -> long-run={bgl:.1f}% | "
+                              f"Bear margin adj={bma:.1f}pp | Bull margin adj={bua:+.1f}pp")
+            lines.append("")
+
+        if 'credit_profile' in model_outputs:
+            c = model_outputs['credit_profile']
+            lines.append("CREDIT PROFILE:")
+            lines.append(f"  Credit label: {c.get('credit_label', 'N/A')}")
+            lines.append(f"  Net Debt/EBITDA: {c.get('net_debt_ebitda', 0):.1f}x")
+            lines.append(f"  Interest Coverage (EBITDA/Interest): {c.get('interest_coverage', 0):.1f}x")
+            lines.append(f"  FCF Yield: {c.get('fcf_yield_pct', 0):.1f}%")
+            lines.append(f"  Net Debt: ${c.get('net_debt', 0)/1e9:.2f}B")
+            lines.append("")
+
+        if 'capital_returns' in model_outputs:
+            r = model_outputs['capital_returns']
+            lines.append("CAPITAL RETURNS (Shareholder Yield):")
+            lines.append(f"  FCF Yield: {r.get('fcf_yield_pct', 0):.1f}%")
+            lines.append(f"  Dividend Yield: {r.get('dividend_yield_pct', 0):.1f}%")
+            lines.append(f"  Buyback Yield: {r.get('buyback_yield_pct', 0):.1f}%")
+            lines.append(f"  Total Shareholder Yield: {r.get('total_shareholder_yield_pct', 0):.1f}%")
+            lines.append(f"  Payout Sustainability: {r.get('sustainability', 'N/A')}")
+            lines.append("")
+
+        if 'lbo' in model_outputs:
+            l = model_outputs['lbo']
+            lines.append("LBO ANALYSIS:")
+            lines.append(f"  Entry EV: ${l.get('entry_ev', 0)/1e9:.2f}B | Entry EBITDA multiple: {l.get('entry_ebitda_multiple', 0):.1f}x")
+            lines.append(f"  IRR: {l.get('irr_pct', 0):.1f}% | MOIC: {l.get('moic', 0):.2f}x")
+            lines.append(f"  Achieves 20%+ IRR: {l.get('achieves_20pct_irr', False)}")
+            lines.append(f"  Exit equity: ${l.get('exit_equity', 0)/1e9:.2f}B over {l.get('hold_years', 5)} years")
+            lines.append("")
+
+        lines.append("")
+        return "\n".join(lines)
+
     def _build_analysis_prompt(self,
                                user_query: str,
                                execution_plan: Dict[str, Any],
                                tools_results: List[Dict[str, Any]],
                                analytical_considerations: Optional[List[Dict[str, str]]] = None,
-                               variables: Dict[str, Any] = None) -> str:
+                               variables: Dict[str, Any] = None,
+                               previous_analysis: Optional[str] = None,
+                               revision_feedback: Optional[str] = None,
+                               data_gaps: Optional[List[Dict[str, Any]]] = None,
+                               model_outputs: Optional[Dict[str, Any]] = None) -> str:
         """Build the analysis prompt with all context.
 
         Uses the shared variable store as the primary data source.
@@ -444,29 +713,22 @@ COMMON MISTAKES TO AVOID:
         else:
             gathered_display = "(No structured data gathered)"
 
-        prompt = f"""
-################################################################################
-#                           CRITICAL INSTRUCTIONS                               #
-################################################################################
-
-TODAY'S DATE: {current_date}
-CURRENT YEAR: {datetime.now().year}
+        prompt = f"""TODAY'S DATE: {current_date}
 TICKER: {execution_plan.get('ticker', flat_vars.get('ticker', 'N/A'))}
+ALL PROJECTIONS START FROM {datetime.now().year}. USE ONLY DATA PROVIDED BELOW. DO NOT HALLUCINATE NUMBERS.
 
->>> THE CURRENT YEAR IS {datetime.now().year}. ALL PROJECTIONS START FROM {datetime.now().year}. <<<
->>> MANDATORY: USE ONLY THE DATA PROVIDED BELOW <<<
->>> DO NOT MAKE UP OR HALLUCINATE ANY NUMBERS <<<
->>> IF DATA IS MISSING, SAY "ASSUMPTION: [value]" <<<
-
-################################################################################
-#                         GATHERED DATA                                        #
-################################################################################
+--- GATHERED DATA ---
 
 {gathered_display}
 
-################################################################################
-#                           CLIENT REQUEST                                      #
-################################################################################
+"""
+
+        # Add financial modeling outputs (scenario DCF, credit profile, capital returns, LBO)
+        # These are Python-computed, verified calculations -- treat as primary quantitative inputs.
+        if model_outputs and model_outputs.get('models_run'):
+            prompt += self._format_model_outputs(model_outputs)
+
+        prompt += f"""--- CLIENT REQUEST ---
 
 {user_query}
 
@@ -474,11 +736,7 @@ TICKER: {execution_plan.get('ticker', flat_vars.get('ticker', 'N/A'))}
 
         # Add analytical guidance from probing phase
         if analytical_considerations:
-            prompt += f"""
-################################################################################
-#                    ANALYTICAL GUIDANCE                                        #
-################################################################################
-"""
+            prompt += "--- ANALYTICAL GUIDANCE ---\n\n"
             for idx, item in enumerate(analytical_considerations, 1):
                 if isinstance(item, dict):
                     prompt += f"{idx}. [{item.get('topic', 'General')}] {item.get('guidance', '')}\n"
@@ -487,16 +745,10 @@ TICKER: {execution_plan.get('ticker', flat_vars.get('ticker', 'N/A'))}
             prompt += "\n"
 
         # Add execution context
-        prompt += f"""
-################################################################################
-#                         ANALYSIS CONTEXT                                      #
-################################################################################
-Task Type: {execution_plan.get('task_type', 'N/A')}
-Current Date: {current_date}
-"""
-
+        prompt += f"--- ANALYSIS CONTEXT ---\n\nTask Type: {execution_plan.get('task_type', 'N/A')}\n"
         if 'reasoning' in execution_plan:
-            prompt += f"Data Gathering Strategy: {execution_plan['reasoning']}\n"
+            prompt += f"Strategy: {execution_plan['reasoning']}\n"
+        prompt += "\n"
 
         # Add tool results that contain nested data (lists, dicts) that
         # _flatten_result skips. These are full outputs like DCF projections,
@@ -508,19 +760,12 @@ Current Date: {current_date}
             data = result.get('data', {})
 
             if result_type in ('sec_data', 'financial_data') and isinstance(data, dict):
-                # Check if there's nested data that variables missed
                 nested = {k: v for k, v in data.items() if isinstance(v, (dict, list)) and v}
                 if nested:
                     detailed_parts.append(f"[{tool_name}] {json.dumps(nested, indent=1, default=str)}\n")
 
         if detailed_parts:
-            prompt += f"""
-################################################################################
-#                    DETAILED TOOL OUTPUT                                       #
-################################################################################
-
-{"".join(detailed_parts)}
-"""
+            prompt += f"--- DETAILED TOOL OUTPUT ---\n\n{''.join(detailed_parts)}\n"
 
         # Add market intelligence data (Finnhub: insider, analyst, peers, earnings, financials)
         intel_parts = []
@@ -540,34 +785,15 @@ Current Date: {current_date}
                 news_parts.append(self._format_news_summary(tool_name, result))
 
         if intel_parts:
-            prompt += f"""
-################################################################################
-#                    MARKET INTELLIGENCE                                       #
-################################################################################
-
-{"".join(intel_parts)}
-"""
+            prompt += f"--- MARKET INTELLIGENCE ---\n\n{''.join(intel_parts)}\n"
 
         if macro_parts:
-            prompt += f"""
-################################################################################
-#                    MACRO ENVIRONMENT                                        #
-################################################################################
-
-{"".join(macro_parts)}
-"""
+            prompt += f"--- MACRO ENVIRONMENT ---\n\n{''.join(macro_parts)}\n"
 
         if news_parts:
-            prompt += f"""
-################################################################################
-#                    NEWS & SENTIMENT                                          #
-################################################################################
-
-{"".join(news_parts)}
-"""
+            prompt += f"--- NEWS & SENTIMENT ---\n\n{''.join(news_parts)}\n"
 
         # Add unstructured data (search results, web content) as supplementary
-        # The search summarizer already filters irrelevant content, so show everything
         supp_parts = []
 
         for result in tools_results:
@@ -584,37 +810,65 @@ Current Date: {current_date}
                 supp_parts.append(part)
 
         if supp_parts:
-            prompt += f"""
-################################################################################
-#                    SUPPLEMENTARY RESEARCH ({len(supp_parts)} sources)          #
-################################################################################
+            prompt += f"--- SUPPLEMENTARY RESEARCH ({len(supp_parts)} sources) ---\n\n{''.join(supp_parts)}\n"
 
-{"".join(supp_parts)}
+        # Surface data gaps from Plan Verifier so the model makes explicit labeled assumptions
+        # rather than silently ignoring missing inputs or hallucinating substitutes.
+        if data_gaps:
+            gap_lines = []
+            for gap in data_gaps:
+                priority = gap.get('priority', 'helpful').upper()
+                description = gap.get('description', '')
+                tool = gap.get('recommended_tool', '')
+                gap_lines.append(f"  [{priority}] {description} (tool: {tool})")
+            prompt += (
+                "--- DATA GAPS (fetching these failed -- make explicit ASSUMPTION: labels) ---\n\n"
+                + "\n".join(gap_lines)
+                + "\n\nFor each gap above: state the assumption you are using and why, "
+                "label it ASSUMPTION:, and note how it affects your confidence.\n\n"
+            )
+
+        # If this is a revision, anchor on the prior conclusion + reviewer feedback.
+        # previous_analysis is just the conclusion section -- not the full report.
+        if revision_feedback:
+            if previous_analysis:
+                prompt += f"--- PRIOR CONCLUSION ---\n\n{previous_analysis}\n\n"
+            prompt += f"""--- REVISION INSTRUCTIONS ---
+
+The quality reviewer found the following issue with the previous analysis:
+
+{revision_feedback}
+
+--- YOUR TASK ---
+
+Write a COMPLETE fresh analysis answering: "{user_query}"
 """
-
-        # Final instructions
-        prompt += f"""
-################################################################################
-#                              YOUR TASK                                        #
-################################################################################
+            if previous_analysis:
+                prompt += "The prior conclusion above shows where the analysis landed -- remain consistent with it unless the reviewer's feedback directly contradicts it.\n\n"
+            prompt += """Format:
+- 2-3 sentence executive summary with recommendation if applicable
+- Section headers relevant to the query (e.g., VALUATION, MACRO CONTEXT, SENTIMENT, RISKS)
+- "Label: Value (source)" pairs and bullet points, not prose paragraphs
+- Calculations on a single line (e.g., "FCF = EBITDA - Capex - Tax = $144.8B - $12.7B - $20.7B = $111.4B")
+- End with ASSUMPTIONS, DATA GAPS, and CONCLUSION
+"""
+        else:
+            prompt += f"""--- YOUR TASK ---
 
 Analyze the data above to answer: "{user_query}"
 
-RULES:
-1. Use ONLY the data provided above. Do not invent numbers.
+Rules:
+1. Use ONLY the data provided. Do not invent numbers.
 2. If data is missing, write "ASSUMPTION: [value]" and justify it.
 3. Show calculations step-by-step where applicable.
 4. Do not confuse millions, billions, and trillions.
 
-FORMAT GUIDELINES:
-- Start with a 2-3 sentence executive summary including your recommendation if applicable
-- Use section headers relevant to the query (e.g., VALUATION, MACRO CONTEXT, SENTIMENT, RISKS)
-- Present data as "Label: Value (source)" pairs and bullet points, not prose paragraphs
-- Show all calculations step-by-step on a single line (e.g., "FCF = EBITDA - Capex - Tax = $144.8B - $12.7B - $20.7B = $111.4B")
-- End with ASSUMPTIONS (what you assumed), DATA GAPS (what was missing), and your CONCLUSION
-- Keep it tight -- the output goes directly to a quality verification agent
-
-Begin your analysis:
+Format:
+- 2-3 sentence executive summary with recommendation if applicable
+- Section headers relevant to the query (e.g., VALUATION, MACRO CONTEXT, SENTIMENT, RISKS)
+- "Label: Value (source)" pairs and bullet points, not prose paragraphs
+- Calculations on a single line (e.g., "FCF = EBITDA - Capex - Tax = $144.8B - $12.7B - $20.7B = $111.4B")
+- End with ASSUMPTIONS, DATA GAPS, and CONCLUSION
 """
 
         return prompt

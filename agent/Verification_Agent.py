@@ -1,23 +1,20 @@
 from .openrouter_template import OpenRouterModel
 from pydantic import BaseModel
-from typing import Dict, Optional, List
+from typing import Dict, Optional
 import sys
 import json
 
 
 class VerificationResult(BaseModel):
-  action: str
-  action_reasoning: str
-  quality_score: float
-  answers_question: bool
-  strengths: List[str]
-  weaknesses: List[str]
-  missing_components: List[str]
+  action: str              # "approve" | "revise" | "reject"
+  action_reasoning: str    # brief explanation of the decision
+  quality_score: float     # 0.0 to 1.0
+  feedback: str            # for revise/reject: what specifically to fix; for approve: empty string
 
 
 class Verification_Agent(OpenRouterModel):
   response_schema = VerificationResult
-  MAX_OUTPUT_TOKENS = 4096  # Needs room for thinking + JSON output
+  MAX_OUTPUT_TOKENS = 8192  # R1 thinking can be long; give JSON plenty of room
 
   def __init__(self, model_name: str = 'deepseek/deepseek-r1-0528:free'):
     super().__init__(model_name=model_name)
@@ -40,18 +37,23 @@ CHECK THESE 5 THINGS:
 5. Is anything missing? (what data gaps exist, what would improve it)
 
 ACTIONS:
-- "approve": Answers the question, calculations defensible, assumptions documented
-- "revise": Partially answers but needs specific fixes (you MUST say what to fix)
-- "reject": Fundamentally wrong or doesn't answer the question at all
+- "approve": Answers the question, has a recommendation or conclusion, assumptions documented. DEFAULT to this.
+- "revise": Only use if a CRITICAL component is outright missing (e.g. asked for DCF, zero valuation numbers provided). NOT for data gaps, missing segments, or stylistic issues.
+- "reject": Only if analysis is fundamentally wrong or answers a completely different question.
 
 EXAMPLES:
 User: "Run DCF on AAPL" -> Analysis gives fair value range with methodology -> APPROVE
 User: "Run DCF on AAPL" -> Analysis describes business but no valuation -> REJECT
-User: "Is MSFT a good buy?" -> PE analysis with price target -> APPROVE
+User: "Is MSFT a good buy?" -> Any analysis with a buy/hold/sell conclusion -> APPROVE
+User: "Advanced analysis on AAPL" -> Comprehensive analysis with recommendation -> APPROVE even if some data gaps noted
 
 RULES:
-- BIAS TOWARD APPROVE: If the analysis answers the question and the data is reasonable, APPROVE it. Minor stylistic issues, rounding differences, or data that shows "top N" instead of all entries are NOT reasons to revise. Only revise for material errors that would mislead an investor.
-- Do NOT flag data as invalid just because you cannot verify the source. The data was gathered by automated tools and is presumed correct.
+- STRONGLY BIAS TOWARD APPROVE. If the analysis has a conclusion and uses real numbers, APPROVE it.
+- Data gaps, missing segments, qualitative unknowns are NORMAL and EXPECTED. Do NOT revise for these.
+- Do NOT revise for: missing segment breakdown, unquantified regulatory risk, stylistic issues, rounding, "top N" vs all entries.
+- Only "revise" if you can name ONE specific calculation that is provably wrong or one critical answer that is completely absent.
+- Do NOT flag data as invalid because you cannot verify the source. All data came from automated tools and is presumed correct.
+- An analysis that says "data gap: X" is being honest and thorough — that is a STRENGTH, not a weakness.
 
 OUTPUT FORMAT:
 You MUST respond with ONLY valid JSON matching this exact schema. No text before or after the JSON.
@@ -59,12 +61,9 @@ You MUST respond with ONLY valid JSON matching this exact schema. No text before
   "action": "approve" | "revise" | "reject",
   "action_reasoning": "string explaining why you chose this action",
   "quality_score": 0.0 to 1.0,
-  "answers_question": true or false,
-  "strengths": ["list", "of", "strengths"],
-  "weaknesses": ["list", "of", "weaknesses"],
-  "missing_components": ["list", "of", "missing", "items"]
+  "feedback": "for revise/reject: one specific thing to fix; for approve: empty string"
 }}
-ALL 7 fields are REQUIRED. Do not add or omit any fields."""
+ALL 4 fields are REQUIRED. Do not add or omit any fields."""
 
     return prompt
 
@@ -76,6 +75,7 @@ ALL 7 fields are REQUIRED. Do not add or omit any fields."""
         Dict with verification results and action (approve/revise/reject).
         On parse failure, returns error dict with raw_response for master to use.
     """
+    self.conversatoin_history = []  # Each verification is independent — don't leak prior analyses into context
     system_prompt = self.build_prompt()
 
     user_prompt = f"""User Request: {user_query}
