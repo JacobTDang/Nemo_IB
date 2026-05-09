@@ -88,7 +88,7 @@ class FinnhubClient:
     for attempt in range(2):
       await self._rate_limiter.acquire()
       try:
-        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=30)) as resp:
           if resp.status == 429:
             if attempt == 0:
               await asyncio.sleep(2)
