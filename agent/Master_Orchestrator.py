@@ -1,5 +1,6 @@
 from .openrouter_template import OpenRouterModel
 from .workflows.agent_state import AgentState
+from .workflows.constants import MAX_ITERATIONS, MAX_EXECUTIONS, MAX_ANALYSES
 from pydantic import BaseModel
 from typing import Dict, Any, Optional
 import json
@@ -111,9 +112,9 @@ class Master_Orchestrator(OpenRouterModel):
       summary += f"- Revision Context: {json.dumps(state['revision_context'], default=str)[:300]}\n"
 
     # Per-phase counters (shown against limits so model knows remaining budget)
-    summary += f"- Execution Count: {state.get('execution_count', 0)} / 15 max\n"
-    summary += f"- Analysis Count: {state.get('analysis_count', 0)} / 6 max\n"
-    summary += f"- Global Iteration: {state.get('global_iteration', 0)} / 50 max\n"
+    summary += f"- Execution Count: {state.get('execution_count', 0)} / {MAX_EXECUTIONS} max\n"
+    summary += f"- Analysis Count: {state.get('analysis_count', 0)} / {MAX_ANALYSES} max\n"
+    summary += f"- Global Iteration: {state.get('global_iteration', 0)} / {MAX_ITERATIONS} max\n"
 
     # Show gathered variables (flat keys only, skip namespaced)
     variables = state.get('variables', {})
@@ -135,7 +136,7 @@ class Master_Orchestrator(OpenRouterModel):
 
   def _build_system_prompt(self) -> str:
     """Build the master orchestrator system prompt."""
-    return """You are the Master Orchestrator in a financial analysis workflow. You decide which sub-agent to invoke next based on the current state.
+    return f"""You are the Master Orchestrator in a financial analysis workflow. You decide which sub-agent to invoke next based on the current state.
 
 AVAILABLE SUB-AGENTS:
 1. probe - Generates strategic research questions before analysis. USE when: first pass on standard/complex queries. SKIP when: simple queries, already probed.
@@ -169,9 +170,9 @@ When routing to plan for data gaps, populate revision_context:
 - {"type": "missing_data", "feedback": <description of what is missing and which tools to use>}
 
 GUARDRAILS (you cannot override these, the system enforces them):
-- Maximum 50 global iterations
-- Maximum 15 executions
-- Maximum 6 analyses
+- Maximum {MAX_ITERATIONS} global iterations
+- Maximum {MAX_EXECUTIONS} executions
+- Maximum {MAX_ANALYSES} analyses
 
 RULES:
 - next_action must be one of: probe, plan, execute, model, analyze, done
