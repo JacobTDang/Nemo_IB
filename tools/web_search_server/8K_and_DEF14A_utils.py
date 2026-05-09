@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple, Set, Union, cast
 from dataclasses import dataclass, field, asdict
 from enum import Enum, auto
 from datetime import datetime
+import sys
 from edgar import Company, set_identity
 from io import StringIO
 import pandas as pd
@@ -1446,13 +1447,13 @@ class SECFilingParser:
                 raw_table_text = '\n'.join(cleaned_lines)
 
             if debug:
-                print(f"\n[DEBUG] System status:")
-                print(f"  BeautifulSoup available: {BeautifulSoup is not None}")
+                print(f"\n[DEBUG] System status:", file=sys.stderr)
+                print(f"  BeautifulSoup available: {BeautifulSoup is not None}", file=sys.stderr)
                 if BeautifulSoup is None:
-                    print(f"  ⚠️  Install BeautifulSoup for HTML icon extraction:")
-                    print(f"      pip install beautifulsoup4 lxml --break-system-packages")
+                    print(f"  ⚠️  Install BeautifulSoup for HTML icon extraction:", file=sys.stderr)
+                    print(f"      pip install beautifulsoup4 lxml --break-system-packages", file=sys.stderr)
 
-                print(f"\n[DEBUG] After table extraction:")
+                print(f"\n[DEBUG] After table extraction:", file=sys.stderr)
                 ind_counts = {"True": 0, "False": 0, "None": 0}
                 for m in final_members:
                     ind_val = m.get('independent')
@@ -1462,22 +1463,22 @@ class SECFilingParser:
                         ind_counts["False"] += 1
                     else:
                         ind_counts["None"] += 1
-                print(f"  Independence: {ind_counts['True']} True, {ind_counts['False']} False, {ind_counts['None']} None")
+                print(f"  Independence: {ind_counts['True']} True, {ind_counts['False']} False, {ind_counts['None']} None", file=sys.stderr)
                 if ind_counts["None"] > 0 and BeautifulSoup is None:
-                    print(f"  ⚠️  WARNING: {ind_counts['None']} directors with unknown independence")
-                    print(f"  ⚠️  BeautifulSoup NOT installed - HTML icons cannot be extracted")
-                    print(f"  ⚠️  To fix: pip install beautifulsoup4 lxml --break-system-packages")
+                    print(f"  ⚠️  WARNING: {ind_counts['None']} directors with unknown independence", file=sys.stderr)
+                    print(f"  ⚠️  BeautifulSoup NOT installed - HTML icons cannot be extracted", file=sys.stderr)
+                    print(f"  ⚠️  To fix: pip install beautifulsoup4 lxml --break-system-packages", file=sys.stderr)
 
             # NEW: Fill independence with explicit text evidence when available
             ind_map = self._extract_independent_directors_from_text(text)
 
             if debug:
-                print(f"\n[DEBUG] Text independence extraction:")
-                print(f"  ind_map size: {len(ind_map)}")
+                print(f"\n[DEBUG] Text independence extraction:", file=sys.stderr)
+                print(f"  ind_map size: {len(ind_map)}", file=sys.stderr)
                 if ind_map:
-                    print(f"  ind_map keys: {list(ind_map.keys())[:10]}")  # Show first 10
-                print(f"  final_members count: {len(final_members)}")
-                print(f"  final_members names: {[m['name'] for m in final_members]}")
+                    print(f"  ind_map keys: {list(ind_map.keys())[:10]}", file=sys.stderr)  # Show first 10
+                print(f"  final_members count: {len(final_members)}", file=sys.stderr)
+                print(f"  final_members names: {[m['name'] for m in final_members]}", file=sys.stderr)
 
             for m in final_members:
                 if m.get("independent") is None:
@@ -1487,7 +1488,7 @@ class SECFilingParser:
                         m["evidence"] = asdict(ind_map[key])  # Overwrite with better evidence for independence
                         m["extraction_method"] = (m.get("extraction_method") or "table") + "+text_independence"
                         if debug:
-                            print(f"  ✓ Enriched {m['name']} with independence=True")
+                            print(f"  ✓ Enriched {m['name']} with independence=True", file=sys.stderr)
 
             # NEW: Separate validated facts from candidates
             validated, candidates = [], []
@@ -1557,12 +1558,12 @@ class SECFilingParser:
         out: Dict[str, Optional[bool]] = {}
         if not html:
             if debug:
-                print(f"    [HTML Icon] No HTML provided")
+                print(f"    [HTML Icon] No HTML provided", file=sys.stderr)
             return out
 
         if BeautifulSoup is None:
             if debug:
-                print(f"    [HTML Icon] BeautifulSoup not installed")
+                print(f"    [HTML Icon] BeautifulSoup not installed", file=sys.stderr)
             # BeautifulSoup not installed - cannot parse HTML icons
             return out
 
@@ -1573,23 +1574,23 @@ class SECFilingParser:
                 soup = BeautifulSoup(html, "html.parser")
             except:
                 if debug:
-                    print(f"    [HTML Icon] Failed to parse HTML")
+                    print(f"    [HTML Icon] Failed to parse HTML", file=sys.stderr)
                 return out
 
         tables = soup.find_all("table")
         if debug:
-            print(f"    [HTML Icon] Found {len(tables)} tables, looking for table_idx={table_idx}")
+            print(f"    [HTML Icon] Found {len(tables)} tables, looking for table_idx={table_idx}", file=sys.stderr)
 
         if table_idx < 0 or table_idx >= len(tables):
             if debug:
-                print(f"    [HTML Icon] Table index out of range")
+                print(f"    [HTML Icon] Table index out of range", file=sys.stderr)
             return out
 
         table = tables[table_idx]
         rows = table.find_all("tr")
         if not rows:
             if debug:
-                print(f"    [HTML Icon] No rows in table")
+                print(f"    [HTML Icon] No rows in table", file=sys.stderr)
             return out
 
         # Initialize to satisfy type checker
@@ -1604,7 +1605,7 @@ class SECFilingParser:
             header_row_idx = 0  # Assume first row is header
 
             if debug:
-                print(f"    [HTML Icon] Using pandas column indices: name={name_idx}, independent={indep_idx}")
+                print(f"    [HTML Icon] Using pandas column indices: name={name_idx}, independent={indep_idx}", file=sys.stderr)
         else:
             # Fallback: try to detect headers (original logic)
             headers = []
@@ -1640,7 +1641,7 @@ class SECFilingParser:
                 header_row_idx = 0
 
             if debug:
-                print(f"    [HTML Icon] Header row: {header_row_idx}, headers: {headers[:10]}")  # First 10
+                print(f"    [HTML Icon] Header row: {header_row_idx}, headers: {headers[:10]}", file=sys.stderr)  # First 10
 
             name_idx = None
             indep_idx = None
@@ -1651,11 +1652,11 @@ class SECFilingParser:
                     name_idx = i
 
             if debug:
-                print(f"    [HTML Icon] name_idx={name_idx}, indep_idx={indep_idx}")
+                print(f"    [HTML Icon] name_idx={name_idx}, indep_idx={indep_idx}", file=sys.stderr)
 
             if indep_idx is None or name_idx is None:
                 if debug:
-                    print(f"    [HTML Icon] Missing name or independence column")
+                    print(f"    [HTML Icon] Missing name or independence column", file=sys.stderr)
                 return out
 
             # Type checker: name_idx and indep_idx are guaranteed to be int here
@@ -1714,7 +1715,7 @@ class SECFilingParser:
             cells = tr.find_all(["td", "th"])
 
             if debug and row_idx == header_row_idx + 1:  # First data row
-                print(f"    [HTML Icon] First data row has {len(cells)} cells (need > {max(indep_idx, name_idx)})")
+                print(f"    [HTML Icon] First data row has {len(cells)} cells (need > {max(indep_idx, name_idx)})", file=sys.stderr)
 
             if len(cells) <= max(indep_idx, name_idx):
                 too_few_cells += 1
@@ -1732,7 +1733,7 @@ class SECFilingParser:
             key = norm_name_key(name)
 
             if debug and extracted_count < 3:  # Show first 3 directors
-                print(f"    [HTML Icon] Sample row {extracted_count + 1}: name='{name}', ind_raw='{ind_raw}', ind={ind}")
+                print(f"    [HTML Icon] Sample row {extracted_count + 1}: name='{name}', ind_raw='{ind_raw}', ind={ind}", file=sys.stderr)
                 extracted_count += 1
 
             if ind is True:
@@ -1752,11 +1753,11 @@ class SECFilingParser:
                     out[k] = False
 
         if debug:
-            print(f"    [HTML Icon] Row processing: {total_rows} total rows, {skipped_header} header, {too_few_cells} too few cells, {no_name} no name")
-            print(f"    [HTML Icon] Final: extracted {len(out)} entries, saw_true={saw_true}, pending_blank={len(pending_blank)}")
+            print(f"    [HTML Icon] Row processing: {total_rows} total rows, {skipped_header} header, {too_few_cells} too few cells, {no_name} no name", file=sys.stderr)
+            print(f"    [HTML Icon] Final: extracted {len(out)} entries, saw_true={saw_true}, pending_blank={len(pending_blank)}", file=sys.stderr)
             if out:
                 sample = list(out.items())[:3]
-                print(f"    [HTML Icon] Sample entries: {sample}")
+                print(f"    [HTML Icon] Sample entries: {sample}", file=sys.stderr)
 
         return out
 
@@ -1846,7 +1847,7 @@ class SECFilingParser:
                 ind_html_map = {}
                 if cols.get('independent') is not None:
                     if debug:
-                        print(f"\n[DEBUG] HTML icon extraction for table {table_idx}:")
+                        print(f"\n[DEBUG] HTML icon extraction for table {table_idx}:", file=sys.stderr)
                     # Pass pandas column indices to BeautifulSoup
                     ind_html_map = self._html_board_independence_map(
                         html,
@@ -1856,10 +1857,10 @@ class SECFilingParser:
                         debug=debug
                     )
                     if debug:
-                        print(f"  HTML ind_html_map size: {len(ind_html_map)}")
+                        print(f"  HTML ind_html_map size: {len(ind_html_map)}", file=sys.stderr)
                     if not ind_html_map and BeautifulSoup is None:
                         if debug:
-                            print(f"  BeautifulSoup not available - HTML icons cannot be extracted")
+                            print(f"  BeautifulSoup not available - HTML icons cannot be extracted", file=sys.stderr)
                         # BeautifulSoup not installed - HTML icons can't be extracted
                         pass  # Silently fail, will use text enrichment fallback
 
@@ -2050,7 +2051,7 @@ def safe_get_8k_items(filing: Any) -> Tuple[List[str], str]:
     return items_list, source
 
 # Wrapper functions
-def extract_8k_events(ticker: str, limit: int = 10): return SECFilingParser().extract_8k_events(ticker, limit)
+def extract_8k_events(ticker: str, limit: int = 10, debug: bool = False): return SECFilingParser().extract_8k_events(ticker, limit)
 def extract_proxy_compensation(ticker: str): return SECFilingParser().extract_proxy_compensation(ticker)
 def extract_governance_data(ticker: str, debug: bool = False):
     return SECFilingParser().extract_governance_data(ticker, debug=debug)

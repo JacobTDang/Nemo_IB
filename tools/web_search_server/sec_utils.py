@@ -3,12 +3,19 @@ from edgar import Company, set_identity
 from edgar.xbrl import XBRL
 import pandas as pd
 import os
-
+import re
+import sys
 # useful documentation for edgartools xbrl: https://edgartools.readthedocs.io/en/latest/getting-xbrl/
 
 # set identity first
 NAME = os.getenv('NAME', 'Investment Analyst')
 SEC_EMAIL = os.getenv('SEC_EMAIL', 'analyst@example.com')
+
+# Module-level cache: prevents the 4 SEC tools (ebitda, capex, tax, depreciation) from each
+# downloading and parsing the same 10-K XBRL independently. Within one MCP server process
+# lifetime the filing content doesn't change, so caching is safe.
+_filing_cache: Dict[tuple, Any] = {}
+
 
 def filter_annual_data(xbrl, concept: str, form_type: str = '10-K') -> Optional[Dict[str, Any]]:
   """
@@ -42,15 +49,18 @@ def filter_annual_data(xbrl, concept: str, form_type: str = '10-K') -> Optional[
 
     if not target_periods.empty:
       period_data = target_periods[target_periods['period_end_dt'] == target_periods['period_end_dt'].max()]
-      # For revenue, take the highest value (total revenue vs segment revenue)
-      if 'evenue' in concept:
+      # XBRL often has multiple facts for the same concept and period
+      # (segments + consolidated total). The consolidated total is always
+      # the largest positive value, so take the max for any concept that
+      # can have segment breakdowns.
+      if len(period_data) > 1:
         period_data = period_data.loc[period_data['numeric_value'].idxmax()]
       else:
         period_data = period_data.iloc[0]
     else:
       # Fallback to most recent data if no target periods found
       period_data = facts[facts['period_end_dt'] == facts['period_end_dt'].max()]
-      if 'evenue' in concept and len(period_data) > 1:
+      if len(period_data) > 1:
         period_data = period_data.loc[period_data['numeric_value'].idxmax()]
       else:
         period_data = period_data.iloc[0]
@@ -71,7 +81,18 @@ def filter_annual_data(xbrl, concept: str, form_type: str = '10-K') -> Optional[
     return None
 
 def get_latest_filing(ticker: str, form_type: str = '10-K') -> Optional[Dict[str, Any]]:
-  # get the latest SEC filing with XBRL data for a company
+  """Get latest SEC filing with XBRL data.
+
+  Results are cached in-process by (ticker, form_type) key.
+  When multiple SEC tools run in the same parallel batch (e.g. get_ebitda_margin,
+  get_capex_pct_revenue, get_tax_rate, get_depreciation all called concurrently),
+  the cache prevents 4 duplicate 10-K downloads that would trigger SEC rate limiting.
+  """
+  cache_key = (ticker.upper(), form_type)
+  if cache_key in _filing_cache:
+    return _filing_cache[cache_key]
+
+  result = None
   try:
     # Set identity globally first
     set_identity(f"{NAME} {SEC_EMAIL}")
@@ -96,7 +117,7 @@ def get_latest_filing(ticker: str, form_type: str = '10-K') -> Optional[Dict[str
           url = getattr(latest_filing, attr)
           break
 
-      return {
+      result = {
         'filing_date': latest_filing.filing_date,
         'url': url,
         'accession_number': latest_filing.accession_number,
@@ -104,12 +125,13 @@ def get_latest_filing(ticker: str, form_type: str = '10-K') -> Optional[Dict[str
         'xbrl_data': xbrl_data
       }
 
-    return None
-
   except Exception:
-    return None
+    result = None
 
-def get_disclosures_names(ticker:str, form_type: str = '10-k') -> Dict[str, Any]:
+  _filing_cache[cache_key] = result
+  return result
+
+def get_disclosures_names(ticker:str, form_type: str = '10-K') -> Dict[str, Any]:
   # get the disclosure name for agent to use
   try:
     filing_data = get_latest_filing(ticker, form_type)
@@ -199,20 +221,21 @@ def extract_disclosure_data(ticker: str, disclosure_name: str, form_type: str = 
               break
 
         if target_disclosure:
-          print(f'Found disclosure: {disclosure_name}')
+          print(f'Found disclosure: {disclosure_name}', file=sys.stderr, flush=True)
 
           # Get summary info about the disclosure
           disclosure_summary = {
             'name': disclosure_name,
             'role_or_type': target_disclosure.role_or_type if hasattr(target_disclosure, 'role_or_type') else None,
-            'primary_concept': target_disclosure.primary_concept if hasattr(target_disclosure, 'primary_concept') else None
+            'primary_concept': target_disclosure.primary_concept if hasattr(target_disclosure, 'primary_concept') else None,
+            'success': True
           }
 
           # Try to get DataFrame but filter out text-heavy data
           if hasattr(target_disclosure, 'to_dataframe'):
             try:
               df = target_disclosure.to_dataframe()
-              print(f'DataFrame shape: {df.shape if df is not None else None}')
+              print(f'DataFrame shape: {df.shape if df is not None else None}', file=sys.stderr, flush=True)
 
               if df is not None and not df.empty:
                 disclosure_summary['data_shape'] = df.shape
@@ -228,11 +251,10 @@ def extract_disclosure_data(ticker: str, disclosure_name: str, form_type: str = 
                       break
 
                 if text_heavy:
-                  print("This disclosure contains mostly text/HTML data - extracting clean text")
+                  print("This disclosure contains mostly text/HTML data - extracting clean text", file=sys.stderr, flush=True)
                   disclosure_summary['data_type'] = 'text_heavy'
 
                   # Extract clean text from HTML
-                  import re
                   for col in df.columns:
                     if df[col].dtype == 'object' and not df[col].isna().iloc[0]:
                       raw_content = str(df[col].iloc[0])
@@ -246,21 +268,23 @@ def extract_disclosure_data(ticker: str, disclosure_name: str, form_type: str = 
                         clean_text = re.sub(r'\s+', ' ', clean_text).strip()
 
                         disclosure_summary[f'clean_text_{col}'] = clean_text
-                        print(f"Extracted clean text length: {len(clean_text)} characters")
+                        print(f"Extracted clean text length: {len(clean_text)} characters", file=sys.stderr, flush=True)
 
                 else:
                   # Only include actual data for numerical/structured disclosures
                   disclosure_summary['data_type'] = 'structured'
                   disclosure_summary['sample_data'] = df.head(3).to_dict("records")
 
-              print(f'Disclosure summary: {disclosure_summary}')
+              print(f'Disclosure summary: {disclosure_summary}', file=sys.stderr, flush=True)
 
             except Exception as e:
-              print(f'Error converting to dataframe: {e}')
+              print(f'Error converting to dataframe: {e}', file=sys.stderr, flush=True)
+
+          return disclosure_summary
 
         else:
-          print(f'debug: Unable to find disclosure: {disclosure_name}')
-          print(f'Available disclosures: {[d.role_or_type.split("/")[-1] if hasattr(d, "role_or_type") and "/" in d.role_or_type else str(d) for d in disclosures[:5]]}...')
+          print(f'debug: Unable to find disclosure: {disclosure_name}', file=sys.stderr, flush=True)
+          print(f'Available disclosures: {[d.role_or_type.split("/")[-1] if hasattr(d, "role_or_type") and "/" in d.role_or_type else str(d) for d in disclosures[:5]]}...', file=sys.stderr, flush=True)
 
 
       except Exception as e:
@@ -333,7 +357,7 @@ def get_revenue_base(ticker: str, form_type: str= "10-K") -> Dict[str, Any]:
       'success': False
     }
 
-def get_ebitda_margin(ticker: str, form_type: str = '10-k') -> Dict[str, Any]:
+def get_ebitda_margin(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
   # Ignores interst, taxes, and non-cash expenses, so it allows you to compare the underlying profit generation of a company from there core operations
   # how to ususally calculate it
   # 1. Find the operating income from income statement
@@ -414,6 +438,14 @@ def get_ebitda_margin(ticker: str, form_type: str = '10-k') -> Dict[str, Any]:
       revenue = revenue_data['revenue_base']  # already in raw dollars
 
       # Calculate EBITDA and EBITDA margin
+      if 'operating_income' not in ebitda or 'd&a' not in ebitda:
+        missing = []
+        if 'operating_income' not in ebitda: missing.append('operating_income')
+        if 'd&a' not in ebitda: missing.append('d&a')
+        return {
+          'error': f"Missing EBITDA components for {ticker}: {', '.join(missing)}",
+          'success': False
+        }
       ebitda_amount = ebitda['operating_income'] + ebitda['d&a']
       ebitda_margin_percent = (ebitda_amount / revenue) * 100
 
@@ -443,7 +475,7 @@ def get_ebitda_margin(ticker: str, form_type: str = '10-k') -> Dict[str, Any]:
       'success': False
     }
 
-def get_capex_pct_revenue(ticker: str, form_type: str = '10-k') -> Dict[str, Any]:
+def get_capex_pct_revenue(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
   # function to get capital expenditures: Capex is the money that the company spends to buy, maintain, or upgrade physical assets
   # this metric will show CapEX as percentage of revenue, it shows how much a company is reinvesting back into its assets
   # CapEx % of revenue = capital expedeitures / total revenue
@@ -461,6 +493,7 @@ def get_capex_pct_revenue(ticker: str, form_type: str = '10-k') -> Dict[str, Any
       'CapitalExpenditures'                                  # Basic total
       ]
       total_capex = 0
+      capex_concept_used = None
 
       for concept in primary_capex_concepts:
         result = filter_annual_data(xbrl, concept, form_type)
@@ -481,7 +514,7 @@ def get_capex_pct_revenue(ticker: str, form_type: str = '10-k') -> Dict[str, Any
         'us-gaap:PaymentsToAcquireComputerSoftwareAndEquipment',
         'us-gaap:PaymentsToAcquireOtherPropertyPlantAndEquipment'
         ]
-        print(f'WARNING for {ticker}: Might not account for all capital expenditures. Possible overlap of capital expenditures. Using concepts: {component_concepts}')
+        print(f'WARNING for {ticker}: Might not account for all capital expenditures. Possible overlap of capital expenditures. Using concepts: {component_concepts}', file=sys.stderr)
         for concept in component_concepts:
           result = filter_annual_data(xbrl, concept, form_type)
           if result:
@@ -516,14 +549,14 @@ def get_capex_pct_revenue(ticker: str, form_type: str = '10-k') -> Dict[str, Any
         'success': False
       }
 
-  except:
+  except Exception:
     return{
       'error': f'Unable to get filing for {ticker}',
       'success': False
     }
 
 
-def get_tax_rate(ticker: str, form_type: str = '10-k') -> Dict[str, Any]:
+def get_tax_rate(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
   # returns the effective/actual tax rate that the company pays on its profits
   # can find it on the income statement in 'income before provision for income taxes or similar wording' and 'provision for income taxes
   # formula: Effective tax rate = provision for income taxes / earnings before taxes
@@ -542,6 +575,7 @@ def get_tax_rate(ticker: str, form_type: str = '10-k') -> Dict[str, Any]:
       'IncomeTaxExpense'                                           # Basic form
       ]
       tax_expense = 0.0 # bc panda dataframe return np.float64
+      tax_concept_used = None
       for concept in tax_expense_concepts:
         result = filter_annual_data(xbrl, concept, form_type)
         if result:
@@ -559,6 +593,7 @@ def get_tax_rate(ticker: str, form_type: str = '10-k') -> Dict[str, Any]:
       ]
 
       pretax_income = 0.0
+      pretax_concept_used = None
       for concept in pretax_income_concepts:
         result = filter_annual_data(xbrl, concept, form_type)
         if result:
@@ -567,11 +602,11 @@ def get_tax_rate(ticker: str, form_type: str = '10-k') -> Dict[str, Any]:
           break
 
       # calulate the effective tax rate: Effective tax rate = provision for income taxes / earnings before taxes
-      if tax_expense != 0: # prevent divide by 0 error
+      if pretax_income != 0: # prevent divide by 0 error
         effective_tax_rate = (tax_expense / pretax_income) * 100
       else:
         return{
-          'error': f"tax expense is 0, unable to divide by 0",
+          'error': f"pretax income is 0, unable to calculate effective tax rate",
           'success': False
         }
 
@@ -597,7 +632,7 @@ def get_tax_rate(ticker: str, form_type: str = '10-k') -> Dict[str, Any]:
     }
 
 
-def get_depreciation(ticker: str, form_type: str = '10-k') -> Dict[str, Any]:
+def get_depreciation(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
   # this is the accounting method of allocating the cost of a physical asset over its uselife. It is a non cash expense is will be expressed as a percentage of revenue
   # formula: depreication % of revenue = depreication & amorization / total revenue
   # this will be helpful beacuse it helps us find the age and cost structure of a company's assets
@@ -619,6 +654,7 @@ def get_depreciation(ticker: str, form_type: str = '10-k') -> Dict[str, Any]:
       ]
 
       d_a_value = 0.0
+      d_a_concept = None
       for concept in depreciation_concepts:
         results = filter_annual_data(xbrl, concept, form_type)
         if results:
@@ -663,4 +699,216 @@ def get_depreciation(ticker: str, form_type: str = '10-k') -> Dict[str, Any]:
       'success':False
     }
 if __name__ == "__main__":
-  pass
+  # Test diverse companies across different industries
+  test_companies = [
+    "AAPL",  # Tech/Manufacturing (Apple)
+    "GOOGL", # Tech/Services (Google)
+    "JPM",   # Banking (JPMorgan Chase)
+    "JNJ",   # Healthcare/Pharma (Johnson & Johnson)
+    "WMT",   # Retail (Walmart)
+    "XOM",   # Energy (ExxonMobil)
+    "BAC",   # Banking (Bank of America)
+    "MSFT"   # Tech/Software (Microsoft)
+  ]
+
+  # Test SEC form type support
+  print("Testing SEC Form Type Support:")
+  print("=" * 60)
+
+  test_ticker = "AAPL"
+  forms_to_test = ['10-K', '10-Q', '8-K', 'S-1', 'DEF 14A', '13F']
+
+  for form in forms_to_test:
+    try:
+      filing_data = get_latest_filing(test_ticker, form)
+      if filing_data:
+        print(f"✓ {form}: SUCCESS - Found filing dated {filing_data['filing_date']}")
+        # Check if XBRL is available
+        if filing_data['xbrl_data']:
+          print(f"  XBRL: Available")
+        else:
+          print(f"  XBRL: Not available")
+      else:
+        print(f"✗ {form}: No filings found")
+    except Exception as e:
+      print(f"✗ {form}: ERROR - {str(e)}")
+    print("-" * 40)
+
+  print("Testing Different Form Types - Revenue Comparison:")
+  print("=" * 60)
+
+  test_ticker = "AAPL"
+  form_types = ['10-K', '10-Q']
+
+  for form_type in form_types:
+    print(f"\n{form_type} DATA:")
+    print("-" * 30)
+
+    try:
+      # Test revenue
+      revenue_result = get_revenue_base(test_ticker, form_type)
+      if revenue_result['success']:
+        print(f"Revenue: ${revenue_result['revenue_base']/1e9:.1f}B")
+        print(f"Period End: {revenue_result['period_end']}")
+        print(f"Concept: {revenue_result['concept_used']}")
+
+      # Test EBITDA
+      ebitda_result = get_ebitda_margin(test_ticker, form_type)
+      if ebitda_result['success']:
+        print(f"EBITDA Margin: {ebitda_result['ebitda_margin_percent']:.2f}%")
+        print(f"EBITDA Amount: ${ebitda_result['ebitda_amount']/1e9:.1f}B")
+
+      # Test CapEx
+      capex_result = get_capex_pct_revenue(test_ticker, form_type)
+      if capex_result['success']:
+        print(f"CapEx % of Revenue: {capex_result['capex_pct_revenue']:.2f}%")
+        print(f"Total CapEx: ${capex_result['total_capex']/1e9:.2f}B")
+
+      # Test Tax Rate
+      tax_result = get_tax_rate(test_ticker, form_type)
+      if tax_result['success']:
+        print(f"Effective Tax Rate: {tax_result['effective_tax_rate']:.2f}%")
+
+    except Exception as e:
+      print(f"ERROR with {form_type}: {str(e)}")
+
+  print("\n" + "=" * 60)
+  print("Testing 8-K, DEF 14A Disclosure Data:")
+  print("=" * 60)
+
+  test_ticker = "AAPL"
+  special_forms = ['8-K', 'DEF 14A']
+
+  for form_type in special_forms:
+    print(f"\n{form_type} DISCLOSURES:")
+    print("-" * 40)
+
+    try:
+      # Get disclosure names first
+      disclosures_result = get_disclosures_names(test_ticker, form_type)
+      if disclosures_result['success']:
+        print(f"Found {len(disclosures_result['disclosure_names'])} disclosures:")
+        for i, disclosure in enumerate(disclosures_result['disclosure_names'][:5]):  # Show first 5
+          print(f"  {i+1}. {disclosure}")
+
+        # Try to extract data from first disclosure
+        if disclosures_result['disclosure_names']:
+          first_disclosure = disclosures_result['disclosure_names'][0]
+          print(f"\nExtracting data from: {first_disclosure}")
+          disclosure_data = extract_disclosure_data(test_ticker, first_disclosure, form_type)
+          if 'clean_text' in str(disclosure_data):
+            print("Found text-based disclosure data")
+          elif 'sample_data' in str(disclosure_data):
+            print("Found structured disclosure data")
+          else:
+            print("No structured data found")
+      else:
+        print(f"Error getting disclosures: {disclosures_result['error']}")
+
+    except Exception as e:
+      print(f"ERROR with {form_type}: {str(e)}")
+
+  print("\n" + "=" * 60)
+  print("Investigating Filing Structure and Content:")
+  print("=" * 60)
+
+  test_ticker = "AAPL"
+  investigation_forms = ['8-K', 'DEF 14A']
+
+  for form_type in investigation_forms:
+    print(f"\n{form_type} FILING STRUCTURE:")
+    print("-" * 50)
+
+    try:
+      # Get the raw filing object
+      filing_data = get_latest_filing(test_ticker, form_type)
+      if filing_data:
+        filing = filing_data['filing_object']
+        print(f"Filing Date: {filing_data['filing_date']}")
+        print(f"Accession Number: {filing_data['accession_number']}")
+        print(f"URL: {filing_data['url']}")
+
+        # Check what attributes the filing object has
+        print(f"\nFiling Object Attributes:")
+        attrs = [attr for attr in dir(filing) if not attr.startswith('_')]
+        for attr in attrs[:10]:  # Show first 10 attributes
+          print(f"  - {attr}")
+
+        # Try to get the actual document content
+        try:
+          # Check if filing has documents
+          if hasattr(filing, 'documents'):
+            docs = filing.documents
+            print(f"\nNumber of Documents: {len(docs) if docs else 'None'}")
+            if docs:
+              for i, doc in enumerate(docs[:3]):  # Show first 3 docs
+                print(f"  Doc {i+1}: {doc.document if hasattr(doc, 'document') else 'Unknown'}")
+
+          # Check if filing has html content
+          if hasattr(filing, 'html'):
+            html_content = filing.html()
+            print(f"\nHTML Content Length: {len(html_content)} characters")
+            print(f"HTML Preview (first 500 chars):\n{html_content[:500]}...")
+
+          # Check if filing has text content
+          if hasattr(filing, 'text'):
+            text_content = filing.text()
+            print(f"\nText Content Length: {len(text_content)} characters")
+            print(f"Text Preview (first 500 chars):\n{text_content[:500]}...")
+
+        except Exception as e:
+          print(f"Error accessing content: {e}")
+
+        # For DEF 14A, check for tables
+        if form_type == 'DEF 14A':
+          try:
+            if hasattr(filing, 'tables'):
+              tables = filing.tables()
+              print(f"\nTables found: {len(tables) if tables else 0}")
+              if tables:
+                for i, table in enumerate(tables[:2]):  # Show first 2 tables
+                  print(f"  Table {i+1} shape: {table.shape if hasattr(table, 'shape') else 'Unknown'}")
+          except Exception as e:
+            print(f"Error accessing tables: {e}")
+
+        # Check XBRL structure
+        if filing_data['xbrl_data']:
+          xbrl = filing_data['xbrl_data']
+          print(f"\nXBRL Structure:")
+
+          # Check statements
+          if hasattr(xbrl, 'statements'):
+            statements = xbrl.statements
+            print(f"  Statements available: {len(statements) if statements else 0}")
+
+          # Check facts
+          if hasattr(xbrl, 'facts'):
+            facts = xbrl.facts
+            print(f"  Facts available: {len(facts) if hasattr(facts, '__len__') else 'Unknown'}")
+
+          # Check concepts
+          if hasattr(xbrl, 'concepts'):
+            concepts = xbrl.concepts
+            print(f"  Concepts available: {len(concepts) if hasattr(concepts, '__len__') else 'Unknown'}")
+
+      else:
+        print(f"No {form_type} filing found")
+
+    except Exception as e:
+      print(f"ERROR investigating {form_type}: {str(e)}")
+
+  print("\n" + "=" * 60)
+  print("Testing EBITDA margins across different industries:")
+  print("=" * 60)
+
+  for ticker in test_companies:
+    try:
+      result = get_ebitda_margin(ticker, '10-K')
+      if result['success']:
+        print(f"{ticker}: {result['ebitda_margin_percent']:.2f}% EBITDA margin "
+              f"(Revenue: ${result['revenue']/1e9:.1f}B, Concept: {result['operating_income_concept_used']})")
+      else:
+        print(f"{ticker}: ERROR - {result['error']}")
+    except Exception as e:
+      print(f"{ticker}: EXCEPTION - {str(e)}")
+    print("-" * 50)

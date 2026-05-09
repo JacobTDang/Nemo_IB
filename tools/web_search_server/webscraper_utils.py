@@ -42,53 +42,64 @@ class SessionManager:
 # Global session manager
 _session_manager = SessionManager()
 
-def search_duckduckgo(query: str, max_results = 5) -> List[Dict]:
-  """Enhanced DuckDuckGo search with URL validation"""
-  try:
-    search_results = []
+def search_duckduckgo(query: str, max_results: int = 5) -> List[Dict]:
+  """DuckDuckGo search with targeted financial queries and retry on failure.
 
-    # Create targeted financial queries using advanced operators
-    financial_queries = [
-      f"{query} site:sec.gov",                    # SEC filings
-      f"{query} site:investor.",                  # Company investor relations
-      f"{query} site:reuters.com",                # Reuters financial news
-      f"{query} site:apnews.com",                 # AP News business
-      f"{query} -site:bloomberg.com -site:wsj.com"  # Exclude paywalls
-    ]
+  Runs three progressively broader queries so at least one returns results:
+    1. SEC filings only (highest authority)
+    2. Free financial news sources (Motley Fool, Reuters, AP, Stock Analysis)
+    3. General web excluding paywalls (Bloomberg, WSJ, FT)
 
-    # Search each targeted query
-    results_per_query = max(1, max_results // len(financial_queries))
+  Each sub-query requests max_results results independently; duplicates are
+  removed at the end. Retries once with a 2-second backoff if DDGS itself
+  fails (rate limit, network hiccup, etc.).
+  """
+  import time
 
-    with DDGS() as ddgs:
-      for targeted_query in financial_queries:
-        try:
-          for result in ddgs.text(targeted_query, max_results=results_per_query):
-            link = result.get('href', '')
-            # Validate URL before adding
-            if link and is_valid_url(link):
-              search_results.append({
-                'title': result.get('title', ''),
-                'link': link,
-                'snippet': result.get('body',''),
-                'source': 'duckduckgo',
-                'query_type': targeted_query.split()[0] if 'site:' in targeted_query else 'general'
-              })
-        except:
-          continue  # Skip if individual query fails
+  targeted_queries = [
+    f"{query} site:sec.gov",
+    f"{query} (site:fool.com OR site:stockanalysis.com OR site:reuters.com OR site:apnews.com)",
+    f"{query} -site:bloomberg.com -site:wsj.com -site:ft.com",
+  ]
 
-    # Remove duplicates based on URL
-    seen_urls = set()
-    unique_results = []
-    for result in search_results:
-      if result['link'] not in seen_urls:
-        seen_urls.add(result['link'])
-        unique_results.append(result)
+  seen_urls: set = set()
+  all_results: List[Dict] = []
 
-    return unique_results[:max_results]
+  for attempt in range(2):  # One retry on full DDGS failure
+    try:
+      with DDGS() as ddgs:
+        for targeted_query in targeted_queries:
+          if len(all_results) >= max_results:
+            break
+          try:
+            for result in ddgs.text(targeted_query, max_results=max_results):
+              link = result.get('href', '')
+              if link and is_valid_url(link) and link not in seen_urls:
+                seen_urls.add(link)
+                all_results.append({
+                  'title': result.get('title', ''),
+                  'link': link,
+                  'snippet': result.get('body', ''),
+                  'source': 'duckduckgo',
+                })
+          except Exception:
+            continue  # This sub-query failed, try the next one
 
-  except Exception as e:
-    print(f"DuckDuckGo search failed: {e}", file=sys.stderr, flush=True)
-    return []
+      if all_results:
+        return all_results[:max_results]
+
+      # DDGS succeeded but returned nothing -- retry may help with rate limits
+      if attempt == 0:
+        time.sleep(2.0)
+
+    except Exception as e:
+      if attempt == 0:
+        print(f"DuckDuckGo search failed (attempt 1), retrying in 2s: {e}", file=sys.stderr, flush=True)
+        time.sleep(2.0)
+      else:
+        print(f"DuckDuckGo search failed: {e}", file=sys.stderr, flush=True)
+
+  return []
 
 def is_valid_url(url: str) -> bool:
   """Validate URL has proper scheme and structure"""

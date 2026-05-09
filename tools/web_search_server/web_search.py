@@ -3,9 +3,7 @@ import asyncio
 import json
 import os
 from datetime import date, datetime
-import os
-# NOTE: ClientSession, StdioServerParameters, stdio_client are imported only in client mode below
-from tools.web_search_server.webscraper_utils import search_duckduckgo, _session_manager, batch_scrape, web_scrape
+from tools.web_search_server.webscraper_utils import search_duckduckgo, _session_manager, web_scrape
 from tools.web_search_server.sec_utils import (
     get_revenue_base, get_ebitda_margin, get_capex_pct_revenue,
     get_tax_rate, get_depreciation, get_disclosures_names,
@@ -311,7 +309,7 @@ class WebSearchServer:
     tasks = [asyncio.to_thread(web_scrape, url, 3, 1) for url in urls]
     results = await asyncio.gather(*tasks)
 
-    _session_manager.close_all # close session for good practice
+    _session_manager.close_all()  # close session for good practice
     return [TextContent(
       type="text",
       text=safe_json_dumps({
