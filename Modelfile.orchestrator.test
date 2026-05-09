@@ -1,0 +1,18 @@
+FROM ./agent/models/gguf/nvidia_Orchestrator-8B-Q6_K.gguf
+
+# Test template with NO stop tokens
+TEMPLATE """<|im_start|>system
+{{ .System }}<|im_end|>
+<|im_start|>user
+{{ .Prompt }}<|im_end|>
+<|im_start|>assistant
+"""
+
+# Minimal parameters
+PARAMETER temperature 0.7
+PARAMETER num_predict 512
+PARAMETER num_ctx 8192
+
+# NO STOP TOKENS - let it output everything
+
+SYSTEM """You are a helpful assistant. Output complete responses."""
