@@ -17,6 +17,37 @@ SEC_EMAIL = os.getenv('SEC_EMAIL', 'analyst@example.com')
 _filing_cache: Dict[tuple, Any] = {}
 
 
+def filter_instant_data(xbrl, concept: str) -> Optional[Dict[str, Any]]:
+  """Filter XBRL for instant (point-in-time) facts -- balance sheet items.
+
+  Balance sheet items use 'period_instant' rather than 'period_start'/'period_end'.
+  Returns the most recent fact and its as-of date.
+  """
+  try:
+    facts = xbrl.facts.query().by_concept(concept).to_dataframe()
+    if facts.empty:
+      return None
+    # Filter to instant-type rows (balance sheet); period_instant has the as-of date
+    if 'period_type' in facts.columns:
+      facts = facts[facts['period_type'] == 'instant']
+    if facts.empty:
+      return None
+    facts['instant_dt'] = pd.to_datetime(facts['period_instant'])
+    latest = facts[facts['instant_dt'] == facts['instant_dt'].max()]
+    if len(latest) > 1:
+      # Consolidated total = largest absolute value among segments
+      latest = latest.loc[latest['numeric_value'].abs().idxmax()]
+    else:
+      latest = latest.iloc[0]
+    return {
+      'value': latest['numeric_value'],
+      'concept_used': concept,
+      'period_end': latest['period_instant'],
+    }
+  except Exception:
+    return None
+
+
 def filter_annual_data(xbrl, concept: str, form_type: str = '10-K') -> Optional[Dict[str, Any]]:
   """
   Helper function to filter XBRL facts for period data based on form type
@@ -698,6 +729,162 @@ def get_depreciation(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
       'error': f"Unable to get filing for {ticker}",
       'success':False
     }
+
+
+def _get_revenue_from_xbrl(xbrl, form_type: str):
+  """Helper: try the two most common revenue concepts; return (value, period_end) or None."""
+  for concept in ('us-gaap:Revenues',
+                  'us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax',
+                  'us-gaap:SalesRevenueNet'):
+    d = filter_annual_data(xbrl, concept, form_type)
+    if d:
+      return d['value'], d['period_end']
+  return None
+
+
+def get_margin_breakdown(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
+  """Extract gross margin, SG&A %, R&D % from the latest filing.
+
+  Returns ticker, revenue, gross_profit, sga, rnd, *_pct_revenue values, plus
+  concepts_used for traceability. Banks (no COGS) typically have no GrossProfit
+  XBRL concept; absence is expected, not an error.
+  """
+  try:
+    filing_data = get_latest_filing(ticker, form_type)
+    if not filing_data or not filing_data.get('xbrl_data'):
+      return {'error': f'No filing found for {ticker}', 'success': False}
+
+    xbrl = filing_data['xbrl_data']
+    rev_tuple = _get_revenue_from_xbrl(xbrl, form_type)
+    if rev_tuple is None:
+      return {'ticker': ticker, 'error': 'No revenue concept found', 'success': False}
+    revenue, period_end = rev_tuple
+
+    result = {'ticker': ticker, 'revenue': revenue, 'period_end': period_end, 'success': True}
+    concepts_used = {}
+
+    for c in ('us-gaap:GrossProfit',):
+      gp = filter_annual_data(xbrl, c, form_type)
+      if gp:
+        result['gross_profit'] = gp['value']
+        result['gross_margin_pct'] = (gp['value'] / revenue) * 100
+        concepts_used['gross_profit'] = c
+        break
+
+    for c in ('us-gaap:SellingGeneralAndAdministrativeExpense',
+              'us-gaap:GeneralAndAdministrativeExpense'):
+      sga = filter_annual_data(xbrl, c, form_type)
+      if sga:
+        result['sga'] = sga['value']
+        result['sga_pct_revenue'] = (sga['value'] / revenue) * 100
+        concepts_used['sga'] = c
+        break
+
+    for c in ('us-gaap:ResearchAndDevelopmentExpense',):
+      rnd = filter_annual_data(xbrl, c, form_type)
+      if rnd:
+        result['rnd'] = rnd['value']
+        result['rnd_pct_revenue'] = (rnd['value'] / revenue) * 100
+        concepts_used['rnd'] = c
+        break
+
+    result['concepts_used'] = concepts_used
+
+    if 'gross_profit' not in result:
+      print(f"[Validate SEC] {ticker}: gross_profit XBRL concept not found (expected for banks/financials)",
+            file=sys.stderr, flush=True)
+    return result
+
+  except Exception as e:
+    return {'ticker': ticker, 'error': f'get_margin_breakdown failed: {e}', 'success': False}
+
+
+def get_historical_fcf(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
+  """Extract operating cash flow, capex, and compute FCF and FCF margin from latest filing."""
+  try:
+    filing_data = get_latest_filing(ticker, form_type)
+    if not filing_data or not filing_data.get('xbrl_data'):
+      return {'error': f'No filing found for {ticker}', 'success': False}
+
+    xbrl = filing_data['xbrl_data']
+    ocf = None
+    for c in ('us-gaap:NetCashProvidedByUsedInOperatingActivities',
+              'us-gaap:NetCashProvidedByUsedInOperatingActivitiesContinuingOperations'):
+      d = filter_annual_data(xbrl, c, form_type)
+      if d:
+        ocf = d['value']
+        break
+
+    capex = None
+    for c in ('us-gaap:PaymentsToAcquirePropertyPlantAndEquipment',
+              'us-gaap:PaymentsForCapitalImprovements'):
+      d = filter_annual_data(xbrl, c, form_type)
+      if d:
+        capex = abs(d['value'])  # capex usually reported negative on CF statement
+        break
+
+    if ocf is None:
+      return {'ticker': ticker, 'error': 'OCF concept not found', 'success': False}
+
+    fcf = ocf - (capex or 0)
+    rev_tuple = _get_revenue_from_xbrl(xbrl, form_type)
+    revenue = rev_tuple[0] if rev_tuple else None
+    period_end = rev_tuple[1] if rev_tuple else None
+
+    return {
+      'ticker': ticker,
+      'operating_cash_flow': ocf,
+      'capex': capex,
+      'free_cash_flow': fcf,
+      'fcf_margin_pct': (fcf / revenue * 100) if revenue else None,
+      'period_end': period_end,
+      'success': True
+    }
+  except Exception as e:
+    return {'ticker': ticker, 'error': f'get_historical_fcf failed: {e}', 'success': False}
+
+
+def get_working_capital(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
+  """Extract current assets/liabilities and compute NWC + NWC % of revenue.
+
+  Balance sheet items are XBRL instant facts (point-in-time), not duration facts,
+  so this uses filter_instant_data rather than filter_annual_data.
+  """
+  try:
+    filing_data = get_latest_filing(ticker, form_type)
+    if not filing_data or not filing_data.get('xbrl_data'):
+      return {'error': 'No filing', 'success': False}
+
+    xbrl = filing_data['xbrl_data']
+    ca = filter_instant_data(xbrl, 'us-gaap:AssetsCurrent')
+    cl = filter_instant_data(xbrl, 'us-gaap:LiabilitiesCurrent')
+    ar = filter_instant_data(xbrl, 'us-gaap:AccountsReceivableNetCurrent')
+    inv = filter_instant_data(xbrl, 'us-gaap:InventoryNet')
+    ap = filter_instant_data(xbrl, 'us-gaap:AccountsPayableCurrent')
+    rev_tuple = _get_revenue_from_xbrl(xbrl, form_type)
+
+    if not (ca and cl):
+      return {'ticker': ticker, 'error': 'Current assets/liabilities not found', 'success': False}
+
+    nwc = ca['value'] - cl['value']
+    revenue = rev_tuple[0] if rev_tuple else None
+
+    return {
+      'ticker': ticker,
+      'current_assets': ca['value'],
+      'current_liabilities': cl['value'],
+      'net_working_capital': nwc,
+      'nwc_pct_revenue': (nwc / revenue * 100) if revenue else None,
+      'accounts_receivable': ar['value'] if ar else None,
+      'inventory': inv['value'] if inv else None,
+      'accounts_payable': ap['value'] if ap else None,
+      'period_end': ca['period_end'],
+      'success': True
+    }
+  except Exception as e:
+    return {'ticker': ticker, 'error': f'get_working_capital failed: {e}', 'success': False}
+
+
 if __name__ == "__main__":
   # Test diverse companies across different industries
   test_companies = [

@@ -7,7 +7,8 @@ from tools.web_search_server.webscraper_utils import search_duckduckgo, _session
 from tools.web_search_server.sec_utils import (
     get_revenue_base, get_ebitda_margin, get_capex_pct_revenue,
     get_tax_rate, get_depreciation, get_disclosures_names,
-    extract_disclosure_data, get_latest_filing
+    extract_disclosure_data, get_latest_filing,
+    get_margin_breakdown, get_historical_fcf, get_working_capital,
 )
 import importlib.util
 import sys
@@ -154,6 +155,42 @@ class WebSearchServer:
           }
         ),
         Tool(
+          name="get_margin_breakdown",
+          description="Extract gross margin, SG&A pct revenue, and R&D pct revenue from latest SEC filing. Critical for scenario DCF (separates pricing power from cost discipline) and for benchmarking R&D intensity vs peers. Banks/financials typically lack gross_profit XBRL concept; absence is expected.",
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Stock symbol"},
+              "form_type": {"type": "string", "description": "SEC form type", "default": "10-K"}
+            },
+            "required": ["ticker"]
+          }
+        ),
+        Tool(
+          name="get_historical_fcf",
+          description="Extract operating cash flow, capex, and computed free cash flow from latest SEC filing. More authoritative than Finnhub's derived FCF since it comes directly from XBRL CF statement. Returns FCF margin percentage.",
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Stock symbol"},
+              "form_type": {"type": "string", "description": "SEC form type", "default": "10-K"}
+            },
+            "required": ["ticker"]
+          }
+        ),
+        Tool(
+          name="get_working_capital",
+          description="Extract current assets, current liabilities, AR/inventory/AP, compute net working capital and NWC as percent of revenue. Negative NWC indicates supplier-financed operations (capital-efficient); positive NWC indicates cash trapped in operations.",
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Stock symbol"},
+              "form_type": {"type": "string", "description": "SEC form type", "default": "10-K"}
+            },
+            "required": ["ticker"]
+          }
+        ),
+        Tool(
           name="get_disclosures_names",
           description="Get list of available disclosure names from SEC filings",
           inputSchema={
@@ -253,6 +290,12 @@ class WebSearchServer:
           return result
         elif name == 'get_depreciation':
           return await parent.get_depreciation(args['ticker'], args.get('form_type', '10-K'))
+        elif name == 'get_margin_breakdown':
+          return await parent.get_margin_breakdown(args['ticker'], args.get('form_type', '10-K'))
+        elif name == 'get_historical_fcf':
+          return await parent.get_historical_fcf(args['ticker'], args.get('form_type', '10-K'))
+        elif name == 'get_working_capital':
+          return await parent.get_working_capital(args['ticker'], args.get('form_type', '10-K'))
         elif name == 'get_disclosures_names':
           return await parent.get_disclosures_names(args['ticker'], args.get('form_type', '10-K'))
         elif name == 'extract_disclosure_data':
@@ -336,6 +379,18 @@ class WebSearchServer:
 
   async def get_depreciation(self, ticker: str, form_type: str = '10-K') -> List[TextContent]:
     result = await asyncio.to_thread(get_depreciation, ticker, form_type)
+    return [TextContent(type="text", text=safe_json_dumps(result))]
+
+  async def get_margin_breakdown(self, ticker: str, form_type: str = '10-K') -> List[TextContent]:
+    result = await asyncio.to_thread(get_margin_breakdown, ticker, form_type)
+    return [TextContent(type="text", text=safe_json_dumps(result))]
+
+  async def get_historical_fcf(self, ticker: str, form_type: str = '10-K') -> List[TextContent]:
+    result = await asyncio.to_thread(get_historical_fcf, ticker, form_type)
+    return [TextContent(type="text", text=safe_json_dumps(result))]
+
+  async def get_working_capital(self, ticker: str, form_type: str = '10-K') -> List[TextContent]:
+    result = await asyncio.to_thread(get_working_capital, ticker, form_type)
     return [TextContent(type="text", text=safe_json_dumps(result))]
 
   async def get_disclosures_names(self, ticker: str, form_type: str = '10-K') -> List[TextContent]:
