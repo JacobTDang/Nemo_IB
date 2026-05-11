@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}Nemo IB - Home{% endblock %}
+{% block content %}
+<section class="watchlist">
+  <h2>Watchlist ({{ watchlist|length }})</h2>
+  <div class="ticker-row">
+    {% for t in watchlist %}
+      <a class="ticker-chip" href="/ticker/{{ t }}">{{ t }}</a>
+    {% endfor %}
+  </div>
+</section>
+
+<section hx-get="/_partials/positions" hx-trigger="every 30s" hx-swap="innerHTML">
+  {% include "partials/positions_block.html" %}
+</section>
+
+<section hx-get="/_partials/events" hx-trigger="every 30s" hx-swap="innerHTML">
+  {% include "partials/events_block.html" %}
+</section>
+
+<section hx-get="/_partials/theses" hx-trigger="every 60s" hx-swap="innerHTML">
+  {% include "partials/theses_block.html" %}
+</section>
+{% endblock %}

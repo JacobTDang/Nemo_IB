@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Positions - Nemo IB{% endblock %}
+{% block content %}
+<section>
+  {% include "partials/positions_block.html" %}
+</section>
+
+<section>
+  <h2>Recent Orders ({{ recent_orders|length }})</h2>
+  {% if recent_orders %}
+  <table>
+    <tr><th>Created</th><th>Ticker</th><th>Side</th><th>Type</th><th>Qty</th><th>Limit</th><th>Status</th><th>Thesis</th></tr>
+    {% for o in recent_orders %}
+    <tr>
+      <td>{{ o.created_at[:16] }}</td>
+      <td>{{ o.ticker }}</td>
+      <td>{{ o.side }}</td>
+      <td>{{ o.order_type }}</td>
+      <td>{{ o.quantity }}</td>
+      <td>{% if o.limit_price %}${{ '%.2f'|format(o.limit_price) }}{% else %}-{% endif %}</td>
+      <td>{{ o.status }}</td>
+      <td>{% if o.thesis_id %}#{{ o.thesis_id }}{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p>No orders yet.</p>
+  {% endif %}
+</section>
+{% endblock %}

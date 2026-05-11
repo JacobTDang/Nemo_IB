@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}{{ ticker }} - Nemo IB{% endblock %}
+{% block content %}
+<h2>{{ ticker }}</h2>
+
+{% if latest %}
+<section class="thesis rec-{{ latest.recommendation|lower }}">
+  <h3>Active Thesis</h3>
+  <div class="thesis-head">
+    <span class="badge">{{ latest.recommendation }}</span>
+    <span class="conf">confidence {{ '%.2f'|format(latest.confidence or 0) }}</span>
+    <span class="date">{{ latest.thesis_date[:10] if latest.thesis_date else '' }}</span>
+  </div>
+  <p><strong>Summary:</strong> {{ latest.analysis_summary }}</p>
+  {% if latest.key_assumptions %}
+  <h4>Key Assumptions</h4>
+  <ul>{% for a in latest.key_assumptions %}<li>{{ a }}</li>{% endfor %}</ul>
+  {% endif %}
+  {% if latest.data_gaps %}
+  <h4>Data Gaps</h4>
+  <ul>{% for g in latest.data_gaps %}<li>{{ g }}</li>{% endfor %}</ul>
+  {% endif %}
+</section>
+{% else %}
+<p>No active thesis for {{ ticker }} yet.</p>
+{% endif %}
+
+{% if history|length > 1 %}
+<section>
+  <h3>Thesis History ({{ history|length }})</h3>
+  <table>
+    <tr><th>Date</th><th>Rec</th><th>Conf</th><th>Signal</th><th>Status</th></tr>
+    {% for t in history %}
+    <tr>
+      <td>{{ t.thesis_date[:10] }}</td>
+      <td>{{ t.recommendation }}</td>
+      <td>{{ '%.2f'|format(t.confidence or 0) }}</td>
+      <td>{{ t.signal }}</td>
+      <td>{% if t.superseded_by %}<em>superseded</em>{% else %}<strong>active</strong>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</section>
+{% endif %}
+
+<section>
+  <h3>Recent Events for {{ ticker }} ({{ events|length }})</h3>
+  {% if events %}
+  <table>
+    <tr><th>When</th><th>Materiality</th><th>Headline</th></tr>
+    {% for e in events %}
+    <tr class="event-{{ e.materiality }}">
+      <td>{{ e.ingested_at[:16] if e.ingested_at else '' }}</td>
+      <td>{{ e.materiality }}</td>
+      <td>{{ e.headline[:160] }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p>No recent events for {{ ticker }}.</p>
+  {% endif %}
+</section>
+{% endblock %}

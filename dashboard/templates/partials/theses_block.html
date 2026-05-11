@@ -1,0 +1,18 @@
+<h2>Active Theses ({{ theses|length }})</h2>
+{% if theses %}
+<div class="theses">
+  {% for t in theses %}
+    <div class="thesis rec-{{ t.recommendation|lower }}">
+      <div class="thesis-head">
+        <a href="/ticker/{{ t.ticker }}">{{ t.ticker }}</a>
+        <span class="badge">{{ t.recommendation }}</span>
+        <span class="conf">conf {{ '%.2f'|format(t.confidence or 0) }}</span>
+        <span class="date">{{ t.thesis_date[:10] if t.thesis_date else '' }}</span>
+      </div>
+      <p>{{ t.analysis_summary }}</p>
+    </div>
+  {% endfor %}
+</div>
+{% else %}
+<p>No active theses. Run an analysis to create one.</p>
+{% endif %}

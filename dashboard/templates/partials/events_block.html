@@ -1,0 +1,22 @@
+<h2>Recent Material Events ({{ events|length }})</h2>
+{% if events %}
+<table>
+  <tr><th>When</th><th>Ticker</th><th>Mat</th><th>Cat</th><th>Sig</th><th>Headline</th></tr>
+  {% for e in events %}
+  <tr class="event-{{ e.materiality }}">
+    <td>{{ e.ingested_at[:16] if e.ingested_at else '' }}</td>
+    <td>
+      {% if e.primary_ticker %}
+        <a href="/ticker/{{ e.primary_ticker }}">{{ e.primary_ticker }}</a>
+      {% else %}-{% endif %}
+    </td>
+    <td>{{ e.materiality }}</td>
+    <td>{{ e.category }}</td>
+    <td>{{ e.directional_signal }}</td>
+    <td title="{{ e.classifier_reason }}">{{ e.headline[:120] }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p>No material events yet. (News watcher daemon running?)</p>
+{% endif %}

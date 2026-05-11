@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}Events - Nemo IB{% endblock %}
+{% block content %}
+<h2>All Recent Events ({{ events|length }})</h2>
+{% if events %}
+<table>
+  <tr><th>Ingested</th><th>Source</th><th>Ticker</th><th>Mat</th><th>Cat</th><th>Sig</th><th>Urgency</th><th>Headline</th></tr>
+  {% for e in events %}
+  <tr class="event-{{ e.materiality }}">
+    <td>{{ e.ingested_at[:16] if e.ingested_at else '' }}</td>
+    <td>{{ e.source }}</td>
+    <td>{{ e.primary_ticker or e.ticker or '-' }}</td>
+    <td>{{ e.materiality }}</td>
+    <td>{{ e.category }}</td>
+    <td>{{ e.directional_signal }}</td>
+    <td>{{ e.urgency }}</td>
+    <td title="{{ e.classifier_reason }}">{{ e.headline[:160] }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p>No events yet.</p>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,31 @@
+<h2>Open Positions ({{ positions|length }})</h2>
+{% if portfolio %}
+<div class="portfolio-summary">
+  <span>Equity: ${{ '%.2f'|format(portfolio.total_value) }}</span>
+  <span class="{% if portfolio.daily_pnl >= 0 %}positive{% else %}negative{% endif %}">
+    Day P&amp;L: ${{ '%.2f'|format(portfolio.daily_pnl) }}
+    ({{ '%.2f'|format(portfolio.daily_pnl_pct * 100) }}%)
+  </span>
+  <span>Opened today: {{ portfolio.positions_opened_today }}</span>
+</div>
+{% endif %}
+{% if positions %}
+<table>
+  <tr><th>Ticker</th><th>Side</th><th>Qty</th><th>Entry</th><th>Current</th><th>Unrealized</th><th>Thesis</th></tr>
+  {% for p in positions %}
+  <tr>
+    <td><a href="/ticker/{{ p.ticker }}">{{ p.ticker }}</a></td>
+    <td>{{ p.side }}</td>
+    <td>{{ p.quantity }}</td>
+    <td>${{ '%.2f'|format(p.entry_price) }}</td>
+    <td>${{ '%.2f'|format(p.current_price or p.entry_price) }}</td>
+    <td class="{% if p.unrealized_pnl >= 0 %}positive{% else %}negative{% endif %}">
+      ${{ '%.2f'|format(p.unrealized_pnl or 0) }}
+    </td>
+    <td>{% if p.thesis_id %}#{{ p.thesis_id }}{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p>No open positions.</p>
+{% endif %}
