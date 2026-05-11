@@ -3,7 +3,9 @@ import asyncio
 import json
 import os
 from datetime import date, datetime
-from tools.web_search_server.webscraper_utils import search_duckduckgo, _session_manager, web_scrape
+from tools.web_search_server.searxng_client import searxng_search
+from tools.web_search_server.scraper import scrape_urls
+from agent.cache import Session_Cache
 from tools.web_search_server.sec_utils import (
     get_revenue_base, get_ebitda_margin, get_capex_pct_revenue,
     get_tax_rate, get_depreciation, get_disclosures_names,
@@ -47,6 +49,7 @@ def safe_json_dumps(obj):
 class WebSearchServer:
   def __init__(self):
     self.server = Server("web_client")
+    self.cache = Session_Cache()
     self._setup_handlers()
 
   def _setup_handlers(self):
@@ -326,33 +329,34 @@ class WebSearchServer:
 
 
   async def search(self, ticker: str, query: Dict) -> List[TextContent]:
-    # flexible, so we can search for multiple queries at a time
+    """Run multiple queries concurrently against the local SearXNG instance."""
     queries = list(query.values())
-
-    # create corotines that will run sync functions in threads
-    tasks = [asyncio.to_thread(search_duckduckgo, f"{ticker} {q}", 5) for q in queries]
+    tasks = [searxng_search(f"{ticker} {q}", max_results=5) for q in queries]
     result_list = await asyncio.gather(*tasks)
-    search_results = []
+    search_results: List[Dict] = []
+    for sub in result_list:
+      search_results.extend(sub)
 
-    # flatten from [[dicts, ...]] to [dicts ...]
-    for result in result_list:
-      search_results.extend(result)
+    print(f"  [Validate Search] {len(queries)} queries -> {len(search_results)} total URLs",
+          file=sys.stderr, flush=True)
 
     return [TextContent(
-      type = 'text',
-      text = safe_json_dumps({
+      type='text',
+      text=safe_json_dumps({
         'ticker': ticker,
-        'search_result' : search_results
+        'search_result': search_results,
       })
     )]
 
 
   async def get_urls_content(self, urls: List[str]) -> List[TextContent]:
-    # turn each url scrap into a corontine
-    tasks = [asyncio.to_thread(web_scrape, url, 3, 1) for url in urls]
-    results = await asyncio.gather(*tasks)
+    """Scrape URLs concurrently via Trafilatura (Crawl4AI fallback), cached by URL."""
+    results = await scrape_urls(urls, cache=self.cache)
 
-    _session_manager.close_all()  # close session for good practice
+    successes = sum(1 for r in results if r.get('success'))
+    print(f"  [Validate Scrape] {successes}/{len(urls)} URLs scraped successfully",
+          file=sys.stderr, flush=True)
+
     return [TextContent(
       type="text",
       text=safe_json_dumps({
