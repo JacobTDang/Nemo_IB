@@ -408,6 +408,25 @@ OUTPUT ONLY VALID JSON matching the ModelingDecision schema. No text before or a
       if margin > 1:
         margin /= 100
 
+      # Polymorphic fetcher fallback: if variable store missed, try multi-source
+      ticker = variables.get('ticker', '')
+      if (revenue <= 0 or margin <= 0) and ticker:
+        from data.sources import get_revenue, get_ebitda_margin_pct
+        if revenue <= 0:
+          v, src = get_revenue(ticker, variables)
+          if v is not None:
+            revenue = v
+            variables['revenue_base'] = revenue
+            print(f"[Sources] revenue resolved via {src}: ${revenue/1e9:.2f}B",
+                  file=sys.stderr, flush=True)
+        if margin <= 0:
+          v, src = get_ebitda_margin_pct(ticker, variables)
+          if v is not None:
+            margin = v / 100 if v > 1 else v
+            variables['ebitda_margin'] = margin
+            print(f"[Sources] ebitda_margin resolved via {src}: {margin*100:.2f}%",
+                  file=sys.stderr, flush=True)
+
       # Fail-fast: without revenue or margin, ebitda = 0 and credit ratios explode
       if revenue <= 0 or margin <= 0:
         print(f"[Validate Credit] Skipped: revenue={revenue} margin={margin} "
@@ -452,6 +471,22 @@ OUTPUT ONLY VALID JSON matching the ModelingDecision schema. No text before or a
       if margin > 1:
         margin /= 100
       market_cap = self._get(variables, 'marketCap', 'market_cap')
+
+      # Polymorphic fetcher fallback
+      ticker = variables.get('ticker', '')
+      if (revenue <= 0 or margin <= 0 or market_cap <= 0) and ticker:
+        from data.sources import get_revenue, get_ebitda_margin_pct, get_market_cap
+        if revenue <= 0:
+          v, src = get_revenue(ticker, variables)
+          if v is not None: revenue, variables['revenue_base'] = v, v
+        if margin <= 0:
+          v, src = get_ebitda_margin_pct(ticker, variables)
+          if v is not None:
+            margin = v / 100 if v > 1 else v
+            variables['ebitda_margin'] = margin
+        if market_cap <= 0:
+          v, src = get_market_cap(ticker, variables)
+          if v is not None: market_cap, variables['marketCap'] = v, v
 
       # Fail-fast: yields are meaningless without revenue, margin, or market cap
       if revenue <= 0 or margin <= 0 or market_cap <= 0:
@@ -498,6 +533,22 @@ OUTPUT ONLY VALID JSON matching the ModelingDecision schema. No text before or a
       margin     = self._get(variables, 'ebitda_margin')
       if margin > 1:
         margin /= 100
+
+      # Polymorphic fetcher fallback for LBO inputs
+      ticker = variables.get('ticker', '')
+      if (market_cap <= 0 or revenue <= 0 or margin <= 0) and ticker:
+        from data.sources import get_revenue, get_ebitda_margin_pct, get_market_cap
+        if revenue <= 0:
+          v, src = get_revenue(ticker, variables)
+          if v is not None: revenue, variables['revenue_base'] = v, v
+        if margin <= 0:
+          v, src = get_ebitda_margin_pct(ticker, variables)
+          if v is not None:
+            margin = v / 100 if v > 1 else v
+            variables['ebitda_margin'] = margin
+        if market_cap <= 0:
+          v, src = get_market_cap(ticker, variables)
+          if v is not None: market_cap, variables['marketCap'] = v, v
 
       # Fail-fast: LBO needs market_cap (for entry_ev) + revenue/margin (for ebitda)
       if market_cap <= 0 or revenue <= 0 or margin <= 0:
