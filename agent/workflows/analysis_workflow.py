@@ -686,7 +686,10 @@ class WorkFlow:
     plan_verification = state.get('plan_verification', {})
     data_gaps = plan_verification.get('gaps', []) if plan_verification else []
 
-    result = self.financial_analyst.analyze(
+    # analyze() returns (markdown_string, AnalysisReport) since the structured
+    # report refactor. The Pydantic model gives us data_gaps/conclusion/signal
+    # directly instead of regex-parsing the markdown.
+    result, analysis_report = self.financial_analyst.analyze(
       user_query=user_query,
       execution_plan=execution_plan,
       tools_results=summarized_output,
@@ -726,15 +729,22 @@ class WorkFlow:
     stale_keys = [k for k in updated_vars if k.startswith('analysis.')]
     for k in stale_keys:
       del updated_vars[k]
-    analysis_meta = self._extract_analysis_metadata(result)
-    for k, v in analysis_meta.items():
-      updated_vars[f"analysis.{k}"] = v
-    # Store verifier outcome so master_node can use it to force `done`
-    updated_vars['analysis.qc_action'] = qc_action
-    updated_vars['analysis.qc_score'] = qc_score
 
-    if analysis_meta.get('data_gaps'):
-      print(f"  [Analysis] Data gaps detected: {analysis_meta['data_gaps']}", file=sys.stderr, flush=True)
+    # Direct field access from the structured AnalysisReport (replaces the
+    # regex-based _extract_analysis_metadata).
+    updated_vars['analysis.data_gaps']      = analysis_report.data_gaps
+    updated_vars['analysis.conclusion']     = analysis_report.conclusion
+    updated_vars['analysis.signal']         = analysis_report.signal
+    updated_vars['analysis.recommendation'] = analysis_report.recommendation
+    updated_vars['analysis.confidence']     = analysis_report.confidence
+    updated_vars['analysis.has_gaps']       = bool(analysis_report.data_gaps)
+    # Store verifier outcome so master_node can use it to force `done`
+    updated_vars['analysis.qc_action']      = qc_action
+    updated_vars['analysis.qc_score']       = qc_score
+
+    if analysis_report.data_gaps:
+      print(f"  [Analysis] Data gaps detected: {analysis_report.data_gaps}",
+            file=sys.stderr, flush=True)
 
     return {
       'analysis_report': result,

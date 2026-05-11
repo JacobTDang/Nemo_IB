@@ -1,8 +1,48 @@
 from .openrouter_template import OpenRouterModel
+from pydantic import BaseModel, Field, ValidationError
 from typing import Dict, Any, List, Optional
 import json
 import sys
 from datetime import datetime
+
+
+class AnalysisReport(BaseModel):
+    """Structured output for the analysis phase. Replaces free-form markdown.
+
+    Downstream code reads `data_gaps`, `conclusion`, `signal`, `recommendation`,
+    and `confidence` directly from this model rather than regex-parsing markdown.
+    """
+    executive_summary: str = Field(description="2-3 sentence top-line answer to the user query.")
+    recommendation: str = Field(description="One of: BUY, HOLD, SELL, NEUTRAL, INFO. Use INFO when the query is factual not directional.")
+    signal: str = Field(description="Directional read: 'bullish', 'bearish', 'neutral', or 'n/a'")
+    valuation: str = Field(description="Free-text valuation section with calculations. Use 'Label: Value (source)' format.")
+    financial_performance: str = Field(description="Financial metrics, margins, growth, returns on capital.")
+    macro_context: Optional[str] = Field(default=None, description="Rates, inflation, sector context. Omit if irrelevant.")
+    sentiment: Optional[str] = Field(default=None, description="News, analyst consensus, insider activity.")
+    risks: List[str] = Field(default_factory=list, description="Bulleted risk factors.")
+    assumptions: List[str] = Field(default_factory=list, description="Each as 'NAME: value because reason'.")
+    data_gaps: List[str] = Field(default_factory=list, description="Specific data points that were missing and how it affected the analysis.")
+    confidence: float = Field(description="0.0 to 1.0 — confidence in the recommendation given data quality.")
+    conclusion: str = Field(description="Final 1-2 sentence verdict with the recommendation rationale.")
+
+    def render_markdown(self) -> str:
+        """Render the structured report as markdown for the user-visible output."""
+        out = [f"## EXECUTIVE SUMMARY\n{self.executive_summary}\n"]
+        out.append(f"## RECOMMENDATION: {self.recommendation}\n")
+        out.append(f"## VALUATION\n{self.valuation}\n")
+        out.append(f"## FINANCIAL PERFORMANCE\n{self.financial_performance}\n")
+        if self.macro_context:
+            out.append(f"## MACRO CONTEXT\n{self.macro_context}\n")
+        if self.sentiment:
+            out.append(f"## SENTIMENT\n{self.sentiment}\n")
+        if self.risks:
+            out.append("## RISKS\n" + "\n".join(f"- {r}" for r in self.risks) + "\n")
+        if self.assumptions:
+            out.append("## ASSUMPTIONS\n" + "\n".join(f"- {a}" for a in self.assumptions) + "\n")
+        out.append("## DATA GAPS\n" + ("\n".join(f"- {g}" for g in self.data_gaps) or "- None") + "\n")
+        out.append(f"## CONFIDENCE: {self.confidence:.2f}\n")
+        out.append(f"## CONCLUSION\n{self.conclusion}")
+        return "\n".join(out)
 
 
 class Financial_Analysis_Agent(OpenRouterModel):
@@ -15,7 +55,11 @@ class Financial_Analysis_Agent(OpenRouterModel):
     - Market factors (sector trends, competitive landscape, valuation)
     - Macro factors (interest rates, economic growth, regulation)
     - Risk factors (business, financial, market risks)
+
+    Outputs an AnalysisReport (Pydantic model) — see render_markdown() for the
+    user-visible string form.
     """
+    response_schema = AnalysisReport
     MAX_OUTPUT_TOKENS = 8192  # R1 thinking + full analysis; also reduces stream drops by finishing faster
 
     def __init__(self, model_name: str = None):
@@ -68,12 +112,77 @@ class Financial_Analysis_Agent(OpenRouterModel):
         print(f"{'='*60}\n", file=sys.stderr, flush=True)
 
         # Generate analysis
-        analysis = self.generate_response(
+        raw_response = self.generate_response(
             prompt=analysis_prompt,
             system_prompt=system_prompt
         )
 
-        return self._strip_unicode_artifacts(analysis)
+        # Try structured parse first. On failure, fall back to a minimal report
+        # built from the raw text so the workflow never breaks.
+        try:
+          report = self.parse_response(raw_response)
+          print(f"[Analyze] Structured output parsed: {report.recommendation}, "
+                f"confidence={report.confidence:.2f}, gaps={len(report.data_gaps)}",
+                file=sys.stderr, flush=True)
+        except (ValidationError, Exception) as e:
+          print(f"[Analyze] Pydantic parse failed ({type(e).__name__}); "
+                "falling back to raw-text report.", file=sys.stderr, flush=True)
+          report = self._fallback_report_from_raw(raw_response, user_query)
+
+        markdown = self._strip_unicode_artifacts(report.render_markdown())
+        return markdown, report
+
+    @staticmethod
+    def _fallback_report_from_raw(raw: str, user_query: str) -> 'AnalysisReport':
+        """When Pydantic parsing fails, salvage an AnalysisReport from raw markdown.
+
+        Uses lightweight regex extraction to populate the most-used fields.
+        Everything else gets a sensible default so downstream code keeps working.
+        """
+        import re
+        # Pull the first sensible conclusion-shaped section
+        concl_match = re.search(
+            r'(?:CONCLUSION|RECOMMENDATION|VERDICT)[:\s]*\n?(.*?)$',
+            raw, re.IGNORECASE | re.DOTALL,
+        )
+        conclusion = (concl_match.group(1).strip()[:500] if concl_match
+                      else "(unstructured output - see valuation section)")
+
+        # Pull data gaps as bulleted lines under DATA GAPS heading
+        gaps: List[str] = []
+        gap_match = re.search(
+            r'(?:DATA\s*GAPS?|MISSING\s*DATA)[:\s]*\n(.*?)(?=\n\s*(?:##|---|\Z))',
+            raw, re.IGNORECASE | re.DOTALL,
+        )
+        if gap_match:
+          for line in gap_match.group(1).split('\n'):
+            stripped = line.strip().lstrip('-*0123456789. ')
+            if len(stripped) > 5:
+              gaps.append(stripped)
+
+        # Recommendation heuristic
+        raw_upper = raw.upper()
+        if any(k in raw_upper for k in ('STRONG BUY', 'RECOMMEND BUY', 'BULLISH')):
+          rec, signal = 'BUY', 'bullish'
+        elif any(k in raw_upper for k in ('STRONG SELL', 'BEARISH', 'OVERVALUED')):
+          rec, signal = 'SELL', 'bearish'
+        elif 'HOLD' in raw_upper or 'NEUTRAL' in raw_upper:
+          rec, signal = 'HOLD', 'neutral'
+        else:
+          rec, signal = 'INFO', 'n/a'
+
+        return AnalysisReport(
+          executive_summary=f"(Fallback) Analysis for: {user_query}",
+          recommendation=rec,
+          signal=signal,
+          valuation=raw[:4000],  # dump raw text as valuation section
+          financial_performance="(see valuation)",
+          risks=[],
+          assumptions=[],
+          data_gaps=gaps,
+          confidence=0.4,  # low confidence since structure was missing
+          conclusion=conclusion,
+        )
 
     @staticmethod
     def _strip_unicode_artifacts(text: str) -> str:
@@ -886,12 +995,21 @@ Write a COMPLETE fresh analysis answering: "{user_query}"
 """
             if previous_analysis:
                 prompt += "The prior conclusion above shows where the analysis landed -- remain consistent with it unless the reviewer's feedback directly contradicts it.\n\n"
-            prompt += """Format:
-- 2-3 sentence executive summary with recommendation if applicable
-- Section headers relevant to the query (e.g., VALUATION, MACRO CONTEXT, SENTIMENT, RISKS)
-- "Label: Value (source)" pairs and bullet points, not prose paragraphs
-- Calculations on a single line (e.g., "FCF = EBITDA - Capex - Tax = $144.8B - $12.7B - $20.7B = $111.4B")
-- End with ASSUMPTIONS, DATA GAPS, and CONCLUSION
+            prompt += """OUTPUT FORMAT: Return ONLY valid JSON matching this schema, no markdown wrapper:
+{
+  "executive_summary": "2-3 sentences with recommendation",
+  "recommendation": "BUY | HOLD | SELL | NEUTRAL | INFO",
+  "signal": "bullish | bearish | neutral | n/a",
+  "valuation": "Free-text section. Use 'Label: Value (source)' pairs. Show calculations inline e.g. 'FCF = EBITDA - Capex - Tax = $144.8B - $12.7B - $20.7B = $111.4B'",
+  "financial_performance": "Margins, growth, returns on capital",
+  "macro_context": "Rates, inflation, sector context (or null if irrelevant)",
+  "sentiment": "News, analyst consensus, insider activity (or null)",
+  "risks": ["risk 1", "risk 2", ...],
+  "assumptions": ["NAME: value because reason", ...],
+  "data_gaps": ["specific missing data point", ...],
+  "confidence": 0.75,
+  "conclusion": "1-2 sentence final verdict with recommendation rationale"
+}
 """
         else:
             prompt += f"""--- YOUR TASK ---
@@ -904,12 +1022,21 @@ Rules:
 3. Show calculations step-by-step where applicable.
 4. Do not confuse millions, billions, and trillions.
 
-Format:
-- 2-3 sentence executive summary with recommendation if applicable
-- Section headers relevant to the query (e.g., VALUATION, MACRO CONTEXT, SENTIMENT, RISKS)
-- "Label: Value (source)" pairs and bullet points, not prose paragraphs
-- Calculations on a single line (e.g., "FCF = EBITDA - Capex - Tax = $144.8B - $12.7B - $20.7B = $111.4B")
-- End with ASSUMPTIONS, DATA GAPS, and CONCLUSION
+OUTPUT FORMAT: Return ONLY valid JSON matching this schema, no markdown wrapper:
+{
+  "executive_summary": "2-3 sentences with recommendation",
+  "recommendation": "BUY | HOLD | SELL | NEUTRAL | INFO",
+  "signal": "bullish | bearish | neutral | n/a",
+  "valuation": "Free-text section. Use 'Label: Value (source)' pairs. Show calculations inline e.g. 'FCF = EBITDA - Capex - Tax = $144.8B - $12.7B - $20.7B = $111.4B'",
+  "financial_performance": "Margins, growth, returns on capital",
+  "macro_context": "Rates, inflation, sector context (or null if irrelevant)",
+  "sentiment": "News, analyst consensus, insider activity (or null)",
+  "risks": ["risk 1", "risk 2", ...],
+  "assumptions": ["NAME: value because reason", ...],
+  "data_gaps": ["specific missing data point", ...],
+  "confidence": 0.75,
+  "conclusion": "1-2 sentence final verdict with recommendation rationale"
+}
 """
 
         return prompt
