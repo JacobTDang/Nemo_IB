@@ -1,4 +1,4 @@
-from .openrouter_template import OpenRouterModel
+from .openrouter_template import OpenRouterModel, PRIMARY_REASONING_MODEL
 from pydantic import BaseModel
 from typing import Dict, Optional, List, Any
 import sys
@@ -18,7 +18,9 @@ class PlanVerificationResult(BaseModel):
   gaps: List[DataGap]
 
 
-_DEEPSEEK_MODEL = 'deepseek/deepseek-r1-0528:free'
+# Manual parse-failure fallback uses whatever reasoning model was verified
+# alive at import time (was hard-coded to the now-dead deepseek-r1-0528).
+_DEEPSEEK_MODEL = PRIMARY_REASONING_MODEL
 
 
 class Plan_Verifier_Agent(OpenRouterModel):

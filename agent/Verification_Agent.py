@@ -16,7 +16,8 @@ class Verification_Agent(OpenRouterModel):
   response_schema = VerificationResult
   MAX_OUTPUT_TOKENS = 8192  # R1 thinking can be long; give JSON plenty of room
 
-  def __init__(self, model_name: str = 'deepseek/deepseek-r1-0528:free'):
+  def __init__(self, model_name: str = None):
+    # None -> base class picks PRIMARY_REASONING_MODEL (verified-alive at import)
     super().__init__(model_name=model_name)
 
   def build_prompt(self) -> str:

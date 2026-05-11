@@ -1,4 +1,4 @@
-from openai import OpenAI, APIError, AuthenticationError, RateLimitError, APIConnectionError, APITimeoutError
+from openai import OpenAI, APIError, AuthenticationError, RateLimitError, APIConnectionError, APITimeoutError, NotFoundError
 import httpx
 import os, sys, json, re, time
 
@@ -20,6 +20,62 @@ if hasattr(sys.stdout, 'reconfigure'):
   sys.stderr.reconfigure(errors='replace')
 
 
+def _verify_model_alive(model_id: str, api_key: str, timeout: float = 10.0) -> bool:
+  """Send a 1-token completion to check the model endpoint exists.
+
+  Returns True if alive (or if the error is non-404 — auth, rate limit, timeout
+  all indicate the model name itself is at least known). Returns False only on
+  explicit 404 NotFoundError.
+  """
+  try:
+    client = OpenAI(api_key=api_key, base_url="https://openrouter.ai/api/v1", timeout=timeout)
+    client.chat.completions.create(
+      model=model_id,
+      messages=[{"role": "user", "content": "ping"}],
+      max_tokens=1,
+    )
+    return True
+  except NotFoundError:
+    return False
+  except Exception:
+    return True  # rate limit, auth, etc. don't prove the model is dead
+
+
+def _resolve_primary_reasoning_model() -> str:
+  """Probe candidate reasoning models at import time and return the first live one.
+
+  Reads the OPENROUTER_API_KEY env var. If unset, returns the ultimate fallback
+  without probing. PRIMARY_REASONING_MODEL env var overrides everything.
+  """
+  load_dotenv()
+  api_key = os.getenv("OPENROUTER_API_KEY")
+  ultimate_fallback = 'z-ai/glm-4.5-air:free'
+
+  if not api_key:
+    return ultimate_fallback
+
+  candidates = [
+    os.getenv("PRIMARY_REASONING_MODEL"),  # explicit override
+    'deepseek/deepseek-chat-v3.1:free',
+    'deepseek/deepseek-r1-distill-llama-70b:free',
+    'qwen/qwq-32b-preview:free',
+    'meta-llama/llama-3.3-70b-instruct:free',
+  ]
+  for candidate in candidates:
+    if candidate and _verify_model_alive(candidate, api_key):
+      print(f"[OpenRouter] Reasoning model resolved to: {candidate}",
+            file=sys.stderr, flush=True)
+      return candidate
+
+  print(f"[OpenRouter] All reasoning candidates dead, using fallback: {ultimate_fallback}",
+        file=sys.stderr, flush=True)
+  return ultimate_fallback
+
+
+# Resolved once at module import time so every agent sees the same model.
+PRIMARY_REASONING_MODEL = _resolve_primary_reasoning_model()
+
+
 class OpenRouterModel:
   """
   OpenRouter API base class using the OpenAI-compatible SDK.
@@ -38,8 +94,11 @@ class OpenRouterModel:
   MAX_OUTPUT_TOKENS = 2048  # Subclasses can override (e.g., verifier needs more room after thinking)
   REASONING_EFFORT = "low"  # Subclasses can set to None to disable reasoning (e.g., orchestrator just needs JSON)
 
-  def __init__(self, model_name: str = 'deepseek/deepseek-r1-0528:free', api_key_env: str = "OPENROUTER_API_KEY"):
+  def __init__(self, model_name: str = None, api_key_env: str = "OPENROUTER_API_KEY"):
     load_dotenv()
+    # Default to the verified primary reasoning model resolved at import time
+    if model_name is None:
+      model_name = PRIMARY_REASONING_MODEL
     # Try the requested env var first, then fall back to the main key.
     # This means a single OPENROUTER_API_KEY is always enough to run the system --
     # model-specific keys (OPENROUTER_NEMOTRON, OPENROUTER_GLM) are optional extras.
