@@ -448,6 +448,32 @@ class WorkFlow:
       planned_tools.add('get_financial_statements')
       injected.append('get_financial_statements (cf, for capital returns)')
 
+    # Fix 7: Inject comparable_company_analysis for relative-valuation queries
+    comps_keywords = ['comp', 'comps', 'comparable', 'peer', 'relative valuation', 'multiples',
+                      'comprehensive', 'advanced', 'deep dive']
+    comps_planned = (
+      'comparable_company_analysis' in planned_tools or
+      'comparable_company_analysis' in already_run
+    )
+    if any(kw in query_lower for kw in comps_keywords) and not comps_planned:
+      peers_available = (
+        'get_company_peers' in planned_tools or
+        'get_company_peers' in already_run or
+        variables.get('company_peers') is not None
+      )
+      if not peers_available:
+        plan['tools_sequence'].append({'tool': 'get_company_peers', 'arguments': {'ticker': ticker}})
+        planned_tools.add('get_company_peers')
+        injected.append('get_company_peers (prereq for comps)')
+      existing_peers = variables.get('company_peers', [])
+      comps_args = {'companies': existing_peers} if existing_peers else {'companies': 'FROM_PREVIOUS'}
+      plan['tools_sequence'].append({
+        'tool': 'comparable_company_analysis',
+        'arguments': comps_args
+      })
+      planned_tools.add('comparable_company_analysis')
+      injected.append('comparable_company_analysis')
+
     if injected:
       print(f"  [Plan Inject] Added missing tools: {injected}", file=sys.stderr, flush=True)
 

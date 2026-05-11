@@ -150,6 +150,9 @@ Ask: Does this request need historical revenue, margins, capex, depreciation, ta
 ---
 CATEGORY 2: FINANCIAL MODELING TOOLS -- market data and quantitative calculations
 Ask: Does this request need market cap / beta / debt? Does it involve a DCF, WACC, or peer comp?
+For ANY comps / "valued vs peers" / advanced / comprehensive query you MUST include BOTH
+get_company_peers AND comparable_company_analysis. Peers from get_company_peers feed the
+companies argument of comparable_company_analysis (use FROM_PREVIOUS as placeholder).
 
 {financial_tools_str}
 ---
