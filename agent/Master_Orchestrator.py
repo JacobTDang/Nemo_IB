@@ -162,12 +162,14 @@ ROUTING LOGIC:
 - Phase "executed" -> route to model (standard/complex) or done (simple, if query answered by data alone)
   Note: Plan Verification guardrails will intercept and re-route to plan if critical gaps remain.
 - Phase "modeled" -> route to analyze
-- Phase "analyzed" -> done (analysis is the final output, no separate verification step)
-  Exception: route to plan with revision_context if data gaps in analysis are severe and execution budget remains.
+- Phase "analyzed" -> ALWAYS route to done. The plan_verifier and quality verifier already
+  gated the analysis; do NOT re-plan even if you see data gaps in the state summary.
+  Data gaps are NORMAL — the analysis already noted them as ASSUMPTIONs. Re-planning here
+  causes infinite loops.
 
 REVISION HANDLING:
 When routing to plan for data gaps, populate revision_context:
-- {"type": "missing_data", "feedback": <description of what is missing and which tools to use>}
+- {{"type": "missing_data", "feedback": <description of what is missing and which tools to use>}}
 
 GUARDRAILS (you cannot override these, the system enforces them):
 - Maximum {MAX_ITERATIONS} global iterations
@@ -180,20 +182,20 @@ RULES:
 - revision_context is null unless routing to plan for data gaps
 
 OUTPUT FORMAT - you must output exactly this JSON structure, no other fields:
-{
+{{
   "next_action": "<one of: probe, plan, execute, model, analyze, done>",
   "reasoning": "<1-2 sentence explanation of why you chose this action>",
   "query_complexity": "<simple, standard, or complex>",
   "revision_context": null
-}
+}}
 
 Example when re-planning for gaps:
-{
+{{
   "next_action": "plan",
   "reasoning": "Analysis missing WACC inputs. Fetching market data and macro rates before re-running DCF.",
   "query_complexity": "standard",
-  "revision_context": {"type": "missing_data", "feedback": "WACC inputs missing: fetch get_market_data and get_macro_snapshot"}
-}"""
+  "revision_context": {{"type": "missing_data", "feedback": "WACC inputs missing: fetch get_market_data and get_macro_snapshot"}}
+}}"""
 
   def decide(self, state: AgentState) -> Dict[str, Any]:
     """

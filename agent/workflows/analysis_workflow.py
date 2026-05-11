@@ -151,6 +151,20 @@ class WorkFlow:
         print(f"Guardrail: Exec limit hit and analysis done. LLM chose '{next_action}'. Overriding to done.", file=sys.stderr, flush=True)
         next_action = 'done'
 
+    # Guardrail: verifier-approved + plan_verify-complete -> force done.
+    # Closes a known re-plan-loop bug where the LLM reads `analysis.data_gaps`
+    # in the state summary and decides to re-plan despite both validators
+    # already approving the analysis.
+    if state.get('current_phase') == 'analyzed':
+      variables = state.get('variables', {}) or {}
+      plan_verification = state.get('plan_verification', {}) or {}
+      qc_action = variables.get('analysis.qc_action', 'approve')
+      plan_verify_complete = plan_verification.get('complete', True)
+      if qc_action == 'approve' and plan_verify_complete and next_action != 'done':
+        print(f"Guardrail: verifier approved + plan_verify complete. "
+              f"Overriding '{next_action}' -> 'done'.", file=sys.stderr, flush=True)
+        next_action = 'done'
+
     phase_history.append(f"master->{next_action}")
 
     return {
@@ -684,7 +698,10 @@ class WorkFlow:
       model_outputs=state.get('model_outputs')
     )
 
-    # Non-blocking QC: append note to report if verifier flags a critical issue
+    # Non-blocking QC: append note to report if verifier flags a critical issue.
+    # Also store action/score in state so master_node can use it to force `done`.
+    qc_action = 'approve'  # safe default if verification fails
+    qc_score = 0.0
     try:
       verification = await asyncio.to_thread(
         self.verification_agent.verify,
@@ -692,14 +709,14 @@ class WorkFlow:
         result,
         execution_plan
       )
-      action = verification.get('action', 'approve') if isinstance(verification, dict) else 'approve'
+      qc_action = verification.get('action', 'approve') if isinstance(verification, dict) else 'approve'
+      qc_score = verification.get('quality_score', 0) if isinstance(verification, dict) else 0
       feedback = verification.get('feedback', '') if isinstance(verification, dict) else ''
-      if action == 'revise' and feedback:
+      if qc_action == 'revise' and feedback:
         result = result + f"\n\n---\nQC NOTE: {feedback}"
         print(f"[QC] Appended verifier note: {feedback[:100]}", file=sys.stderr, flush=True)
       else:
-        score = verification.get('quality_score', 0) if isinstance(verification, dict) else 0
-        print(f"[QC] Verification: {action} (score={score})", file=sys.stderr, flush=True)
+        print(f"[QC] Verification: {qc_action} (score={qc_score})", file=sys.stderr, flush=True)
     except Exception as e:
       print(f"[QC] Verification failed (non-critical): {e}", file=sys.stderr, flush=True)
 
@@ -712,6 +729,9 @@ class WorkFlow:
     analysis_meta = self._extract_analysis_metadata(result)
     for k, v in analysis_meta.items():
       updated_vars[f"analysis.{k}"] = v
+    # Store verifier outcome so master_node can use it to force `done`
+    updated_vars['analysis.qc_action'] = qc_action
+    updated_vars['analysis.qc_score'] = qc_score
 
     if analysis_meta.get('data_gaps'):
       print(f"  [Analysis] Data gaps detected: {analysis_meta['data_gaps']}", file=sys.stderr, flush=True)
