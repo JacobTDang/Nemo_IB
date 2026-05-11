@@ -519,7 +519,7 @@ class WorkFlow:
       if tool not in already_in_plan:
         plan['tools_sequence'].append({
           'tool': tool,
-          'arguments': {'ticker': state.get('ticker', '')} if tool != 'calculate_wacc' else {}
+          'arguments': {'ticker': ticker} if tool != 'calculate_wacc' else {}
         })
         already_in_plan.add(tool)
         preflight_added.append(tool)
