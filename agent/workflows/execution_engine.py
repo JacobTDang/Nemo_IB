@@ -9,6 +9,7 @@ from ..News_Processing_Agent import News_Processing_Agent
 from ..cache import Session_Cache
 import asyncio
 import json
+import sys
 
 
 # SEC tools return structured XBRL data -- pass through without summarization
@@ -17,6 +18,7 @@ SEC_TOOLS = {
   'get_depreciation', 'get_tax_rate', 'extract_8k_events',
   'get_disclosures_names', 'extract_disclosure_data', 'get_latest_filing',
   'extract_proxy_compensation', 'extract_governance_data',
+  'get_margin_breakdown', 'get_historical_fcf', 'get_working_capital',
 }
 
 # Financial modeling tools -- deterministic calculations, pass through
@@ -183,16 +185,49 @@ def _flatten_market_intel(variables: Dict[str, Any], tool_name: str, data: Dict[
 
   elif tool_name == 'get_financial_statements':
     # data is already unwrapped by _process_market_intel (envelope stripped)
-    # Shape: {"statement": "cf", "freq": "annual", "periods": [{...}, ...]}
+    # Shape: {"statement": "cf"|"ic"|"bs", "freq": "annual", "periods": [{...}, ...]}
     stmt = data.get('statement', '')
     periods = data.get('periods', [])
-    if stmt == 'cf' and periods and isinstance(periods, list):
-      latest = periods[0]  # most recent annual period
+    if not (periods and isinstance(periods, list)):
+      return
+    latest = periods[0]  # most recent annual period
+
+    if stmt == 'cf':
       for field in ('dividendsPaid', 'repurchaseOfCapitalStock', 'operatingCashFlow',
                     'capitalExpenditures', 'freeCashFlow'):
         if field in latest and latest[field] is not None:
           variables[f"cf.{field}"] = latest[field]
           variables[field] = latest[field]
+
+    elif stmt == 'ic':
+      for field in ('revenue', 'costOfRevenue', 'grossProfit', 'operatingExpense',
+                    'operatingIncome', 'ebitda', 'ebit', 'netIncome', 'eps', 'epsDiluted'):
+        if field in latest and latest[field] is not None:
+          variables[f"ic.{field}"] = latest[field]
+          variables[field] = latest[field]
+      rev = latest.get('revenue')
+      if rev and rev > 0:
+        gp = latest.get('grossProfit')
+        if gp is not None:
+          variables['ic.grossMargin'] = gp / rev
+        ni = latest.get('netIncome')
+        if ni is not None:
+          variables['ic.netMargin'] = ni / rev
+
+    elif stmt == 'bs':
+      for field in ('totalAssets', 'totalCurrentAssets', 'cashAndEquivalents',
+                    'totalLiabilities', 'totalCurrentLiabilities', 'longTermDebt',
+                    'shortTermDebt', 'totalDebt', 'totalEquity', 'stockholdersEquity',
+                    'goodwill', 'intangibleAssets'):
+        if field in latest and latest[field] is not None:
+          variables[f"bs.{field}"] = latest[field]
+          # Don't overwrite flat keys produced by get_market_data
+          if field not in ('totalDebt', 'cashAndEquivalents'):
+            variables[field] = latest[field]
+
+    extracted = [k for k in variables if k.startswith(f"{stmt}.")]
+    print(f"[Validate Flatten] get_financial_statements ({stmt}) wrote {len(extracted)} keys",
+          file=sys.stderr, flush=True)
 
 
 def _flatten_news_analysis(variables: Dict[str, Any], tool_name: str, analysis: Dict[str, Any]):
@@ -251,6 +286,15 @@ def _flatten_macro(variables: Dict[str, Any], tool_name: str, data: Dict[str, An
     spread = data.get('T10Y2Y', {})
     if isinstance(spread, dict) and spread.get('current') is not None:
       variables['macro.spread_10y_2y'] = spread['current']
+
+    nfci = data.get('NFCI', {})
+    if isinstance(nfci, dict) and nfci.get('current') is not None:
+      variables['macro.NFCI'] = nfci['current']
+      variables['NFCI'] = nfci['current']
+
+    umich = data.get('UMCSENT', {})
+    if isinstance(umich, dict) and umich.get('current') is not None:
+      variables['macro.consumer_sentiment'] = umich['current']
 
   elif tool_name == 'get_treasury_yields':
     curve = data.get('curve', {})
