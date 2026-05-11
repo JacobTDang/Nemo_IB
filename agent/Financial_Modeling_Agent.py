@@ -19,6 +19,7 @@ from datetime import datetime
 from tools.financial_modeling_engine.analysis_tools import (
   _dcf_math, _wacc_math, _lbo_math,
   _credit_profile_math, _scenario_dcf_math, _capital_returns_math,
+  _ddm_math, _sensitivity_table_math,
 )
 
 
@@ -52,6 +53,8 @@ class ModelingDecision(BaseModel):
   run_credit_profile: bool
   run_capital_returns: bool
   run_lbo: bool
+  run_sensitivity_table: bool = False  # auto-true when run_scenario_dcf is true
+  run_ddm: bool = False                # true for high-payout / utility / REIT / consumer staples
   scenario_params: Optional[ScenarioParams] = None  # required if run_scenario_dcf
   lbo_params: Optional[LBOParams] = None            # required if run_lbo
   reasoning: str
@@ -111,6 +114,14 @@ class Financial_Modeling_Agent(OpenRouterModel):
           f"CapReturns={decision.run_capital_returns} | "
           f"LBO={decision.run_lbo}", file=sys.stderr, flush=True)
 
+    # Validate that signal inputs reached the decision
+    beat_rate = variables.get('earnings_quality.beat_rate_pct')
+    curve = variables.get('yield_curve_shape')
+    nfci = variables.get('macro.NFCI')
+    bull_y1 = decision.scenario_params.bull_growth_y1 if decision.scenario_params else None
+    print(f"[Validate Signals] beat_rate={beat_rate} | curve={curve} | nfci={nfci} | chose bull_y1={bull_y1}",
+          file=sys.stderr, flush=True)
+
     # Run calculations
     outputs: Dict[str, Any] = {
       'decision': decision.model_dump(),
@@ -141,6 +152,19 @@ class Financial_Modeling_Agent(OpenRouterModel):
       if result:
         outputs['lbo'] = result
         outputs['models_run'].append('lbo')
+
+    # Sensitivity table auto-runs whenever scenario DCF runs
+    if decision.run_sensitivity_table or decision.run_scenario_dcf:
+      result = self._run_sensitivity_table(variables)
+      if result:
+        outputs['sensitivity_table'] = result
+        outputs['models_run'].append('sensitivity_table')
+
+    if decision.run_ddm:
+      result = self._run_ddm(variables)
+      if result:
+        outputs['ddm'] = result
+        outputs['models_run'].append('ddm')
 
     print(f"[Modeling Agent] Models run: {outputs['models_run']}", file=sys.stderr, flush=True)
     return outputs
@@ -181,6 +205,17 @@ SELECTION RULES:
 - run_credit_profile: true when total_debt (or totalDebt) AND ebitda (or revenue_base + ebitda_margin) are present.
 - run_capital_returns: true ONLY when dividendsPaid or repurchaseOfCapitalStock appear in the variable store with non-zero values.
 - run_lbo: true ONLY when the query involves M&A, private equity, buyout potential, acquisition, or takeout analysis.
+- run_sensitivity_table: true WHENEVER run_scenario_dcf is true (no extra cost, builds the football field).
+- run_ddm: true when one or more applies: (a) cf.dividendsPaid is non-zero AND payout_ratio_pct > 50, (b) profile.gicsSubIndustry or profile.finnhubIndustry contains "Utility"/"Utilities"/"REIT"/"Consumer Staples"/"Tobacco", (c) the query mentions "dividend" or "income".
+
+SIGNAL-BASED ADJUSTMENTS (apply cumulatively to scenario_params):
+- If earnings_quality.beat_rate_pct > 75: management consistently beats; raise bull_growth_y1 by 0.02 (200bps).
+- If earnings_quality.beat_rate_pct < 40: management misses; lower bull_growth_y1 by 0.02, lower base_growth_y1 by 0.01.
+- If insider_sentiment.signal == "net_buying": raise bull_margin_adj by 0.005.
+- If insider_sentiment.signal == "net_selling": lower bull_growth_y1 by 0.01.
+- If yield_curve_shape == "inverted": use more conservative settings; lower bull_growth_y1 by 0.02 and make bear_margin_adj more negative by 0.01.
+- If macro.NFCI > 0 (tightening financial conditions): compress bull case; lower bull_growth_long_run by 0.005.
+- Use profile.finnhubIndustry / profile.gicsSubIndustry to inform sector-appropriate margins (e.g. utilities = capital-intensive, low margins; software = high margins).
 
 OUTPUT ONLY VALID JSON matching the ModelingDecision schema. No text before or after."""
 
@@ -193,8 +228,13 @@ OUTPUT ONLY VALID JSON matching the ModelingDecision schema. No text before or a
     namespaced_relevant = [
       'financials.revenueGrowthTTMYoy', 'financials.revenueGrowth5Y',
       'financials.evEbitdaTTM', 'financials.ebitdaCagr5Y',
-      'macro.real_gdp_growth', 'macro.DGS10',
+      'macro.real_gdp_growth', 'macro.DGS10', 'macro.NFCI',
       'cf.dividendsPaid', 'cf.repurchaseOfCapitalStock', 'cf.operatingCashFlow',
+      'ic.grossMargin', 'ic.netMargin',
+      'earnings_quality.beat_rate_pct', 'earnings_quality.avg_surprise_pct',
+      'insider_sentiment.signal', 'insider_sentiment.avg_mspr',
+      'yield_curve_shape',
+      'profile.finnhubIndustry', 'profile.gicsSubIndustry',
     ]
     ns_present = {k: variables[k] for k in namespaced_relevant if k in variables and variables[k]}
 
@@ -321,9 +361,41 @@ OUTPUT ONLY VALID JSON matching the ModelingDecision schema. No text before or a
         bear_margin=bear_margin, base_margin=base_margin_, bull_margin=bull_margin,
       )
       result['scenario_assumptions'] = params.model_dump()
+
+      # Regime-weighted expected price -- yield curve + NFCI inform probability weights
+      curve = variables.get('yield_curve_shape', 'normal')
+      nfci = variables.get('macro.NFCI', 0) or 0
+      if curve == 'inverted' and nfci > 0:
+        weights = {'bear': 0.50, 'base': 0.35, 'bull': 0.15}
+        regime = 'late-cycle / tightening'
+      elif curve == 'inverted':
+        weights = {'bear': 0.40, 'base': 0.40, 'bull': 0.20}
+        regime = 'late-cycle'
+      elif nfci > 0.5:
+        weights = {'bear': 0.35, 'base': 0.45, 'bull': 0.20}
+        regime = 'tightening conditions'
+      elif curve == 'flat':
+        weights = {'bear': 0.30, 'base': 0.45, 'bull': 0.25}
+        regime = 'transitional'
+      else:
+        weights = {'bear': 0.20, 'base': 0.50, 'bull': 0.30}
+        regime = 'expansion'
+
+      px = result['price_range']
+      expected_price = (weights['bear'] * px['low']
+                        + weights['base'] * px['mid']
+                        + weights['bull'] * px['high'])
+      result['regime_weighted'] = {
+        'regime': regime,
+        'weights': weights,
+        'expected_price': round(expected_price, 2),
+        'inputs': {'yield_curve': curve, 'nfci': nfci},
+      }
+
       print(f"[Modeling Agent] Scenario DCF: Bear=${result['price_range']['low']:.2f} | "
             f"Base=${result['price_range']['mid']:.2f} | "
-            f"Bull=${result['price_range']['high']:.2f}", file=sys.stderr, flush=True)
+            f"Bull=${result['price_range']['high']:.2f} | "
+            f"Regime={regime} | Weighted=${expected_price:.2f}", file=sys.stderr, flush=True)
       return result
     except Exception as e:
       print(f"[Modeling Agent] Scenario DCF failed: {e}", file=sys.stderr, flush=True)
@@ -407,10 +479,15 @@ OUTPUT ONLY VALID JSON matching the ModelingDecision schema. No text before or a
       risk_free  = self._get(variables, 'macro.DGS10', default=0.045)
       if risk_free > 1:
         risk_free /= 100
-      hy_spread  = self._get(variables, 'BAMLH0A0HYM2', default=0.035) / 100
-      if hy_spread > 0.5:
-        hy_spread /= 100  # guard against bps values
+      # HY spread stored as basis points by _flatten_macro; convert to decimal.
+      hy_spread_bps = self._get(variables, 'credit_spread.BAMLH0A0HYM2', 'credit_spread_hy', 'BAMLH0A0HYM2')
+      if hy_spread_bps == 0:
+        hy_spread = 0.035  # fallback when no macro data available
+      else:
+        hy_spread = hy_spread_bps / 10000  # 350bps -> 0.035
       debt_rate  = risk_free + max(0.025, hy_spread)
+      print(f"[Validate LBO] rf={risk_free:.4f} + hy_spread={hy_spread:.4f} (raw_bps={hy_spread_bps}) = debt_rate={debt_rate:.4f}",
+            file=sys.stderr, flush=True)
 
       revenue_base = self._get(variables, 'revenue_base')
       margin       = self._get(variables, 'ebitda_margin')
@@ -457,4 +534,82 @@ OUTPUT ONLY VALID JSON matching the ModelingDecision schema. No text before or a
       return result
     except Exception as e:
       print(f"[Modeling Agent] LBO failed: {e}", file=sys.stderr, flush=True)
+      return None
+
+  def _run_sensitivity_table(self, variables: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    try:
+      base_margin = self._get(variables, 'ebitda_margin')
+      if base_margin > 1:
+        base_margin /= 100
+      ttm = self._get(variables, 'financials.revenueGrowthTTMYoy') / 100
+      if ttm <= 0:
+        ttm = 0.05
+      long_run = self._get(variables, 'financials.revenueGrowth5Y') / 100
+      if long_run <= 0:
+        long_run = ttm * 0.5
+      growth_schedule = self._build_growth_schedule(ttm, long_run)
+
+      base_inputs = {
+        'revenue_base':      self._get(variables, 'revenue_base'),
+        'ebitda_margin':     base_margin,
+        'capex_pct_revenue': self._get(variables, 'capex_pct_revenue'),
+        'tax_rate':          self._get(variables, 'tax_rate'),
+        'depreciation':      self._get(variables, 'depreciation'),
+        'revenue_growth':    growth_schedule,
+        'wacc':              self._get(variables, 'wacc'),
+        'terminal_growth':   self._get(variables, 'terminal_growth', default=0.025),
+        'terminal_multiple': self._get(variables, 'terminal_multiple', 'financials.evEbitdaTTM'),
+        'cash':              self._get(variables, 'totalCash', 'cash'),
+        'debt':              self._get(variables, 'totalDebt', 'debt'),
+        'shares_outstanding': self._get(variables, 'sharesOutstanding', 'shares_outstanding'),
+        'ticker':            variables.get('ticker', ''),
+      }
+      if base_inputs['wacc'] <= 0 or base_inputs['revenue_base'] <= 0:
+        print(f"[Modeling Agent] Sensitivity skipped: missing WACC or revenue", file=sys.stderr, flush=True)
+        return None
+
+      result = _sensitivity_table_math(base_inputs)
+      print(f"[Validate Sensitivity] {result['cells_filled']} cells, range "
+            f"${result['min_price']:.2f}-${result['max_price']:.2f} | mid=${result['mid_price']:.2f}",
+            file=sys.stderr, flush=True)
+      return result
+    except Exception as e:
+      print(f"[Modeling Agent] Sensitivity table failed: {e}", file=sys.stderr, flush=True)
+      return None
+
+  def _run_ddm(self, variables: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    try:
+      # DPS = dividendsPaid / sharesOutstanding (absolute value; CF reports outflows as negative)
+      div_paid = abs(self._get(variables, 'cf.dividendsPaid', 'dividendsPaid'))
+      shares   = self._get(variables, 'sharesOutstanding', 'shares_outstanding')
+      if div_paid <= 0 or shares <= 0:
+        print(f"[Modeling Agent] DDM skipped: missing dividends or shares", file=sys.stderr, flush=True)
+        return None
+      current_dps = div_paid / shares
+
+      # Cost of equity: from WACC calc if available, else fall back to risk_free + 0.06*beta
+      cost_of_equity = self._get(variables, 'cost_of_equity')
+      if cost_of_equity <= 0:
+        rf = self._get(variables, 'risk_free_rate', 'macro.DGS10', default=0.045)
+        if rf > 1:
+          rf /= 100
+        beta = self._get(variables, 'beta', default=1.0)
+        cost_of_equity = rf + 0.06 * beta
+
+      # Terminal growth: prefer macro GDP, fall back to 3%
+      tg = self._get(variables, 'terminal_growth', 'macro.real_gdp_growth', default=0.03)
+      if tg > 1:
+        tg /= 100
+
+      result = _ddm_math(
+        current_dps=current_dps,
+        cost_of_equity=cost_of_equity,
+        terminal_growth=tg,
+      )
+      if result.get('success'):
+        print(f"[Validate DDM] DPS={current_dps:.4f} Ke={cost_of_equity:.4f} g={tg:.4f} "
+              f"-> ${result['intrinsic_value_per_share']:.2f}", file=sys.stderr, flush=True)
+      return result
+    except Exception as e:
+      print(f"[Modeling Agent] DDM failed: {e}", file=sys.stderr, flush=True)
       return None
