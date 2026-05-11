@@ -28,6 +28,14 @@ class Session_Cache():
                             result_article TEXT,
                             created_at TIMESTAMP
         )""")
+
+        # URL-keyed scrape cache. INSERT OR REPLACE on PRIMARY KEY makes writes idempotent
+        # so re-scraping the same URL within a session just refreshes the row.
+        self.cursor.execute("""CREATE TABLE IF NOT EXISTS scrape_cache(
+                            url TEXT PRIMARY KEY,
+                            content_json TEXT,
+                            created_at TIMESTAMP
+        )""")
         self.connection.commit()
 
     def get(self, tool_name: str, args: Dict[str, str]) -> Optional[Dict[str, str]]:
@@ -115,13 +123,34 @@ class Session_Cache():
         self.connection.commit()
 
 
+    def get_scrape(self, url: str) -> Optional[Dict[str, Any]]:
+        """Retrieve a cached scrape result by URL. Returns None on miss."""
+        self.cursor.execute(
+            "SELECT content_json FROM scrape_cache WHERE url = ?",
+            (url,)
+        )
+        row = self.cursor.fetchone()
+        if row is None:
+            return None
+        return json.loads(row[0])
+
+    def put_scrape(self, url: str, result: Dict[str, Any]) -> None:
+        """Cache a scraped page by URL. Never stores failed scrapes."""
+        if not (isinstance(result, dict) and result.get('success')):
+            return
+        content_json = json.dumps(result, sort_keys=True)
+        created_at = datetime.now().isoformat()
+        self.cursor.execute(
+            """INSERT OR REPLACE INTO scrape_cache (url, content_json, created_at)
+               VALUES (?, ?, ?)""",
+            (url, content_json, created_at)
+        )
+        self.connection.commit()
+
     def clear(self):
-        self.cursor.execute("""
-                            DELETE FROM tool_cache
-                            """)
-        self.cursor.execute("""
-                            DELETE FROM news_cache
-                            """)
+        self.cursor.execute("DELETE FROM tool_cache")
+        self.cursor.execute("DELETE FROM news_cache")
+        self.cursor.execute("DELETE FROM scrape_cache")
         self.connection.commit()
 
 
