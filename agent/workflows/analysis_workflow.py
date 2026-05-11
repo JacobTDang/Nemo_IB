@@ -784,6 +784,38 @@ class WorkFlow:
       print(f"  [Analysis] Data gaps detected: {analysis_report.data_gaps}",
             file=sys.stderr, flush=True)
 
+    # Persist as a thesis. Supersede any prior active thesis for this ticker so
+    # only one is "current" at a time, but keep history queryable.
+    persisted_thesis_id = None
+    persist_ticker = state.get('ticker') or ''
+    if persist_ticker and analysis_report.recommendation != 'INFO':
+      try:
+        from state.theses import insert_thesis, latest_thesis, supersede_thesis
+        prior = latest_thesis(persist_ticker)
+        new_id = insert_thesis(
+          ticker=persist_ticker,
+          recommendation=analysis_report.recommendation,
+          signal=analysis_report.signal,
+          target_price=None,
+          stop_loss=None,
+          confidence=analysis_report.confidence,
+          analysis_summary=analysis_report.executive_summary,
+          key_assumptions=analysis_report.assumptions,
+          data_gaps=analysis_report.data_gaps,
+          full_report_md=result,
+        )
+        if prior:
+          supersede_thesis(prior['thesis_id'], new_id)
+        persisted_thesis_id = new_id
+        print(f"[Theses] persisted #{new_id} for {persist_ticker} "
+              f"(superseded #{prior['thesis_id'] if prior else 'none'})",
+              file=sys.stderr, flush=True)
+      except Exception as e:
+        print(f"[Theses] persist failed (non-critical): {e}",
+              file=sys.stderr, flush=True)
+
+    updated_vars['analysis.thesis_id'] = persisted_thesis_id
+
     return {
       'analysis_report': result,
       'current_phase': 'analyzed',
