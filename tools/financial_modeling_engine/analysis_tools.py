@@ -537,6 +537,98 @@ def _capital_returns_math(market_cap: float, ebitda: float, capex_abs: float,
   return result
 
 
+def _ddm_math(current_dps: float, cost_of_equity: float, terminal_growth: float,
+              high_growth_rate: float = None, high_growth_years: int = 0) -> dict:
+  """Dividend Discount Model. Gordon Growth or two-stage.
+
+  Gordon: P = D_1 / (Ke - g) where D_1 = current_dps * (1 + g).
+  Two-stage: PV of dividends grown at high_growth_rate for high_growth_years,
+             then perpetuity at terminal_growth.
+  """
+  if cost_of_equity <= terminal_growth + 0.005:
+    return {'error': 'Cost of equity must exceed terminal growth by >0.5%', 'success': False}
+
+  if high_growth_years == 0:
+    d1 = current_dps * (1 + terminal_growth)
+    price = d1 / (cost_of_equity - terminal_growth)
+    return {
+      'method': 'gordon_growth',
+      'intrinsic_value_per_share': round(price, 2),
+      'd1': round(d1, 4),
+      'cost_of_equity': cost_of_equity,
+      'terminal_growth': terminal_growth,
+      'success': True,
+    }
+
+  # Two-stage: explicit high-growth phase then perpetuity
+  pv = 0
+  d = current_dps
+  for year in range(1, high_growth_years + 1):
+    d *= (1 + high_growth_rate)
+    pv += d / (1 + cost_of_equity) ** year
+
+  d_terminal = d * (1 + terminal_growth)
+  terminal_pv = (d_terminal / (cost_of_equity - terminal_growth)) / (1 + cost_of_equity) ** high_growth_years
+  total = pv + terminal_pv
+  return {
+    'method': 'two_stage',
+    'intrinsic_value_per_share': round(total, 2),
+    'pv_high_growth_phase': round(pv, 2),
+    'pv_terminal': round(terminal_pv, 2),
+    'high_growth_years': high_growth_years,
+    'high_growth_rate': high_growth_rate,
+    'terminal_growth': terminal_growth,
+    'cost_of_equity': cost_of_equity,
+    'success': True,
+  }
+
+
+def _sensitivity_table_math(base_inputs: dict,
+                            wacc_range: list = None,
+                            tg_range: list = None) -> dict:
+  """2D sensitivity grid: (WACC, terminal_growth) -> price per share.
+
+  base_inputs: same dict as _dcf_math, with wacc/terminal_growth overridden per cell.
+  wacc_range: list of WACC decimals. Default: base WACC +/-2% in 1% steps.
+  tg_range:   list of terminal_growth decimals. Default: 1.5%, 2.0%, 2.5%, 3.0%, 3.5%.
+
+  Cells where WACC - terminal_growth <= 0.005 return None (perpetuity formula unstable).
+  """
+  base_wacc = base_inputs.get('wacc', 0.10)
+  if wacc_range is None:
+    wacc_range = [round(base_wacc + d, 4) for d in (-0.02, -0.01, 0, 0.01, 0.02)]
+  if tg_range is None:
+    tg_range = [0.015, 0.02, 0.025, 0.03, 0.035]
+
+  table = {}
+  prices = []
+  for w in wacc_range:
+    table[f"{w:.4f}"] = {}
+    for tg in tg_range:
+      if w - tg <= 0.005:
+        table[f"{w:.4f}"][f"{tg:.4f}"] = None
+        continue
+      inputs = {**base_inputs, 'wacc': w, 'terminal_growth': tg}
+      r = _dcf_math(**inputs)
+      px = r.get('price_per_share', 0)
+      table[f"{w:.4f}"][f"{tg:.4f}"] = round(px, 2)
+      prices.append(px)
+
+  mid_price = None
+  if f"{base_wacc:.4f}" in table and f"{0.025:.4f}" in table[f"{base_wacc:.4f}"]:
+    mid_price = table[f"{base_wacc:.4f}"][f"{0.025:.4f}"]
+
+  return {
+    'table': table,
+    'wacc_range': wacc_range,
+    'tg_range': tg_range,
+    'min_price': round(min(prices), 2) if prices else None,
+    'max_price': round(max(prices), 2) if prices else None,
+    'mid_price': mid_price,
+    'cells_filled': len(prices),
+  }
+
+
 # ---------------------------------------------------------------------------
 # MCP Server
 # ---------------------------------------------------------------------------
