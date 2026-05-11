@@ -1,0 +1,29 @@
+use_default_settings: true
+
+server:
+  secret_key: "change-me-in-production-but-local-only"
+  limiter: false
+  image_proxy: false
+  bind_address: "0.0.0.0"
+  port: 8080
+
+search:
+  formats:
+    - html
+    - json
+  default_lang: en
+  safe_search: 0
+
+engines:
+  - name: google
+    disabled: false
+  - name: bing
+    disabled: false
+  - name: brave
+    disabled: false
+  - name: duckduckgo
+    disabled: false
+  - name: startpage
+    disabled: false
+  - name: qwant
+    disabled: false
