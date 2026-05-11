@@ -407,6 +407,13 @@ OUTPUT ONLY VALID JSON matching the ModelingDecision schema. No text before or a
       margin    = self._get(variables, 'ebitda_margin')
       if margin > 1:
         margin /= 100
+
+      # Fail-fast: without revenue or margin, ebitda = 0 and credit ratios explode
+      if revenue <= 0 or margin <= 0:
+        print(f"[Validate Credit] Skipped: revenue={revenue} margin={margin} "
+              "(missing fundamentals)", file=sys.stderr, flush=True)
+        return None
+
       dep_pct   = self._get(variables, 'depreciation')
       if dep_pct > 1:
         dep_pct /= 100
@@ -428,6 +435,9 @@ OUTPUT ONLY VALID JSON matching the ModelingDecision schema. No text before or a
         tax_rate=         self._get(variables, 'tax_rate'),
         market_cap=       self._get(variables, 'marketCap', 'market_cap'),
       )
+      if result.get('error'):
+        print(f"[Validate Credit] {result['error']}", file=sys.stderr, flush=True)
+        return None
       print(f"[Modeling Agent] Credit Profile: {result['credit_label']} | "
             f"Net Debt/EBITDA: {result['net_debt_ebitda']:.1f}x", file=sys.stderr, flush=True)
       return result
@@ -437,10 +447,19 @@ OUTPUT ONLY VALID JSON matching the ModelingDecision schema. No text before or a
 
   def _run_capital_returns(self, variables: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
-      revenue   = self._get(variables, 'revenue_base')
-      margin    = self._get(variables, 'ebitda_margin')
+      revenue    = self._get(variables, 'revenue_base')
+      margin     = self._get(variables, 'ebitda_margin')
       if margin > 1:
         margin /= 100
+      market_cap = self._get(variables, 'marketCap', 'market_cap')
+
+      # Fail-fast: yields are meaningless without revenue, margin, or market cap
+      if revenue <= 0 or margin <= 0 or market_cap <= 0:
+        print(f"[Validate CapReturns] Skipped: revenue={revenue} margin={margin} "
+              f"market_cap={market_cap} (missing fundamentals)",
+              file=sys.stderr, flush=True)
+        return None
+
       dep_pct   = self._get(variables, 'depreciation')
       if dep_pct > 1:
         dep_pct /= 100
@@ -449,7 +468,7 @@ OUTPUT ONLY VALID JSON matching the ModelingDecision schema. No text before or a
         capex_pct /= 100
 
       result = _capital_returns_math(
-        market_cap=          self._get(variables, 'marketCap', 'market_cap'),
+        market_cap=          market_cap,
         ebitda=              revenue * margin,
         capex_abs=           revenue * capex_pct,
         tax_rate=            self._get(variables, 'tax_rate'),
@@ -459,6 +478,9 @@ OUTPUT ONLY VALID JSON matching the ModelingDecision schema. No text before or a
                                        'repurchaseOfCapitalStock'),
         shares_outstanding=  self._get(variables, 'sharesOutstanding', 'shares_outstanding'),
       )
+      if result.get('error'):
+        print(f"[Validate CapReturns] {result['error']}", file=sys.stderr, flush=True)
+        return None
       print(f"[Modeling Agent] Capital Returns: TSY={result['total_shareholder_yield_pct']}% | "
             f"{result['sustainability']}", file=sys.stderr, flush=True)
       return result
@@ -472,6 +494,17 @@ OUTPUT ONLY VALID JSON matching the ModelingDecision schema. No text before or a
       market_cap = self._get(variables, 'marketCap', 'market_cap')
       total_debt = self._get(variables, 'totalDebt', 'total_debt')
       cash       = self._get(variables, 'totalCash', 'cash')
+      revenue    = self._get(variables, 'revenue_base')
+      margin     = self._get(variables, 'ebitda_margin')
+      if margin > 1:
+        margin /= 100
+
+      # Fail-fast: LBO needs market_cap (for entry_ev) + revenue/margin (for ebitda)
+      if market_cap <= 0 or revenue <= 0 or margin <= 0:
+        print(f"[Validate LBO] Skipped: market_cap={market_cap} revenue={revenue} "
+              f"margin={margin} (missing fundamentals)", file=sys.stderr, flush=True)
+        return None
+
       net_debt   = total_debt - cash
       entry_ev   = (market_cap + net_debt) * (1 + params.entry_premium)
 
@@ -489,10 +522,8 @@ OUTPUT ONLY VALID JSON matching the ModelingDecision schema. No text before or a
       print(f"[Validate LBO] rf={risk_free:.4f} + hy_spread={hy_spread:.4f} (raw_bps={hy_spread_bps}) = debt_rate={debt_rate:.4f}",
             file=sys.stderr, flush=True)
 
-      revenue_base = self._get(variables, 'revenue_base')
-      margin       = self._get(variables, 'ebitda_margin')
-      if margin > 1:
-        margin /= 100
+      # revenue/margin already validated and normalized at top of method
+      revenue_base = revenue
       dep_pct      = self._get(variables, 'depreciation')
       if dep_pct > 1:
         dep_pct /= 100

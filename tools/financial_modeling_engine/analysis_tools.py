@@ -383,17 +383,27 @@ def _credit_profile_math(total_debt: float, cash: float, ebitda: float,
   depreciation_abs: D&A in raw dollars (revenue * depreciation_pct)
   capex_abs: CapEx in raw dollars (revenue * capex_pct_revenue)
   """
+  # Fail-fast: a missing fundamental (ebitda) silently produces garbage like
+  # `Net Debt / 1.0 = $16B (labeled as "16B x leverage")`. Refuse to compute
+  # rather than fabricate a denominator.
+  if ebitda <= 0:
+    return {
+      'error': f'_credit_profile_math: ebitda must be positive, got {ebitda}',
+      'success': False,
+    }
+
   if tax_rate > 1:
     tax_rate /= 100
 
   net_debt = total_debt - cash
   ebit = ebitda - depreciation_abs
 
-  safe_ebitda = ebitda if ebitda > 0 else 1.0
+  # Interest expense is acceptable as zero (debt-free companies). Treat as
+  # large-but-finite so interest_coverage produces a meaningful "infinite" signal.
   safe_interest = interest_expense if interest_expense > 0 else 1.0
 
-  net_debt_ebitda = net_debt / safe_ebitda
-  total_debt_ebitda = total_debt / safe_ebitda
+  net_debt_ebitda = net_debt / ebitda
+  total_debt_ebitda = total_debt / ebitda
   interest_coverage = ebit / safe_interest
 
   # FCF approximation: NOPAT + D&A - CapEx
@@ -489,6 +499,19 @@ def _capital_returns_math(market_cap: float, ebitda: float, capex_abs: float,
 
   dividends_paid / shares_repurchased: raw dollar amounts (negative = outflow from CF stmt).
   """
+  # Fail-fast: market_cap is the denominator for every yield; without it
+  # the entire model fabricates garbage percentages.
+  if market_cap <= 0:
+    return {
+      'error': f'_capital_returns_math: market_cap must be positive, got {market_cap}',
+      'success': False,
+    }
+  if ebitda <= 0:
+    return {
+      'error': f'_capital_returns_math: ebitda must be positive, got {ebitda}',
+      'success': False,
+    }
+
   if tax_rate > 1:
     tax_rate /= 100
 
@@ -496,7 +519,7 @@ def _capital_returns_math(market_cap: float, ebitda: float, capex_abs: float,
   nopat = max(0.0, ebit) * (1 - tax_rate)
   fcf_estimate = nopat + depreciation_abs - capex_abs
 
-  safe_mktcap = market_cap if market_cap > 0 else 1.0
+  safe_mktcap = market_cap  # validated above
 
   # CF statement reports outflows as negative -- take abs
   div_abs = abs(dividends_paid)
