@@ -491,6 +491,44 @@ class WorkFlow:
     if injected:
       print(f"  [Plan Inject] Added missing tools: {injected}", file=sys.stderr, flush=True)
 
+    # Pre-flight dependency contract: identify which modeling tools the modeling
+    # phase will likely run, check what variable-store keys they need, and
+    # schedule fetches for any keys the planner missed. Deterministically
+    # eliminates the most common "run analysis, find gaps, re-plan" loop.
+    from agent.Financial_Modeling_Agent import Financial_Modeling_Agent as _FMA
+    likely_models = {'scenario_dcf', 'credit_profile', 'capital_returns', 'sensitivity_table'}
+    q_lower = user_query.lower()
+    if any(kw in q_lower for kw in ('dividend', 'income', 'utility', 'reit', 'payout')):
+      likely_models.add('ddm')
+    if any(kw in q_lower for kw in ('lbo', 'buyout', 'acquisition', 'm&a', 'takeout')):
+      likely_models.add('lbo')
+
+    all_missing = set()
+    for m in likely_models:
+      missing = _FMA.missing_inputs_for(m, variables)
+      if missing:
+        all_missing.update(missing)
+      else:
+        print(f"  [Pre-flight] All inputs satisfied for {m}",
+              file=sys.stderr, flush=True)
+
+    fill_tools = _FMA.tools_to_fill_gaps(list(all_missing))
+    already_in_plan = {t.get('tool') for t in plan.get('tools_sequence', [])}
+    preflight_added = []
+    for tool in fill_tools:
+      if tool not in already_in_plan:
+        plan['tools_sequence'].append({
+          'tool': tool,
+          'arguments': {'ticker': state.get('ticker', '')} if tool != 'calculate_wacc' else {}
+        })
+        already_in_plan.add(tool)
+        preflight_added.append(tool)
+
+    if preflight_added:
+      print(f"  [Pre-flight] Injecting {preflight_added} to satisfy "
+            f"missing inputs: {sorted(all_missing)}",
+            file=sys.stderr, flush=True)
+
     return plan
 
   @staticmethod

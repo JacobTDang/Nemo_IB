@@ -60,6 +60,18 @@ class ModelingDecision(BaseModel):
   reasoning: str
 
 
+def _has_meaningful_value(v) -> bool:
+  """A variable-store value 'exists' if it's non-None, non-empty, non-zero.
+
+  Note: bool gets special handling — False is a meaningful value (not missing).
+  """
+  if isinstance(v, bool):
+    return True
+  if v is None or v == 0 or v == '' or v == []:
+    return False
+  return True
+
+
 class Financial_Modeling_Agent(OpenRouterModel):
   """
   Hybrid financial modeling agent.
@@ -72,6 +84,62 @@ class Financial_Modeling_Agent(OpenRouterModel):
   response_schema = ModelingDecision
   MAX_OUTPUT_TOKENS = 2048   # JSON decision only; no prose output needed
   REASONING_EFFORT = None    # No deep reasoning -- just parameter selection
+
+  # ---------------------------------------------------------------------------
+  # Pre-flight dependency contract
+  # ---------------------------------------------------------------------------
+  # Per-model data contract. Keys are variable-store keys that must be present
+  # (non-zero, non-None) before the model can run. Used by plan_node to
+  # deterministically schedule data-gathering tools BEFORE execution rather
+  # than relying on the Plan Verifier to catch gaps post-hoc.
+
+  REQUIRED_INPUTS = {
+    'scenario_dcf': ['revenue_base', 'ebitda_margin', 'capex_pct_revenue',
+                     'tax_rate', 'depreciation', 'wacc', 'sharesOutstanding'],
+    'credit_profile': ['revenue_base', 'ebitda_margin', 'totalDebt'],
+    'capital_returns': ['revenue_base', 'ebitda_margin', 'marketCap'],
+    'lbo': ['revenue_base', 'ebitda_margin', 'marketCap', 'totalDebt'],
+    'sensitivity_table': ['revenue_base', 'wacc', 'sharesOutstanding'],
+    'ddm': ['dividendsPaid', 'sharesOutstanding'],
+  }
+
+  # Maps each required input back to the MCP tool that produces it.
+  # Aliases (ebitda_margin_percent vs ebitda_margin) both point to the same tool.
+  INPUT_TO_TOOL = {
+    'revenue_base':          'get_revenue_base',
+    'ebitda_margin':         'get_ebitda_margin',
+    'ebitda_margin_percent': 'get_ebitda_margin',
+    'capex_pct_revenue':     'get_capex_pct_revenue',
+    'tax_rate':              'get_tax_rate',
+    'effective_tax_rate':    'get_tax_rate',
+    'depreciation':          'get_depreciation',
+    'd&a_pct':               'get_depreciation',
+    'wacc':                  'calculate_wacc',
+    'marketCap':             'get_market_data',
+    'beta':                  'get_market_data',
+    'totalDebt':             'get_market_data',
+    'totalCash':             'get_market_data',
+    'sharesOutstanding':     'get_market_data',
+    'interestExpense':       'get_market_data',
+    'dividendsPaid':         'get_financial_statements',
+  }
+
+  @classmethod
+  def missing_inputs_for(cls, model_name: str, variables: dict) -> list:
+    """Return the variable-store keys still missing for the named model.
+    Empty list = ready to run.
+    """
+    required = cls.REQUIRED_INPUTS.get(model_name, [])
+    return [k for k in required if not _has_meaningful_value(variables.get(k))]
+
+  @classmethod
+  def tools_to_fill_gaps(cls, missing: list) -> list:
+    """Map a list of missing keys to the deduped tool names that fetch them.
+    Order preserved so dependencies (e.g. SEC tools before calculate_wacc) stay sensible.
+    """
+    return list(dict.fromkeys(
+      cls.INPUT_TO_TOOL[k] for k in missing if k in cls.INPUT_TO_TOOL
+    ))
 
   def __init__(self, model_name: str = 'z-ai/glm-4.5-air:free'):
     super().__init__(model_name=model_name)
