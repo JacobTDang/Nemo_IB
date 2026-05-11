@@ -650,7 +650,47 @@ COMMON MISTAKES TO AVOID:
                 bua = assumptions.get('bull_margin_adj', 0) * 100
                 lines.append(f"  Base growth Y1={bg1:.1f}% -> long-run={bgl:.1f}% | "
                               f"Bear margin adj={bma:.1f}pp | Bull margin adj={bua:+.1f}pp")
+            # Regime-weighted expected price
+            rw = s.get('regime_weighted')
+            if rw:
+                w = rw.get('weights', {})
+                lines.append(f"  Regime: {rw.get('regime', 'N/A')} | "
+                              f"Weights: bear={w.get('bear',0):.0%} "
+                              f"base={w.get('base',0):.0%} "
+                              f"bull={w.get('bull',0):.0%}")
+                lines.append(f"  Probability-weighted expected price: ${rw.get('expected_price', 0):.2f}")
             lines.append("")
+
+        if 'sensitivity_table' in model_outputs:
+            st = model_outputs['sensitivity_table']
+            lines.append("SENSITIVITY TABLE (price per share, WACC x terminal growth):")
+            lines.append(f"  Price range: ${st.get('min_price', 0):.2f} - ${st.get('max_price', 0):.2f} | "
+                          f"Mid: ${st.get('mid_price', 0):.2f} | Cells: {st.get('cells_filled', 0)}")
+            tg_range = st.get('tg_range', [])
+            header = "  WACC \\ g% |" + " | ".join(f"{tg*100:5.2f}%" for tg in tg_range)
+            lines.append(header)
+            lines.append("  " + "-" * (len(header) - 2))
+            for w_key, row in st.get('table', {}).items():
+                w_pct = float(w_key) * 100
+                cells = []
+                for tg in tg_range:
+                    v = row.get(f"{tg:.4f}")
+                    cells.append("  N/A " if v is None else f"${v:6.2f}")
+                lines.append(f"  {w_pct:6.2f}%  | " + " | ".join(cells))
+            lines.append("")
+
+        if 'ddm' in model_outputs:
+            d = model_outputs['ddm']
+            if d.get('success'):
+                lines.append("DIVIDEND DISCOUNT MODEL (DDM):")
+                lines.append(f"  Method: {d.get('method', 'gordon_growth')}")
+                lines.append(f"  Intrinsic value per share: ${d.get('intrinsic_value_per_share', 0):.2f}")
+                lines.append(f"  Inputs: Ke={d.get('cost_of_equity', 0)*100:.2f}% | "
+                              f"g={d.get('terminal_growth', 0)*100:.2f}%")
+                if d.get('method') == 'two_stage':
+                    lines.append(f"  High-growth phase: {d.get('high_growth_years')}y at "
+                                  f"{d.get('high_growth_rate', 0)*100:.1f}%")
+                lines.append("")
 
         if 'credit_profile' in model_outputs:
             c = model_outputs['credit_profile']
