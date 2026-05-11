@@ -14,6 +14,9 @@ from ..Search_Summarizer_Agent import Search_Summarizer_Agent
 from ..Master_Orchestrator import Master_Orchestrator
 from ..News_Processing_Agent import News_Processing_Agent
 from ..Verification_Agent import Verification_Agent
+from ..Bull_Agent import Bull_Agent
+from ..Bear_Agent import Bear_Agent
+from ..Arbiter_Agent import Arbiter_Agent
 from ..MCP_manager import MCPConnectionManager
 from .execution_engine import run_tools
 from .constants import MAX_ITERATIONS, MAX_EXECUTIONS, MAX_ANALYSES
@@ -34,6 +37,9 @@ class WorkFlow:
     self.plan_verifier = Plan_Verifier_Agent()
     self.news_agent = News_Processing_Agent()
     self.verification_agent = Verification_Agent()
+    self.bull_agent = Bull_Agent()
+    self.bear_agent = Bear_Agent()
+    self.arbiter_agent = Arbiter_Agent()
     self.workflow = StateGraph(AgentState)
     self.mcp = mcp
 
@@ -784,21 +790,112 @@ class WorkFlow:
       print(f"  [Analysis] Data gaps detected: {analysis_report.data_gaps}",
             file=sys.stderr, flush=True)
 
-    # Persist as a thesis. Supersede any prior active thesis for this ticker so
-    # only one is "current" at a time, but keep history queryable.
+    # Bull/Bear/Arbiter debate. Bull and Bear run in parallel; Arbiter
+    # synthesizes. The verdict overrides the analyst's recommendation in the
+    # persisted thesis. Debate is skipped for INFO queries (no directional
+    # call to debate).
+    bull_case = None
+    bear_case = None
+    arbiter_verdict = None
+    if analysis_report.recommendation != 'INFO':
+      print("\n[Debate] Bull and Bear arguing in parallel...", file=sys.stderr, flush=True)
+      try:
+        bull_case, bear_case = await asyncio.gather(
+          asyncio.to_thread(
+            self.bull_agent.argue,
+            result, variables, state.get('model_outputs'), state.get('ticker', '')
+          ),
+          asyncio.to_thread(
+            self.bear_agent.argue,
+            result, variables, state.get('model_outputs'), state.get('ticker', '')
+          ),
+          return_exceptions=True,
+        )
+        # gather with return_exceptions yields exceptions instead of raising;
+        # coerce to None so downstream code doesn't see weird types.
+        if isinstance(bull_case, BaseException):
+          print(f"[Debate] Bull raised: {bull_case}", file=sys.stderr, flush=True)
+          bull_case = None
+        if isinstance(bear_case, BaseException):
+          print(f"[Debate] Bear raised: {bear_case}", file=sys.stderr, flush=True)
+          bear_case = None
+        if bull_case:
+          print(f"[Debate] Bull: thesis='{bull_case.thesis[:80]}...' conviction={bull_case.conviction:.2f}",
+                file=sys.stderr, flush=True)
+        if bear_case:
+          print(f"[Debate] Bear: thesis='{bear_case.thesis[:80]}...' conviction={bear_case.conviction:.2f}",
+                file=sys.stderr, flush=True)
+
+        if bull_case and bear_case:
+          arbiter_verdict = await asyncio.to_thread(
+            self.arbiter_agent.judge,
+            result, bull_case, bear_case, variables, state.get('ticker', '')
+          )
+          if arbiter_verdict:
+            print(f"[Debate] Arbiter: {arbiter_verdict.final_recommendation} "
+                  f"(conf={arbiter_verdict.confidence:.2f}, "
+                  f"bull={arbiter_verdict.bull_strength:.2f}, "
+                  f"bear={arbiter_verdict.bear_strength:.2f}, "
+                  f"sizing={arbiter_verdict.position_sizing_guidance})",
+                  file=sys.stderr, flush=True)
+      except Exception as e:
+        print(f"[Debate] Failed (non-critical): {e}", file=sys.stderr, flush=True)
+
+    # Effective recommendation: arbiter's call when available, else analyst's.
+    eff_recommendation = (
+      arbiter_verdict.final_recommendation if arbiter_verdict
+      else analysis_report.recommendation
+    )
+    eff_confidence = (
+      arbiter_verdict.confidence if arbiter_verdict
+      else analysis_report.confidence
+    )
+    updated_vars['analysis.recommendation'] = eff_recommendation
+    updated_vars['analysis.confidence']     = eff_confidence
+
+    # Append debate section to the user-visible markdown so the user can see
+    # both sides and the arbiter's reasoning.
+    if arbiter_verdict:
+      debate_md = (
+        "\n\n---\n## DEBATE\n\n"
+        f"### Bull (conviction {bull_case.conviction:.2f})\n"
+        f"{bull_case.thesis}\n\n"
+        + ("**Catalysts:**\n" + "\n".join(f"- {c}" for c in bull_case.catalysts) + "\n\n"
+           if bull_case.catalysts else "")
+        + f"### Bear (conviction {bear_case.conviction:.2f})\n"
+        f"{bear_case.thesis}\n\n"
+        + ("**Risks:**\n" + "\n".join(f"- {r}" for r in bear_case.risks) + "\n\n"
+           if bear_case.risks else "")
+        + f"### Arbiter Verdict: {arbiter_verdict.final_recommendation} "
+        f"(confidence {arbiter_verdict.confidence:.2f}, "
+        f"sizing: {arbiter_verdict.position_sizing_guidance})\n"
+        f"{arbiter_verdict.rationale}\n\n"
+        + ("**Decisive factors:**\n" + "\n".join(f"- {d}" for d in arbiter_verdict.decisive_factors) + "\n\n"
+           if arbiter_verdict.decisive_factors else "")
+        + ("**Conditions to change mind:**\n"
+           + "\n".join(f"- {c}" for c in arbiter_verdict.conditions_to_change_mind) + "\n"
+           if arbiter_verdict.conditions_to_change_mind else "")
+      )
+      result = result + debate_md
+
+    # Persist as a thesis using the EFFECTIVE recommendation (arbiter > analyst).
     persisted_thesis_id = None
     persist_ticker = state.get('ticker') or ''
-    if persist_ticker and analysis_report.recommendation != 'INFO':
+    if persist_ticker and eff_recommendation != 'INFO':
       try:
         from state.theses import insert_thesis, latest_thesis, supersede_thesis
         prior = latest_thesis(persist_ticker)
+        # Merge analyst risks + arbiter acknowledged_risks into data_gaps?
+        # No — assumptions stay analyst's; data_gaps stay analyst's; thesis
+        # records the FINAL recommendation though. The arbiter's
+        # conditions_to_change_mind list is preserved in the markdown.
         new_id = insert_thesis(
           ticker=persist_ticker,
-          recommendation=analysis_report.recommendation,
+          recommendation=eff_recommendation,
           signal=analysis_report.signal,
           target_price=None,
           stop_loss=None,
-          confidence=analysis_report.confidence,
+          confidence=eff_confidence,
           analysis_summary=analysis_report.executive_summary,
           key_assumptions=analysis_report.assumptions,
           data_gaps=analysis_report.data_gaps,
@@ -808,13 +905,23 @@ class WorkFlow:
           supersede_thesis(prior['thesis_id'], new_id)
         persisted_thesis_id = new_id
         print(f"[Theses] persisted #{new_id} for {persist_ticker} "
-              f"(superseded #{prior['thesis_id'] if prior else 'none'})",
+              f"(superseded #{prior['thesis_id'] if prior else 'none'}) "
+              f"recommendation={eff_recommendation}",
               file=sys.stderr, flush=True)
       except Exception as e:
         print(f"[Theses] persist failed (non-critical): {e}",
               file=sys.stderr, flush=True)
 
     updated_vars['analysis.thesis_id'] = persisted_thesis_id
+    updated_vars['analysis.bull_strength'] = (
+      arbiter_verdict.bull_strength if arbiter_verdict else None
+    )
+    updated_vars['analysis.bear_strength'] = (
+      arbiter_verdict.bear_strength if arbiter_verdict else None
+    )
+    updated_vars['analysis.position_sizing'] = (
+      arbiter_verdict.position_sizing_guidance if arbiter_verdict else None
+    )
 
     return {
       'analysis_report': result,
