@@ -653,6 +653,348 @@ def _sensitivity_table_math(base_inputs: dict,
 
 
 # ---------------------------------------------------------------------------
+# Quantitative depth: reverse DCF, Monte Carlo, Piotroski, Altman Z
+# ---------------------------------------------------------------------------
+
+def _reverse_dcf_math(current_price: float, base_inputs: dict,
+                      growth_lower: float = -0.20,
+                      growth_upper: float = 0.50,
+                      tol: float = 0.0005,
+                      max_iter: int = 60) -> dict:
+  """Solve for the uniform revenue growth rate that justifies the current price.
+
+  Strategy: bisection over a monotonic-in-growth DCF. Higher growth -> higher
+  price_per_share. We search for growth such that |dcf_price - current_price|
+  is below tol fraction.
+
+  Returns implied growth (decimal) and comparison vs the base case.
+  """
+  inputs = dict(base_inputs)
+  # Strip the revenue_growth list — we replace it
+  inputs.pop('revenue_growth', None)
+  base_horizon = len(base_inputs.get('revenue_growth', [0]*5))
+
+  def price_at(g):
+    try:
+      r = _dcf_math(revenue_growth=[g] * base_horizon, **inputs)
+      return r.get('price_per_share', 0)
+    except Exception:
+      return float('nan')
+
+  p_lo = price_at(growth_lower)
+  p_hi = price_at(growth_upper)
+  if not (p_lo < current_price < p_hi or p_lo > current_price > p_hi):
+    return {
+      'error': 'no_solution_in_range',
+      'current_price': current_price,
+      'price_at_lower_growth': round(p_lo, 2) if p_lo == p_lo else None,
+      'price_at_upper_growth': round(p_hi, 2) if p_hi == p_hi else None,
+      'growth_range_tested': [growth_lower, growth_upper],
+    }
+
+  lo, hi = growth_lower, growth_upper
+  for _ in range(max_iter):
+    mid = (lo + hi) / 2
+    p_mid = price_at(mid)
+    if abs(p_mid - current_price) / current_price < tol:
+      break
+    if (p_mid < current_price) == (p_lo < current_price):
+      lo, p_lo = mid, p_mid
+    else:
+      hi = mid
+
+  implied_g = mid
+  # Base case growth (avg of input revenue_growth)
+  base_growth = base_inputs.get('revenue_growth', [0])
+  base_avg = sum(base_growth) / len(base_growth) if base_growth else 0
+  spread = implied_g - base_avg
+
+  return {
+    'implied_growth_pct': round(implied_g * 100, 2),
+    'implied_growth_decimal': round(implied_g, 4),
+    'base_case_growth_pct': round(base_avg * 100, 2),
+    'spread_pct': round(spread * 100, 2),
+    'verdict': ('rich' if spread > 0.02
+                else 'cheap' if spread < -0.02
+                else 'fairly_priced'),
+    'current_price': current_price,
+    'method': 'bisection_on_uniform_revenue_growth',
+    'horizon_years': base_horizon,
+  }
+
+
+def _monte_carlo_dcf_math(base_inputs: dict, n_iter: int = 5000,
+                          wacc_std: float = 0.0075,
+                          margin_std: float = 0.015,
+                          growth_std: float = 0.025,
+                          seed: int = 42) -> dict:
+  """Run n_iter DCFs with WACC/margin/growth perturbed by gaussian noise.
+
+  Returns price distribution stats. Use to gauge fair-value uncertainty.
+  Default stds are conservative: ~75bps WACC, 150bps margin, 250bps growth.
+  """
+  import numpy as np
+  rng = np.random.default_rng(seed)
+  prices = []
+  base_growth = base_inputs.get('revenue_growth', [0.05] * 5)
+  base_g_mean = float(sum(base_growth) / len(base_growth))
+  horizon = len(base_growth)
+
+  for _ in range(n_iter):
+    w = float(rng.normal(base_inputs['wacc'], wacc_std))
+    if w < 0.02:
+      w = 0.02  # floor
+    m = float(rng.normal(base_inputs['ebitda_margin'], margin_std))
+    if m < 0.0:
+      m = 0.0
+    g = float(rng.normal(base_g_mean, growth_std))
+    g = max(g, -0.30)  # cap downside revenue growth
+    inputs = {**base_inputs, 'wacc': w, 'ebitda_margin': m,
+              'revenue_growth': [g] * horizon}
+    try:
+      r = _dcf_math(**inputs)
+      p = r.get('price_per_share', 0)
+      if p > 0 and p < 1e6:
+        prices.append(p)
+    except Exception:
+      continue
+
+  if not prices:
+    return {'error': 'no_valid_iterations', 'n_attempted': n_iter}
+
+  prices_arr = np.array(prices)
+  return {
+    'n_iter_attempted': n_iter,
+    'n_iter_valid': len(prices),
+    'mean': round(float(prices_arr.mean()), 2),
+    'median': round(float(np.median(prices_arr)), 2),
+    'std': round(float(prices_arr.std()), 2),
+    'p5': round(float(np.percentile(prices_arr, 5)), 2),
+    'p10': round(float(np.percentile(prices_arr, 10)), 2),
+    'p25': round(float(np.percentile(prices_arr, 25)), 2),
+    'p75': round(float(np.percentile(prices_arr, 75)), 2),
+    'p90': round(float(np.percentile(prices_arr, 90)), 2),
+    'p95': round(float(np.percentile(prices_arr, 95)), 2),
+    'coefficient_of_variation': round(float(prices_arr.std() / prices_arr.mean()), 4),
+    'assumptions': {
+      'wacc_std': wacc_std, 'margin_std': margin_std,
+      'growth_std': growth_std, 'seed': seed,
+    },
+  }
+
+
+def _piotroski_f_score_math(financials: dict) -> dict:
+  """Piotroski F-score: 9 binary tests on financial strength. Range 0-9.
+
+  Expected keys (all decimals/dollars, current-period unless _prior suffix):
+    net_income, op_cash_flow, total_assets, total_assets_prior,
+    long_term_debt, long_term_debt_prior, current_ratio, current_ratio_prior,
+    shares_outstanding, shares_outstanding_prior,
+    gross_margin, gross_margin_prior,
+    asset_turnover, asset_turnover_prior
+
+  Missing inputs are treated as failing the test.
+  """
+  ni = financials.get('net_income', 0)
+  ocf = financials.get('op_cash_flow', 0)
+  ta_now = financials.get('total_assets', 1)
+  ta_prev = financials.get('total_assets_prior', 1)
+
+  # ROA = NI / TA (average if both periods available)
+  roa_now = ni / ta_now if ta_now else 0
+  ni_prev = financials.get('net_income_prior', 0)
+  roa_prev = ni_prev / ta_prev if ta_prev else 0
+
+  tests = {
+    'positive_net_income': ni > 0,
+    'positive_op_cash_flow': ocf > 0,
+    'roa_improving': roa_now > roa_prev,
+    'cfo_exceeds_ni': ocf > ni,
+    'lt_debt_decreasing': (
+      financials.get('long_term_debt', 0)
+      < financials.get('long_term_debt_prior', float('inf'))
+    ),
+    'current_ratio_improving': (
+      financials.get('current_ratio', 0)
+      > financials.get('current_ratio_prior', float('inf'))
+    ),
+    'no_dilution': (
+      financials.get('shares_outstanding', float('inf'))
+      <= financials.get('shares_outstanding_prior', 0)
+    ),
+    'gross_margin_improving': (
+      financials.get('gross_margin', 0)
+      > financials.get('gross_margin_prior', float('inf'))
+    ),
+    'asset_turnover_improving': (
+      financials.get('asset_turnover', 0)
+      > financials.get('asset_turnover_prior', float('inf'))
+    ),
+  }
+  score = sum(1 for v in tests.values() if v)
+  if score >= 7:
+    rating = 'strong'
+  elif score <= 3:
+    rating = 'weak'
+  else:
+    rating = 'mixed'
+  return {
+    'score': score, 'max_score': 9,
+    'rating': rating,
+    'tests': tests,
+    'method': 'Piotroski (2000) F-score',
+  }
+
+
+def _altman_z_score_math(financials: dict) -> dict:
+  """Altman Z-score (original 1968 manufacturing form).
+
+  Z = 1.2*X1 + 1.4*X2 + 3.3*X3 + 0.6*X4 + 1.0*X5
+    X1 = working_capital / total_assets
+    X2 = retained_earnings / total_assets
+    X3 = EBIT / total_assets
+    X4 = market_cap / total_liabilities
+    X5 = revenue / total_assets
+
+  Zones:
+    Z > 2.99 -> safe
+    1.81 <= Z <= 2.99 -> grey
+    Z < 1.81 -> distress
+  """
+  ta = financials.get('total_assets', 0) or 1
+  wc = financials.get('working_capital', 0)
+  re_ = financials.get('retained_earnings', 0)
+  ebit = financials.get('ebit', 0)
+  mc = financials.get('market_cap', 0)
+  tl = financials.get('total_liabilities', 0) or 1
+  rev = financials.get('revenue', 0)
+
+  x1 = wc / ta
+  x2 = re_ / ta
+  x3 = ebit / ta
+  x4 = mc / tl
+  x5 = rev / ta
+
+  z = 1.2 * x1 + 1.4 * x2 + 3.3 * x3 + 0.6 * x4 + 1.0 * x5
+
+  if z > 2.99:
+    zone = 'safe'
+  elif z >= 1.81:
+    zone = 'grey'
+  else:
+    zone = 'distress'
+
+  return {
+    'z_score': round(z, 2),
+    'zone': zone,
+    'components': {
+      'X1_wc_ta': round(x1, 4),
+      'X2_re_ta': round(x2, 4),
+      'X3_ebit_ta': round(x3, 4),
+      'X4_mc_tl': round(x4, 4),
+      'X5_rev_ta': round(x5, 4),
+    },
+    'method': 'Altman (1968) Z-score (manufacturing form)',
+  }
+
+
+def _detect_insider_clusters(transactions: list, lookback_days: int = 30) -> dict:
+  """Cluster analysis on insider transactions.
+
+  transactions: list of dicts with keys 'date' (ISO str), 'shares' (signed),
+                'insider_name', 'transaction_value' (optional).
+  Returns directional cluster signal when 3+ distinct insiders trade the same
+  direction within lookback_days.
+  """
+  from datetime import datetime, timedelta
+  if not transactions:
+    return {'signal': None, 'reason': 'no_transactions'}
+  cutoff = datetime.now() - timedelta(days=lookback_days)
+  recent = []
+  for t in transactions:
+    try:
+      d = datetime.fromisoformat(str(t.get('date', '')).replace('Z', ''))
+    except Exception:
+      continue
+    if d >= cutoff:
+      recent.append(t)
+  if not recent:
+    return {'signal': None, 'reason': 'no_recent_transactions'}
+
+  buyers = {t.get('insider_name', 'unknown') for t in recent if t.get('shares', 0) > 0}
+  sellers = {t.get('insider_name', 'unknown') for t in recent if t.get('shares', 0) < 0}
+  buyer_dollars = sum(abs(t.get('transaction_value', 0))
+                      for t in recent if t.get('shares', 0) > 0)
+  seller_dollars = sum(abs(t.get('transaction_value', 0))
+                       for t in recent if t.get('shares', 0) < 0)
+
+  if len(buyers) >= 3 and not sellers:
+    signal = 'strong_cluster_buy'
+  elif len(buyers) >= 3 and len(buyers) >= 2 * len(sellers):
+    signal = 'cluster_buy'
+  elif len(sellers) >= 3 and not buyers:
+    signal = 'strong_cluster_sell'
+  elif len(sellers) >= 3 and len(sellers) >= 2 * len(buyers):
+    signal = 'cluster_sell'
+  else:
+    signal = None
+
+  return {
+    'signal': signal,
+    'distinct_buyers': len(buyers),
+    'distinct_sellers': len(sellers),
+    'buyer_dollar_volume': buyer_dollars,
+    'seller_dollar_volume': seller_dollars,
+    'lookback_days': lookback_days,
+    'transactions_in_window': len(recent),
+  }
+
+
+def _revisions_momentum_math(trends: list) -> dict:
+  """Given Finnhub-shaped recommendation_trends list (newest first), compute
+  the change in net buy-side consensus over 30/90 day windows.
+
+  Each trend dict has keys: strongBuy, buy, hold, sell, strongSell, period.
+  """
+  if not trends or len(trends) < 2:
+    return {'error': 'insufficient_history', 'periods_available': len(trends or [])}
+
+  def net(t):
+    return (t.get('strongBuy', 0) + t.get('buy', 0)
+            - t.get('sell', 0) - t.get('strongSell', 0))
+
+  curr = trends[0]
+  m1 = trends[1] if len(trends) >= 2 else curr
+  m3 = trends[3] if len(trends) >= 4 else m1
+
+  delta_30 = net(curr) - net(m1)
+  delta_90 = net(curr) - net(m3)
+  composite = delta_30 + 0.5 * delta_90
+
+  if composite > 2:
+    direction = 'strong_rising'
+  elif composite > 0:
+    direction = 'rising'
+  elif composite < -2:
+    direction = 'strong_falling'
+  elif composite < 0:
+    direction = 'falling'
+  else:
+    direction = 'flat'
+
+  return {
+    'net_current': net(curr),
+    'net_30d_ago': net(m1),
+    'net_90d_ago': net(m3),
+    'delta_30d': delta_30,
+    'delta_90d': delta_90,
+    'composite_score': round(composite, 2),
+    'direction': direction,
+    'current_period': curr.get('period'),
+  }
+
+
+# ---------------------------------------------------------------------------
 # MCP Server
 # ---------------------------------------------------------------------------
 

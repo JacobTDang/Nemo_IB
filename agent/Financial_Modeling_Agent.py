@@ -19,6 +19,8 @@ from datetime import datetime
 from tools.financial_modeling_engine.analysis_tools import (
   _dcf_math, _wacc_math, _lbo_math,
   _credit_profile_math, _scenario_dcf_math, _capital_returns_math,
+  _reverse_dcf_math, _monte_carlo_dcf_math,
+  _piotroski_f_score_math, _altman_z_score_math,
   _ddm_math, _sensitivity_table_math,
 )
 
@@ -202,6 +204,27 @@ class Financial_Modeling_Agent(OpenRouterModel):
       if result:
         outputs['scenario_dcf'] = result
         outputs['models_run'].append('scenario_dcf')
+        # Auto-run reverse DCF + Monte Carlo from the same base inputs.
+        # These add quant depth (market-implied growth + fair value distribution)
+        # at near-zero marginal cost.
+        rev = self._run_reverse_dcf(variables, decision.scenario_params)
+        if rev:
+          outputs['reverse_dcf'] = rev
+          outputs['models_run'].append('reverse_dcf')
+        mc = self._run_monte_carlo_dcf(variables, decision.scenario_params)
+        if mc:
+          outputs['monte_carlo_dcf'] = mc
+          outputs['models_run'].append('monte_carlo_dcf')
+
+    # Quality scores -- always run if the inputs are present. Cheap math.
+    fscore = self._run_piotroski(variables)
+    if fscore:
+      outputs['piotroski_f_score'] = fscore
+      outputs['models_run'].append('piotroski_f_score')
+    zscore = self._run_altman_z(variables)
+    if zscore:
+      outputs['altman_z_score'] = zscore
+      outputs['models_run'].append('altman_z_score')
 
     if decision.run_credit_profile:
       result = self._run_credit_profile(variables)
@@ -468,6 +491,131 @@ OUTPUT ONLY VALID JSON matching the ModelingDecision schema. No text before or a
     except Exception as e:
       print(f"[Modeling Agent] Scenario DCF failed: {e}", file=sys.stderr, flush=True)
       return None
+
+  def _build_dcf_base_inputs(self, variables: Dict[str, Any],
+                              params: ScenarioParams) -> Optional[Dict[str, Any]]:
+    """Build the shared base_inputs dict used by reverse DCF + Monte Carlo.
+    Returns None if any critical input is missing."""
+    try:
+      base_margin = self._get(variables, 'ebitda_margin')
+      if base_margin > 1:
+        base_margin /= 100
+      base_growth = self._build_growth_schedule(
+        params.base_growth_y1, params.base_growth_long_run
+      )
+      inputs = {
+        'revenue_base':       self._get(variables, 'revenue_base'),
+        'ebitda_margin':      base_margin,
+        'capex_pct_revenue':  self._get(variables, 'capex_pct_revenue'),
+        'tax_rate':           self._get(variables, 'tax_rate'),
+        'depreciation':       self._get(variables, 'depreciation'),
+        'wacc':               self._get(variables, 'wacc'),
+        'terminal_growth':    self._get(variables, 'terminal_growth'),
+        'terminal_multiple':  self._get(variables, 'terminal_multiple',
+                                         'financials.evEbitdaTTM'),
+        'cash':               self._get(variables, 'totalCash', 'cash'),
+        'debt':               self._get(variables, 'totalDebt', 'debt'),
+        'shares_outstanding': self._get(variables, 'sharesOutstanding', 'shares_outstanding'),
+        'ticker':             variables.get('ticker', ''),
+        'revenue_growth':     base_growth,
+      }
+      # Sanity guard
+      if (inputs['revenue_base'] <= 0 or inputs['ebitda_margin'] <= 0
+          or inputs['wacc'] <= 0 or inputs['shares_outstanding'] <= 0):
+        return None
+      return inputs
+    except Exception as e:
+      print(f"[Modeling Agent] base_inputs build failed: {e}", file=sys.stderr, flush=True)
+      return None
+
+  def _run_reverse_dcf(self, variables: Dict[str, Any],
+                        params: ScenarioParams) -> Optional[Dict[str, Any]]:
+    """Solve for the implied uniform revenue growth at current_price."""
+    try:
+      base = self._build_dcf_base_inputs(variables, params)
+      if not base:
+        return None
+      current_price = self._get(variables, 'current_price', 'currentPrice',
+                                 'regularMarketPrice')
+      if current_price <= 0:
+        return None
+      result = _reverse_dcf_math(current_price=current_price, base_inputs=base)
+      if 'implied_growth_pct' in result:
+        print(f"[Modeling Agent] Reverse DCF: implied growth "
+              f"{result['implied_growth_pct']}% vs base {result['base_case_growth_pct']}% "
+              f"-> {result['verdict']}", file=sys.stderr, flush=True)
+      return result
+    except Exception as e:
+      print(f"[Modeling Agent] Reverse DCF failed: {e}", file=sys.stderr, flush=True)
+      return None
+
+  def _run_monte_carlo_dcf(self, variables: Dict[str, Any],
+                            params: ScenarioParams) -> Optional[Dict[str, Any]]:
+    """Run 5k DCF iterations with gaussian-noise inputs for fair-value CI."""
+    try:
+      base = self._build_dcf_base_inputs(variables, params)
+      if not base:
+        return None
+      result = _monte_carlo_dcf_math(base_inputs=base, n_iter=5000)
+      if 'mean' in result:
+        print(f"[Modeling Agent] Monte Carlo: mean=${result['mean']} "
+              f"p10=${result['p10']} p90=${result['p90']} "
+              f"(n_valid={result['n_iter_valid']})", file=sys.stderr, flush=True)
+      return result
+    except Exception as e:
+      print(f"[Modeling Agent] Monte Carlo failed: {e}", file=sys.stderr, flush=True)
+      return None
+
+  def _run_piotroski(self, variables: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Run Piotroski F-score if enough inputs are present (need at least
+    net_income + op_cash_flow). Missing tests fail (counted as zero)."""
+    ni = self._get(variables, 'net_income', 'netIncome', 'NetIncomeLoss')
+    ocf = self._get(variables, 'op_cash_flow', 'operatingCashFlow',
+                     'NetCashProvidedByOperatingActivities')
+    if ni == 0 and ocf == 0:
+      return None  # nothing meaningful to score
+    fin = {
+      'net_income':            ni,
+      'net_income_prior':      self._get(variables, 'net_income_prior', 'netIncome_prior'),
+      'op_cash_flow':          ocf,
+      'total_assets':          self._get(variables, 'total_assets', 'totalAssets', 'Assets'),
+      'total_assets_prior':    self._get(variables, 'total_assets_prior'),
+      'long_term_debt':        self._get(variables, 'long_term_debt', 'longTermDebt'),
+      'long_term_debt_prior':  self._get(variables, 'long_term_debt_prior'),
+      'current_ratio':         self._get(variables, 'current_ratio', 'currentRatio'),
+      'current_ratio_prior':   self._get(variables, 'current_ratio_prior'),
+      'shares_outstanding':       self._get(variables, 'sharesOutstanding', 'shares_outstanding'),
+      'shares_outstanding_prior': self._get(variables, 'shares_outstanding_prior'),
+      'gross_margin':          self._get(variables, 'gross_margin', 'grossMargins'),
+      'gross_margin_prior':    self._get(variables, 'gross_margin_prior'),
+      'asset_turnover':        self._get(variables, 'asset_turnover'),
+      'asset_turnover_prior':  self._get(variables, 'asset_turnover_prior'),
+    }
+    result = _piotroski_f_score_math(fin)
+    print(f"[Modeling Agent] Piotroski F-score: {result['score']}/9 ({result['rating']})",
+          file=sys.stderr, flush=True)
+    return result
+
+  def _run_altman_z(self, variables: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Altman Z-score if balance sheet inputs are present."""
+    ta = self._get(variables, 'total_assets', 'totalAssets', 'Assets')
+    if ta <= 0:
+      return None
+    fin = {
+      'total_assets':       ta,
+      'working_capital':    self._get(variables, 'working_capital', 'workingCapital'),
+      'retained_earnings':  self._get(variables, 'retained_earnings', 'retainedEarnings'),
+      'ebit':               self._get(variables, 'ebit', 'EBIT'),
+      'market_cap':         self._get(variables, 'market_cap', 'marketCap'),
+      'total_liabilities':  self._get(variables, 'total_liabilities', 'totalLiab', 'Liabilities'),
+      'revenue':            self._get(variables, 'revenue_base', 'totalRevenue', 'Revenues'),
+    }
+    if fin['total_liabilities'] <= 0 or fin['revenue'] <= 0:
+      return None
+    result = _altman_z_score_math(fin)
+    print(f"[Modeling Agent] Altman Z-score: {result['z_score']} ({result['zone']})",
+          file=sys.stderr, flush=True)
+    return result
 
   def _run_credit_profile(self, variables: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
