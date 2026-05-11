@@ -1,6 +1,7 @@
 from openai import OpenAI, APIError, AuthenticationError, RateLimitError, APIConnectionError, APITimeoutError, NotFoundError
 import httpx
 import os, sys, json, re, time
+from threading import Lock
 
 def _strip_non_ascii(text: str) -> str:
   """Remove non-ASCII characters from a streaming chunk before printing.
@@ -41,39 +42,80 @@ def _verify_model_alive(model_id: str, api_key: str, timeout: float = 10.0) -> b
     return True  # rate limit, auth, etc. don't prove the model is dead
 
 
-def _resolve_primary_reasoning_model() -> str:
-  """Probe candidate reasoning models at import time and return the first live one.
+# ---------------------------------------------------------------------------
+# Reasoning model pool
+# ---------------------------------------------------------------------------
+# Module-level state. All access goes through the helpers below.
+_MODEL_POOL: list = []                  # alive models, in preference order
+_MODEL_LAST_USED: dict = {}             # model -> unix timestamp last picked
+_MODEL_DEMOTED_UNTIL: dict = {}         # model -> unix timestamp it's banned
+_POOL_LOCK = Lock()
+_DEMOTE_SECONDS = 90                    # how long a model is banned after a 429
 
-  Reads the OPENROUTER_API_KEY env var. If unset, returns the ultimate fallback
-  without probing. PRIMARY_REASONING_MODEL env var overrides everything.
+
+def _build_reasoning_pool() -> list:
+  """Ping each candidate, return the alive ones in preference order.
+
+  Reads OPENROUTER_API_KEY. If unset, returns the ultimate fallback only.
+  Honors PRIMARY_REASONING_MODEL env var as a top-priority override.
   """
   load_dotenv()
   api_key = os.getenv("OPENROUTER_API_KEY")
   ultimate_fallback = 'z-ai/glm-4.5-air:free'
 
   if not api_key:
-    return ultimate_fallback
+    return [ultimate_fallback]
 
   candidates = [
-    os.getenv("PRIMARY_REASONING_MODEL"),  # explicit override
+    os.getenv("PRIMARY_REASONING_MODEL"),    # explicit override stays at top
     'deepseek/deepseek-chat-v3.1:free',
     'deepseek/deepseek-r1-distill-llama-70b:free',
     'qwen/qwq-32b-preview:free',
     'meta-llama/llama-3.3-70b-instruct:free',
+    'z-ai/glm-4.5-air:free',
   ]
-  for candidate in candidates:
-    if candidate and _verify_model_alive(candidate, api_key):
-      print(f"[OpenRouter] Reasoning model resolved to: {candidate}",
-            file=sys.stderr, flush=True)
-      return candidate
-
-  print(f"[OpenRouter] All reasoning candidates dead, using fallback: {ultimate_fallback}",
+  alive = []
+  seen = set()
+  for c in candidates:
+    if c and c not in seen and _verify_model_alive(c, api_key):
+      alive.append(c)
+      seen.add(c)
+  if not alive:
+    alive = [ultimate_fallback]
+  print(f"[OpenRouter] Pool initialized with {len(alive)} models: {alive}",
         file=sys.stderr, flush=True)
-  return ultimate_fallback
+  return alive
 
 
-# Resolved once at module import time so every agent sees the same model.
-PRIMARY_REASONING_MODEL = _resolve_primary_reasoning_model()
+def _pick_next_model() -> str:
+  """Return the least-recently-used non-demoted model from the pool."""
+  with _POOL_LOCK:
+    if not _MODEL_POOL:
+      return 'z-ai/glm-4.5-air:free'
+    now = time.time()
+    eligible = [m for m in _MODEL_POOL if _MODEL_DEMOTED_UNTIL.get(m, 0) < now]
+    if not eligible:
+      # All demoted -- return the one that demotes soonest
+      eligible = sorted(_MODEL_POOL, key=lambda m: _MODEL_DEMOTED_UNTIL.get(m, 0))[:1]
+    pick = min(eligible, key=lambda m: _MODEL_LAST_USED.get(m, 0))
+    _MODEL_LAST_USED[pick] = now
+    return pick
+
+
+def _demote_model(model: str, seconds: float = None) -> None:
+  """Mark a model unhealthy for N seconds (called after 429 / connection error)."""
+  if seconds is None:
+    seconds = _DEMOTE_SECONDS
+  with _POOL_LOCK:
+    _MODEL_DEMOTED_UNTIL[model] = time.time() + seconds
+    print(f"[OpenRouter] Demoted {model} for {seconds:.0f}s",
+          file=sys.stderr, flush=True)
+
+
+# Initialize pool at import; PRIMARY_REASONING_MODEL stays as a convenience alias
+# pointing at the first-preference alive model (used by existing constructor defaults).
+_MODEL_POOL = _build_reasoning_pool()
+PRIMARY_REASONING_MODEL = _MODEL_POOL[0]
 
 
 class OpenRouterModel:
@@ -234,6 +276,18 @@ class OpenRouterModel:
           break
         if attempt == self.MAX_RETRIES:
           break
+        # Pool rotation: on rate-limit / connection errors, demote the current
+        # model and pick a different alive one BEFORE wasting more retries.
+        # Only rotates when there are 2+ pool members AND the error is one
+        # that rotating will help with (429s, connection issues).
+        if isinstance(e, (RateLimitError, APIConnectionError, APITimeoutError)) and len(_MODEL_POOL) > 1:
+          _demote_model(self.model_name)
+          new_model = _pick_next_model()
+          if new_model != self.model_name:
+            print(f"\n[Pool rotate] {self.model_name} -> {new_model}",
+                  file=sys.stderr, flush=True)
+            self.model_name = new_model
+            kwargs['model'] = new_model
         delay = self.RETRY_BASE_DELAY * (2 ** (attempt - 1))
         print(f"\n[Retry {attempt}/{self.MAX_RETRIES}] {error_type}: {e}. "
               f"Retrying in {delay}s...", file=sys.stderr, flush=True)
