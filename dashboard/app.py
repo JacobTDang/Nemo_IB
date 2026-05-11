@@ -145,6 +145,41 @@ async def health():
 
 # ---- HTMX partials (auto-refresh fragments) -------------------------------
 
+@app.get("/audit/order/{order_id}", response_class=JSONResponse)
+async def audit_order(order_id: str):
+  """Trace an order back through thesis -> events. Full causal chain."""
+  conn = get_connection()
+  try:
+    order = conn.execute("SELECT * FROM orders WHERE order_id = ?",
+                         (order_id,)).fetchone()
+    if not order:
+      return {'error': 'order_not_found', 'order_id': order_id}
+    o = dict(order)
+    thesis = None
+    if o.get('thesis_id'):
+      t = conn.execute("SELECT * FROM theses WHERE thesis_id = ?",
+                       (o['thesis_id'],)).fetchone()
+      thesis = dict(t) if t else None
+    events = []
+    if thesis:
+      # Pull events for the ticker that arrived BEFORE this thesis was created
+      events_rows = conn.execute("""
+        SELECT * FROM events
+        WHERE (primary_ticker = ? OR ticker = ?)
+          AND ingested_at <= ?
+        ORDER BY ingested_at DESC LIMIT 20
+      """, (thesis['ticker'], thesis['ticker'], thesis['thesis_date'])).fetchall()
+      events = [dict(r) for r in events_rows]
+  finally:
+    conn.close()
+  return {
+    'order': o,
+    'thesis': thesis,
+    'related_events': events,
+    'chain_complete': bool(thesis),
+  }
+
+
 @app.get("/_partials/positions", response_class=HTMLResponse)
 async def partial_positions(request: Request):
   ctx = {"request": request, "positions": open_positions(),

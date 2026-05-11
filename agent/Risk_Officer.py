@@ -28,6 +28,7 @@ class Risk_Officer:
   MAX_NEW_POSITIONS_PER_DAY = 3
   MIN_CONFIDENCE_TO_TRADE   = 0.65  # arbiter confidence floor
   REQUIRE_DEBATE_SPREAD     = 0.20  # |bull - bear| spread must exceed this
+  MAX_CORRELATION_TO_BASKET = 0.75  # avg pairwise corr w/ open positions
 
   def __init__(self,
                max_position_pct: Optional[float] = None,
@@ -44,7 +45,9 @@ class Risk_Officer:
                proposed_quantity: float,
                proposed_price: float,
                arbiter_verdict: ArbiterVerdict,
-               portfolio: Dict[str, Any]) -> RiskDecision:
+               portfolio: Dict[str, Any],
+               proposed_ticker: Optional[str] = None,
+               open_basket: Optional[List[str]] = None) -> RiskDecision:
     """Returns approve=True or False with reasons.
 
     On approve, may return adjusted_quantity if size was capped by limits.
@@ -93,7 +96,23 @@ class Risk_Officer:
         f"{self.MAX_NEW_POSITIONS_PER_DAY} new positions already opened today"
       ])
 
-    # 7. Position size cap (5% of starting portfolio)
+    # 7. Correlation to existing basket (Phase 9). Only checked when caller
+    # provides proposed_ticker AND open_basket. Otherwise skipped — Phase 6
+    # callers don't have to know about correlation.
+    if proposed_ticker and open_basket:
+      try:
+        from agent.correlation import correlation_decision
+        c = correlation_decision(
+          proposed_ticker, open_basket,
+          threshold=self.MAX_CORRELATION_TO_BASKET, days=90
+        )
+        if not c['ok']:
+          return RiskDecision(approve=False, reasons=[c['reason']])
+      except Exception as e:
+        # Correlation check is best-effort; don't block trades on yfinance hiccups
+        reasons.append(f"correlation_check_skipped: {type(e).__name__}")
+
+    # 8. Position size cap (5% of starting portfolio)
     starting_value = portfolio.get('starting_value', 100_000.0)
     max_dollar = starting_value * self.MAX_POSITION_PCT
     requested_dollar = proposed_quantity * proposed_price
@@ -108,7 +127,7 @@ class Risk_Officer:
         f"({self.MAX_POSITION_PCT*100:.0f}% of starting capital)"
       )
 
-    # 8. Aggressive sizing requires high confidence
+    # 9. Aggressive sizing requires high confidence
     if (arbiter_verdict.position_sizing_guidance == 'aggressive'
         and arbiter_verdict.confidence < 0.75):
       reasons.append("aggressive sizing requested but confidence <0.75; "
@@ -120,7 +139,7 @@ class Risk_Officer:
         adjusted_qty = proposed_quantity * 0.5
       adjusted_dollar = adjusted_qty * proposed_price
 
-    # 9. Cautious sizing applies a 50% reduction
+    # 10. Cautious sizing applies a 50% reduction
     if arbiter_verdict.position_sizing_guidance == 'cautious':
       reasons.append("cautious sizing -> 50% of approved size")
       base_qty = adjusted_qty if adjusted_qty is not None else proposed_quantity
