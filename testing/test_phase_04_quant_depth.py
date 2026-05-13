@@ -165,6 +165,36 @@ def test_piotroski_partial_data_handles_gracefully():
         f"with {len(result['skipped_tests'])} tests skipped")
 
 
+def test_piotroski_few_tests_does_not_yield_strong():
+  """When fewer than _PIOTROSKI_MIN_EVALUATED tests can be evaluated, the
+  rating must be 'insufficient_data' regardless of how many of the few
+  evaluable tests passed. Pre-fix, 2 passes out of 2 evaluable tests gave
+  ratio 1.0 -> 'strong', which is not defensible."""
+  # Only positive_net_income + positive_op_cash_flow can evaluate from these
+  # inputs (everything else needs prior-period data). Both pass.
+  fin = {'net_income': 100, 'op_cash_flow': 80}
+  result = _piotroski_f_score_math(fin)
+  assert result['score'] == 2, f"expected 2 passes, got {result['score']}"
+  assert result['max_score_evaluated'] <= 3, \
+    f"expected at most 3 evaluable tests, got {result['max_score_evaluated']}"
+  assert result['rating'] == 'insufficient_data', \
+    f"too few tests must yield insufficient_data, got {result['rating']!r}"
+  print(f"PASS: score=2 of {result['max_score_evaluated']} evaluable -> "
+        f"{result['rating']!r} (not 'strong')")
+
+
+def test_piotroski_few_tests_does_not_yield_weak():
+  """Mirror of the above: a single failing test should not flip to 'weak'."""
+  # Only positive_net_income can evaluate; net income is negative so it fails.
+  fin = {'net_income': -50}
+  result = _piotroski_f_score_math(fin)
+  assert result['score'] == 0
+  assert result['max_score_evaluated'] <= 2, result['max_score_evaluated']
+  assert result['rating'] == 'insufficient_data', \
+    f"too few tests must yield insufficient_data, got {result['rating']!r}"
+  print(f"PASS: 1 evaluable test (fail) -> insufficient_data, not 'weak'")
+
+
 def test_piotroski_full_data_unchanged():
   """Regression guard: with full data, the score and rating must remain
   9/9-strong with no skipped tests."""
@@ -332,6 +362,8 @@ if __name__ == "__main__":
   test_piotroski_strong_company()
   test_piotroski_weak_company()
   test_piotroski_partial_data_handles_gracefully()
+  test_piotroski_few_tests_does_not_yield_strong()
+  test_piotroski_few_tests_does_not_yield_weak()
   test_piotroski_full_data_unchanged()
   test_altman_z_safe_zone()
   test_altman_z_distress_zone()

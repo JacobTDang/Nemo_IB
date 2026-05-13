@@ -839,7 +839,12 @@ def _piotroski_f_score_math(financials: dict) -> dict:
   score = sum(1 for v in evaluated.values() if v)
   max_score_evaluated = len(evaluated)
 
-  if max_score_evaluated == 0:
+  # Refuse to issue a strong/weak verdict off fewer than this many evaluable
+  # tests — a 9-test framework loses its discriminating power if most tests
+  # are skipped due to missing inputs.
+  _PIOTROSKI_MIN_EVALUATED = 6
+
+  if max_score_evaluated < _PIOTROSKI_MIN_EVALUATED:
     rating = 'insufficient_data'
   else:
     ratio = score / max_score_evaluated
