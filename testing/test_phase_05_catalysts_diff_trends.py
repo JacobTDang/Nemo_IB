@@ -166,7 +166,13 @@ def test_paragraph_split_filters_short():
 def test_paragraph_split_handles_varied_separators():
   """Real 10-K text uses many paragraph separators: \\n\\n, \\n  \\n,
   \\n\\t\\n, and similar. Pre-fix the splitter handled only \\n\\n,
-  collapsing multiple paragraphs into one when other whitespace appeared."""
+  collapsing multiple paragraphs into one when other whitespace appeared.
+
+  Also exercises markers WITHOUT trailing whitespace (e.g. `•RiskNoSpace`
+  and `2)NumberedNoSpace`) which the marker regex must also strip — pre
+  the round-2 fix `\\s+` required trailing space, so no-space markers
+  survived stripping and Jaccard-mismatched against differently-formatted
+  prior filings."""
   text = (
     "We face competition from established players in the consumer electronics "
     "market, including companies with greater resources and established customer bases.\n\n"
@@ -177,19 +183,31 @@ def test_paragraph_split_handles_varied_separators():
     "  - Bulleted: Geopolitical tensions with China could result in tariffs, export "
     "restrictions, or other trade barriers that disrupt our access to manufacturing capacity.\n\n"
     "1. Numbered: Foreign exchange exposure could materially affect our financial results "
-    "as a significant share of revenue is generated outside the United States.\n"
+    "as a significant share of revenue is generated outside the United States.\n\n"
+    "•RiskNoSpace: this paragraph has a bullet with no trailing space and should still have "
+    "its leading marker stripped to avoid false-positive diffs across filings.\n\n"
+    "2)NumberedNoSpace: this paragraph uses a numbered marker without trailing space and "
+    "should also be stripped so Jaccard scoring matches across formatting variants.\n"
   )
   paras = _paragraph_split(text, min_chars=80)
-  assert len(paras) == 5, \
-    f"expected 5 paragraphs separated by varied whitespace; got {len(paras)}"
-  # No paragraph should still begin with a bullet/number marker (those should
-  # be stripped before Jaccard scoring)
+  assert len(paras) == 7, \
+    f"expected 7 paragraphs (5 original + 2 no-space markers); got {len(paras)}"
   for p in paras:
+    # Existing markers
     assert not p.startswith('- ') and not p.startswith('* ') \
-      and not p.startswith('1.') and not p.startswith('2.'), \
+      and not p.startswith('1.') and not p.startswith('2. '), \
       f"leading marker not stripped: {p[:30]}..."
-  print(f"PASS: paragraph splitter handles {len(paras)} paragraphs with mixed separators "
-        "and strips leading bullets/numbering")
+    # No-space markers (round 2)
+    assert not p.startswith('•') and not p.startswith('2)'), \
+      f"no-space marker not stripped: {p[:30]}..."
+  # Both no-space paragraphs should now read with their content right at the
+  # start (no leading punctuation).
+  assert any(p.startswith('RiskNoSpace:') for p in paras), \
+    "•RiskNoSpace paragraph should have its bullet stripped"
+  assert any(p.startswith('NumberedNoSpace:') for p in paras), \
+    "2)NumberedNoSpace paragraph should have its number stripped"
+  print(f"PASS: paragraph splitter handles {len(paras)} paragraphs and strips "
+        "leading markers with OR without trailing whitespace")
 
 
 def test_ngrams_jaccard_self_match():

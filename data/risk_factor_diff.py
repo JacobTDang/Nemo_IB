@@ -16,7 +16,10 @@ from typing import List, Dict, Any, Optional, Tuple
 
 # Strip leading bullet/numbering markers so similarity scoring isn't fooled
 # by formatting differences (e.g., "- Risk X" in one filing, "Risk X" in another).
-_LEADING_MARKER = re.compile(r'^\s*(?:[-*•·]|\d+[.)])\s+')
+# Trailing whitespace is OPTIONAL — SEC filings sometimes glue the marker to
+# the content (`•Risk: ...`, `1)Risk: ...`). `p.strip()` at the call site
+# handles leading whitespace, so we only need to consume the marker itself.
+_LEADING_MARKER = re.compile(r'^\s*(?:[-*•·]|\d+[.)])\s*')
 
 
 def _paragraph_split(text: str, min_chars: int = 80) -> List[str]:
