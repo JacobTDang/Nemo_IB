@@ -248,6 +248,84 @@ def test_finnhub_loop_recovers_from_connection_exception():
   print("PASS: daemon survives connection exception")
 
 
+def test_classifier_rate_limit_enforced():
+  """Token bucket throttles classifier to at most max_calls per window seconds.
+  Uses a virtual clock + patched asyncio.sleep so the test stays under 3s real
+  time even when simulating minutes of throttling."""
+  import asyncio as _asyncio
+  from daemons.news_watcher import MaterialityRateLimiter
+
+  current = [0.0]
+  def clock():
+    return current[0]
+
+  async def fake_sleep(seconds):
+    current[0] += seconds
+
+  call_times = []
+
+  async def run():
+    limiter = MaterialityRateLimiter(max_calls=10, window=60.0, clock=clock)
+    for _ in range(15):
+      await limiter.acquire()
+      call_times.append(current[0])
+      current[0] += 1.0  # simulate ~1s of work per call
+
+  with patch('daemons.news_watcher.asyncio.sleep', fake_sleep):
+    _asyncio.run(run())
+
+  in_first_minute = sum(1 for t in call_times if t < 60.0)
+  assert in_first_minute <= 10, \
+    f"max_calls=10 in window=60s but {in_first_minute} calls landed in first 60s"
+  assert len(call_times) == 15, "all 15 calls eventually acquired"
+  print(f"PASS: rate limiter capped first-minute calls to {in_first_minute} "
+        f"(15 total over {call_times[-1]:.0f}s virtual)")
+
+
+def test_max_per_ticker_caps_articles():
+  """Even if Finnhub returns 30 articles for a ticker, only MAX_PER_TICKER
+  should be classified (lower load on Groq)."""
+  import daemons.news_watcher as nw
+  init_schema(); _clean()
+  nw.POLL_FINNHUB = 1
+  fake_articles = [
+    {'headline': f'AAPL article {i}', 'summary': f'b{i}',
+     'datetime': 1715000000 + i, 'source': 'reuters', 'url': f'http://x/{i}'}
+    for i in range(30)
+  ]
+
+  class FakeResp:
+    status = 200
+    async def json(self): return fake_articles
+    async def __aenter__(self): return self
+    async def __aexit__(self, *a): pass
+  class FakeSession:
+    def get(self, url, params, timeout): return FakeResp()
+    async def __aenter__(self): return self
+    async def __aexit__(self, *a): pass
+
+  classifier = FakeClassifier()
+  with patch('daemons.news_watcher.get_watchlist', return_value=['AAPL']), \
+       patch('daemons.news_watcher.FinnhubClient') as MockClient, \
+       patch('aiohttp.ClientSession', return_value=FakeSession()):
+    MockClient.return_value._api_key = 'fake'
+
+    async def run_one_round():
+      nw._running = True
+      task = asyncio.create_task(nw.watch_finnhub_company_news(classifier))
+      await asyncio.sleep(0.4)
+      nw._running = False
+      try:
+        await asyncio.wait_for(task, timeout=3)
+      except asyncio.TimeoutError:
+        task.cancel()
+    asyncio.run(run_one_round())
+
+  assert classifier.calls <= nw.MAX_PER_TICKER, \
+    f"classifier called {classifier.calls} times; cap is {nw.MAX_PER_TICKER}"
+  print(f"PASS: per-ticker cap honored ({classifier.calls} ≤ {nw.MAX_PER_TICKER})")
+
+
 def test_shutdown_flag_terminates_loop_promptly():
   """Setting _running=False should make the loop return within ~1s."""
   init_schema(); _clean()
@@ -292,6 +370,8 @@ if __name__ == "__main__":
   test_finnhub_loop_dedups_on_second_pass()
   test_finnhub_loop_recovers_from_http_error()
   test_finnhub_loop_recovers_from_connection_exception()
+  test_classifier_rate_limit_enforced()
+  test_max_per_ticker_caps_articles()
   test_shutdown_flag_terminates_loop_promptly()
   _clean()
   print("\nAll Phase 1c news_watcher tests passed.")

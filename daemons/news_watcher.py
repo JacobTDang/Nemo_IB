@@ -19,8 +19,9 @@ import asyncio
 import sys
 import os
 import signal
+import time
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Optional, Callable
 import json
 
 import feedparser
@@ -39,7 +40,61 @@ POLL_FINNHUB = 60
 POLL_SEC = 120
 POLL_MACRO = 180
 
+# Throttle classifier calls below Groq free-tier limits (30 RPM). 25 leaves
+# headroom for retries. Cap articles per source to keep one tick from
+# saturating the bucket — recent items are the materially-moving ones anyway.
+MATERIALITY_RPM = 25
+MAX_PER_TICKER = 8
+MAX_SEC_FILINGS = 15
+MAX_GENERAL_NEWS = 12
+
 _running = True
+
+
+class MaterialityRateLimiter:
+  """Sliding-window token bucket. Throttles to max_calls per window seconds.
+
+  Awaitable: `await limiter.acquire()` blocks (via asyncio.sleep) until a slot
+  frees. `clock` is injectable for testing — defaults to time.monotonic.
+  """
+  def __init__(self, max_calls: int = MATERIALITY_RPM, window: float = 60.0,
+               clock: Optional[Callable[[], float]] = None):
+    self.max_calls = max_calls
+    self.window = window
+    self._clock = clock or time.monotonic
+    self._timestamps: List[float] = []
+    self._lock = asyncio.Lock()
+
+  async def acquire(self) -> None:
+    while True:
+      async with self._lock:
+        now = self._clock()
+        cutoff = now - self.window
+        self._timestamps = [t for t in self._timestamps if t > cutoff]
+        if len(self._timestamps) < self.max_calls:
+          self._timestamps.append(now)
+          return
+        sleep_for = self._timestamps[0] - cutoff
+      # Release lock while sleeping so other coroutines can also queue
+      await asyncio.sleep(max(sleep_for, 0.001))
+
+
+# Module-level singleton so all three watch tasks share the bucket.
+_LIMITER: Optional[MaterialityRateLimiter] = None
+
+
+def _get_limiter() -> MaterialityRateLimiter:
+  global _LIMITER
+  if _LIMITER is None:
+    _LIMITER = MaterialityRateLimiter()
+  return _LIMITER
+
+
+async def _classify(classifier, headline: str, summary: str, source: str):
+  """Rate-limited classifier wrapper. Runs the sync classify in a thread so
+  the Groq HTTP call doesn't block the event loop."""
+  await _get_limiter().acquire()
+  return await asyncio.to_thread(classifier.classify, headline, summary, source)
 
 
 def _stop(*_):
@@ -80,15 +135,15 @@ async def watch_finnhub_company_news(classifier: Materiality_Classifier):
         print(f"[news_watcher][finnhub] {ticker} failed: {e}", file=sys.stderr, flush=True)
         continue
 
-      for art in (articles or [])[:20]:
+      for art in (articles or [])[:MAX_PER_TICKER]:
         headline = art.get('headline', '')
         summary = art.get('summary', '')
         published = datetime.fromtimestamp(art.get('datetime', 0)).isoformat()
         source = f"finnhub:{art.get('source', 'unknown')}"
         if seen(source, headline, published):
           continue
-        # Classify
-        result = classifier.classify(headline, summary, source)
+        # Classify (rate-limited + threaded)
+        result = await _classify(classifier, headline, summary, source)
         if result is None:
           continue  # parse failed; skip
         store_event(
@@ -126,7 +181,7 @@ async def watch_sec_edgar(classifier: Materiality_Classifier):
       continue
 
     watchlist = set(get_watchlist())
-    for entry in feed.entries[:30]:
+    for entry in feed.entries[:MAX_SEC_FILINGS]:
       title = entry.get('title', '')
       # Title format: "FORM_TYPE - COMPANY NAME (CIK)"
       # We only ingest when the company matches a watched ticker; this requires
@@ -138,7 +193,7 @@ async def watch_sec_edgar(classifier: Materiality_Classifier):
       source = 'sec:edgar'
       if seen(source, title, published):
         continue
-      result = classifier.classify(title, summary, source)
+      result = await _classify(classifier, title, summary, source)
       if result is None:
         continue
       # Only store if relevant to our watchlist OR classifier flagged material
@@ -186,14 +241,14 @@ async def watch_finnhub_general(classifier: Materiality_Classifier):
       print(f"[news_watcher][general] failed: {e}", file=sys.stderr, flush=True)
       articles = []
 
-    for art in (articles or [])[:15]:
+    for art in (articles or [])[:MAX_GENERAL_NEWS]:
       headline = art.get('headline', '')
       summary = art.get('summary', '')
       published = datetime.fromtimestamp(art.get('datetime', 0)).isoformat()
       source = f"finnhub-general:{art.get('source', 'unknown')}"
       if seen(source, headline, published):
         continue
-      result = classifier.classify(headline, summary, source)
+      result = await _classify(classifier, headline, summary, source)
       if result is None or not result.is_material:
         continue
       store_event(
