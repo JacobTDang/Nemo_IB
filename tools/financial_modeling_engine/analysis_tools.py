@@ -786,62 +786,77 @@ def _monte_carlo_dcf_math(base_inputs: dict, n_iter: int = 5000,
 def _piotroski_f_score_math(financials: dict) -> dict:
   """Piotroski F-score: 9 binary tests on financial strength. Range 0-9.
 
-  Expected keys (all decimals/dollars, current-period unless _prior suffix):
-    net_income, op_cash_flow, total_assets, total_assets_prior,
-    long_term_debt, long_term_debt_prior, current_ratio, current_ratio_prior,
-    shares_outstanding, shares_outstanding_prior,
-    gross_margin, gross_margin_prior,
-    asset_turnover, asset_turnover_prior
+  Each test requires specific inputs; when ANY required input is missing
+  (the key is absent OR its value is None), the test is SKIPPED — neither
+  passed nor failed. Score is the count of passes; `max_score_evaluated`
+  is the count of tests that actually ran. `skipped_tests` lists the names
+  of skipped tests so callers can see how complete the evaluation was.
 
-  Missing inputs are treated as failing the test.
+  Pre-fix, defaults like `float('inf')` and `1` caused tests to evaluate
+  spuriously True/False when inputs were missing.
   """
-  ni = financials.get('net_income', 0)
-  ocf = financials.get('op_cash_flow', 0)
-  ta_now = financials.get('total_assets', 1)
-  ta_prev = financials.get('total_assets_prior', 1)
+  def g(key):
+    """Return the value or None — distinguishes 'missing' from 'zero'."""
+    v = financials.get(key)
+    return v if v is not None else None
 
-  # ROA = NI / TA (average if both periods available)
-  roa_now = ni / ta_now if ta_now else 0
-  ni_prev = financials.get('net_income_prior', 0)
-  roa_prev = ni_prev / ta_prev if ta_prev else 0
+  def _gt(a, b):
+    return None if a is None or b is None else a > b
+  def _lt(a, b):
+    return None if a is None or b is None else a < b
+  def _lte(a, b):
+    return None if a is None or b is None else a <= b
 
-  tests = {
-    'positive_net_income': ni > 0,
-    'positive_op_cash_flow': ocf > 0,
-    'roa_improving': roa_now > roa_prev,
-    'cfo_exceeds_ni': ocf > ni,
-    'lt_debt_decreasing': (
-      financials.get('long_term_debt', 0)
-      < financials.get('long_term_debt_prior', float('inf'))
-    ),
-    'current_ratio_improving': (
-      financials.get('current_ratio', 0)
-      > financials.get('current_ratio_prior', float('inf'))
-    ),
-    'no_dilution': (
-      financials.get('shares_outstanding', float('inf'))
-      <= financials.get('shares_outstanding_prior', 0)
-    ),
-    'gross_margin_improving': (
-      financials.get('gross_margin', 0)
-      > financials.get('gross_margin_prior', float('inf'))
-    ),
-    'asset_turnover_improving': (
-      financials.get('asset_turnover', 0)
-      > financials.get('asset_turnover_prior', float('inf'))
-    ),
+  ni = g('net_income')
+  ocf = g('op_cash_flow')
+  ta_now = g('total_assets')
+  ta_prev = g('total_assets_prior')
+  ni_prev = g('net_income_prior')
+
+  # ROA needs NI and TA for the period; either missing -> ROA is None
+  def _roa(ni_val, ta_val):
+    if ni_val is None or ta_val is None or ta_val == 0:
+      return None
+    return ni_val / ta_val
+  roa_now = _roa(ni, ta_now)
+  roa_prev = _roa(ni_prev, ta_prev)
+
+  raw_tests = {
+    'positive_net_income':      (ni > 0)  if ni  is not None else None,
+    'positive_op_cash_flow':    (ocf > 0) if ocf is not None else None,
+    'roa_improving':            _gt(roa_now, roa_prev),
+    'cfo_exceeds_ni':           _gt(ocf, ni),
+    'lt_debt_decreasing':       _lt(g('long_term_debt'), g('long_term_debt_prior')),
+    'current_ratio_improving':  _gt(g('current_ratio'), g('current_ratio_prior')),
+    'no_dilution':              _lte(g('shares_outstanding'),
+                                      g('shares_outstanding_prior')),
+    'gross_margin_improving':   _gt(g('gross_margin'), g('gross_margin_prior')),
+    'asset_turnover_improving': _gt(g('asset_turnover'), g('asset_turnover_prior')),
   }
-  score = sum(1 for v in tests.values() if v)
-  if score >= 7:
-    rating = 'strong'
-  elif score <= 3:
-    rating = 'weak'
+
+  skipped_tests = [k for k, v in raw_tests.items() if v is None]
+  evaluated = {k: bool(v) for k, v in raw_tests.items() if v is not None}
+  score = sum(1 for v in evaluated.values() if v)
+  max_score_evaluated = len(evaluated)
+
+  if max_score_evaluated == 0:
+    rating = 'insufficient_data'
   else:
-    rating = 'mixed'
+    ratio = score / max_score_evaluated
+    if ratio >= 7 / 9:
+      rating = 'strong'
+    elif ratio <= 3 / 9:
+      rating = 'weak'
+    else:
+      rating = 'mixed'
+
   return {
-    'score': score, 'max_score': 9,
+    'score': score,
+    'max_score': 9,
+    'max_score_evaluated': max_score_evaluated,
     'rating': rating,
-    'tests': tests,
+    'tests': evaluated,
+    'skipped_tests': skipped_tests,
     'method': 'Piotroski (2000) F-score',
   }
 

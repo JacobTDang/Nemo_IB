@@ -148,14 +148,42 @@ def test_piotroski_weak_company():
 
 
 def test_piotroski_partial_data_handles_gracefully():
-  """When most prior-period data is missing, score should be low but not crash."""
+  """With only net_income + op_cash_flow, only tests that don't need prior-period
+  data should evaluate. The rest are skipped, NOT spuriously True. Pre-fix, the
+  defaults (`float('inf')`, `1`) caused roa_improving and lt_debt_decreasing to
+  pass spuriously, inflating the score."""
   fin = {'net_income': 100, 'op_cash_flow': 80}
   result = _piotroski_f_score_math(fin)
   assert 'score' in result
-  # Only 2 tests can pass: positive_ni, positive_ocf, cfo_exceeds_ni (ocf<ni so fails)
-  # And dilution test passes if shares_prior=0 default makes it inf -> shares<=inf is true
-  assert result['score'] >= 2
-  print(f"PASS: partial data scores {result['score']}/9 without crashing")
+  assert result['score'] <= 3, \
+    f"with most data missing, score should be at most 3, got {result['score']}"
+  assert len(result.get('skipped_tests', [])) >= 6, \
+    f"at least 6 tests should be skipped, got {len(result.get('skipped_tests', []))}"
+  assert result.get('max_score_evaluated', 9) <= 3, \
+    f"max_score_evaluated should be at most 3, got {result.get('max_score_evaluated')}"
+  print(f"PASS: partial data score={result['score']}/{result['max_score_evaluated']} "
+        f"with {len(result['skipped_tests'])} tests skipped")
+
+
+def test_piotroski_full_data_unchanged():
+  """Regression guard: with full data, the score and rating must remain
+  9/9-strong with no skipped tests."""
+  fin = {
+    'net_income': 100, 'net_income_prior': 80,
+    'op_cash_flow': 150, 'total_assets': 1000, 'total_assets_prior': 950,
+    'long_term_debt': 200, 'long_term_debt_prior': 250,
+    'current_ratio': 2.0, 'current_ratio_prior': 1.8,
+    'shares_outstanding': 100, 'shares_outstanding_prior': 100,
+    'gross_margin': 0.45, 'gross_margin_prior': 0.40,
+    'asset_turnover': 1.5, 'asset_turnover_prior': 1.2,
+  }
+  result = _piotroski_f_score_math(fin)
+  assert result['score'] == 9, f"full data should score 9/9, got {result['score']}"
+  assert result['rating'] == 'strong'
+  assert result.get('max_score_evaluated') == 9
+  assert not result.get('skipped_tests'), \
+    f"no skips with full data; got {result.get('skipped_tests')}"
+  print(f"PASS: full data -> score=9/9, no skipped tests")
 
 
 # ---- Altman Z-score --------------------------------------------------------
@@ -304,6 +332,7 @@ if __name__ == "__main__":
   test_piotroski_strong_company()
   test_piotroski_weak_company()
   test_piotroski_partial_data_handles_gracefully()
+  test_piotroski_full_data_unchanged()
   test_altman_z_safe_zone()
   test_altman_z_distress_zone()
   test_altman_z_components_are_round()
