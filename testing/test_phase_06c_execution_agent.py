@@ -181,6 +181,40 @@ def test_idempotency_via_existing_client_id():
   print("PASS: duplicate client_order_id rejected before broker (broker called once only)")
 
 
+def test_rejected_order_id_includes_unique_suffix():
+  """The rejected order_id must include a uuid suffix so that two failures
+  with the same client_order_id can't collide on the orders table PK.
+  Pre-fix the order_id was literally `rejected-{client_order_id}` with no
+  suffix — a hand-retry of the same client_order_id silently lost the second
+  audit row via INSERT OR IGNORE."""
+  init_schema(); _clean()
+  mocks = _make_alpaca_mock()
+  mocks['_client'].submit_order.side_effect = Exception("broker unavailable")
+
+  with patch.dict(os.environ, {'ALPACA_PAPER_KEY': 'k', 'ALPACA_PAPER_SECRET': 's'}, clear=False), \
+       patch.dict('sys.modules', mocks):
+    from agent.Execution_Agent import Execution_Agent
+    ea = Execution_Agent(paper=True)
+    r = ea.place_order(ticker="TST_FAIL2", quantity=10, side="buy",
+                       order_type="market", thesis_id=77)
+
+  assert not r['success']
+  from state.positions import recent_orders
+  rejected = [o for o in recent_orders(limit=20)
+              if o['ticker'] == 'TST_FAIL2' and o['status'] == 'rejected']
+  assert len(rejected) == 1
+  oid = rejected[0]['order_id']
+  cli = rejected[0]['client_order_id']
+  expected_prefix = f"rejected-{cli}-"
+  assert oid.startswith(expected_prefix), \
+    f"rejected order_id must include a unique suffix to avoid PK collisions; " \
+    f"got {oid!r} (expected to start with {expected_prefix!r})"
+  suffix = oid[len(expected_prefix):]
+  assert len(suffix) >= 4 and all(c in '0123456789abcdef' for c in suffix), \
+    f"suffix should be hex with length >= 4; got {suffix!r}"
+  print(f"PASS: rejected order_id has unique suffix ({oid})")
+
+
 def test_account_summary_returns_floats():
   mocks = _make_alpaca_mock()
   with patch.dict(os.environ, {'ALPACA_PAPER_KEY': 'k', 'ALPACA_PAPER_SECRET': 's'}, clear=False), \
@@ -241,6 +275,7 @@ if __name__ == "__main__":
   test_place_limit_order_requires_price()
   test_invalid_side_rejected()
   test_broker_failure_recorded_as_rejected()
+  test_rejected_order_id_includes_unique_suffix()
   test_idempotency_via_existing_client_id()
   test_account_summary_returns_floats()
   test_account_summary_handles_broker_error()

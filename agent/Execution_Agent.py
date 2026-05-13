@@ -132,9 +132,12 @@ class Execution_Agent:
       order = client.submit_order(req)
       broker_order_id = str(order.id)
     except Exception as e:
-      # Record the attempt as rejected for the audit trail
+      # Record the attempt as rejected for the audit trail. The order_id
+      # includes a uuid suffix so a hand-retry of the same client_order_id
+      # produces a distinct PK — multiple "rejected-*" rows for the same
+      # client_order_id are intentional in the audit log.
       record_order(
-        order_id=f"rejected-{client_order_id}",
+        order_id=f"rejected-{client_order_id}-{uuid.uuid4().hex[:6]}",
         client_order_id=client_order_id,
         ticker=ticker_u, side=side, order_type=order_type,
         quantity=quantity, limit_price=limit_price,
