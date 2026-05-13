@@ -163,6 +163,35 @@ def test_paragraph_split_filters_short():
   print(f"PASS: paragraph split filters fragments below min_chars")
 
 
+def test_paragraph_split_handles_varied_separators():
+  """Real 10-K text uses many paragraph separators: \\n\\n, \\n  \\n,
+  \\n\\t\\n, and similar. Pre-fix the splitter handled only \\n\\n,
+  collapsing multiple paragraphs into one when other whitespace appeared."""
+  text = (
+    "We face competition from established players in the consumer electronics "
+    "market, including companies with greater resources and established customer bases.\n\n"
+    "Our supply chain depends on third-party manufacturers concentrated primarily in Asia. "
+    "Disruptions could materially adversely affect our business.\n  \n"  # spaces between newlines
+    "Cybersecurity incidents could disrupt our operations and harm our reputation. "
+    "We invest substantial resources in protecting our systems and customer data.\n\t\n"  # tab between newlines
+    "  - Bulleted: Geopolitical tensions with China could result in tariffs, export "
+    "restrictions, or other trade barriers that disrupt our access to manufacturing capacity.\n\n"
+    "1. Numbered: Foreign exchange exposure could materially affect our financial results "
+    "as a significant share of revenue is generated outside the United States.\n"
+  )
+  paras = _paragraph_split(text, min_chars=80)
+  assert len(paras) == 5, \
+    f"expected 5 paragraphs separated by varied whitespace; got {len(paras)}"
+  # No paragraph should still begin with a bullet/number marker (those should
+  # be stripped before Jaccard scoring)
+  for p in paras:
+    assert not p.startswith('- ') and not p.startswith('* ') \
+      and not p.startswith('1.') and not p.startswith('2.'), \
+      f"leading marker not stripped: {p[:30]}..."
+  print(f"PASS: paragraph splitter handles {len(paras)} paragraphs with mixed separators "
+        "and strips leading bullets/numbering")
+
+
 def test_ngrams_jaccard_self_match():
   text = "supply chain disruption manufacturing Asia"
   s = _ngrams(text, n=3)
@@ -281,6 +310,7 @@ if __name__ == "__main__":
   test_summarize_for_analyst_renders_compactly()
   test_summarize_for_analyst_empty()
   test_paragraph_split_filters_short()
+  test_paragraph_split_handles_varied_separators()
   test_ngrams_jaccard_self_match()
   test_diff_detects_new_risk_paragraph()
   test_diff_detects_modified_supply_chain_paragraph()

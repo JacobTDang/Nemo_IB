@@ -9,17 +9,35 @@ Strategy: pull current and prior year's 10-K Risk Factors section via
 edgartools, split into paragraphs, fuzzy-match across years (Jaccard on
 3-grams), and return new/removed/modified paragraphs.
 """
+import re
 import sys
 from typing import List, Dict, Any, Optional, Tuple
 
 
+# Strip leading bullet/numbering markers so similarity scoring isn't fooled
+# by formatting differences (e.g., "- Risk X" in one filing, "Risk X" in another).
+_LEADING_MARKER = re.compile(r'^\s*(?:[-*•·]|\d+[.)])\s+')
+
+
 def _paragraph_split(text: str, min_chars: int = 80) -> List[str]:
-  """Split a Risk Factors section into individual risk paragraphs."""
+  """Split a Risk Factors section into individual risk paragraphs.
+
+  Splits on any run of whitespace that includes at least two newlines (handles
+  `\\n\\n`, `\\n  \\n`, `\\n\\t\\n`, and similar). Strips leading bullet or
+  numbering markers from each paragraph so Jaccard scoring is robust to
+  formatting differences across years.
+  """
   if not text:
     return []
-  # Split on double newlines; clean and filter short fragments
-  paras = [p.strip() for p in text.replace('\r', '\n').split('\n\n')]
-  return [p for p in paras if len(p) >= min_chars]
+  normalized = text.replace('\r\n', '\n').replace('\r', '\n')
+  # Two-or-more newlines, optionally with whitespace between them
+  raw_paras = re.split(r'\n[ \t]*\n+', normalized)
+  out: List[str] = []
+  for p in raw_paras:
+    cleaned = _LEADING_MARKER.sub('', p.strip())
+    if len(cleaned) >= min_chars:
+      out.append(cleaned)
+  return out
 
 
 def _ngrams(text: str, n: int = 3) -> set:
