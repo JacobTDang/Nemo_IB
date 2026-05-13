@@ -74,7 +74,16 @@ def correlation_decision(candidate: str, basket: List[str],
 
   Returns:
     {ok: bool, avg_correlation: float, threshold, reason: str}
+
+  Special case: if `candidate` is already in `basket`, this is a scale-up of
+  an existing position — not a new concentration. Short-circuit and approve
+  without computing a meaningless self-correlation.
   """
+  if candidate and basket and candidate.upper() in {b.upper() for b in basket}:
+    return {
+      'ok': True, 'avg_correlation': None, 'threshold': threshold,
+      'reason': f'scale_up_existing_position ({candidate})',
+    }
   avg = avg_correlation_to_basket(candidate, basket, days)
   if avg is None:
     return {

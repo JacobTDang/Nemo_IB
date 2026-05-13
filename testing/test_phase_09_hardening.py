@@ -122,6 +122,36 @@ def test_correlation_decision_blocks_high_corr():
   print(f"PASS: high correlation blocks (avg={d['avg_correlation']})")
 
 
+def test_correlation_allows_scaling_existing_position():
+  """When the candidate is already in the basket, this is a scale-up — not a
+  new concentration. The check should approve without trying to compute a
+  meaningless self-correlation."""
+  d = correlation_decision('AAPL', ['AAPL', 'MSFT'], threshold=0.7)
+  assert d['ok'] is True, f"scaling existing position should be allowed; got {d}"
+  assert 'scale_up' in d['reason'], f"reason should signal scale-up; got {d['reason']}"
+  assert d['avg_correlation'] is None
+  print(f"PASS: scaling existing position approved (reason={d['reason']})")
+
+
+def test_risk_officer_allows_scaling_existing_position():
+  """Risk Officer must not reject a BUY for a ticker already held."""
+  verdict = ArbiterVerdict(
+    final_recommendation='BUY', confidence=0.75,
+    bull_strength=0.78, bear_strength=0.45,
+    decisive_factors=['ok'], acknowledged_risks=['ok'],
+    conditions_to_change_mind=['ok'],
+    position_sizing_guidance='normal', rationale='scaling up'
+  )
+  portfolio = {'total_value': 100_000, 'starting_value': 100_000,
+                'daily_pnl_pct': 0, 'positions_opened_today': 0}
+  ro = Risk_Officer()
+  # No yfinance call should happen — scale-up short-circuits before correlation matrix
+  d = ro.evaluate(10, 200, verdict, portfolio,
+                   proposed_ticker='AAPL', open_basket=['AAPL', 'MSFT'])
+  assert d.approve, f"scaling existing position should approve; got {d}"
+  print(f"PASS: Risk Officer approves scaling existing position")
+
+
 def test_correlation_decision_passes_low_corr():
   fake_returns = _make_fake_returns(['NEW', 'OLD1', 'OLD2'],
                                      correlations={'NEW': 0.1, 'OLD1': 0.95, 'OLD2': 0.95})
@@ -234,6 +264,8 @@ if __name__ == "__main__":
   test_correlation_matrix_returns_dataframe()
   test_avg_correlation_to_basket()
   test_correlation_decision_blocks_high_corr()
+  test_correlation_allows_scaling_existing_position()
+  test_risk_officer_allows_scaling_existing_position()
   test_correlation_decision_passes_low_corr()
   test_correlation_decision_skips_on_unavailable_data()
   test_correlation_empty_basket_ok()
