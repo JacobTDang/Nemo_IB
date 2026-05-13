@@ -13,7 +13,7 @@ from typing import List, Dict, Optional
 from functools import lru_cache
 
 
-@lru_cache(maxsize=1)
+@lru_cache(maxsize=16)
 def _daily_returns_panel_cached(tickers_tuple: tuple, days: int = 90):
   """Pull daily close % changes for a tuple of tickers. Cached for 1 call.
 
