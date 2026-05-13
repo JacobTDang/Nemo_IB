@@ -132,11 +132,13 @@ def portfolio_stats(paper: bool = True, start_value: float = 100_000.0) -> Dict[
     open_capital = sum((r['current_price'] or r['entry_price']) * r['quantity']
                        for r in open_rows)
 
-    # Realized P&L since EOD prior trading day (use start of today midnight)
+    # Realized P&L since EOD prior trading day (use start of today midnight).
+    # Filter by paper flag so live and paper P&L never bleed into each other.
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     todays_closes = conn.execute(
-      "SELECT realized_pnl FROM positions WHERE status='closed' AND closed_at >= ?",
-      (today.isoformat(),)
+      "SELECT realized_pnl FROM positions "
+      "WHERE status='closed' AND closed_at >= ? AND paper = ?",
+      (today.isoformat(), 1 if paper else 0)
     ).fetchall()
     realized_today = sum(r['realized_pnl'] or 0 for r in todays_closes)
 

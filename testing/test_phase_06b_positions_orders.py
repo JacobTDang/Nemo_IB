@@ -99,6 +99,28 @@ def test_portfolio_stats_aggregation():
 
 # ---- Orders --------------------------------------------------------------
 
+def test_portfolio_stats_isolates_paper_from_live():
+  """Realized P&L today must filter by paper/live. Pre-fix, the today's-closes
+  query had no paper filter, so a live close would pollute paper stats."""
+  init_schema(); _clean()
+  # Paper close: +$50 realized
+  paper_pid = open_position("TST_PAPER", "long", 10, 100.0, paper=True)
+  close_position(paper_pid, 105.0, "test")  # (105-100)*10 = $50
+  # Live close: +$1000 realized — must NOT show up in paper stats
+  live_pid = open_position("TST_LIVE", "long", 10, 100.0, paper=False)
+  close_position(live_pid, 200.0, "test")  # (200-100)*10 = $1000
+
+  paper_stats = portfolio_stats(paper=True, start_value=100_000)
+  assert paper_stats['realized_pnl_today'] == 50.0, \
+    f"paper stats must exclude live close; got {paper_stats['realized_pnl_today']} (expected 50)"
+
+  live_stats = portfolio_stats(paper=False, start_value=100_000)
+  assert live_stats['realized_pnl_today'] == 1000.0, \
+    f"live stats must exclude paper close; got {live_stats['realized_pnl_today']}"
+  print(f"PASS: portfolio_stats isolates paper ({paper_stats['realized_pnl_today']}) "
+        f"from live ({live_stats['realized_pnl_today']})")
+
+
 def test_record_order_idempotency():
   init_schema(); _clean()
   record_order(order_id="oid-1", client_order_id="test-cli-1",
@@ -157,6 +179,7 @@ if __name__ == "__main__":
   test_close_short_position_pnl()
   test_update_position_price_recomputes_unrealized()
   test_portfolio_stats_aggregation()
+  test_portfolio_stats_isolates_paper_from_live()
   test_record_order_idempotency()
   test_order_exists_for_client_id()
   test_update_order_status()
