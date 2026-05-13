@@ -117,6 +117,29 @@ def test_aggregate_stats_correct_hit_rate():
   print(f"PASS: hit_rate={stats['hit_rate']}, expectancy={stats['expectancy_pct_per_thesis']}%")
 
 
+def test_aggregate_stats_hold_wins_positive_avg_win():
+  """HOLD wins should contribute POSITIVE signed return (small-move bonus),
+  not -abs(ret). Pre-fix, the code returned -abs(ret) for ALL HOLD positions
+  including wins, so avg_win was negative and expectancy was corrupted."""
+  results = []
+  # 5 HOLD wins: small moves (1% each) — bonus = 5 - 1 = 4 per win
+  for i in range(5):
+    results.append({'ticker': f'H{i}', 'recommendation': 'HOLD', 'confidence': 0.5,
+                    'realized_return_pct': 1.0, 'win': True, 'included': True})
+  # 3 HOLD losses: moves at 6% (just past threshold) — penalty = -6 per loss
+  for i in range(3):
+    results.append({'ticker': f'L{i}', 'recommendation': 'HOLD', 'confidence': 0.4,
+                    'realized_return_pct': 6.0, 'win': False, 'included': True})
+  stats = aggregate_stats(results)
+  assert stats['avg_win_signed_pct'] > 0, \
+    f"HOLD wins should give positive avg_win, got {stats['avg_win_signed_pct']}"
+  assert stats['expectancy_pct_per_thesis'] > 0, \
+    f"high hit rate + small losses should yield positive expectancy, " \
+    f"got {stats['expectancy_pct_per_thesis']}"
+  print(f"PASS: HOLD wins -> positive avg_win ({stats['avg_win_signed_pct']}), "
+        f"expectancy ({stats['expectancy_pct_per_thesis']})")
+
+
 def test_aggregate_excludes_info_and_errors():
   results = [
     {'recommendation': 'INFO', 'confidence': 0.5, 'win': False, 'included': False, 'realized_return_pct': 0},
@@ -196,6 +219,7 @@ if __name__ == "__main__":
   test_future_window_returns_error()
   test_missing_price_returns_error()
   test_aggregate_stats_correct_hit_rate()
+  test_aggregate_stats_hold_wins_positive_avg_win()
   test_aggregate_excludes_info_and_errors()
   test_aggregate_empty_returns_error()
   test_calibration_well_calibrated_when_conf_matches_hit()

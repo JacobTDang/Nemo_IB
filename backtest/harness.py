@@ -156,14 +156,21 @@ def aggregate_stats(results: List[Dict[str, Any]]) -> Dict[str, Any]:
   buy_returns = [r['realized_return_pct'] for r in valid if r['recommendation'] == 'BUY']
   sell_returns = [r['realized_return_pct'] for r in valid if r['recommendation'] == 'SELL']
 
-  # Win/loss magnitude — depends on direction
+  # Win/loss magnitude — depends on direction.
+  # HOLD asymmetry: a "win" means the price stayed put, so reward is a capped
+  # bonus that shrinks as the move grows toward the 5% threshold. A "loss" is
+  # the full magnitude of the unexpected move.
   def signed_return(r):
-    if r['recommendation'] == 'BUY':
-      return r['realized_return_pct']
-    if r['recommendation'] == 'SELL':
-      return -r['realized_return_pct']
-    if r['recommendation'] == 'HOLD':
-      return -abs(r['realized_return_pct'])  # losses if it moved a lot
+    rec = r['recommendation']
+    ret = r['realized_return_pct']
+    if rec == 'BUY':
+      return ret
+    if rec == 'SELL':
+      return -ret
+    if rec == 'HOLD':
+      if r.get('win'):
+        return max(0.0, 5.0 - abs(ret))
+      return -abs(ret)
     return 0
 
   win_sizes = [signed_return(r) for r in wins]
