@@ -214,6 +214,48 @@ def test_recent_events_respects_time_window():
   print("PASS: recent_events_for_ticker respects time window")
 
 
+def test_recent_events_no_substring_false_positive():
+  """The affected_tickers query uses LIKE %"TICKER"% — the surrounding
+  quotes anchor the match so a ticker that is a SUBSTRING of another
+  (e.g., 'APL' vs 'AAPL', 'AA' vs 'AAPL') does NOT false-positive.
+
+  This test is a regression guard: it documents the invariant that the
+  current implementation honors. Bugs here would silently widen the event
+  audience for unrelated tickers."""
+  init_schema()
+  _clean_test_events()
+  store_event(
+    source="test:phase1a:substr", ticker='',
+    headline="event affecting AA and AAPL",
+    body="b", url="u", published_at="2026-05-10T12:00:00",
+    materiality="high", category="other",
+    affected_tickers=["AA", "AAPL"], primary_ticker="AAPL",
+    directional_signal="neutral", urgency="days", classifier_reason="r"
+  )
+  # Direct match: ticker IS in affected list
+  hits_aa = [e for e in recent_events_for_ticker("AA", hours=24)
+             if e['source'] == 'test:phase1a:substr']
+  hits_aapl = [e for e in recent_events_for_ticker("AAPL", hours=24)
+               if e['source'] == 'test:phase1a:substr']
+  assert len(hits_aa) == 1, f"AA is in affected list — expected 1, got {len(hits_aa)}"
+  assert len(hits_aapl) == 1, f"AAPL is in affected list — expected 1, got {len(hits_aapl)}"
+
+  # Substring of AAPL — should NOT match
+  for unrelated in ["APL", "AAP", "PL"]:
+    hits = [e for e in recent_events_for_ticker(unrelated, hours=24)
+            if e['source'] == 'test:phase1a:substr']
+    assert len(hits) == 0, \
+      f"ticker {unrelated!r} is just a substring; must not false-positive (got {len(hits)})"
+
+  # Wildcard-using string — SQLite LIKE has `_` as single-char wildcard, but
+  # the 5-char anchored pattern still rules out matches. Confirm.
+  hits_wild = [e for e in recent_events_for_ticker("AA_", hours=24)
+               if e['source'] == 'test:phase1a:substr']
+  assert len(hits_wild) == 0, \
+    f"ticker with SQL wildcard char must not produce false positives (got {len(hits_wild)})"
+  print("PASS: affected_tickers query is substring-safe (quote-anchored LIKE pattern)")
+
+
 def test_body_truncation_does_not_crash():
   init_schema()
   _clean_test_events()
@@ -244,6 +286,7 @@ if __name__ == "__main__":
   test_mark_processed()
   test_recent_events_for_ticker_matches_primary_and_affected()
   test_recent_events_respects_time_window()
+  test_recent_events_no_substring_false_positive()
   test_body_truncation_does_not_crash()
   _clean_test_events()
   print("\nAll Phase 1a events_store tests passed.")
