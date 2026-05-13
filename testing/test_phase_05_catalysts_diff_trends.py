@@ -80,6 +80,28 @@ def test_catalysts_no_api_key_still_returns_macro():
   print(f"PASS: macro/FOMC events surface even without Finnhub key ({len(events)} events)")
 
 
+def test_nfp_lands_on_first_friday():
+  """NFP release is always the first Friday of the month, not day-of-month=5.
+  Pre-fix the function emitted NFP on the 5th, which is a Friday only ~14% of
+  the time."""
+  events = upcoming_catalysts('AAPL', days_out=180)
+  from datetime import datetime as _dt
+  nfp_events = [e for e in events
+                 if 'NFP' in (e.get('description') or '') and e.get('type') == 'macro_release']
+  assert nfp_events, f"expected at least one NFP event in 180-day window; got events: " \
+    f"{[e.get('description') for e in events]}"
+  failures = []
+  for e in nfp_events:
+    dt = _dt.fromisoformat(e['date'])
+    if dt.weekday() != 4:  # 4 == Friday
+      failures.append(f"NFP {e['date']} weekday={dt.weekday()} (not Friday)")
+    if dt.day > 7:
+      failures.append(f"NFP {e['date']} day={dt.day} (not first week)")
+  assert not failures, "NFP date errors:\n  " + "\n  ".join(failures)
+  print(f"PASS: all {len(nfp_events)} NFP events fall on first Friday "
+        f"({[e['date'] for e in nfp_events]})")
+
+
 def test_summarize_for_analyst_renders_compactly():
   events = [
     {'type': 'earnings', 'date': '2026-08-01', 'ticker': 'AAPL',
@@ -255,6 +277,7 @@ if __name__ == "__main__":
   test_catalysts_includes_earnings_when_available()
   test_catalysts_sorted_chronologically()
   test_catalysts_no_api_key_still_returns_macro()
+  test_nfp_lands_on_first_friday()
   test_summarize_for_analyst_renders_compactly()
   test_summarize_for_analyst_empty()
   test_paragraph_split_filters_short()

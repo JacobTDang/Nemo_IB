@@ -10,6 +10,7 @@ this table at the start of each year.
 """
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
+import calendar
 import os
 import sys
 
@@ -24,12 +25,29 @@ FOMC_DATES_2026 = [
 
 # Macro release dates (typical day-of-month — exact dates vary).
 # For prod use the FRED /releases/dates API; this is a fallback timeline.
+# NFP is computed separately as the first Friday of each month — see
+# _first_friday_of_month() below.
 MACRO_PATTERNS = {
   'CPI':       {'day_of_month': 12, 'impact': 'rate-sensitive'},
-  'NFP':       {'day_of_month': 5,  'impact': 'rate-sensitive'},  # 1st Fri
   'GDP':       {'day_of_month': 26, 'impact': 'macro-broad'},     # advance
   'RetailSales': {'day_of_month': 15, 'impact': 'consumer'},
 }
+
+
+def _first_friday_of_month(year: int, month: int) -> Optional[datetime]:
+  """Return the first Friday of the given month, or None if year/month invalid.
+  Uses calendar.monthcalendar with the default Monday-start week (Friday is
+  index 4). The first week may begin in the prior month — in that case its
+  Friday entry is 0, and we fall through to the second week."""
+  try:
+    weeks = calendar.monthcalendar(year, month)
+  except (ValueError, calendar.IllegalMonthError):
+    return None
+  for week in weeks:
+    fri = week[4]  # Mon=0, Tue=1, Wed=2, Thu=3, Fri=4
+    if fri != 0:
+      return datetime(year, month, fri)
+  return None
 
 
 def upcoming_catalysts(ticker: str, days_out: int = 60) -> List[Dict[str, Any]]:
@@ -80,6 +98,20 @@ def upcoming_catalysts(ticker: str, days_out: int = 60) -> List[Dict[str, Any]]:
           'description': f'{name} release (approximate)',
           'impact': info['impact'], 'ticker': None,
         })
+
+  # 4b. NFP — always the first Friday of each month in the window.
+  for month_offset in range(0, (days_out // 30) + 2):
+    target_month = (now.month + month_offset - 1) % 12 + 1
+    target_year = now.year + (now.month + month_offset - 1) // 12
+    nfp_date = _first_friday_of_month(target_year, target_month)
+    if nfp_date is None:
+      continue
+    if now <= nfp_date <= end:
+      out.append({
+        'type': 'macro_release', 'date': nfp_date.date().isoformat(),
+        'description': 'NFP release',
+        'impact': 'rate-sensitive', 'ticker': None,
+      })
 
   return sorted(out, key=lambda x: x['date'])
 
