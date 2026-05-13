@@ -4,7 +4,7 @@ Pre-mortem uses real Groq (1 call). Correlation uses mocked yfinance.
 Audit trail uses seeded DB.
 """
 import sys, os
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
@@ -89,6 +89,34 @@ def _make_fake_returns(tickers, n=90, correlations=None):
     noise = np.random.randn(n)
     data[t] = corr * base + np.sqrt(1 - corr**2) * noise
   return pd.DataFrame(data, index=pd.date_range('2025-05-10', periods=n, freq='B'))
+
+
+def test_correlation_handles_single_ticker_panel_no_crash():
+  """yfinance returns a flat-Index DataFrame for single-ticker download.
+  Our cache must handle that explicitly without AttributeError or returning
+  the WHOLE DataFrame (Open/High/Low/Close/Volume) instead of just Close."""
+  import pandas as pd
+  import numpy as np
+  fake_df = pd.DataFrame({
+    'Open':  np.linspace(190, 200, 30),
+    'High':  np.linspace(192, 202, 30),
+    'Low':   np.linspace(189, 199, 30),
+    'Close': np.linspace(191, 201, 30),
+    'Volume': [1_000_000] * 30,
+  }, index=pd.date_range('2026-04-01', periods=30, freq='B'))
+
+  fake_yf = MagicMock()
+  fake_yf.download.return_value = fake_df
+
+  with patch.dict('sys.modules', {'yfinance': fake_yf}):
+    from agent import correlation as corr_mod
+    corr_mod._daily_returns_panel_cached.cache_clear()
+    corr = corr_mod.correlation_matrix(['SINGLE_T'])
+  assert corr is not None, "single-ticker should produce a 1x1 corr matrix, not None"
+  assert corr.shape == (1, 1), f"expected 1x1, got {corr.shape}"
+  # Self-correlation is 1.0
+  assert abs(corr.iloc[0, 0] - 1.0) < 1e-9
+  print(f"PASS: single-ticker corr matrix shape={corr.shape}, value={corr.iloc[0,0]:.2f}")
 
 
 def test_correlation_matrix_returns_dataframe():
@@ -261,6 +289,7 @@ def test_audit_order_without_thesis_still_returns():
 if __name__ == "__main__":
   test_pre_mortem_produces_structured_output()
   test_pre_mortem_failure_modes_are_specific()
+  test_correlation_handles_single_ticker_panel_no_crash()
   test_correlation_matrix_returns_dataframe()
   test_avg_correlation_to_basket()
   test_correlation_decision_blocks_high_corr()

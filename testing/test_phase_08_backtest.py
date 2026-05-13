@@ -6,7 +6,10 @@ from datetime import datetime, timedelta
 from typing import Dict, Tuple, Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from backtest.harness import backtest_thesis, aggregate_stats, backtest_all_theses
+from backtest.harness import (
+  backtest_thesis, aggregate_stats, backtest_all_theses,
+  _default_yfinance_fetcher,
+)
 from backtest.calibration import calibration_table
 
 
@@ -88,6 +91,43 @@ def test_future_window_returns_error():
   assert 'error' in r
   assert 'future' in r['error']
   print("PASS: not-yet-aged thesis returns error not crash")
+
+
+def test_default_fetcher_handles_single_ticker_history():
+  """yfinance Ticker.history() always returns a flat-Index DataFrame.
+  The fetcher must extract start/end Close prices correctly without crashing
+  on the multi-ticker code path."""
+  from unittest.mock import patch, MagicMock
+  import pandas as pd
+  import numpy as np
+  from datetime import datetime, timedelta
+
+  # Build a mock that mirrors yfinance Ticker.history() return shape exactly.
+  idx = pd.date_range('2026-04-01', periods=40, freq='B')
+  fake_hist = pd.DataFrame({
+    'Open':   np.linspace(190, 210, 40),
+    'High':   np.linspace(192, 212, 40),
+    'Low':    np.linspace(189, 209, 40),
+    'Close':  np.linspace(191, 211, 40),
+    'Volume': [1_000_000] * 40,
+  }, index=idx)
+
+  fake_ticker = MagicMock()
+  fake_ticker.history.return_value = fake_hist
+  fake_yf = MagicMock()
+  fake_yf.Ticker.return_value = fake_ticker
+
+  with patch.dict('sys.modules', {'yfinance': fake_yf}):
+    start_iso = idx[5].to_pydatetime().isoformat()
+    end_iso   = idx[35].to_pydatetime().isoformat()
+    prices = _default_yfinance_fetcher('AAPL', start_iso, end_iso)
+
+  assert prices is not None, "default fetcher should return a (start, end) tuple"
+  start_p, end_p = prices
+  assert isinstance(start_p, float) and isinstance(end_p, float)
+  # Start at row 5 (price ~193.6), end at row 35 (price ~209) — monotonic up
+  assert end_p > start_p, f"expected upward path, got start={start_p}, end={end_p}"
+  print(f"PASS: single-ticker history extracted start=${start_p:.2f} end=${end_p:.2f}")
 
 
 def test_missing_price_returns_error():
@@ -217,6 +257,7 @@ if __name__ == "__main__":
   test_hold_large_move_is_loss()
   test_info_thesis_excluded()
   test_future_window_returns_error()
+  test_default_fetcher_handles_single_ticker_history()
   test_missing_price_returns_error()
   test_aggregate_stats_correct_hit_rate()
   test_aggregate_stats_hold_wins_positive_avg_win()

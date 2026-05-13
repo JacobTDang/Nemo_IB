@@ -15,21 +15,41 @@ from functools import lru_cache
 
 @lru_cache(maxsize=1)
 def _daily_returns_panel_cached(tickers_tuple: tuple, days: int = 90):
-  """Pull daily close % changes for a tuple of tickers. Cached for 1 call."""
+  """Pull daily close % changes for a tuple of tickers. Cached for 1 call.
+
+  yfinance returns DIFFERENT shapes depending on input:
+    - Multi-ticker download: MultiIndex columns like ('Close', 'AAPL'), so
+      `df['Close']` yields a (n_days x n_tickers) DataFrame.
+    - Single-ticker download: flat Index columns [Open, High, Low, Close,
+      Volume], so `df['Close']` yields a Series.
+
+  We always return a DataFrame keyed by ticker so downstream `.corr()` works
+  uniformly. For single-ticker input the result is a 1-column DataFrame and
+  the corr matrix is 1x1.
+  """
   try:
     import yfinance as yf
     import pandas as pd
     end = datetime.now()
     start = end - timedelta(days=days * 2)  # padding for weekends
-    df = yf.download(list(tickers_tuple), start=start.date(), end=end.date(),
+    tickers = list(tickers_tuple)
+    df = yf.download(tickers, start=start.date(), end=end.date(),
                      progress=False, auto_adjust=True)
-    if df.empty:
+    if df is None or df.empty:
       return None
-    # yfinance multi-ticker returns multi-index columns: ('Close', 'AAPL'), etc.
-    if 'Close' in df.columns.get_level_values(0):
-      closes = df['Close']
+
+    if len(tickers) == 1:
+      # Flat-Index DataFrame. Extract Close as a 1-column DataFrame named
+      # after the ticker.
+      if 'Close' not in df.columns:
+        return None
+      closes = df[['Close']].rename(columns={'Close': tickers[0]})
     else:
-      closes = df  # single-ticker fallback
+      # Multi-ticker: MultiIndex columns. Top level should include 'Close'.
+      if 'Close' not in df.columns.get_level_values(0):
+        return None
+      closes = df['Close']
+
     returns = closes.pct_change().dropna()
     return returns
   except Exception as e:
