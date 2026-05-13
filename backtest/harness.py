@@ -26,6 +26,16 @@ PriceFetcher = Callable[[str, str, str], Optional[Tuple[float, float]]]
 # (ticker, start_iso, end_iso) -> (start_price, end_price) or None
 
 
+# Percent-magnitude threshold for HOLD outcome classification:
+#   |realized_return_pct| < HOLD_SMALL_MOVE_PCT  -> win (market stayed put)
+#   |realized_return_pct| >= HOLD_SMALL_MOVE_PCT -> loss
+# The reward bonus on a HOLD win shrinks linearly toward this threshold:
+#   bonus = max(0, HOLD_SMALL_MOVE_PCT - |ret|)
+# Keep both the win classification and the bonus computation referencing this
+# constant — they must move together.
+HOLD_SMALL_MOVE_PCT: float = 5.0
+
+
 def _default_yfinance_fetcher(ticker: str, start_iso: str, end_iso: str
                                ) -> Optional[Tuple[float, float]]:
   """Default price source: yfinance daily closes."""
@@ -96,7 +106,7 @@ def backtest_thesis(thesis: Dict[str, Any], forward_days: int = 30,
   elif rec == 'SELL':
     win = ret_pct < 0
   elif rec == 'HOLD':
-    win = abs(ret_pct) < 5  # small-move win condition
+    win = abs(ret_pct) < HOLD_SMALL_MOVE_PCT  # see constant docstring
   else:
     included = False
     win = False
@@ -169,7 +179,7 @@ def aggregate_stats(results: List[Dict[str, Any]]) -> Dict[str, Any]:
       return -ret
     if rec == 'HOLD':
       if r.get('win'):
-        return max(0.0, 5.0 - abs(ret))
+        return max(0.0, HOLD_SMALL_MOVE_PCT - abs(ret))
       return -abs(ret)
     return 0
 

@@ -140,6 +140,38 @@ def test_missing_price_returns_error():
 
 # ---- aggregate_stats -------------------------------------------------------
 
+def test_hold_threshold_is_shared():
+  """The HOLD win/loss threshold must be a single module constant referenced
+  by both backtest_thesis (win classification) and aggregate_stats.signed_return
+  (reward bonus). Pre-fix there were two literal `5`s in two places — bound
+  to drift apart."""
+  from backtest.harness import HOLD_SMALL_MOVE_PCT
+  assert isinstance(HOLD_SMALL_MOVE_PCT, (int, float))
+  assert HOLD_SMALL_MOVE_PCT > 0
+
+  # Win just inside the threshold
+  t_win = _thesis('AAPL', 'HOLD', 0.5, days_ago=60)
+  start_date = t_win['thesis_date'][:10]
+  near_inside = HOLD_SMALL_MOVE_PCT - 0.1  # e.g. 4.9% with default 5.0
+  end_price = 100.0 * (1 + near_inside / 100.0)
+  fetcher_win = _fake_fetcher({('AAPL', start_date): (100.0, end_price)})
+  r_win = backtest_thesis(t_win, forward_days=30, price_fetcher=fetcher_win)
+  assert r_win['win'] is True, \
+    f"HOLD with |ret|={near_inside}% (below {HOLD_SMALL_MOVE_PCT}%) must be a win; got {r_win}"
+
+  # Loss just outside the threshold
+  t_loss = _thesis('AAPL', 'HOLD', 0.5, days_ago=60)
+  start_date_l = t_loss['thesis_date'][:10]
+  near_outside = HOLD_SMALL_MOVE_PCT + 0.1  # 5.1%
+  end_price_l = 100.0 * (1 + near_outside / 100.0)
+  fetcher_loss = _fake_fetcher({('AAPL', start_date_l): (100.0, end_price_l)})
+  r_loss = backtest_thesis(t_loss, forward_days=30, price_fetcher=fetcher_loss)
+  assert r_loss['win'] is False, \
+    f"HOLD with |ret|={near_outside}% (above {HOLD_SMALL_MOVE_PCT}%) must be a loss; got {r_loss}"
+  print(f"PASS: HOLD threshold {HOLD_SMALL_MOVE_PCT}% shared "
+        f"(win at {near_inside}%, loss at {near_outside}%)")
+
+
 def test_aggregate_stats_correct_hit_rate():
   # 7 wins out of 10
   results = []
@@ -259,6 +291,7 @@ if __name__ == "__main__":
   test_future_window_returns_error()
   test_default_fetcher_handles_single_ticker_history()
   test_missing_price_returns_error()
+  test_hold_threshold_is_shared()
   test_aggregate_stats_correct_hit_rate()
   test_aggregate_stats_hold_wins_positive_avg_win()
   test_aggregate_excludes_info_and_errors()
