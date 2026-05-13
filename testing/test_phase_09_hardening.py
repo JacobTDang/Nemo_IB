@@ -131,6 +131,34 @@ def test_correlation_matrix_returns_dataframe():
   print(f"PASS: correlation matrix computes (A-B={corr.loc['A','B']:.2f}, A-C={corr.loc['A','C']:.2f})")
 
 
+def test_avg_correlation_excludes_self_from_basket():
+  """When the candidate appears in the basket, avg_correlation_to_basket
+  should compute the average correlation to the OTHER tickers in the basket,
+  not return the self-correlation of 1.0. Pre-fix the function early-returned
+  1.0, which would falsely lock out any in-basket ticker from new buys."""
+  # AAPL paired with two uncorrelated tickers — average should be ~0.0,
+  # definitely not 1.0
+  fake_returns = _make_fake_returns(['AAPL', 'MSFT', 'GOOGL'],
+                                     correlations={'AAPL': 0.05, 'MSFT': 0.05, 'GOOGL': 0.05})
+  with patch('agent.correlation._daily_returns_panel_cached', return_value=fake_returns):
+    avg = avg_correlation_to_basket('AAPL', ['AAPL', 'MSFT', 'GOOGL'])
+  assert avg is not None
+  assert avg < 0.5, \
+    f"avg should be ~0 (excluding self-correlation); got {avg} — bug returns 1.0"
+  print(f"PASS: avg_correlation_to_basket excludes self ({avg:.3f}, not 1.0)")
+
+
+def test_avg_correlation_only_candidate_in_basket_returns_none():
+  """basket=[candidate] -> no other ticker to correlate against -> None
+  (insufficient data), not 1.0 or 0.0."""
+  fake_returns = _make_fake_returns(['AAPL'], correlations={'AAPL': 0.5})
+  with patch('agent.correlation._daily_returns_panel_cached', return_value=fake_returns):
+    avg = avg_correlation_to_basket('AAPL', ['AAPL'])
+  assert avg is None, \
+    f"basket containing only the candidate has no peers; expected None, got {avg}"
+  print("PASS: avg_correlation_to_basket returns None when basket is just [candidate]")
+
+
 def test_avg_correlation_to_basket():
   fake_returns = _make_fake_returns(['CAND', 'X', 'Y'], correlations={'CAND': 0.9, 'X': 0.9, 'Y': 0.9})
   with patch('agent.correlation._daily_returns_panel_cached', return_value=fake_returns):
@@ -291,6 +319,8 @@ if __name__ == "__main__":
   test_pre_mortem_failure_modes_are_specific()
   test_correlation_handles_single_ticker_panel_no_crash()
   test_correlation_matrix_returns_dataframe()
+  test_avg_correlation_excludes_self_from_basket()
+  test_avg_correlation_only_candidate_in_basket_returns_none()
   test_avg_correlation_to_basket()
   test_correlation_decision_blocks_high_corr()
   test_correlation_allows_scaling_existing_position()

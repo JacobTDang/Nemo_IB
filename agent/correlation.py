@@ -69,18 +69,27 @@ def correlation_matrix(tickers: List[str], days: int = 90):
 
 def avg_correlation_to_basket(candidate: str, basket: List[str],
                                days: int = 90) -> Optional[float]:
-  """Average pairwise correlation between candidate and each ticker in basket.
+  """Average pairwise correlation between the candidate and the OTHER tickers
+  in the basket.
 
-  Returns None when correlation data can't be fetched."""
+  Behavior:
+    - Empty basket -> 0.0 (no peers to be correlated with)
+    - basket == [candidate] -> None (no peers after removing self)
+    - candidate appears in basket -> excludes self from the average so the
+      caller gets the meaningful "how correlated to the rest" number, not
+      the self-correlation 1.0
+  """
   if not basket:
-    return 0.0  # no existing positions to be correlated with
-  if candidate in basket:
-    return 1.0  # already in basket
-  all_tickers = [candidate] + list(basket)
+    return 0.0
+  cand_u = candidate.upper()
+  other_basket = [b for b in basket if b.upper() != cand_u]
+  if not other_basket:
+    return None
+  all_tickers = [candidate] + other_basket
   corr = correlation_matrix(all_tickers, days)
   if corr is None or candidate not in corr.columns:
     return None
-  pairs = [float(corr.loc[candidate, b]) for b in basket
+  pairs = [float(corr.loc[candidate, b]) for b in other_basket
            if b in corr.index and b != candidate]
   if not pairs:
     return None
