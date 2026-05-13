@@ -6,6 +6,7 @@ locally without privilege concerns.
 """
 import os
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
@@ -28,12 +29,15 @@ BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 
-app = FastAPI(title="Nemo IB", docs_url="/api/docs", redoc_url=None)
-
-# Make sure schema exists on first request
-@app.on_event("startup")
-async def _startup():
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+  # Startup: ensure schema exists. Teardown: nothing to do (read-only).
   init_schema()
+  yield
+
+
+app = FastAPI(title="Nemo IB", docs_url="/api/docs", redoc_url=None,
+              lifespan=_lifespan)
 
 # Static assets (CSS)
 static_path = BASE_DIR / "static"

@@ -130,6 +130,24 @@ def test_no_dashboard_route_is_a_post():
   print(f"PASS: dashboard is read-only (no POST/PUT/DELETE routes)")
 
 
+def test_app_starts_via_lifespan():
+  """The dashboard should boot via the modern FastAPI lifespan handler, not
+  the deprecated `@app.on_event('startup')`. `with TestClient(app)` forces
+  the lifespan context manager to execute on enter/exit."""
+  with TestClient(app) as c:
+    r = c.get("/health")
+    assert r.status_code == 200
+    j = r.json()
+    assert j['status'] == 'ok'
+  # Verify the deprecated decorator was NOT used (regression guard)
+  import dashboard.app as app_mod
+  assert getattr(app_mod, '_lifespan', None) is not None, \
+    "expected _lifespan context manager on the module"
+  # FastAPI internal: lifespan-aware apps store the context on the router
+  assert app.router.lifespan_context is not None
+  print(f"PASS: app boots via lifespan handler (health -> {j['status']})")
+
+
 def test_static_css_served():
   r = client.get("/static/style.css")
   assert r.status_code == 200
@@ -146,6 +164,7 @@ if __name__ == "__main__":
   test_events_page_renders()
   test_partial_endpoints_return_html()
   test_no_dashboard_route_is_a_post()
+  test_app_starts_via_lifespan()
   test_static_css_served()
   _clean()
   print("\nAll Phase 7 dashboard tests passed.")
