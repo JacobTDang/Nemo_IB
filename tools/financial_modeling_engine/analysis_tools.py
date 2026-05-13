@@ -701,7 +701,7 @@ def _reverse_dcf_math(current_price: float, base_inputs: dict,
     if (p_mid < current_price) == (p_lo < current_price):
       lo, p_lo = mid, p_mid
     else:
-      hi = mid
+      hi, p_hi = mid, p_mid
 
   implied_g = mid
   # Base case growth (avg of input revenue_growth)
