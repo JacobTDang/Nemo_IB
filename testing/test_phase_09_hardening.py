@@ -91,6 +91,36 @@ def _make_fake_returns(tickers, n=90, correlations=None):
   return pd.DataFrame(data, index=pd.date_range('2025-05-10', periods=n, freq='B'))
 
 
+def test_correlation_panel_returns_none_on_degenerate_multi_ticker():
+  """yfinance occasionally returns a flat-Index DataFrame even when given
+  multiple tickers (e.g., when most tickers fail and only one comes back).
+  In that case we cannot compute pairwise correlations — better to return
+  None and skip the check than silently produce a 1x1 corr matrix from
+  whatever ticker happened to come back."""
+  import pandas as pd
+  import numpy as np
+  fake_df = pd.DataFrame({
+    'Open':   np.linspace(190, 200, 30),
+    'High':   np.linspace(192, 202, 30),
+    'Low':    np.linspace(189, 199, 30),
+    'Close':  np.linspace(191, 201, 30),
+    'Volume': [1_000_000] * 30,
+  }, index=pd.date_range('2026-04-01', periods=30, freq='B'))
+  assert not isinstance(fake_df.columns, pd.MultiIndex), \
+    "fixture must be flat-Index"
+
+  fake_yf = MagicMock()
+  fake_yf.download.return_value = fake_df
+
+  with patch.dict('sys.modules', {'yfinance': fake_yf}):
+    from agent import correlation as corr_mod
+    corr_mod._daily_returns_panel_cached.cache_clear()
+    corr = corr_mod.correlation_matrix(['A', 'B', 'C'])
+  assert corr is None, \
+    f"degenerate multi-ticker shape must return None; got shape={corr.shape if corr is not None else None}"
+  print("PASS: flat-Index DataFrame for multi-ticker request -> None (skip)")
+
+
 def test_correlation_handles_single_ticker_panel_no_crash():
   """yfinance returns a flat-Index DataFrame for single-ticker download.
   Our cache must handle that explicitly without AttributeError or returning
@@ -318,6 +348,7 @@ if __name__ == "__main__":
   test_pre_mortem_produces_structured_output()
   test_pre_mortem_failure_modes_are_specific()
   test_correlation_handles_single_ticker_panel_no_crash()
+  test_correlation_panel_returns_none_on_degenerate_multi_ticker()
   test_correlation_matrix_returns_dataframe()
   test_avg_correlation_excludes_self_from_basket()
   test_avg_correlation_only_candidate_in_basket_returns_none()

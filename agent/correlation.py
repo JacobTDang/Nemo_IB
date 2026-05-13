@@ -38,17 +38,24 @@ def _daily_returns_panel_cached(tickers_tuple: tuple, days: int = 90):
     if df is None or df.empty:
       return None
 
-    if len(tickers) == 1:
-      # Flat-Index DataFrame. Extract Close as a 1-column DataFrame named
-      # after the ticker.
-      if 'Close' not in df.columns:
-        return None
-      closes = df[['Close']].rename(columns={'Close': tickers[0]})
-    else:
-      # Multi-ticker: MultiIndex columns. Top level should include 'Close'.
+    # Branch on the actual DataFrame shape, not the number of tickers
+    # requested — yfinance can return either shape independent of input.
+    if isinstance(df.columns, pd.MultiIndex):
       if 'Close' not in df.columns.get_level_values(0):
         return None
       closes = df['Close']
+    else:
+      # Flat-Index DataFrame.
+      if 'Close' not in df.columns:
+        return None
+      if len(tickers) == 1:
+        closes = df[['Close']].rename(columns={'Close': tickers[0]})
+      else:
+        # Degenerate: multi-ticker request, single-ticker shape returned.
+        # We cannot compute pairwise correlations from this; skip the check.
+        print(f"[correlation] degenerate flat-Index DataFrame for "
+              f"{len(tickers)} tickers — returning None", file=sys.stderr, flush=True)
+        return None
 
     returns = closes.pct_change().dropna()
     return returns
