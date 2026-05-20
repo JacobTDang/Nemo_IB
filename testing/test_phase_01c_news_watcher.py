@@ -29,6 +29,15 @@ def _clean():
     conn.close()
 
 
+def _install_permissive_limiter():
+  """Replace the module-level rate limiter with a permissive one for tests
+  that don't care about pacing. Production min_interval is window/max_calls
+  = 60/25 = 2.4s, which would block fast tests. Tests that need to assert
+  pacing (test_rate_limiter_paces_evenly, test_classifier_rate_limit_enforced)
+  construct their own limiter and don't use the singleton."""
+  nw._LIMITER = nw.MaterialityRateLimiter(max_calls=10_000, window=1.0)
+
+
 class FakeMaterialityResult:
   def __init__(self, is_material=True, category='earnings', tickers=None,
                primary='AAPL', signal='bullish', urgency='immediate',
@@ -62,7 +71,7 @@ class FakeClassifier:
 
 def test_finnhub_loop_one_round_writes_classified_events():
   """One pass through watch_finnhub_company_news should classify + store articles."""
-  init_schema(); _clean()
+  init_schema(); _clean(); _install_permissive_limiter()
   # Speed the daemon up so the test finishes
   nw.POLL_FINNHUB = 1
 
@@ -125,7 +134,7 @@ def test_finnhub_loop_one_round_writes_classified_events():
 
 def test_finnhub_loop_dedups_on_second_pass():
   """Same article seen twice should only be classified once."""
-  init_schema(); _clean()
+  init_schema(); _clean(); _install_permissive_limiter()
   nw.POLL_FINNHUB = 1
   fake_articles = [
     {'headline': 'AAPL repeat article', 'summary': 'dup',
@@ -171,7 +180,7 @@ def test_finnhub_loop_dedups_on_second_pass():
 
 def test_finnhub_loop_recovers_from_http_error():
   """A 500 from the API shouldn't kill the daemon."""
-  init_schema(); _clean()
+  init_schema(); _clean(); _install_permissive_limiter()
   nw.POLL_FINNHUB = 1
 
   class FakeResp500:
@@ -214,7 +223,7 @@ def test_finnhub_loop_recovers_from_http_error():
 
 def test_finnhub_loop_recovers_from_connection_exception():
   """A connection error should be caught, logged, and the loop continues."""
-  init_schema(); _clean()
+  init_schema(); _clean(); _install_permissive_limiter()
   nw.POLL_FINNHUB = 1
 
   class FakeSession:
@@ -246,6 +255,48 @@ def test_finnhub_loop_recovers_from_connection_exception():
     result = asyncio.run(run())
   assert result, "daemon should catch ConnectionError and keep running"
   print("PASS: daemon survives connection exception")
+
+
+def test_rate_limiter_paces_evenly():
+  """With max_calls=10 and window=60s, consecutive acquires must be spaced
+  at least 60/10 = 6 seconds apart. Pre-fix the token bucket let bursts
+  through then dumped all waiters into a single backoff cycle (thundering
+  herd). Even pacing eliminates that."""
+  import asyncio as _asyncio
+  from daemons.news_watcher import MaterialityRateLimiter
+
+  current = [0.0]
+  def clock():
+    return current[0]
+
+  async def fake_sleep(seconds):
+    current[0] += seconds
+
+  acquire_times = []
+
+  async def run():
+    limiter = MaterialityRateLimiter(max_calls=10, window=60.0, clock=clock)
+    for _ in range(20):
+      await limiter.acquire()
+      acquire_times.append(current[0])
+
+  with patch('daemons.news_watcher.asyncio.sleep', fake_sleep):
+    _asyncio.run(run())
+
+  assert len(acquire_times) == 20
+  min_interval = 60.0 / 10
+  # Within ~1e-6 tolerance, every consecutive pair must be at least 6s apart
+  gaps = [acquire_times[i] - acquire_times[i - 1] for i in range(1, len(acquire_times))]
+  too_close = [g for g in gaps if g < min_interval - 1e-6]
+  assert not too_close, \
+    f"all gaps must be >= {min_interval}s; violations: {too_close}"
+  # And the average gap should be close to min_interval (proves the pacer is
+  # not idle-padding more than necessary)
+  avg = sum(gaps) / len(gaps)
+  assert abs(avg - min_interval) < 0.01, \
+    f"avg gap should be ~{min_interval}s, got {avg}"
+  print(f"PASS: pacer spaced 20 acquires at exactly {min_interval}s "
+        f"(min_gap={min(gaps):.2f}, avg={avg:.2f})")
 
 
 def test_classifier_rate_limit_enforced():
@@ -286,7 +337,7 @@ def test_max_per_ticker_caps_articles():
   """Even if Finnhub returns 30 articles for a ticker, only MAX_PER_TICKER
   should be classified (lower load on Groq)."""
   import daemons.news_watcher as nw
-  init_schema(); _clean()
+  init_schema(); _clean(); _install_permissive_limiter()
   nw.POLL_FINNHUB = 1
   fake_articles = [
     {'headline': f'AAPL article {i}', 'summary': f'b{i}',
@@ -328,7 +379,7 @@ def test_max_per_ticker_caps_articles():
 
 def test_shutdown_flag_terminates_loop_promptly():
   """Setting _running=False should make the loop return within ~1s."""
-  init_schema(); _clean()
+  init_schema(); _clean(); _install_permissive_limiter()
   nw.POLL_FINNHUB = 60  # set high so we know shutdown is what stopped it
 
   class FakeResp:
@@ -370,6 +421,7 @@ if __name__ == "__main__":
   test_finnhub_loop_dedups_on_second_pass()
   test_finnhub_loop_recovers_from_http_error()
   test_finnhub_loop_recovers_from_connection_exception()
+  test_rate_limiter_paces_evenly()
   test_classifier_rate_limit_enforced()
   test_max_per_ticker_caps_articles()
   test_shutdown_flag_terminates_loop_promptly()

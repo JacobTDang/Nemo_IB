@@ -66,17 +66,25 @@ class MaterialityRateLimiter:
     self._lock = asyncio.Lock()
 
   async def acquire(self) -> None:
-    while True:
-      async with self._lock:
-        now = self._clock()
-        cutoff = now - self.window
-        self._timestamps = [t for t in self._timestamps if t > cutoff]
-        if len(self._timestamps) < self.max_calls:
-          self._timestamps.append(now)
-          return
-        sleep_for = self._timestamps[0] - cutoff
-      # Release lock while sleeping so other coroutines can also queue
-      await asyncio.sleep(max(sleep_for, 0.001))
+    """Even-pacing acquire: enforce a minimum interval of `window / max_calls`
+    between consecutive acquires. The lock is held only long enough to
+    record the timestamp, so contending waiters serialize cleanly without
+    a thundering herd.
+    """
+    async with self._lock:
+      now = self._clock()
+      min_interval = self.window / self.max_calls
+      if self._timestamps:
+        since_last = now - self._timestamps[-1]
+        sleep_for = max(0.0, min_interval - since_last)
+      else:
+        sleep_for = 0.0
+      scheduled = now + sleep_for
+      self._timestamps.append(scheduled)
+      cutoff = scheduled - self.window
+      self._timestamps = [t for t in self._timestamps if t > cutoff]
+    if sleep_for > 0:
+      await asyncio.sleep(sleep_for)
 
 
 # Module-level singleton so all three watch tasks share the bucket.
