@@ -101,6 +101,7 @@ def _condense_insider_data(raw: Dict[str, Any]) -> Dict[str, Any]:
             "buy_count": 0, "sell_count": 0, "top_insiders": [],
             "recent_30d": {"bought": 0, "sold": 0, "net": 0},
             "recent_90d": {"bought": 0, "sold": 0, "net": 0},
+            "period_start": None, "period_end": None,
             "signal": "neutral"}
 
   total_bought = 0
@@ -173,6 +174,20 @@ def _condense_insider_data(raw: Dict[str, Any]) -> Dict[str, Any]:
   else:
     signal = "neutral"
 
+  # Derive the actual date range present in the data so downstream agents
+  # don't fabricate qualifiers like "since Q1 2024". Finnhub returns ~1
+  # year of transactions but doesn't guarantee a fixed window.
+  valid_dates = []
+  for txn in transactions:
+    s = txn.get("transactionDate", "")
+    if s:
+      try:
+        valid_dates.append(datetime.strptime(s, "%Y-%m-%d").date())
+      except ValueError:
+        continue
+  period_start = min(valid_dates).isoformat() if valid_dates else None
+  period_end = max(valid_dates).isoformat() if valid_dates else None
+
   return {
     "total_bought": total_bought,
     "total_sold": total_sold,
@@ -182,6 +197,8 @@ def _condense_insider_data(raw: Dict[str, Any]) -> Dict[str, Any]:
     "top_insiders": top_insiders,
     "recent_30d": {"bought": r30["bought"], "sold": r30["sold"], "net": r30["bought"] - r30["sold"]},
     "recent_90d": {"bought": r90["bought"], "sold": r90["sold"], "net": r90["bought"] - r90["sold"]},
+    "period_start": period_start,
+    "period_end": period_end,
     "signal": signal
   }
 
