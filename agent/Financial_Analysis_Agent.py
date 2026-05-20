@@ -160,11 +160,25 @@ class Financial_Analysis_Agent(OpenRouterModel):
             if len(stripped) > 5:
               gaps.append(stripped)
 
-        # Recommendation heuristic
+        # Recommendation heuristic. Pre-fix the keyword set was too narrow —
+        # any directional vocabulary outside ('STRONG BUY', 'BULLISH', etc.)
+        # fell through to INFO and suppressed the Bull/Bear debate downstream.
+        # Expanded list covers analyst lexicon commonly used when the
+        # structured parse fails for reasons unrelated to clarity of direction.
         raw_upper = raw.upper()
-        if any(k in raw_upper for k in ('STRONG BUY', 'RECOMMEND BUY', 'BULLISH')):
+        bullish_terms = (
+          'STRONG BUY', 'RECOMMEND BUY', 'BULLISH',
+          'OUTPERFORM', 'OVERWEIGHT',
+          'APPRECIATE', 'ATTRACTIVE', 'UNDERVALUED',
+        )
+        bearish_terms = (
+          'STRONG SELL', 'RECOMMEND SELL', 'BEARISH',
+          'UNDERPERFORM', 'UNDERWEIGHT',
+          'DEPRECIATE', 'UNFAVORABLE', 'OVERVALUED',
+        )
+        if any(k in raw_upper for k in bullish_terms):
           rec, signal = 'BUY', 'bullish'
-        elif any(k in raw_upper for k in ('STRONG SELL', 'BEARISH', 'OVERVALUED')):
+        elif any(k in raw_upper for k in bearish_terms):
           rec, signal = 'SELL', 'bearish'
         elif 'HOLD' in raw_upper or 'NEUTRAL' in raw_upper:
           rec, signal = 'HOLD', 'neutral'
