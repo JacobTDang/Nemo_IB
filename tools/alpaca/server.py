@@ -295,9 +295,9 @@ class AlpacaServer:
       else float(args["quantity"])
     )
 
-    try:
+    def _blocking_place():
       ea = Execution_Agent(paper=True)
-      broker_result = ea.place_order(
+      return ea.place_order(
         ticker=str(args["ticker"]),
         quantity=effective_qty,
         side=str(args["side"]),
@@ -305,6 +305,13 @@ class AlpacaServer:
         thesis_id=args.get("thesis_id"),
         arbiter_verdict_id=args.get("arbiter_verdict_id"),
       )
+
+    try:
+      broker_result = await asyncio.wait_for(
+        asyncio.to_thread(_blocking_place), timeout=20.0
+      )
+    except asyncio.TimeoutError:
+      broker_result = {"success": False, "error": "broker_timeout_20s"}
     except Exception as e:
       broker_result = {"success": False,
                         "error": f"{type(e).__name__}: {e}"}
@@ -325,10 +332,17 @@ class AlpacaServer:
         "success": False,
         "error": "reason_required: a non-empty `reason` field is required for audit",
       }))]
-    try:
+    def _blocking_close():
       from agent.Execution_Agent import Execution_Agent
       ea = Execution_Agent(paper=True)
-      result = ea.close_position_for(ticker=ticker, reason=reason)
+      return ea.close_position_for(ticker=ticker, reason=reason)
+
+    try:
+      result = await asyncio.wait_for(
+        asyncio.to_thread(_blocking_close), timeout=20.0
+      )
+    except asyncio.TimeoutError:
+      result = {"success": False, "error": "broker_timeout_20s"}
     except Exception as e:
       result = {"success": False,
                  "error": f"{type(e).__name__}: {e}"}
@@ -340,18 +354,28 @@ class AlpacaServer:
     still returned so callers can decide what to trust."""
     broker_positions: List[Dict[str, Any]] = []
     broker_error: str | None = None
-    try:
+
+    def _fetch_broker_positions():
       from agent.Execution_Agent import Execution_Agent
       agent = Execution_Agent(paper=True)
       client = agent._get_client()
+      out = []
       for p in client.get_all_positions() or []:
-        broker_positions.append({
+        out.append({
           "symbol": str(getattr(p, "symbol", "")).upper(),
           "qty": float(getattr(p, "qty", 0) or 0),
           "side": str(getattr(p, "side", "long")),
           "market_value": float(getattr(p, "market_value", 0) or 0),
           "avg_entry_price": float(getattr(p, "avg_entry_price", 0) or 0),
         })
+      return out
+
+    try:
+      broker_positions = await asyncio.wait_for(
+        asyncio.to_thread(_fetch_broker_positions), timeout=15.0
+      )
+    except asyncio.TimeoutError:
+      broker_error = "broker_timeout_15s"
     except Exception as e:
       broker_error = f"{type(e).__name__}: {e}"
 
@@ -393,12 +417,18 @@ class AlpacaServer:
 
   async def get_paper_account(self) -> List[TextContent]:
     """Wraps Execution_Agent.get_account_summary() in an MCP TextContent
-    envelope. Lazy-imports Execution_Agent so missing alpaca-py only
-    surfaces when this tool is called, not at server startup."""
-    try:
+    envelope. The broker call is synchronous and could block the asyncio
+    event loop for many seconds against a hung/unreachable Alpaca host,
+    so we offload to a worker thread with a 15s timeout. The MCP server's
+    JSON-RPC keepalive would otherwise drop the connection."""
+    def _blocking():
       from agent.Execution_Agent import Execution_Agent
       agent = Execution_Agent(paper=True)
-      summary = agent.get_account_summary()
+      return agent.get_account_summary()
+    try:
+      summary = await asyncio.wait_for(asyncio.to_thread(_blocking), timeout=15.0)
+    except asyncio.TimeoutError:
+      summary = {"paper": True, "error": "broker_timeout_15s"}
     except Exception as e:
       summary = {"paper": True, "error": f"{type(e).__name__}: {e}"}
     return [TextContent(type="text", text=_safe_dumps(summary))]
