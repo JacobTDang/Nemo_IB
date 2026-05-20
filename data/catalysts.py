@@ -41,7 +41,8 @@ def _first_friday_of_month(year: int, month: int) -> Optional[datetime]:
   Friday entry is 0, and we fall through to the second week."""
   try:
     weeks = calendar.monthcalendar(year, month)
-  except (ValueError, calendar.IllegalMonthError):
+  except ValueError:
+    # IllegalMonthError is a ValueError subclass — no need to list separately.
     return None
   for week in weeks:
     fri = week[4]  # Mon=0, Tue=1, Wed=2, Thu=3, Fri=4
