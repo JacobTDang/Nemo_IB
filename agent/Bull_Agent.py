@@ -40,6 +40,13 @@ GROUND RULES:
   - CATALYST DATES MUST come from the CATALYST CALENDAR below. Do NOT invent
     earnings dates, FOMC dates, ex-dividend dates, or anything else dated.
     If the calendar is empty, refer to events by name without specific dates.
+  - DO NOT reference any date BEFORE today's date (TODAY'S DATE is in the
+    prompt header). Past events are not catalysts.
+  - DO NOT use vague timeframes ("late 2024", "early 2025", "next quarter",
+    "in a few months", "over the coming year"). Either cite the exact date
+    from the CATALYST CALENDAR, or describe the event by name with NO
+    timing language at all. "iPhone refresh cycle" is OK; "iPhone 17 launch
+    late 2024" is NOT.
   - Set upside targets with explicit conditions. "Stock to $250 IF iPhone
     units stabilize" beats "stock could go higher."
   - Preemptively refute the bear case. What would a smart short-seller argue
@@ -88,7 +95,10 @@ class Bull_Agent(GroqModel):
     self.conversatoin_history = []
     flat_vars = {k: v for k, v in (variables or {}).items() if '.' not in k}
     cal_block = self._format_calendar(catalysts)
+    from datetime import datetime as _dt
+    today_iso = _dt.now().date().isoformat()
     prompt = (
+      f"TODAY'S DATE: {today_iso}\n"
       f"TICKER: {ticker}\n\n"
       f"ANALYST DRAFT REPORT (your starting point — do not just restate it):\n"
       f"{analyst_report_md[:8000]}\n\n"

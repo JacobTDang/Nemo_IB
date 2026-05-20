@@ -169,6 +169,51 @@ def test_bull_uses_only_provided_catalysts():
         f"({len(cited_dates)} dates, all valid)")
 
 
+def test_bull_avoids_vague_past_timeframes():
+  """The Round 3 catalyst-calendar grounding successfully blocks hard
+  YYYY-MM-DD invention. But the live AAPL run still produced 'iPhone 17
+  late 2024/early 2025' (already happened — we're in May 2026). Round 4
+  Item 4 added prompt rules forbidding (a) any date BEFORE today and
+  (b) vague timeframes like 'late 2024'. Verify both."""
+  import re
+  from datetime import datetime as _dt
+  bull = Bull_Agent()
+  fixture_cats = [
+    {'type': 'earnings', 'date': '2026-07-31', 'ticker': 'AAPL',
+     'description': 'AAPL earnings (after-close)', 'impact': 'company-specific'},
+    {'type': 'fomc', 'date': '2026-09-16',
+     'description': 'FOMC interest rate decision', 'impact': 'rate-sensitive'},
+  ]
+  case = bull.argue(ANALYST_REPORT, VARIABLES, model_outputs={},
+                     ticker="AAPL", catalysts=fixture_cats)
+  assert case is not None
+
+  current_year = _dt.now().year
+  all_text = ' '.join([case.thesis, case.refutation_of_bear]
+                       + case.catalysts + case.upside_targets)
+  text_lower = all_text.lower()
+
+  # Vague-timeframe terms that the prompt now forbids
+  vague_terms = ['late 2024', 'early 2025', 'late 2025', 'early 2026',
+                  'next quarter', 'in a few months', 'over the coming year',
+                  'in the coming months', 'next year']
+  found_vague = [t for t in vague_terms if t in text_lower]
+  assert not found_vague, \
+    f"Bull used forbidden vague timeframes: {found_vague}\n" \
+    f"Full text sample: {all_text[:500]}"
+
+  # Past year mentions: any 4-digit year before current_year that appears
+  # as a date qualifier. Common patterns: "in 2024", "2024 Q3", "late 2024".
+  past_year_pattern = re.compile(r'\b(20[0-2]\d)\b')
+  past_years = [int(y) for y in past_year_pattern.findall(all_text)
+                if int(y) < current_year]
+  assert not past_years, \
+    f"Bull referenced past years: {sorted(set(past_years))}\n" \
+    f"Full text sample: {all_text[:500]}"
+  print(f"PASS: bull avoided vague timeframes and past-year references "
+        f"(today={_dt.now().date().isoformat()}, scanned {len(all_text)} chars)")
+
+
 def test_bull_targets_have_conditions():
   """Strong bull cases use conditional targets, not just a number."""
   bull = Bull_Agent()
@@ -207,6 +252,7 @@ if __name__ == "__main__":
   test_bear_produces_valid_output()
   test_bull_and_bear_argue_different_sides()
   test_bull_uses_only_provided_catalysts()
+  test_bull_avoids_vague_past_timeframes()
   test_bull_targets_have_conditions()
   test_bear_risks_reference_real_concerns()
   print("\nAll Phase 3a Bull/Bear tests passed.")

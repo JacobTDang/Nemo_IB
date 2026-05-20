@@ -38,6 +38,12 @@ GROUND RULES:
     earnings dates, FOMC dates, or anything else dated when constructing
     risks or downside_targets. If the calendar is empty, refer to events
     by name without specific dates.
+  - DO NOT reference any date BEFORE today's date (TODAY'S DATE is in the
+    prompt header). Past events are not future risks.
+  - DO NOT use vague timeframes ("late 2024", "early 2025", "next quarter",
+    "in a few months"). Either cite the exact date from the CATALYST
+    CALENDAR, or describe the risk by name with NO timing language. "DMA
+    enforcement risk" is OK; "DMA ruling expected late 2024" is NOT.
   - Set downside targets with explicit conditions. "Stock to $130 if iPhone
     units fall >8% YoY" beats "stock could go lower."
   - Preemptively refute the bull case. The bulls will say X. Why is X wrong?
@@ -85,7 +91,10 @@ class Bear_Agent(GroqModel):
     self.conversatoin_history = []
     flat_vars = {k: v for k, v in (variables or {}).items() if '.' not in k}
     cal_block = self._format_calendar(catalysts)
+    from datetime import datetime as _dt
+    today_iso = _dt.now().date().isoformat()
     prompt = (
+      f"TODAY'S DATE: {today_iso}\n"
       f"TICKER: {ticker}\n\n"
       f"ANALYST DRAFT REPORT (your starting point — do not just restate it):\n"
       f"{analyst_report_md[:8000]}\n\n"
