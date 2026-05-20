@@ -143,6 +143,26 @@ class AlpacaServer:
         },
       ),
       Tool(
+        name="close_paper_position",
+        description=(
+          "Closes an open paper position by submitting an opposing market "
+          "order (sell to flatten a long, buy to flatten a short). No "
+          "Risk_Officer gate is applied — reducing exposure is always safe. "
+          "`reason` is REQUIRED for the audit trail (e.g., 'stop_loss_hit', "
+          "'thesis_broken', 'profit_target', 'manual_override'). Returns "
+          "{success: bool, side?: str, order_id?: str, error?: str}."
+        ),
+        inputSchema={
+          "type": "object",
+          "properties": {
+            "ticker": {"type": "string"},
+            "reason": {"type": "string",
+                        "description": "audit log reason; non-empty required"},
+          },
+          "required": ["ticker", "reason"],
+        },
+      ),
+      Tool(
         name="get_paper_positions",
         description=(
           "Returns open paper positions reconciled across two sources: the "
@@ -295,6 +315,25 @@ class AlpacaServer:
     out["qty"] = effective_qty
     return [TextContent(type="text", text=_safe_dumps(out))]
 
+  async def close_paper_position(self, args: Dict[str, Any]) -> List[TextContent]:
+    """Wraps Execution_Agent.close_position_for(). `reason` required for
+    audit; the underlying agent already handles the no-open-position case."""
+    ticker = args.get("ticker", "")
+    reason = (args.get("reason") or "").strip()
+    if not reason:
+      return [TextContent(type="text", text=_safe_dumps({
+        "success": False,
+        "error": "reason_required: a non-empty `reason` field is required for audit",
+      }))]
+    try:
+      from agent.Execution_Agent import Execution_Agent
+      ea = Execution_Agent(paper=True)
+      result = ea.close_position_for(ticker=ticker, reason=reason)
+    except Exception as e:
+      result = {"success": False,
+                 "error": f"{type(e).__name__}: {e}"}
+    return [TextContent(type="text", text=_safe_dumps(result))]
+
   async def get_paper_positions(self) -> List[TextContent]:
     """Reconcile broker positions against the local SQLite audit log.
     Either side failing surfaces as `error` but the other side's data is
@@ -383,6 +422,8 @@ class AlpacaServer:
         return await parent.risk_check_proposed_trade(arguments)
       if name == "place_paper_order":
         return await parent.place_paper_order(arguments)
+      if name == "close_paper_position":
+        return await parent.close_paper_position(arguments)
       return [TextContent(
         type="text",
         text=_safe_dumps({"error": f"unknown tool: {name}"}),
