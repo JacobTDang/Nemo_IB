@@ -71,7 +71,82 @@ class AlpacaServer:
           "required": [],
         },
       ),
+      Tool(
+        name="get_paper_positions",
+        description=(
+          "Returns open paper positions reconciled across two sources: the "
+          "broker (Alpaca) and the local SQLite audit log. Response shape: "
+          "{broker_positions: [...], local_positions: [...], "
+          "reconciled: bool, discrepancies: [str]}. Discrepancies are tagged "
+          "'missing_locally:<TICKER>' (broker has it, DB doesn't) or "
+          "'missing_at_broker:<TICKER>' (DB has it, broker doesn't). "
+          "Use to detect divergence — any unreconciled state needs audit "
+          "before further trading."
+        ),
+        inputSchema={
+          "type": "object",
+          "properties": {},
+          "required": [],
+        },
+      ),
     ]
+
+  async def get_paper_positions(self) -> List[TextContent]:
+    """Reconcile broker positions against the local SQLite audit log.
+    Either side failing surfaces as `error` but the other side's data is
+    still returned so callers can decide what to trust."""
+    broker_positions: List[Dict[str, Any]] = []
+    broker_error: str | None = None
+    try:
+      from agent.Execution_Agent import Execution_Agent
+      agent = Execution_Agent(paper=True)
+      client = agent._get_client()
+      for p in client.get_all_positions() or []:
+        broker_positions.append({
+          "symbol": str(getattr(p, "symbol", "")).upper(),
+          "qty": float(getattr(p, "qty", 0) or 0),
+          "side": str(getattr(p, "side", "long")),
+          "market_value": float(getattr(p, "market_value", 0) or 0),
+          "avg_entry_price": float(getattr(p, "avg_entry_price", 0) or 0),
+        })
+    except Exception as e:
+      broker_error = f"{type(e).__name__}: {e}"
+
+    local_positions: List[Dict[str, Any]] = []
+    local_error: str | None = None
+    try:
+      from state.positions import open_positions
+      for p in open_positions(paper=True) or []:
+        local_positions.append({
+          "position_id": p.get("position_id"),
+          "ticker": str(p.get("ticker", "")).upper(),
+          "side": p.get("side"),
+          "quantity": p.get("quantity"),
+          "entry_price": p.get("entry_price"),
+          "thesis_id": p.get("thesis_id"),
+        })
+    except Exception as e:
+      local_error = f"{type(e).__name__}: {e}"
+
+    broker_tickers = {b["symbol"] for b in broker_positions}
+    local_tickers = {l["ticker"] for l in local_positions}
+    missing_locally = sorted(broker_tickers - local_tickers)
+    missing_at_broker = sorted(local_tickers - broker_tickers)
+    discrepancies = (
+      [f"missing_locally:{t}" for t in missing_locally]
+      + [f"missing_at_broker:{t}" for t in missing_at_broker]
+    )
+    reconciled = (not discrepancies) and (broker_error is None) and (local_error is None)
+
+    out: Dict[str, Any] = {
+      "broker_positions": broker_positions,
+      "local_positions": local_positions,
+      "reconciled": reconciled,
+      "discrepancies": discrepancies,
+    }
+    if broker_error or local_error:
+      out["error"] = "; ".join(filter(None, [broker_error, local_error]))
+    return [TextContent(type="text", text=_safe_dumps(out))]
 
   async def get_paper_account(self) -> List[TextContent]:
     """Wraps Execution_Agent.get_account_summary() in an MCP TextContent
@@ -98,6 +173,8 @@ class AlpacaServer:
         return [TextContent(type="text", text=_safe_dumps({"status": "pong"}))]
       if name == "get_paper_account":
         return await parent.get_paper_account()
+      if name == "get_paper_positions":
+        return await parent.get_paper_positions()
       return [TextContent(
         type="text",
         text=_safe_dumps({"error": f"unknown tool: {name}"}),
