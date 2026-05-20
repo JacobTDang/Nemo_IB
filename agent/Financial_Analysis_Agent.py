@@ -881,6 +881,11 @@ COMMON MISTAKES TO AVOID:
 TICKER: {execution_plan.get('ticker', flat_vars.get('ticker', 'N/A'))}
 ALL PROJECTIONS START FROM {datetime.now().year}. USE ONLY DATA PROVIDED BELOW. DO NOT HALLUCINATE NUMBERS.
 
+KEY-PREFERENCE RULES when citing revenue, EBITDA, or net income:
+  - Prefer `revenue_ttm`, `ebitda_ttm`, `net_income_ttm` (trailing-twelve-month, most current).
+  - `revenue_base` and `ebitda_amount` are LATEST FISCAL YEAR values from SEC filings — use these only for DCF starting points or when explicitly comparing to a prior FY. They are NOT current-period revenue.
+  - When both exist, narrative claims like "Apple did $X in revenue" must use the `_ttm` variant.
+
 --- GATHERED DATA ---
 
 {gathered_display}

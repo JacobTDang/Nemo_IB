@@ -21,9 +21,18 @@ def get_data(ticker: str) -> Dict[str, Any]:
   info = company.info
   data['ticker'] = ticker
   data['marketCap'] = info.get('marketCap')
-  data['revenue'] = info.get('totalRevenue') # gets the trailing revenue over the last 12 months
+  # yfinance `totalRevenue` and `ebitda` ARE trailing-twelve-month values.
+  # Expose them under explicit `*_ttm` aliases so the analyst prompt can
+  # distinguish TTM (these) from latest-annual values (from SEC tools like
+  # get_revenue_base / get_ebitda_margin which return last 10-K's FY total).
+  # The legacy `revenue` / `EBITDA` keys are kept for back-compat with the
+  # DCF/credit/LBO callers that already read them.
+  data['revenue'] = info.get('totalRevenue')
+  data['revenue_ttm'] = data['revenue']
   data['EBITDA'] = info.get('ebitda')
+  data['ebitda_ttm'] = data['EBITDA']
   data['netIncomeToCommon'] = info.get('netIncomeToCommon')
+  data['net_income_ttm'] = data['netIncomeToCommon']
   data['enterpriseValue'] = info.get('enterpriseValue')
   data['cash'] = info.get('totalCash', 0)
   data['totalDebt'] = info.get('totalDebt', 0)
