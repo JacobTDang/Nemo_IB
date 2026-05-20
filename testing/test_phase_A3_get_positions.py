@@ -1,18 +1,12 @@
 """Phase A3: get_paper_positions — broker-vs-local reconciliation.
 
-The MCP tool returns BOTH the broker's view (Alpaca get_all_positions) and
-the local view (state.positions.open_positions(paper=True)), plus a
-`reconciled` boolean and a `discrepancies` list naming positions that
-exist in one but not the other.
-
-This guards against paper-trading divergence between broker state and our
-audit log — a real failure mode the Phase 6 audit invariant required.
+Refactored for A9: mocks AsyncBroker.get_all_positions instead of alpaca-py.
 """
 import asyncio
 import json
 import os
 import sys
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -20,7 +14,7 @@ from state.schema import init_schema, get_connection
 from state.positions import open_position
 
 
-def _clean_test_positions():
+def _clean():
   conn = get_connection()
   try:
     conn.execute("DELETE FROM positions WHERE ticker LIKE 'A3_%'")
@@ -29,35 +23,26 @@ def _clean_test_positions():
     conn.close()
 
 
-def _fake_broker_position(symbol, qty="10", side="long"):
-  p = MagicMock()
-  p.symbol = symbol
-  p.qty = qty
-  p.side = side
-  p.market_value = "1000.0"
-  p.avg_entry_price = "100.0"
-  return p
+def _fake_broker_class(positions=None, raises=None):
+  class _FakeBroker:
+    def __init__(self, *a, **kw):
+      self._positions = positions or []
+      self._raises = raises
+    async def __aenter__(self): return self
+    async def __aexit__(self, *a): pass
+    async def get_all_positions(self):
+      if self._raises:
+        raise self._raises
+      return self._positions
+  return _FakeBroker
 
 
-def _fake_alpaca_modules(broker_positions):
-  client = MagicMock()
-  client.get_all_positions.return_value = broker_positions
-  trading_client_module = MagicMock()
-  trading_client_module.TradingClient = MagicMock(return_value=client)
-  return {
-    'alpaca.trading.client': trading_client_module,
-    'alpaca.trading.requests': MagicMock(),
-    'alpaca.trading.enums': MagicMock(),
-  }, client
+def _fake_pos(symbol, qty=10):
+  return {"symbol": symbol.upper(), "qty": float(qty), "side": "long",
+          "market_value": 1000.0, "avg_entry_price": 100.0}
 
 
 def _call_get_positions() -> dict:
-  os.environ['ALPACA_PAPER_KEY'] = 'fake_key'
-  os.environ['ALPACA_PAPER_SECRET'] = 'fake_secret'
-  # Force re-import so the env vars + sys.modules patches take effect
-  for mod in ('agent.Execution_Agent', 'tools.alpaca.server'):
-    if mod in sys.modules:
-      del sys.modules[mod]
   from tools.alpaca import server as alpaca_srv
   srv = alpaca_srv.AlpacaServer()
   result = asyncio.run(srv.get_paper_positions())
@@ -65,85 +50,72 @@ def _call_get_positions() -> dict:
 
 
 def test_reconciled_when_broker_and_local_match():
-  init_schema(); _clean_test_positions()
+  init_schema(); _clean()
   open_position("A3_AAPL", "long", 10, 195.0, paper=True)
   open_position("A3_NVDA", "long", 5, 800.0, paper=True)
-  broker_pos = [_fake_broker_position("A3_AAPL"), _fake_broker_position("A3_NVDA")]
-  fake_modules, _ = _fake_alpaca_modules(broker_pos)
-  with patch.dict('sys.modules', fake_modules):
+  positions = [_fake_pos("A3_AAPL"), _fake_pos("A3_NVDA")]
+  with patch('tools.alpaca.async_broker.AsyncBroker', new=_fake_broker_class(positions)):
     out = _call_get_positions()
-  assert out.get('reconciled') is True, f"should reconcile when sets match; got {out}"
-  assert out.get('discrepancies') == [], f"no discrepancies expected; got {out.get('discrepancies')}"
+  assert out.get('reconciled') is True, f"should reconcile; got {out}"
+  assert out.get('discrepancies') == []
   assert len(out.get('broker_positions', [])) == 2
   assert len(out.get('local_positions', [])) == 2
-  print(f"PASS: matching sets -> reconciled=True, 0 discrepancies")
-  _clean_test_positions()
+  print("PASS: matching sets -> reconciled=True")
+  _clean()
 
 
 def test_discrepancy_when_local_missing_broker_position():
-  init_schema(); _clean_test_positions()
-  # Local has only AAPL; broker has AAPL + MSFT
+  init_schema(); _clean()
   open_position("A3_AAPL", "long", 10, 195.0, paper=True)
-  broker_pos = [_fake_broker_position("A3_AAPL"), _fake_broker_position("A3_MSFT")]
-  fake_modules, _ = _fake_alpaca_modules(broker_pos)
-  with patch.dict('sys.modules', fake_modules):
+  positions = [_fake_pos("A3_AAPL"), _fake_pos("A3_MSFT")]
+  with patch('tools.alpaca.async_broker.AsyncBroker', new=_fake_broker_class(positions)):
     out = _call_get_positions()
   assert out.get('reconciled') is False
-  discreps = out.get('discrepancies', [])
-  assert any('missing_locally:A3_MSFT' in d for d in discreps), \
-    f"expected missing_locally:A3_MSFT in discrepancies; got {discreps}"
-  print(f"PASS: broker-only position flagged: {discreps}")
-  _clean_test_positions()
+  assert any('missing_locally:A3_MSFT' in d for d in out['discrepancies'])
+  print(f"PASS: broker-only flagged: {out['discrepancies']}")
+  _clean()
 
 
 def test_discrepancy_when_broker_missing_local_position():
-  init_schema(); _clean_test_positions()
-  # Local has AAPL + GHOST; broker has only AAPL
+  init_schema(); _clean()
   open_position("A3_AAPL", "long", 10, 195.0, paper=True)
   open_position("A3_GHOST", "long", 1, 50.0, paper=True)
-  broker_pos = [_fake_broker_position("A3_AAPL")]
-  fake_modules, _ = _fake_alpaca_modules(broker_pos)
-  with patch.dict('sys.modules', fake_modules):
+  positions = [_fake_pos("A3_AAPL")]
+  with patch('tools.alpaca.async_broker.AsyncBroker', new=_fake_broker_class(positions)):
     out = _call_get_positions()
   assert out.get('reconciled') is False
-  discreps = out.get('discrepancies', [])
-  assert any('missing_at_broker:A3_GHOST' in d for d in discreps), \
-    f"expected missing_at_broker:A3_GHOST; got {discreps}"
-  print(f"PASS: local-only position flagged: {discreps}")
-  _clean_test_positions()
+  assert any('missing_at_broker:A3_GHOST' in d for d in out['discrepancies'])
+  print(f"PASS: local-only flagged: {out['discrepancies']}")
+  _clean()
 
 
 def test_empty_broker_and_local_reconcile_clean():
-  init_schema(); _clean_test_positions()
-  fake_modules, _ = _fake_alpaca_modules([])
-  with patch.dict('sys.modules', fake_modules):
+  init_schema(); _clean()
+  with patch('tools.alpaca.async_broker.AsyncBroker', new=_fake_broker_class([])):
     out = _call_get_positions()
   assert out.get('reconciled') is True
   assert out.get('broker_positions', []) == []
-  print(f"PASS: empty broker + empty local -> reconciled=True")
-  _clean_test_positions()
+  print("PASS: empty + empty -> reconciled=True")
+  _clean()
 
 
 def test_broker_error_surfaces_gracefully():
-  init_schema(); _clean_test_positions()
-  fake_modules, fake_client = _fake_alpaca_modules([])
-  fake_client.get_all_positions.side_effect = Exception("broker timeout")
-  with patch.dict('sys.modules', fake_modules):
+  init_schema(); _clean()
+  with patch('tools.alpaca.async_broker.AsyncBroker',
+              new=_fake_broker_class(raises=Exception("broker timeout"))):
     out = _call_get_positions()
-  assert 'error' in out, f"broker error should surface in response; got {out}"
-  # local positions should still be reported even when broker fails
-  assert 'local_positions' in out
-  print(f"PASS: broker error surfaced without raise (error={out['error'][:60]})")
-  _clean_test_positions()
+  assert 'error' in out
+  assert 'local_positions' in out  # local side should still come back
+  print(f"PASS: broker error surfaced without raise")
+  _clean()
 
 
 def test_tool_listed_in_descriptors():
   from tools.alpaca import server as alpaca_srv
   srv = alpaca_srv.AlpacaServer()
   tools = asyncio.run(srv.list_tools_descriptors())
-  names = [t.name for t in tools]
-  assert 'get_paper_positions' in names, f"missing from tools: {names}"
-  print(f"PASS: get_paper_positions in descriptors ({names})")
+  assert 'get_paper_positions' in [t.name for t in tools]
+  print(f"PASS: get_paper_positions in descriptors")
 
 
 if __name__ == "__main__":

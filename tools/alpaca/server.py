@@ -14,6 +14,7 @@ from typing import Any, Dict, List
 import asyncio
 import json
 import sys
+import time
 from datetime import date, datetime
 
 from mcp.server import Server
@@ -33,8 +34,13 @@ def _safe_dumps(obj) -> str:
 
 
 class AlpacaServer:
-  """MCP server that bridges Claude Code to the existing Execution_Agent
-  and Risk_Officer. Tool handlers are added incrementally across A2-A6."""
+  """MCP server that bridges Claude Code to Alpaca's paper-trading REST
+  API. Uses `tools.alpaca.async_broker.AsyncBroker` (httpx.AsyncClient)
+  for broker I/O — avoids the 30-60s lag observed with alpaca-py's sync
+  TradingClient wrapped in asyncio.to_thread inside this MCP subprocess.
+
+  Risk_Officer (deterministic Python) still gates every place_paper_order.
+  """
 
   def __init__(self):
     self.server = Server("nemo_alpaca")
@@ -244,7 +250,6 @@ class AlpacaServer:
     success=False and DOES NOT touch the broker. There is no bypass path.
     """
     from agent.Risk_Officer import Risk_Officer
-    from agent.Execution_Agent import Execution_Agent
 
     try:
       verdict, portfolio, basket = self._build_verdict_and_portfolio(args)
@@ -295,26 +300,58 @@ class AlpacaServer:
       else float(args["quantity"])
     )
 
-    def _blocking_place():
-      ea = Execution_Agent(paper=True)
-      return ea.place_order(
-        ticker=str(args["ticker"]),
-        quantity=effective_qty,
-        side=str(args["side"]),
-        order_type="market",
-        thesis_id=args.get("thesis_id"),
-        arbiter_verdict_id=args.get("arbiter_verdict_id"),
-      )
+    # Place the order via AsyncBroker. Audit-logging mirrors
+    # agent.Execution_Agent.place_order() but uses the async REST path.
+    from tools.alpaca.async_broker import AsyncBroker, AsyncBrokerError
+    from state.positions import (
+      record_order, order_exists_for_client_id,
+    )
+    import uuid as _uuid
 
-    try:
-      broker_result = await asyncio.wait_for(
-        asyncio.to_thread(_blocking_place), timeout=20.0
-      )
-    except asyncio.TimeoutError:
-      broker_result = {"success": False, "error": "broker_timeout_20s"}
-    except Exception as e:
-      broker_result = {"success": False,
-                        "error": f"{type(e).__name__}: {e}"}
+    thesis_id = args.get("thesis_id")
+    arbiter_verdict_id = args.get("arbiter_verdict_id")
+    client_order_id = f"nemo-{thesis_id or 'none'}-{_uuid.uuid4().hex[:8]}"
+    ticker_u = str(args["ticker"]).upper()
+    side = str(args["side"]).lower()
+
+    if order_exists_for_client_id(client_order_id):
+      broker_result = {
+        "success": False, "error": "duplicate_client_order_id",
+        "client_order_id": client_order_id,
+      }
+    else:
+      try:
+        async with AsyncBroker(paper=True) as broker:
+          order = await broker.submit_market_order(
+            symbol=ticker_u, qty=effective_qty, side=side,
+            client_order_id=client_order_id,
+          )
+        record_order(
+          order_id=str(order["id"]), client_order_id=client_order_id,
+          ticker=ticker_u, side=side, order_type="market",
+          quantity=effective_qty, limit_price=None, status="pending",
+          thesis_id=thesis_id, arbiter_verdict_id=arbiter_verdict_id,
+          paper=True,
+        )
+        broker_result = {
+          "success": True,
+          "order_id": str(order["id"]),
+          "client_order_id": client_order_id,
+          "paper": True, "ticker": ticker_u, "side": side, "qty": effective_qty,
+        }
+      except (AsyncBrokerError, Exception) as e:
+        # Record the rejected attempt for audit
+        record_order(
+          order_id=f"rejected-{client_order_id}-{_uuid.uuid4().hex[:6]}",
+          client_order_id=client_order_id,
+          ticker=ticker_u, side=side, order_type="market",
+          quantity=effective_qty, limit_price=None, status="rejected",
+          thesis_id=thesis_id, arbiter_verdict_id=arbiter_verdict_id,
+          paper=True,
+        )
+        broker_result = {"success": False,
+                          "error": f"{type(e).__name__}: {e}",
+                          "client_order_id": client_order_id}
 
     # Merge broker result with risk_decision for audit.
     out = dict(broker_result)
@@ -323,8 +360,8 @@ class AlpacaServer:
     return [TextContent(type="text", text=_safe_dumps(out))]
 
   async def close_paper_position(self, args: Dict[str, Any]) -> List[TextContent]:
-    """Wraps Execution_Agent.close_position_for(). `reason` required for
-    audit; the underlying agent already handles the no-open-position case."""
+    """Close an open paper position via Alpaca's DELETE /v2/positions/{symbol}.
+    `reason` required for audit; broker returns the opposing market order."""
     ticker = args.get("ticker", "")
     reason = (args.get("reason") or "").strip()
     if not reason:
@@ -332,50 +369,53 @@ class AlpacaServer:
         "success": False,
         "error": "reason_required: a non-empty `reason` field is required for audit",
       }))]
-    def _blocking_close():
-      from agent.Execution_Agent import Execution_Agent
-      ea = Execution_Agent(paper=True)
-      return ea.close_position_for(ticker=ticker, reason=reason)
 
+    from tools.alpaca.async_broker import AsyncBroker, AsyncBrokerError
+    from state.positions import position_for_ticker, close_position as close_local
+    import uuid as _uuid
+
+    ticker_u = ticker.upper()
     try:
-      result = await asyncio.wait_for(
-        asyncio.to_thread(_blocking_close), timeout=20.0
-      )
-    except asyncio.TimeoutError:
-      result = {"success": False, "error": "broker_timeout_20s"}
+      async with AsyncBroker(paper=True) as broker:
+        # First check the broker for an open position; if none, return 404 quickly
+        existing = await broker.get_open_position(ticker_u)
+        if existing is None:
+          return [TextContent(type="text", text=_safe_dumps({
+            "success": False, "error": "no_open_position",
+            "ticker": ticker_u,
+          }))]
+        order = await broker.close_position(ticker_u)
+      # Close the local audit row too (if present)
+      local_pos = position_for_ticker(ticker_u, paper=True)
+      if local_pos:
+        # exit_price unknown at order submission; use entry as conservative
+        close_local(
+          position_id=local_pos["position_id"],
+          exit_price=local_pos.get("current_price") or local_pos.get("entry_price") or 0,
+          exit_reason=reason,
+        )
+      result = {
+        "success": True,
+        "side": order.get("side", "sell" if existing.get("side") == "long" else "buy"),
+        "order_id": str(order.get("id", "")),
+        "ticker": ticker_u, "reason": reason,
+      }
+    except AsyncBrokerError as e:
+      result = {"success": False, "error": str(e)}
     except Exception as e:
-      result = {"success": False,
-                 "error": f"{type(e).__name__}: {e}"}
+      result = {"success": False, "error": f"{type(e).__name__}: {e}"}
     return [TextContent(type="text", text=_safe_dumps(result))]
 
   async def get_paper_positions(self) -> List[TextContent]:
     """Reconcile broker positions against the local SQLite audit log.
     Either side failing surfaces as `error` but the other side's data is
     still returned so callers can decide what to trust."""
+    from tools.alpaca.async_broker import AsyncBroker
     broker_positions: List[Dict[str, Any]] = []
     broker_error: str | None = None
-
-    def _fetch_broker_positions():
-      from agent.Execution_Agent import Execution_Agent
-      agent = Execution_Agent(paper=True)
-      client = agent._get_client()
-      out = []
-      for p in client.get_all_positions() or []:
-        out.append({
-          "symbol": str(getattr(p, "symbol", "")).upper(),
-          "qty": float(getattr(p, "qty", 0) or 0),
-          "side": str(getattr(p, "side", "long")),
-          "market_value": float(getattr(p, "market_value", 0) or 0),
-          "avg_entry_price": float(getattr(p, "avg_entry_price", 0) or 0),
-        })
-      return out
-
     try:
-      broker_positions = await asyncio.wait_for(
-        asyncio.to_thread(_fetch_broker_positions), timeout=15.0
-      )
-    except asyncio.TimeoutError:
-      broker_error = "broker_timeout_15s"
+      async with AsyncBroker(paper=True) as broker:
+        broker_positions = await broker.get_all_positions()
     except Exception as e:
       broker_error = f"{type(e).__name__}: {e}"
 
@@ -416,19 +456,11 @@ class AlpacaServer:
     return [TextContent(type="text", text=_safe_dumps(out))]
 
   async def get_paper_account(self) -> List[TextContent]:
-    """Wraps Execution_Agent.get_account_summary() in an MCP TextContent
-    envelope. The broker call is synchronous and could block the asyncio
-    event loop for many seconds against a hung/unreachable Alpaca host,
-    so we offload to a worker thread with a 15s timeout. The MCP server's
-    JSON-RPC keepalive would otherwise drop the connection."""
-    def _blocking():
-      from agent.Execution_Agent import Execution_Agent
-      agent = Execution_Agent(paper=True)
-      return agent.get_account_summary()
+    """Account summary via AsyncBroker."""
+    from tools.alpaca.async_broker import AsyncBroker
     try:
-      summary = await asyncio.wait_for(asyncio.to_thread(_blocking), timeout=15.0)
-    except asyncio.TimeoutError:
-      summary = {"paper": True, "error": "broker_timeout_15s"}
+      async with AsyncBroker(paper=True) as broker:
+        summary = await broker.get_account()
     except Exception as e:
       summary = {"paper": True, "error": f"{type(e).__name__}: {e}"}
     return [TextContent(type="text", text=_safe_dumps(summary))]
