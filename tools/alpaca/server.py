@@ -107,6 +107,42 @@ class AlpacaServer:
         },
       ),
       Tool(
+        name="place_paper_order",
+        description=(
+          "Places a paper order with MANDATORY internal Risk_Officer check. "
+          "This tool calls risk_check_proposed_trade FIRST; if Risk_Officer "
+          "rejects, the order is refused and the broker is never contacted. "
+          "If Risk_Officer returns an adjusted_quantity (size cap), the "
+          "broker is called with the smaller quantity. Returns "
+          "{success: bool, order_id?: str, client_order_id?: str, "
+          "qty: number, error?: str, risk_decision: {...}}. "
+          "Always inspect risk_decision in the response for audit."
+        ),
+        inputSchema={
+          "type": "object",
+          "properties": {
+            "ticker":             {"type": "string"},
+            "side":               {"type": "string", "enum": ["buy", "sell"]},
+            "quantity":           {"type": "number"},
+            "price":              {"type": "number"},
+            "recommendation":     {"type": "string",
+                                    "enum": ["BUY", "SELL", "HOLD", "NEUTRAL"]},
+            "confidence":         {"type": "number"},
+            "bull_strength":      {"type": "number"},
+            "bear_strength":      {"type": "number"},
+            "position_sizing":    {"type": "string",
+                                    "enum": ["aggressive", "normal",
+                                              "cautious", "no_position"]},
+            "rationale":          {"type": "string"},
+            "thesis_id":          {"type": ["integer", "null"]},
+            "arbiter_verdict_id": {"type": ["integer", "null"]},
+          },
+          "required": ["ticker", "side", "quantity", "price",
+                        "recommendation", "confidence", "bull_strength",
+                        "bear_strength", "position_sizing"],
+        },
+      ),
+      Tool(
         name="get_paper_positions",
         description=(
           "Returns open paper positions reconciled across two sources: the "
@@ -178,6 +214,85 @@ class AlpacaServer:
         "reasons": [f"risk_check_failed: {type(e).__name__}: {e}"],
         "error": True,
       }
+    return [TextContent(type="text", text=_safe_dumps(out))]
+
+  async def place_paper_order(self, args: Dict[str, Any]) -> List[TextContent]:
+    """Risk_Officer-gated order placement.
+
+    CRITICAL INVARIANT: Risk_Officer.evaluate() is called FIRST. If it
+    returns approve=False, this method returns immediately with
+    success=False and DOES NOT touch the broker. There is no bypass path.
+    """
+    from agent.Risk_Officer import Risk_Officer
+    from agent.Execution_Agent import Execution_Agent
+
+    try:
+      verdict, portfolio, basket = self._build_verdict_and_portfolio(args)
+    except Exception as e:
+      return [TextContent(type="text", text=_safe_dumps({
+        "success": False,
+        "error": f"verdict_build_failed: {type(e).__name__}: {e}",
+        "risk_decision": {"approve": False,
+                           "reasons": ["could not build verdict"]},
+      }))]
+
+    ro = Risk_Officer()
+    try:
+      decision = ro.evaluate(
+        proposed_quantity=float(args["quantity"]),
+        proposed_price=float(args["price"]),
+        arbiter_verdict=verdict,
+        portfolio=portfolio,
+        proposed_ticker=str(args["ticker"]).upper(),
+        open_basket=basket,
+      )
+    except Exception as e:
+      return [TextContent(type="text", text=_safe_dumps({
+        "success": False,
+        "error": f"risk_evaluation_failed: {type(e).__name__}: {e}",
+        "risk_decision": {"approve": False, "reasons": [str(e)]},
+      }))]
+
+    risk_decision_json = {
+      "approve": decision.approve,
+      "reasons": decision.reasons,
+      "adjusted_quantity": decision.adjusted_quantity,
+      "adjusted_dollar_size": decision.adjusted_dollar_size,
+    }
+
+    # HARD GATE: rejection means no broker call. Period.
+    if not decision.approve:
+      return [TextContent(type="text", text=_safe_dumps({
+        "success": False,
+        "error": "risk_rejected: " + "; ".join(decision.reasons or ["no reason"]),
+        "risk_decision": risk_decision_json,
+      }))]
+
+    # Approved. Use adjusted_quantity if Risk_Officer capped/halved the size.
+    effective_qty = (
+      decision.adjusted_quantity
+      if decision.adjusted_quantity is not None
+      else float(args["quantity"])
+    )
+
+    try:
+      ea = Execution_Agent(paper=True)
+      broker_result = ea.place_order(
+        ticker=str(args["ticker"]),
+        quantity=effective_qty,
+        side=str(args["side"]),
+        order_type="market",
+        thesis_id=args.get("thesis_id"),
+        arbiter_verdict_id=args.get("arbiter_verdict_id"),
+      )
+    except Exception as e:
+      broker_result = {"success": False,
+                        "error": f"{type(e).__name__}: {e}"}
+
+    # Merge broker result with risk_decision for audit.
+    out = dict(broker_result)
+    out["risk_decision"] = risk_decision_json
+    out["qty"] = effective_qty
     return [TextContent(type="text", text=_safe_dumps(out))]
 
   async def get_paper_positions(self) -> List[TextContent]:
@@ -266,6 +381,8 @@ class AlpacaServer:
         return await parent.get_paper_positions()
       if name == "risk_check_proposed_trade":
         return await parent.risk_check_proposed_trade(arguments)
+      if name == "place_paper_order":
+        return await parent.place_paper_order(arguments)
       return [TextContent(
         type="text",
         text=_safe_dumps({"error": f"unknown tool: {name}"}),
