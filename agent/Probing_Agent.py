@@ -1,5 +1,5 @@
 from .openrouter_template import OpenRouterModel
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Dict, Optional, List
 import sys
 from datetime import datetime
@@ -18,7 +18,18 @@ class AnalyticalConsideration(BaseModel):
 
 class ProbingResult(BaseModel):
   analysis_type: str
-  ticker: Optional[str] = None
+  ticker: Optional[str] = Field(
+    default=None,
+    description=(
+      "US-listed ticker symbol referenced in the user query (e.g., AAPL, NVDA, "
+      "GOOGL, JPM). Extract from explicit symbol mentions OR infer from a "
+      "well-known company name (Apple -> AAPL, Nvidia -> NVDA, Alphabet/Google "
+      "-> GOOGL, Tesla -> TSLA, Microsoft -> MSFT, Meta/Facebook -> META, "
+      "Amazon -> AMZN, JPMorgan -> JPM). Return null when the query is generic "
+      "(no specific company), references a private/non-US company, or is "
+      "ambiguous. NEVER fabricate a ticker."
+    ),
+  )
   data_requirements: List[DataRequirement]
   analytical_considerations: List[AnalyticalConsideration]
   recommended_approach: str
@@ -47,6 +58,16 @@ YOUR ROLE:
 Before any financial analysis begins, you identify what DATA needs to be fetched and what ANALYTICAL CONSIDERATIONS the analysis agent should reason about. These are two distinct outputs.
 
 You must also surface data requirements for the MODELING PHASE -- the financial models that will run after data gathering. These models have specific data needs listed below.
+
+STEP 0 — EXTRACT THE TICKER:
+Populate the `ticker` field with the US-listed ticker symbol referenced in the user query.
+
+- Explicit symbol mention (e.g., "Analyze AAPL", "NVDA Q3", "look at TSLA"): set ticker to that symbol, uppercase.
+- Company name only (e.g., "Apple", "Nvidia", "Tesla", "Alphabet/Google", "JPMorgan", "Microsoft", "Meta", "Amazon"): infer the ticker (AAPL, NVDA, TSLA, GOOGL, JPM, MSFT, META, AMZN respectively).
+- Generic query with no specific company (e.g., "explain DCF", "how do P/E ratios work"): set ticker to null.
+- Private company, non-US, or ambiguous company name: set ticker to null. NEVER fabricate.
+
+Set ticker BEFORE anything else.
 
 STEP 1 — CHOOSE THE RIGHT ANALYSIS TYPE:
 Read the user's query and match it to one of these types. This determines which tools to include.
