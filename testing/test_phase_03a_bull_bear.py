@@ -132,6 +132,43 @@ def test_bull_and_bear_argue_different_sides():
         f"Bear populates downside fields ({bear_negative_signals}) — opposite sides")
 
 
+def test_bull_uses_only_provided_catalysts():
+  """When a catalyst calendar is supplied, any date the bull cites must
+  match a date in the calendar. Pre-fix the bull invented plausible-looking
+  but unverifiable dates ('Q3 earnings Aug 1', 'FOMC Sep 17') with no
+  grounding in real corporate or macro calendars."""
+  import re
+  bull = Bull_Agent()
+  fixture_cats = [
+    {'type': 'earnings', 'date': '2026-07-31', 'ticker': 'AAPL',
+     'description': 'AAPL earnings (after-close)',
+     'impact': 'company-specific'},
+    {'type': 'fomc', 'date': '2026-09-16',
+     'description': 'FOMC interest rate decision',
+     'impact': 'rate-sensitive'},
+    {'type': 'ex_dividend', 'date': '2026-08-10', 'ticker': 'AAPL',
+     'description': 'AAPL ex-dividend',
+     'impact': 'price-discount-equal-to-dividend'},
+  ]
+  case = bull.argue(ANALYST_REPORT, VARIABLES, model_outputs={},
+                     ticker="AAPL", catalysts=fixture_cats)
+  assert case is not None
+
+  allowed_dates = {c['date'] for c in fixture_cats}
+  # Find every YYYY-MM-DD date in catalysts + upside_targets
+  date_pattern = re.compile(r'\d{4}-\d{2}-\d{2}')
+  all_text = ' '.join(case.catalysts + case.upside_targets +
+                       [case.thesis, case.refutation_of_bear])
+  cited_dates = set(date_pattern.findall(all_text))
+  hallucinated = cited_dates - allowed_dates
+  print(f"  cited_dates: {cited_dates}")
+  print(f"  allowed_dates: {allowed_dates}")
+  assert not hallucinated, \
+    f"bull cited dates not in calendar (hallucinated): {hallucinated}"
+  print(f"PASS: bull cited only dates from the calendar "
+        f"({len(cited_dates)} dates, all valid)")
+
+
 def test_bull_targets_have_conditions():
   """Strong bull cases use conditional targets, not just a number."""
   bull = Bull_Agent()
@@ -169,6 +206,7 @@ if __name__ == "__main__":
   test_bull_produces_valid_output()
   test_bear_produces_valid_output()
   test_bull_and_bear_argue_different_sides()
+  test_bull_uses_only_provided_catalysts()
   test_bull_targets_have_conditions()
   test_bear_risks_reference_real_concerns()
   print("\nAll Phase 3a Bull/Bear tests passed.")

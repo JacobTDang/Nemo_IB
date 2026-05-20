@@ -37,6 +37,9 @@ GROUND RULES:
     analyst report). Do NOT invent numbers.
   - Identify specific catalysts with timing. Vague "growth potential" is weak;
     "Q3 earnings on Aug 1 with Services likely to print +14% YoY" is strong.
+  - CATALYST DATES MUST come from the CATALYST CALENDAR below. Do NOT invent
+    earnings dates, FOMC dates, ex-dividend dates, or anything else dated.
+    If the calendar is empty, refer to events by name without specific dates.
   - Set upside targets with explicit conditions. "Stock to $250 IF iPhone
     units stabilize" beats "stock could go higher."
   - Preemptively refute the bear case. What would a smart short-seller argue
@@ -61,13 +64,30 @@ class Bull_Agent(GroqModel):
   def __init__(self, model_name: str = "llama-3.3-70b-versatile"):
     super().__init__(model_name=model_name)
 
+  @staticmethod
+  def _format_calendar(catalysts: Optional[List[Dict[str, Any]]]) -> str:
+    """Render the catalyst calendar inline. Empty list -> explicit empty note
+    so the model knows it must not invent dates."""
+    if not catalysts:
+      return ("(no upcoming dated catalysts available — do NOT invent specific "
+              "dates; refer to events by name only)")
+    lines = []
+    for c in catalysts[:25]:
+      d = c.get('date', '')
+      typ = c.get('type', '')
+      desc = c.get('description', '')
+      lines.append(f"  {d} | {typ} | {desc}")
+    return "\n".join(lines)
+
   def argue(self,
             analyst_report_md: str,
             variables: Optional[Dict[str, Any]] = None,
             model_outputs: Optional[Dict[str, Any]] = None,
-            ticker: str = "") -> Optional[BullCase]:
+            ticker: str = "",
+            catalysts: Optional[List[Dict[str, Any]]] = None) -> Optional[BullCase]:
     self.conversatoin_history = []
     flat_vars = {k: v for k, v in (variables or {}).items() if '.' not in k}
+    cal_block = self._format_calendar(catalysts)
     prompt = (
       f"TICKER: {ticker}\n\n"
       f"ANALYST DRAFT REPORT (your starting point — do not just restate it):\n"
@@ -76,6 +96,8 @@ class Bull_Agent(GroqModel):
       f"{json.dumps(flat_vars, default=str)[:3500]}\n\n"
       f"MODEL OUTPUTS (DCF/scenario/LBO/credit summaries):\n"
       f"{json.dumps(model_outputs or {}, default=str)[:3000]}\n\n"
+      f"CATALYST CALENDAR — the ONLY dated events you may cite as catalysts:\n"
+      f"{cal_block}\n\n"
       "Build the strongest bull case using these facts."
     )
     try:

@@ -34,6 +34,10 @@ GROUND RULES:
   - Identify specific risks, not vague 'macro headwinds'. "Apple Services
     growth has decelerated from 27% to 14% over six quarters" is concrete;
     "growth might slow" is weak.
+  - CATALYST DATES MUST come from the CATALYST CALENDAR below. Do NOT invent
+    earnings dates, FOMC dates, or anything else dated when constructing
+    risks or downside_targets. If the calendar is empty, refer to events
+    by name without specific dates.
   - Set downside targets with explicit conditions. "Stock to $130 if iPhone
     units fall >8% YoY" beats "stock could go lower."
   - Preemptively refute the bull case. The bulls will say X. Why is X wrong?
@@ -57,13 +61,30 @@ class Bear_Agent(GroqModel):
   def __init__(self, model_name: str = "llama-3.3-70b-versatile"):
     super().__init__(model_name=model_name)
 
+  @staticmethod
+  def _format_calendar(catalysts: Optional[List[Dict[str, Any]]]) -> str:
+    """Render the catalyst calendar inline. Empty -> explicit note so the
+    model knows it must not invent dates in downside_targets."""
+    if not catalysts:
+      return ("(no upcoming dated catalysts available — do NOT invent specific "
+              "dates; refer to events by name only)")
+    lines = []
+    for c in catalysts[:25]:
+      d = c.get('date', '')
+      typ = c.get('type', '')
+      desc = c.get('description', '')
+      lines.append(f"  {d} | {typ} | {desc}")
+    return "\n".join(lines)
+
   def argue(self,
             analyst_report_md: str,
             variables: Optional[Dict[str, Any]] = None,
             model_outputs: Optional[Dict[str, Any]] = None,
-            ticker: str = "") -> Optional[BearCase]:
+            ticker: str = "",
+            catalysts: Optional[List[Dict[str, Any]]] = None) -> Optional[BearCase]:
     self.conversatoin_history = []
     flat_vars = {k: v for k, v in (variables or {}).items() if '.' not in k}
+    cal_block = self._format_calendar(catalysts)
     prompt = (
       f"TICKER: {ticker}\n\n"
       f"ANALYST DRAFT REPORT (your starting point — do not just restate it):\n"
@@ -72,6 +93,9 @@ class Bear_Agent(GroqModel):
       f"{json.dumps(flat_vars, default=str)[:3500]}\n\n"
       f"MODEL OUTPUTS:\n"
       f"{json.dumps(model_outputs or {}, default=str)[:3000]}\n\n"
+      f"CATALYST CALENDAR — the ONLY dated events you may cite in risks or "
+      f"downside_targets:\n"
+      f"{cal_block}\n\n"
       "Build the strongest bear case using these facts."
     )
     try:

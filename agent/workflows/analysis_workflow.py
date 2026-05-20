@@ -799,15 +799,32 @@ class WorkFlow:
     arbiter_verdict = None
     if analysis_report.recommendation != 'INFO':
       print("\n[Debate] Bull and Bear arguing in parallel...", file=sys.stderr, flush=True)
+      # Pull upcoming catalysts so the debate cites real dates instead of
+      # fabricating earnings/FOMC dates. Best-effort — any failure leaves the
+      # list empty, and the agents are instructed not to invent dates when
+      # the calendar is empty.
+      cats: list = []
+      ticker_for_cats = state.get('ticker', '')
+      if ticker_for_cats:
+        try:
+          from data.catalysts import upcoming_catalysts
+          cats = await asyncio.to_thread(upcoming_catalysts, ticker_for_cats, 120)
+          print(f"[Debate] Catalyst calendar: {len(cats)} events in 120 days",
+                file=sys.stderr, flush=True)
+        except Exception as e:
+          print(f"[Debate] Catalyst lookup failed (non-critical): {e}",
+                file=sys.stderr, flush=True)
       try:
         bull_case, bear_case = await asyncio.gather(
           asyncio.to_thread(
             self.bull_agent.argue,
-            result, variables, state.get('model_outputs'), state.get('ticker', '')
+            result, variables, state.get('model_outputs'),
+            state.get('ticker', ''), cats
           ),
           asyncio.to_thread(
             self.bear_agent.argue,
-            result, variables, state.get('model_outputs'), state.get('ticker', '')
+            result, variables, state.get('model_outputs'),
+            state.get('ticker', ''), cats
           ),
           return_exceptions=True,
         )
