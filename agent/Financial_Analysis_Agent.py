@@ -1026,6 +1026,9 @@ Write a COMPLETE fresh analysis answering: "{user_query}"
 }
 """
         else:
+            # Split the interpolated part from the literal JSON schema so the
+            # braces in the schema example don't get parsed as f-string format
+            # specifiers (would raise ValueError: Invalid format specifier).
             prompt += f"""--- YOUR TASK ---
 
 Analyze the data above to answer: "{user_query}"
@@ -1037,7 +1040,8 @@ Rules:
 4. Do not confuse millions, billions, and trillions.
 
 OUTPUT FORMAT: Return ONLY valid JSON matching this schema, no markdown wrapper:
-{
+"""
+            prompt += """{
   "executive_summary": "2-3 sentences with recommendation",
   "recommendation": "BUY | HOLD | SELL | NEUTRAL | INFO",
   "signal": "bullish | bearish | neutral | n/a",
