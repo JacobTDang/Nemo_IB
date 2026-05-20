@@ -72,6 +72,41 @@ class AlpacaServer:
         },
       ),
       Tool(
+        name="risk_check_proposed_trade",
+        description=(
+          "Evaluates a proposed paper trade against the deterministic "
+          "Python Risk_Officer. Returns "
+          "{approve: bool, reasons: [str], adjusted_quantity?: float, "
+          "adjusted_dollar_size?: float}. This tool ONLY evaluates — it "
+          "does NOT place the order. Use this before place_paper_order to "
+          "pre-check whether Risk_Officer will allow the trade. If approve "
+          "is False, do NOT call place_paper_order. If approve is True with "
+          "adjusted_quantity set, use the adjusted quantity (smaller than "
+          "requested) when calling place_paper_order."
+        ),
+        inputSchema={
+          "type": "object",
+          "properties": {
+            "ticker":           {"type": "string"},
+            "side":             {"type": "string", "enum": ["buy", "sell"]},
+            "quantity":         {"type": "number"},
+            "price":            {"type": "number"},
+            "recommendation":   {"type": "string",
+                                  "enum": ["BUY", "SELL", "HOLD", "NEUTRAL"]},
+            "confidence":       {"type": "number"},
+            "bull_strength":    {"type": "number"},
+            "bear_strength":    {"type": "number"},
+            "position_sizing":  {"type": "string",
+                                  "enum": ["aggressive", "normal",
+                                            "cautious", "no_position"]},
+            "rationale":        {"type": "string"},
+          },
+          "required": ["ticker", "side", "quantity", "price",
+                        "recommendation", "confidence", "bull_strength",
+                        "bear_strength", "position_sizing"],
+        },
+      ),
+      Tool(
         name="get_paper_positions",
         description=(
           "Returns open paper positions reconciled across two sources: the "
@@ -90,6 +125,60 @@ class AlpacaServer:
         },
       ),
     ]
+
+  @staticmethod
+  def _build_verdict_and_portfolio(args: Dict[str, Any]):
+    """Common helper: build an ArbiterVerdict from MCP args + pull current
+    portfolio_stats + open basket. Shared between risk_check_proposed_trade
+    (A4) and place_paper_order (A5)."""
+    from agent.Arbiter_Agent import ArbiterVerdict
+    from state.positions import portfolio_stats, open_positions
+    verdict = ArbiterVerdict(
+      final_recommendation=args["recommendation"],
+      confidence=float(args["confidence"]),
+      bull_strength=float(args["bull_strength"]),
+      bear_strength=float(args["bear_strength"]),
+      decisive_factors=[args.get("rationale", "")] if args.get("rationale") else ["(no rationale provided)"],
+      acknowledged_risks=["(risk check evaluation only)"],
+      conditions_to_change_mind=["(evaluated via MCP)"],
+      position_sizing_guidance=args["position_sizing"],
+      rationale=args.get("rationale", ""),
+    )
+    portfolio = portfolio_stats(paper=True)
+    basket = [p["ticker"].upper() for p in open_positions(paper=True) or []]
+    return verdict, portfolio, basket
+
+  async def risk_check_proposed_trade(self, args: Dict[str, Any]) -> List[TextContent]:
+    """Evaluate-only Risk_Officer wrapper. Never calls submit_order.
+
+    Returns the RiskDecision serialized as JSON. Tool callers should respect
+    `approve` strictly: a False approve means do NOT call place_paper_order.
+    """
+    try:
+      from agent.Risk_Officer import Risk_Officer
+      verdict, portfolio, basket = self._build_verdict_and_portfolio(args)
+      ro = Risk_Officer()
+      decision = ro.evaluate(
+        proposed_quantity=float(args["quantity"]),
+        proposed_price=float(args["price"]),
+        arbiter_verdict=verdict,
+        portfolio=portfolio,
+        proposed_ticker=str(args["ticker"]).upper(),
+        open_basket=basket,
+      )
+      out = {
+        "approve": decision.approve,
+        "reasons": decision.reasons,
+        "adjusted_quantity": decision.adjusted_quantity,
+        "adjusted_dollar_size": decision.adjusted_dollar_size,
+      }
+    except Exception as e:
+      out = {
+        "approve": False,
+        "reasons": [f"risk_check_failed: {type(e).__name__}: {e}"],
+        "error": True,
+      }
+    return [TextContent(type="text", text=_safe_dumps(out))]
 
   async def get_paper_positions(self) -> List[TextContent]:
     """Reconcile broker positions against the local SQLite audit log.
@@ -175,6 +264,8 @@ class AlpacaServer:
         return await parent.get_paper_account()
       if name == "get_paper_positions":
         return await parent.get_paper_positions()
+      if name == "risk_check_proposed_trade":
+        return await parent.risk_check_proposed_trade(arguments)
       return [TextContent(
         type="text",
         text=_safe_dumps({"error": f"unknown tool: {name}"}),
