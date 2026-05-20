@@ -898,6 +898,27 @@ class WorkFlow:
     # Persist as a thesis using the EFFECTIVE recommendation (arbiter > analyst).
     persisted_thesis_id = None
     persist_ticker = state.get('ticker') or ''
+    # Fallback: if the probe missed the ticker (Nemotron occasionally omits
+    # the field), regex-extract from the user query before persisting so the
+    # thesis still lands in the DB. Match 1-5 uppercase letters with optional
+    # .A/.B suffix preceded by word boundary, then verify it isn't a common
+    # English word that happens to be all-caps.
+    if not persist_ticker:
+      import re as _re
+      _STOP = {'DCF', 'EPS', 'EBITDA', 'WACC', 'CEO', 'CFO', 'IPO', 'P/E',
+               'YoY', 'YOY', 'AI', 'US', 'USA', 'EU', 'UK', 'Q1', 'Q2', 'Q3',
+               'Q4', 'FY', 'TTM', 'GDP', 'CPI', 'FOMC', 'SEC', 'API'}
+      q = state.get('user_query', '') or ''
+      # Require length >= 2 to avoid picking up single-letter false
+      # positives like "P" or "E" in "P/E".
+      candidates = _re.findall(r'\b([A-Z]{2,5}(?:\.[AB])?)\b', q)
+      for c in candidates:
+        if c not in _STOP:
+          persist_ticker = c
+          print(f"[Theses] ticker missing from state; regex-extracted "
+                f"{persist_ticker!r} from user_query as fallback",
+                file=sys.stderr, flush=True)
+          break
     if persist_ticker and eff_recommendation != 'INFO':
       try:
         from state.theses import insert_thesis, latest_thesis, supersede_thesis
