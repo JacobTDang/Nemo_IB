@@ -6,6 +6,7 @@ CLAUDE.md
 .vscode
 rules
 db_cache/
+testing/fixtures/
 
 # Model weight files (large binaries - never commit)
 *.gguf
