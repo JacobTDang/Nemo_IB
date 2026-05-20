@@ -211,9 +211,21 @@ def _condense_recommendations(raw: List[Dict[str, Any]]) -> Dict[str, Any]:
 
   Returns condensed dict with latest/prior periods, consensus, trend, and total analysts.
   """
+  # Source attribution surfaces methodology so Bull/Bear agents don't
+  # conflict with externally-cited analyst counts (Yahoo / TipRanks
+  # de-duplicate; Finnhub counts each firm-rating row).
+  _SOURCE = "Finnhub /stock/recommendation"
+  _METHODOLOGY = (
+    "Counts reflect Finnhub's aggregated firm-rating buckets for the "
+    "given period and may exceed the number of distinct active analysts "
+    "reported by other sources (e.g., Yahoo, TipRanks). Use with that "
+    "caveat when comparing to externally-cited consensus counts."
+  )
+
   if not raw:
     return {"latest": None, "prior": None, "consensus": "unknown",
-            "trend": "unknown", "total_analysts": 0}
+            "trend": "unknown", "total_analysts": 0,
+            "source": _SOURCE, "methodology_note": _METHODOLOGY}
 
   def _normalize_period(period_data: Dict) -> Dict[str, Any]:
     return {
@@ -258,7 +270,9 @@ def _condense_recommendations(raw: List[Dict[str, Any]]) -> Dict[str, Any]:
     "prior": prior,
     "consensus": consensus,
     "trend": trend,
-    "total_analysts": total_analysts
+    "total_analysts": total_analysts,
+    "source": _SOURCE,
+    "methodology_note": _METHODOLOGY,
   }
 
 
