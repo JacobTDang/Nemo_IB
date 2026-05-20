@@ -40,30 +40,64 @@ class AlpacaServer:
     self.server = Server("nemo_alpaca")
     self._setup_handlers()
 
+  async def list_tools_descriptors(self) -> List[Tool]:
+    """Public mirror of the @list_tools handler — exposes the tool list
+    to unit tests without bouncing through MCP framing."""
+    return [
+      Tool(
+        name="ping_alpaca",
+        description=(
+          "Health check for the Alpaca MCP server. Returns "
+          "{\"status\": \"pong\"}. Use to verify server is reachable."
+        ),
+        inputSchema={
+          "type": "object",
+          "properties": {},
+          "required": [],
+        },
+      ),
+      Tool(
+        name="get_paper_account",
+        description=(
+          "Fetches the current paper-trading account summary from Alpaca: "
+          "equity, cash, buying_power, portfolio_value, and account status. "
+          "Numeric fields are coerced to float. On broker failure, returns "
+          "{\"error\": str, \"paper\": true}. Use to confirm account is "
+          "active and check available capital before proposing trades."
+        ),
+        inputSchema={
+          "type": "object",
+          "properties": {},
+          "required": [],
+        },
+      ),
+    ]
+
+  async def get_paper_account(self) -> List[TextContent]:
+    """Wraps Execution_Agent.get_account_summary() in an MCP TextContent
+    envelope. Lazy-imports Execution_Agent so missing alpaca-py only
+    surfaces when this tool is called, not at server startup."""
+    try:
+      from agent.Execution_Agent import Execution_Agent
+      agent = Execution_Agent(paper=True)
+      summary = agent.get_account_summary()
+    except Exception as e:
+      summary = {"paper": True, "error": f"{type(e).__name__}: {e}"}
+    return [TextContent(type="text", text=_safe_dumps(summary))]
+
   def _setup_handlers(self):
     parent = self
 
     @self.server.list_tools()
     async def list_tools() -> List[Tool]:
-      return [
-        Tool(
-          name="ping_alpaca",
-          description=(
-            "Health check for the Alpaca MCP server. Returns "
-            "{\"status\": \"pong\"}. Use to verify server is reachable."
-          ),
-          inputSchema={
-            "type": "object",
-            "properties": {},
-            "required": [],
-          },
-        ),
-      ]
+      return await parent.list_tools_descriptors()
 
     @self.server.call_tool()
     async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
       if name == "ping_alpaca":
         return [TextContent(type="text", text=_safe_dumps({"status": "pong"}))]
+      if name == "get_paper_account":
+        return await parent.get_paper_account()
       return [TextContent(
         type="text",
         text=_safe_dumps({"error": f"unknown tool: {name}"}),
