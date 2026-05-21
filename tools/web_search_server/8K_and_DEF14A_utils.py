@@ -983,6 +983,128 @@ class SECFilingParser:
             "truth_test_alerts": truth_alerts
         }
 
+    def _extract_502_officer_actions(self, text: str) -> List[Dict[str, Any]]:
+        """Extract per-sub-item officer actions from a 5.02 8-K body.
+
+        5.02 disclosures are structured with sub-labels (a)-(e):
+          (a) departure of director
+          (b) departure of certain officer
+          (c) election of director (filling a vacancy)
+          (d) appointment of certain officer
+          (e) compensatory arrangements
+        We isolate each sub-section between its label and the next label
+        or the next Item heading, then extract the officer name with the
+        existing name regex. The full sub-section text is preserved as
+        evidence so consumers can re-read it.
+        """
+        SUB_ITEM_MAP = {
+            'a': ('departure', 'director'),
+            'b': ('departure', 'officer'),
+            'c': ('election', 'director'),
+            'd': ('appointment', 'officer'),
+            'e': ('compensation', 'officer'),
+        }
+
+        # Find Item 5.02 heading and scope to its end (next Item X.YZ or EOF)
+        head = re.search(r'Item\s+5\.02[\.\s]', text, re.IGNORECASE)
+        if not head:
+            return []
+        start = head.end()
+        next_item = re.search(r'Item\s+\d+\.\d+', text[start:], re.IGNORECASE)
+        end = start + next_item.start() if next_item else len(text)
+        section = text[start:end]
+
+        # Split sub-sections on (a)-(e) labels. The label must be preceded by
+        # whitespace/newline so we don't split mid-sentence on parenthetical
+        # references like "(see Section (d) below)".
+        label_pattern = re.compile(r'(?<=[\s\n])\(([abcde])\)\s', re.IGNORECASE)
+        positions = [(m.start(), m.group(1).lower()) for m in label_pattern.finditer(section)]
+        if not positions:
+            return []
+
+        actions: List[Dict[str, Any]] = []
+        for idx, (pos, letter) in enumerate(positions):
+            sub_end = positions[idx + 1][0] if idx + 1 < len(positions) else len(section)
+            sub_text = section[pos:sub_end].strip()
+
+            # Skip empty / trivially short sub-sections (often "Not Applicable.")
+            if len(sub_text) < 30:
+                continue
+
+            # Officer name: take the first generic-pattern name in the sub-section
+            # that isn't the company name. Use a tighter pattern that requires a
+            # comma-separated title or "as <title>" to follow, which is how 5.02
+            # filings consistently announce appointees ("Jane Doe, EVP of X" or
+            # "Mr. Smith was appointed as Chief Officer").
+            name_pattern = re.compile(
+                r'\b([A-Z][a-z]+(?:\s+[A-Z]\.)?(?:\s+[A-Z][a-z]+){1,3}(?:\s+Jr\.)?)\b'
+            )
+            officer_name = None
+            officer_match_pos = None
+            for m in name_pattern.finditer(sub_text):
+                candidate = m.group(1).strip()
+                if not self.name_extractor._validate_name(candidate):
+                    continue
+                # Drop the most common false positive: 'Microsoft Corporation' etc.
+                # Company-name patterns share a trailing token in this set.
+                if candidate.split()[-1].lower() in {
+                    'corporation', 'company', 'incorporated', 'limited', 'plc',
+                }:
+                    continue
+                officer_name = candidate
+                officer_match_pos = m.start()
+                break
+
+            # Title heuristic. Look for two families of phrasing in a window
+            # around the name:
+            #   1. Officer-style: ", Chief X Officer" or "as Senior Vice President"
+            #   2. Director-style: "to its Board of Directors" / "as a director"
+            #      / "a member of the Board" — common in 5.02 board changes.
+            # Search both before and after the name (200 chars each side) so
+            # phrasings like "Carlos Rodriguez, a member of the Board" match.
+            title = None
+            if officer_name and officer_match_pos is not None:
+                name_len = len(officer_name)
+                pre = sub_text[max(0, officer_match_pos - 200): officer_match_pos]
+                post = sub_text[officer_match_pos + name_len: officer_match_pos + name_len + 300]
+                window = pre + " " + post
+
+                # Officer-title pattern (post-name only — these always follow)
+                tm = re.search(
+                    r'(?:,\s*|\bas\s+)((?:Chief|Senior|Executive|President|Vice|Lead|'
+                    r'Principal|General|Group|Corporate|Deputy|Assistant)[^\.\n,]{2,120})',
+                    post,
+                )
+                if tm:
+                    title = tm.group(1).strip().rstrip(',.;:')
+
+                # Director patterns — check the whole window (pre + post).
+                if not title:
+                    director_patterns = [
+                        r'\bto\s+(?:its|the)\s+Board\s+of\s+Directors\b',
+                        r'\b(?:as|a)\s+(?:a\s+)?member\s+of\s+(?:its\s+|the\s+)?Board\s+of\s+Directors\b',
+                        r'\bas\s+a\s+director\b',
+                        r'\bre-?election\s+(?:to|as)\s+(?:a\s+)?director\b',
+                        r'\bstand\s+for\s+re-?election\b',
+                        r'\bDirector\s+of\s+(?:the\s+)?Company\b',
+                    ]
+                    for pat in director_patterns:
+                        if re.search(pat, window, re.IGNORECASE):
+                            title = "Director"
+                            break
+
+            action_verb, role = SUB_ITEM_MAP.get(letter, ('unknown', 'unknown'))
+            actions.append({
+                'sub_item': letter,
+                'action': action_verb,
+                'role': role,
+                'officer_name': officer_name,
+                'title': title,
+                'evidence_text': sub_text[:1200],  # Generous window, but bounded
+            })
+
+        return actions
+
     def extract_8k_events(self, ticker: str, limit: int = 10) -> Dict[str, Any]:
         try:
             self._set_identity()
@@ -1007,7 +1129,7 @@ class SECFilingParser:
                     date_key = f"{orig_date}_{k}"
                     k += 1
 
-                events_by_date[date_key] = {
+                event_dict = {
                     'event_type': cls.event_type,
                     'category': cls.category.name if cls.category else None,
                     'sec_items': items,
@@ -1016,6 +1138,17 @@ class SECFilingParser:
                     'evidence': asdict(cls.evidence) if cls.evidence else None,
                     'text': text  # Full 8-K text (no truncation)
                 }
+
+                # 5.02-specific structured extraction. Adds an `officer_actions`
+                # list when the filing names departing/appointed officers in
+                # the (a)-(e) sub-items. Left as a separate field so the generic
+                # event evidence (`evidence.snippet`) stays untouched.
+                if '5.02' in items:
+                    actions = self._extract_502_officer_actions(text)
+                    if actions:
+                        event_dict['officer_actions'] = actions
+
+                events_by_date[date_key] = event_dict
 
             truth_passed, truth_alerts = True, []
             quality = self._generate_quality_report(list(events_by_date.values()), truth_passed, truth_alerts)
