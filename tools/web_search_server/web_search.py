@@ -438,7 +438,11 @@ class WebSearchServer:
   async def extract_proxy_compensation(self, ticker: str, debug: bool = False) -> List[TextContent]:
     if filing_parser is None:
       return [TextContent(type="text", text=safe_json_dumps({"error": "Filing parser not available", "success": False}))]
-    result = await asyncio.to_thread(filing_parser.extract_proxy_compensation, ticker, debug)
+    # SECFilingParser.extract_proxy_compensation takes only `ticker`. The
+    # `debug` arg is still on the MCP schema for symmetry with the other
+    # parser tools, but it's a no-op here until the underlying method
+    # learns to honor it.
+    result = await asyncio.to_thread(filing_parser.extract_proxy_compensation, ticker)
     return [TextContent(type="text", text=safe_json_dumps(result))]
 
   async def extract_governance_data(self, ticker: str, debug: bool = False) -> List[TextContent]:
