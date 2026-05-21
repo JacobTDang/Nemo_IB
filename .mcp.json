@@ -1,0 +1,29 @@
+{
+  "mcpServers": {
+    "nemo_web": {
+      "command": "./.venv/Scripts/python.exe",
+      "args": ["-m", "tools.web_search_server.web_search", "server"],
+      "env": {"PYTHONPATH": "."}
+    },
+    "nemo_financial": {
+      "command": "./.venv/Scripts/python.exe",
+      "args": ["-m", "tools.financial_modeling_engine.analysis_tools", "server"],
+      "env": {"PYTHONPATH": "."}
+    },
+    "nemo_finnhub": {
+      "command": "./.venv/Scripts/python.exe",
+      "args": ["-m", "tools.news_agregator.finnhub_server", "server"],
+      "env": {"PYTHONPATH": "."}
+    },
+    "nemo_fred": {
+      "command": "./.venv/Scripts/python.exe",
+      "args": ["-m", "tools.news_agregator.fred_server", "server"],
+      "env": {"PYTHONPATH": "."}
+    },
+    "nemo_alpaca": {
+      "command": "./.venv/Scripts/python.exe",
+      "args": ["-m", "tools.alpaca.server", "server"],
+      "env": {"PYTHONPATH": "."}
+    }
+  }
+}

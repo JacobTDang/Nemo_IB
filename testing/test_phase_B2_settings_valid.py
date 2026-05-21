@@ -1,9 +1,10 @@
-"""Phase B2: validate .claude/settings.json declares all 5 MCP servers.
+"""Phase B2: validate .mcp.json declares all 5 MCP servers.
 
 Asserts:
-- File exists and parses as JSON
+- File exists at the project root and parses as JSON
 - All 5 expected servers listed under mcpServers
 - Each entry has command, args, and env
+- args invoke `python -m <module> server` with the literal "server" arg
 - The python interpreter path is resolvable from the project root
 """
 import json
@@ -13,7 +14,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SETTINGS = os.path.join(ROOT, '.claude', 'settings.json')
+SETTINGS = os.path.join(ROOT, '.mcp.json')
 
 EXPECTED_SERVERS = {
   'nemo_web':       'tools.web_search_server.web_search',
@@ -33,7 +34,7 @@ def _load():
 def test_file_exists_and_parses():
   data = _load()
   assert isinstance(data, dict), "top level must be an object"
-  print("PASS: settings.json parses as JSON object")
+  print("PASS: .mcp.json parses as JSON object")
 
 
 def test_all_servers_registered():
@@ -72,6 +73,23 @@ def test_args_use_module_path():
   print("PASS: every server invokes the correct python module")
 
 
+def test_args_pass_server_subcommand():
+  """Every server's __main__ requires the literal 'server' arg to enter
+  stdio mode — without it the process prints usage and exits 0, which
+  Claude Code reports as a connection failure."""
+  data = _load()
+  mcp = data['mcpServers']
+  for name in EXPECTED_SERVERS:
+    args = mcp[name]['args']
+    assert 'server' in args, f"{name}: args missing 'server' subcommand"
+    # 'server' must come AFTER '-m <module>', not before it
+    m_idx = args.index('-m')
+    srv_idx = args.index('server')
+    assert srv_idx > m_idx + 1, \
+      f"{name}: 'server' must follow -m <module>; got args={args}"
+  print("PASS: every server gets the required 'server' subcommand")
+
+
 def test_pythonpath_in_env():
   data = _load()
   mcp = data['mcpServers']
@@ -107,6 +125,7 @@ if __name__ == "__main__":
   test_all_servers_registered()
   test_each_server_has_command_args_env()
   test_args_use_module_path()
+  test_args_pass_server_subcommand()
   test_pythonpath_in_env()
   test_python_interpreter_is_resolvable()
   test_modules_import_cleanly()
