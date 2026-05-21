@@ -14,8 +14,7 @@ from datetime import date, datetime, timedelta, timezone
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent, ServerCapabilities
-from mcp.server.models import InitializationOptions
+from mcp.types import Tool, TextContent
 
 from tools.news_agregator.fred_utils import FredClient, build_envelope
 
@@ -526,11 +525,11 @@ class FredServer:
   async def run_server(self):
     try:
       async with stdio_server() as (read_stream, write_stream):
-        await self.server.run(read_stream, write_stream, InitializationOptions(
-          server_name="fred",
-          server_version="1.0.0",
-          capabilities=ServerCapabilities()
-        ))
+        await self.server.run(
+          read_stream,
+          write_stream,
+          self.server.create_initialization_options(),
+        )
         print("Successfully created fred process", file=sys.stderr, flush=True)
     except Exception as e:
       import traceback

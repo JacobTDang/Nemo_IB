@@ -15,8 +15,7 @@ from collections import defaultdict
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent, ServerCapabilities
-from mcp.server.models import InitializationOptions
+from mcp.types import Tool, TextContent
 
 from tools.news_agregator.finnhub_utils import FinnhubClient, build_envelope
 
@@ -449,6 +448,203 @@ def _condense_forward_estimates(eps_raw: Any, rev_raw: Any, ebitda_raw: Any) -> 
   return result
 
 
+def _yf_forward_estimates(ticker: str) -> Dict[str, Any]:
+  """yfinance fallback for forward estimates. Synchronous — must be awaited
+  via asyncio.to_thread by the caller.
+
+  Returns the same shape as `_condense_forward_estimates` so consumers can
+  swap sub-fields when Finnhub returns 'no data' (free-tier 403). Each sub-
+  field is tagged with `_source: yfinance_fallback` (or `_inferred` for the
+  EBITDA case, which yfinance does not surface natively and is derived from
+  revenue * info['ebitdaMargins']).
+  """
+  import yfinance as yf
+
+  BILLION = 1e9
+  out = {
+    "eps": {"error": "no yfinance data"},
+    "revenue_B": {"error": "no yfinance data"},
+    "ebitda_B": {"error": "no yfinance equivalent"},
+  }
+
+  def _is_num(x):
+    return x is not None and x == x  # NaN check via self-equality
+
+  def _periods_from_df(df, scale: float):
+    periods = []
+    for label, row in df.iterrows():
+      entry = {"period": str(label)}
+      avg = row.get("avg")
+      low = row.get("low")
+      high = row.get("high")
+      n = row.get("numberOfAnalysts")
+      if _is_num(avg):
+        entry["avg"] = round(float(avg) / scale, 4) if scale != 1.0 else float(avg)
+      if _is_num(high):
+        entry["high"] = round(float(high) / scale, 4) if scale != 1.0 else float(high)
+      if _is_num(low):
+        entry["low"] = round(float(low) / scale, 4) if scale != 1.0 else float(low)
+      if _is_num(n):
+        entry["analysts"] = int(n)
+      periods.append(entry)
+    return periods
+
+  try:
+    t = yf.Ticker(ticker)
+  except Exception as exc:
+    err = f"yfinance Ticker init failed: {type(exc).__name__}: {exc}"
+    return {k: {"error": err} for k in out}
+
+  try:
+    eps_df = t.earnings_estimate
+    if eps_df is not None and not eps_df.empty:
+      out["eps"] = {"periods": _periods_from_df(eps_df, scale=1.0),
+                    "_source": "yfinance_fallback"}
+  except Exception as exc:
+    out["eps"] = {"error": f"yfinance eps: {type(exc).__name__}: {exc}"}
+
+  try:
+    rev_df = t.revenue_estimate
+    if rev_df is not None and not rev_df.empty:
+      out["revenue_B"] = {"periods": _periods_from_df(rev_df, scale=BILLION),
+                          "_source": "yfinance_fallback"}
+  except Exception as exc:
+    out["revenue_B"] = {"error": f"yfinance revenue: {type(exc).__name__}: {exc}"}
+
+  # EBITDA inferred from revenue * info['ebitdaMargins'].
+  # Order matters: t.info is the slow call (can hang 10-30s under Yahoo
+  # throttling), so skip it entirely when revenue failed — without revenue
+  # periods the inference can't produce anything anyway.
+  rev_periods = out["revenue_B"].get("periods") if isinstance(out["revenue_B"], dict) else None
+  if rev_periods:
+    try:
+      margin = t.info.get("ebitdaMargins")
+      if margin:
+        ebitda_periods = []
+        for p in rev_periods:
+          e = {"period": p["period"]}
+          for k in ("avg", "low", "high"):
+            if k in p:
+              e[k] = round(p[k] * margin, 4)
+          if "analysts" in p:
+            e["analysts"] = p["analysts"]
+          ebitda_periods.append(e)
+        out["ebitda_B"] = {"periods": ebitda_periods,
+                           "_source": "yfinance_fallback_inferred",
+                           "_inferred_margin": round(float(margin), 4)}
+    except Exception as exc:
+      out["ebitda_B"] = {"error": f"yfinance ebitda inference: {type(exc).__name__}: {exc}"}
+
+  return out
+
+
+def _yf_financial_statements(ticker: str, statement: str, freq: str) -> Dict[str, Any]:
+  """yfinance fallback for `get_financial_statements`. Used when Finnhub
+  returns HTTP 403 (free-tier scope) or an unrecognized response.
+
+  Maps yfinance DataFrame row labels to the same camelCase keys that
+  `_condense_financial_statements` produces from Finnhub's standardized
+  response so downstream consumers don't need to branch on source. Tags
+  the result with `_source: yfinance_fallback`.
+
+  Synchronous — must be awaited via `asyncio.to_thread` by the caller.
+  """
+  import yfinance as yf
+  import pandas as pd
+
+  attr_map = {
+    ("ic", "annual"):     "income_stmt",
+    ("ic", "quarterly"):  "quarterly_income_stmt",
+    ("cf", "annual"):     "cashflow",
+    ("cf", "quarterly"):  "quarterly_cashflow",
+    ("bs", "annual"):     "balance_sheet",
+    ("bs", "quarterly"):  "quarterly_balance_sheet",
+  }
+  attr = attr_map.get((statement, freq))
+  if not attr:
+    return {"statement": statement, "freq": freq,
+            "error": f"unsupported statement/freq: {statement}/{freq}"}
+
+  LABEL_MAP = {
+    "ic": {
+      "Total Revenue":      "revenue",
+      "Cost Of Revenue":    "costOfRevenue",
+      "Gross Profit":       "grossProfit",
+      "Operating Expense":  "operatingExpense",
+      "Operating Income":   "operatingIncome",
+      "EBITDA":             "ebitda",
+      "EBIT":               "ebit",
+      "Net Income":         "netIncome",
+      "Basic EPS":          "eps",
+      "Diluted EPS":        "epsDiluted",
+    },
+    "cf": {
+      "Operating Cash Flow":         "operatingCashFlow",
+      "Capital Expenditure":         "capitalExpenditures",
+      "Free Cash Flow":              "freeCashFlow",
+      "Cash Dividends Paid":         "dividendsPaid",
+      "Common Stock Dividend Paid":  "dividendsPaid",
+      "Repurchase Of Capital Stock": "repurchaseOfCapitalStock",
+      "Changes In Cash":             "netChangeInCash",
+    },
+    "bs": {
+      "Total Assets":                            "totalAssets",
+      "Current Assets":                          "totalCurrentAssets",
+      "Cash And Cash Equivalents":               "cashAndEquivalents",
+      "Cash Cash Equivalents And Short Term Investments": "cashAndEquivalents",
+      "Other Short Term Investments":            "shortTermInvestments",
+      "Short Term Investments":                  "shortTermInvestments",
+      "Total Liabilities Net Minority Interest": "totalLiabilities",
+      "Current Liabilities":                     "totalCurrentLiabilities",
+      "Long Term Debt":                          "longTermDebt",
+      "Current Debt":                            "shortTermDebt",
+      "Total Debt":                              "totalDebt",
+      "Total Equity Gross Minority Interest":    "totalEquity",
+      "Stockholders Equity":                     "stockholdersEquity",
+      "Goodwill":                                "goodwill",
+      "Other Intangible Assets":                 "intangibleAssets",
+    },
+  }
+  mapping = LABEL_MAP.get(statement, {})
+
+  try:
+    t = yf.Ticker(ticker)
+    df = getattr(t, attr, None)
+  except Exception as exc:
+    return {"statement": statement, "freq": freq,
+            "error": f"yfinance Ticker {attr} failed: {type(exc).__name__}: {exc}"}
+
+  if df is None or df.empty:
+    return {"statement": statement, "freq": freq,
+            "error": "yfinance returned empty statement"}
+
+  cap = 5 if freq == "annual" else 8
+  periods = []
+  for col in list(df.columns)[:cap]:
+    period_label = col.strftime("%Y-%m-%d") if hasattr(col, "strftime") else str(col)
+    row = {"period": period_label}
+    for yf_label, key in mapping.items():
+      if yf_label in df.index:
+        v = df.loc[yf_label, col]
+        if pd.notna(v):
+          # yfinance reports flows positive; CF statement values that are
+          # outflows (capex, dividends, buybacks) come back negative in the
+          # yfinance shape (matching the cash-flow-statement convention).
+          # Convert to positive for buybacks/dividends so downstream consumers
+          # match Finnhub's convention (Finnhub returns these as positive
+          # outflow values in /stock/financials).
+          if key in ("capitalExpenditures", "dividendsPaid",
+                     "repurchaseOfCapitalStock") and v < 0:
+            v = abs(v)
+          row[key] = float(v)
+    periods.append(row)
+
+  return {
+    "statement": statement, "freq": freq, "periods": periods,
+    "count": len(periods), "_source": "yfinance_fallback",
+  }
+
+
 def _condense_financial_statements(raw: Dict[str, Any], statement: str, freq: str) -> Dict[str, Any]:
   """Extract key line items from Finnhub standardized financial statements.
 
@@ -579,11 +775,29 @@ def _slim_articles(articles: List[Dict[str, Any]], cap: int = 20) -> List[Dict[s
   return slimmed
 
 
+def _warm_yfinance_session() -> None:
+  """Pre-fetch Yahoo's crumb/cookie so the first real yfinance call in this
+  process isn't blocked on the 30+ second handshake. fast_info is a lazy
+  accessor and does NOT trigger the crumb fetch — a small yf.download() is
+  the cheapest reliable way to force the cookie handshake. Failures are
+  silent: the subsequent fallback path will still time out gracefully if
+  Yahoo refuses us entirely."""
+  try:
+    import yfinance as yf
+    _ = yf.download("AAPL", period="5d", progress=False, auto_adjust=True)
+  except Exception:
+    pass
+
+
 class FinnhubServer:
   def __init__(self):
     self.server = Server("finnhub")
     self.client = FinnhubClient()
     self._setup_handlers()
+    # Warm yfinance in a daemon thread so the first get_forward_estimates
+    # fallback call doesn't pay the cold-start tax (~30s for Yahoo crumb).
+    import threading
+    threading.Thread(target=_warm_yfinance_session, daemon=True).start()
 
   def _setup_handlers(self):
     parent = self
@@ -670,6 +884,24 @@ class FinnhubServer:
                 "type": "string",
                 "description": "Stock ticker symbol (e.g. AAPL)"
               }
+            },
+            "required": ["ticker"]
+          }
+        ),
+        Tool(
+          name="get_analyst_revisions_history",
+          description=(
+            "Full time series of analyst rating-bucket counts (strong buy / buy / hold / sell / strong sell) over the last N months. "
+            "Detects upgrade/downgrade momentum invisible in a single-period snapshot. Returns per-month counts, net_bullish score "
+            "((strong_buy+buy) - (sell+strong_sell)), 1mo/3mo/6mo deltas, and a momentum signal classifier "
+            "(upgrading_strong / upgrading / neutral / downgrading / downgrading_strong). "
+            "Use to detect institutional re-rating before it shows up in price."
+          ),
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Stock ticker symbol"},
+              "lookback_months": {"type": "integer", "description": "Months of history to include", "default": 12}
             },
             "required": ["ticker"]
           }
@@ -794,6 +1026,8 @@ class FinnhubServer:
           )
         case "get_analyst_recommendations":
           return await parent.get_analyst_recommendations(arguments["ticker"])
+        case "get_analyst_revisions_history":
+          return await parent.get_analyst_revisions_history(arguments["ticker"], arguments.get("lookback_months", 12))
         case "get_company_peers":
           return await parent.get_company_peers(arguments["ticker"])
         case "get_basic_financials":
@@ -858,6 +1092,87 @@ class FinnhubServer:
     envelope = build_envelope(condensed, ticker, "get_analyst_recommendations")
     return [TextContent(type="text", text=safe_json_dumps(envelope))]
 
+  async def get_analyst_revisions_history(self, ticker: str, lookback_months: int = 12) -> List[TextContent]:
+    """Full time series of analyst rating-bucket counts over lookback_months.
+    Lets the consumer detect upgrade/downgrade momentum that's invisible
+    in a single-period snapshot."""
+    result = await self.client.get("/stock/recommendation", {"symbol": ticker})
+    if not isinstance(result, list) or not result:
+      envelope = build_envelope({"error": "no recommendation data"}, ticker,
+                                "get_analyst_revisions_history")
+      return [TextContent(type="text", text=safe_json_dumps(envelope))]
+
+    # Finnhub returns most-recent first
+    periods = []
+    for row in result[:lookback_months]:
+      if not isinstance(row, dict):
+        continue
+      sb = int(row.get("strongBuy") or 0)
+      b = int(row.get("buy") or 0)
+      h = int(row.get("hold") or 0)
+      s = int(row.get("sell") or 0)
+      ss = int(row.get("strongSell") or 0)
+      total = sb + b + h + s + ss
+      # Net upgrade score: (strong_buy + buy) - (sell + strong_sell), normalized
+      net_bullish = (sb + b) - (s + ss)
+      pct_bullish = round((sb + b) / total * 100, 1) if total else 0
+      pct_bearish = round((s + ss) / total * 100, 1) if total else 0
+      periods.append({
+        "period":         row.get("period", ""),
+        "strong_buy":     sb,
+        "buy":            b,
+        "hold":           h,
+        "sell":           s,
+        "strong_sell":    ss,
+        "total":          total,
+        "net_bullish":    net_bullish,
+        "pct_bullish":    pct_bullish,
+        "pct_bearish":    pct_bearish,
+      })
+
+    # Trend deltas (latest vs N months ago)
+    momentum = {}
+    if len(periods) >= 2:
+      latest = periods[0]
+      prior = periods[1]
+      momentum["1mo_strong_buy_delta"] = latest["strong_buy"] - prior["strong_buy"]
+      momentum["1mo_buy_delta"] = latest["buy"] - prior["buy"]
+      momentum["1mo_sell_delta"] = latest["sell"] - prior["sell"]
+      momentum["1mo_net_bullish_delta"] = latest["net_bullish"] - prior["net_bullish"]
+    if len(periods) >= 4:
+      latest = periods[0]
+      m3 = periods[3]
+      momentum["3mo_net_bullish_delta"] = latest["net_bullish"] - m3["net_bullish"]
+    if len(periods) >= 7:
+      latest = periods[0]
+      m6 = periods[6]
+      momentum["6mo_net_bullish_delta"] = latest["net_bullish"] - m6["net_bullish"]
+
+    # Signal classifier
+    signal = "neutral"
+    if momentum.get("3mo_net_bullish_delta") is not None:
+      d3 = momentum["3mo_net_bullish_delta"]
+      if d3 >= 5:
+        signal = "upgrading_strong"
+      elif d3 >= 2:
+        signal = "upgrading"
+      elif d3 <= -5:
+        signal = "downgrading_strong"
+      elif d3 <= -2:
+        signal = "downgrading"
+
+    out = {
+      "ticker":           ticker.upper(),
+      "periods":          periods,
+      "periods_returned": len(periods),
+      "momentum":         momentum,
+      "signal":           signal,
+      "source":           "Finnhub /stock/recommendation",
+      "note":             "Counts reflect Finnhub's firm-rating buckets per month. Net_bullish = (strong_buy+buy)-(sell+strong_sell). Signal classifier uses 3mo net_bullish delta.",
+    }
+    envelope = build_envelope(out, ticker, "get_analyst_revisions_history")
+    return [TextContent(type="text", text=safe_json_dumps(envelope))]
+
   async def get_company_peers(self, ticker: str) -> List[TextContent]:
     result = await self.client.get("/stock/peers", {"symbol": ticker})
     envelope = build_envelope(result, ticker, "get_company_peers")
@@ -884,6 +1199,31 @@ class FinnhubServer:
       self.client.get("/stock/ebitda-estimate", {"symbol": ticker, "freq": "quarterly"}),
     )
     condensed = _condense_forward_estimates(eps_result, rev_result, ebitda_result)
+
+    # yfinance fallback when Finnhub free-tier returns no data on any sub-field.
+    # Only fetch yfinance once per call, and only if at least one sub-field is missing.
+    # Wrap in wait_for: Ticker.info is known to hang under Yahoo throttling.
+    needs_fallback = any(
+      isinstance(condensed.get(k), dict) and condensed[k].get("error")
+      for k in ("eps", "revenue_B", "ebitda_B")
+    )
+    if needs_fallback:
+      try:
+        # 30s budget — yfinance's earnings_estimate / revenue_estimate calls
+        # run ~3s standalone but can hit Yahoo throttling under MCP-subprocess
+        # contention (other yfinance calls in flight via get_market_data).
+        yf_data = await asyncio.wait_for(
+          asyncio.to_thread(_yf_forward_estimates, ticker),
+          timeout=30.0,
+        )
+        for k in ("eps", "revenue_B", "ebitda_B"):
+          if isinstance(condensed.get(k), dict) and condensed[k].get("error"):
+            condensed[k] = yf_data.get(k, condensed[k])
+      except asyncio.TimeoutError:
+        for k in ("eps", "revenue_B", "ebitda_B"):
+          if isinstance(condensed.get(k), dict) and condensed[k].get("error"):
+            condensed[k] = {"error": "no data (Finnhub) + yfinance_timeout"}
+
     envelope = build_envelope(condensed, ticker, "get_forward_estimates", api_calls_made=3)
     return [TextContent(type="text", text=safe_json_dumps(envelope))]
 
@@ -892,6 +1232,28 @@ class FinnhubServer:
       "symbol": ticker, "statement": statement, "freq": freq
     })
     condensed = _condense_financial_statements(result, statement, freq) if isinstance(result, dict) else result
+
+    # yfinance fallback when Finnhub returns 403 / empty / unrecognized format
+    # (free-tier `/stock/financials` is paywalled). Same pattern as
+    # get_forward_estimates — single fallback call, 30s timeout to absorb
+    # Yahoo cold-start handshake, tag _source so consumers see the imputation.
+    needs_fallback = (
+      not isinstance(condensed, dict)
+      or condensed.get("error")
+      or not condensed.get("periods")
+    )
+    if needs_fallback:
+      try:
+        yf_data = await asyncio.wait_for(
+          asyncio.to_thread(_yf_financial_statements, ticker, statement, freq),
+          timeout=30.0,
+        )
+        if yf_data.get("periods"):
+          condensed = yf_data
+      except asyncio.TimeoutError:
+        if isinstance(condensed, dict):
+          condensed["error"] = (condensed.get("error") or "no data") + " + yfinance_timeout"
+
     envelope = build_envelope(condensed, ticker, "get_financial_statements")
     return [TextContent(type="text", text=safe_json_dumps(envelope))]
 
@@ -923,11 +1285,11 @@ class FinnhubServer:
   async def run_server(self):
     try:
       async with stdio_server() as (read_stream, write_stream):
-        await self.server.run(read_stream, write_stream, InitializationOptions(
-          server_name="finnhub",
-          server_version="1.0.0",
-          capabilities=ServerCapabilities()
-        ))
+        await self.server.run(
+          read_stream,
+          write_stream,
+          self.server.create_initialization_options(),
+        )
         print("Successfully created finnhub process", file=sys.stderr, flush=True)
     except Exception as e:
       import traceback

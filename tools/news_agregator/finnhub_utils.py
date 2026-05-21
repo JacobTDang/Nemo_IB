@@ -7,13 +7,17 @@ import time
 import asyncio
 import aiohttp
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict, Any, Optional
 from dotenv import load_dotenv
 
 
+_DOTENV_PATH = Path(__file__).resolve().parents[2] / ".env"
+
+
 def get_api_key() -> str:
   """Load FINNHUB_API_KEY from .env file."""
-  load_dotenv()
+  load_dotenv(dotenv_path=_DOTENV_PATH)
   key = os.getenv("FINNHUB_API_KEY")
   if not key:
     raise RuntimeError("FINNHUB_API_KEY not found in environment. Add it to .env")
