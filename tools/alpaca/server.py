@@ -19,8 +19,7 @@ from datetime import date, datetime
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent, ServerCapabilities
-from mcp.server.models import InitializationOptions
+from mcp.types import Tool, TextContent
 
 
 def _json_default(obj):
@@ -497,11 +496,7 @@ class AlpacaServer:
         await self.server.run(
           read_stream,
           write_stream,
-          InitializationOptions(
-            server_name="nemo_alpaca",
-            server_version="0.1.0",
-            capabilities=ServerCapabilities(),
-          ),
+          self.server.create_initialization_options(),
         )
         print("Successfully created alpaca process", file=sys.stderr, flush=True)
     except Exception:

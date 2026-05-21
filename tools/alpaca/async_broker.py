@@ -23,11 +23,15 @@ Auth headers:
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
 from dotenv import load_dotenv
 
+
+_DOTENV_PATH = Path(__file__).resolve().parents[2] / ".env"
+load_dotenv(dotenv_path=_DOTENV_PATH)
 
 _PAPER_BASE = "https://paper-api.alpaca.markets"
 _LIVE_BASE = "https://api.alpaca.markets"
@@ -56,7 +60,6 @@ class AsyncBroker:
   """
 
   def __init__(self, paper: bool = True, timeout: Optional[httpx.Timeout] = None):
-    load_dotenv()
     self.paper = paper
     if paper:
       self.key = os.getenv("ALPACA_PAPER_KEY") or os.getenv("ALPACA_API_KEY")
