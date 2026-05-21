@@ -430,11 +430,22 @@ async def run(ticker: str) -> dict:
     shares_repurchased = cf_latest.get("repurchaseOfCapitalStock") or 0
     cap_returns_source = "cf_statement" if dividends_paid or shares_repurchased else "none"
 
+    # SEC-XBRL buyback fallback (highest trust per playbook). Finnhub free
+    # tier returns 0 periods for /stock/financials, so cf-statement buybacks
+    # land as 0; SEC's PaymentsForRepurchaseOfCommonStock concept gives a
+    # real annual figure from the latest 10-K.
+    if not shares_repurchased:
+      bb_result = await _call(mcp, "get_buyback_history", {"ticker": ticker}, log)
+      if bb_result.get("success") and bb_result.get("ttm_repurchase"):
+        shares_repurchased = float(bb_result["ttm_repurchase"])
+        cap_returns_source = (
+          "sec_xbrl_plus_imputed_dividends" if cap_returns_source == "none"
+          else f"sec_xbrl+{cap_returns_source}"
+        )
+
     # Yield-based fallback when CF statement is unavailable (e.g. Finnhub
     # free tier returns 403 for /stock/financials). currentDividendYieldTTM
     # is available on free tier, so impute dividends_paid from it.
-    # No equivalent free-tier buyback metric exists, so buybacks stay 0
-    # until a paid data source provides them.
     if not dividends_paid and market_cap:
       div_yield_pct = _scrape(
         vendor_results.get("get_basic_financials", {}) or {},
@@ -442,7 +453,10 @@ async def run(ticker: str) -> dict:
       )
       if div_yield_pct and isinstance(div_yield_pct, (int, float)):
         dividends_paid = round(market_cap * (div_yield_pct / 100.0), 2)
-        cap_returns_source = "imputed_from_yield"
+        if "sec_xbrl" in cap_returns_source:
+          cap_returns_source = "sec_xbrl_buybacks+imputed_dividends"
+        else:
+          cap_returns_source = "imputed_from_yield"
     if ebitda_abs and capex_abs and tax_rate and dep_abs:
       result = await _call(
         mcp, "calculate_capital_returns",
