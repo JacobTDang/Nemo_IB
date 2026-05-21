@@ -1805,10 +1805,20 @@ class SECFilingParser:
 
         if not html: return best_members, None
         try:
+            # SEC HTML often starts with `<?xml version="1.0" encoding="..."?>`
+            # which makes lxml's string parser raise "Unicode strings with
+            # encoding declaration are not supported." The html5lib fallback
+            # is unusable on Python >=3.10 (its 1.1 release imports the
+            # removed `collections.Mapping`). Strip the declaration so the
+            # default lxml path works on a clean string.
+            clean_html = html
+            if clean_html.lstrip().startswith('<?xml') and '?>' in clean_html:
+                clean_html = clean_html.split('?>', 1)[1].lstrip()
             try:
-                dfs = pd.read_html(StringIO(html))
-            except:
-                dfs = pd.read_html(StringIO(html), flavor='html5lib')
+                dfs = pd.read_html(StringIO(clean_html))
+            except Exception:
+                # bs4 flavor works without lxml or html5lib if either is missing
+                dfs = pd.read_html(StringIO(clean_html), flavor='bs4')
 
             for table_idx, df in enumerate(dfs):
                 df = flatten_dataframe(df)
