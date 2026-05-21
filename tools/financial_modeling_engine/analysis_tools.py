@@ -4,11 +4,10 @@ import json
 import sys
 import traceback
 
-from .utils import get_data, calculate_percentiles
+from .utils import get_data, calculate_percentiles, get_institutional_holdings, get_options_metrics, get_short_interest, get_price_history, get_industry_etfs, get_historical_analogue
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent, ServerCapabilities
-from mcp.server.models import InitializationOptions
+from mcp.types import Tool, TextContent
 
 
 # ---------------------------------------------------------------------------
@@ -21,6 +20,38 @@ from mcp.server.models import InitializationOptions
 market_data_description = """Retrieves real-time market data for a company from Yahoo Finance including market cap, enterprise value, revenue, EBITDA, cash, debt, shares outstanding, beta, interest expense, and valuation multiples (P/E, P/B, EV/Revenue, EV/EBITDA, EV/EBIT).
 Should use: When you need current financial data for a company to perform valuation analysis, equity bridge calculations, or to get inputs for WACC calculation (beta, market cap, debt, interest expense).
 Should NOT use: When you need historical time-series data or SEC filing data (use SEC tools instead)."""
+
+extract_13f_holdings_description = """Returns the top institutional holders and mutual fund holders of a stock, plus aggregate institutional ownership statistics. Data sourced from Yahoo's aggregation of SEC 13F-HR filings (institutional holders, filed quarterly) and NPORT-P filings (mutual funds). Each holder row includes shares held, market value in USD, percent of shares outstanding, and quarter-over-quarter percent change in position size.
+Should use: When researching who owns the stock, to detect institutional buying/selling pressure (pct_change_qoq), to size up the 'smart money' bull/bear setup, or to find catalysts in institutional positioning. Critical for the Layer-5 capital-allocation read in the IB analyst playbook.
+Should NOT use: For company insider transactions (use get_insider_transactions instead — that covers officer/director Form 4 filings). For real-time positioning (this lags 45-90 days due to 13F reporting cadence)."""
+
+options_metrics_description = """Options-market signals derived from yfinance option chains. Returns: (1) ATM implied volatility term structure at ~7d/30d/60d/90d expirations, (2) 30d put/call skew (0.9*spot put IV minus 1.1*spot call IV; positive = downside fear premium), (3) nearest-expiry open interest and volume aggregates with put/call ratios.
+Should use: For forward-looking risk read (rising IV into earnings = market pricing surprise), sentiment positioning (volume ratio <0.5 = call-heavy/bullish, >1.0 = put-heavy/bearish), and skew (elevated put skew = institutional hedging).
+Should NOT use: As a primary valuation input — options are sentiment, not fundamentals. Returns a data_quality field — yfinance occasionally returns sentinel IV values (powers of 2) for stale snapshots; trust the volume ratios over IV in those cases."""
+
+short_interest_description = """Short interest snapshot: shares short, days to cover (short ratio), percent of float, and month-over-month change. Source: yfinance (underlying FINRA biweekly disclosures). Includes a signal classifier (low/moderate/elevated/crowded short).
+Should use: For positioning context — crowded shorts on a stock with bull momentum signal squeeze risk; rising shorts on a name with deteriorating fundamentals confirm the bear case. Pair with get_insider_transactions to triangulate sentiment.
+Should NOT use: For intraday positioning — short interest reports lag 2 weeks. Days-to-cover is an estimate based on average volume, not a hard ceiling."""
+
+price_history_description = """Historical price summary: returns over 1M/3M/6M/YTD/1Y/3Y windows, realized volatility (annualized) over 30d/90d/180d/1Y, 52-week high/low with dates, max drawdown from trailing-12-month peak, and a configurable number of recent OHLCV bars. Source: yfinance auto-adjusted daily history.
+Should use: For drawdown framing ('stock down N% from peak'), volatility regime read (vol spike before earnings = expected surprise), and return decomposition over multiple windows.
+Should NOT use: For minute-level technical analysis (this returns daily bars). For intraday spot price use get_market_data."""
+
+industry_etfs_description = """Map a research theme (e.g. 'AI semis', 'energy', 'cloud', 'uranium', 'biotech') to relevant ETFs and return their top holdings + weights. Acts as the bridge from top-down thematic conviction to bottom-up ticker selection — e.g. an AI/memory thesis surfaces SK Hynix (HBM) as AIQ's top holding, not just NVDA. Returns ETF AUM, top 10 holdings, sector weightings. Covers ~50 themes across tech, energy, financials, healthcare, geographic, and macro categories.
+Should use: As the FIRST step in thematic research — convert 'I think AI capex will accelerate' into a list of pure-play tickers via the ETF holdings.
+Should NOT use: For specific ticker lookup (use the ticker directly). For comp basket construction within a sector (use get_company_peers)."""
+
+historical_analogue_description = """Match a current investment thesis against a curated catalog of historical market setups (1999 dot-com, 2007 housing, 2014 oil collapse, 2018 memory bust, 2020 cloud acceleration, 2024 AI capex cycle, etc.). Returns top N matches by structural-tag overlap plus each analogue's lessons. Use structural keywords in the thesis description (capex_cycle, capex_peak, capex_trough, valuation_expansion, valuation_compression, margin_compression, supply_constrained, supply_glut, concentrated_buyers, insider_selling, retail_frenzy, tech, energy, commodities, etc.) for cleaner matches.
+Should use: At the synthesis stage of deep research — once you have the data, ask 'what does this remind me of?' to surface historical lessons and avoid repeating prior cycle mistakes.
+Should NOT use: For ticker-specific predictions; this returns pattern-level analogues, not stock-level forecasts."""
+
+record_thesis_evolution_description = """Record an evolution event against an existing thesis. Use after a meaningful new data point arrives (earnings print, news, macro shift, insider activity) to log how analyst conviction shifted and why. Implements the Soros reflexivity discipline — write your assumptions down, then re-read them when new data arrives. conviction_delta is in 0.0-1.0 units (e.g. +0.05 for a beat that slightly improves conviction, -0.10 for a meaningful negative surprise). Automatically updates the thesis's current confidence, clamped to [0,1]."""
+
+get_thesis_evolution_description = """Return the chronological evolution log for a thesis — the reflexivity trace. Each row shows what observation triggered a conviction change, the magnitude of the change, the new conviction level, and an optional tag (earnings, macro, insider, sector, sentiment). Reading the full evolution log forces the analyst to confront whether the original thesis is still intact or has drifted."""
+
+backtest_signal_description = """Backtest a signal definition on historical price data. Given a rule (e.g. "buy when RSI<30 hold 30 days") and a ticker, returns historical hit rate, mean return, sharpe, sample trades. Use to validate that a research pattern actually worked before betting on it. Supports threshold rules ({metric, op, value}), AND/OR composites, and named built-in signals: oversold_rsi, overbought_rsi, big_drawdown. Available metrics: rsi_14, sma_20, sma_50, sma_200, drawdown_pct, close. Returns n_trades, hit_rate %, mean_return %, sharpe_simple, sample trades with entry/exit dates."""
+
+analyze_exposures_description = """Decompose all active theses into latent factor buckets (ai_capex_long, rate_sensitive_long_duration, energy_long, china_exposure, commodity_supply_constrained, crypto_beta, biotech_speculative, etc.). Surfaces hidden concentration — the diversification illusion that a portfolio of NVDA/AMD/TSM/MSFT is really one AI-capex bet. Returns top concentrations with conviction-weighted sums and explicit warning flags when any factor exceeds 3 theses or 2.0 cumulative conviction. Run before sizing up any position."""
 
 wacc_tool_description = """Calculates Weighted Average Cost of Capital (WACC) using CAPM. Formula: WACC = (E/V)*Ke + (D/V)*Kd*(1-T).
 
@@ -1052,6 +1083,123 @@ class Financial_Analysis:
           }
         ),
         Tool(
+          name="get_options_metrics",
+          description=options_metrics_description,
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Stock symbol"}
+            },
+            "required": ["ticker"]
+          }
+        ),
+        Tool(
+          name="get_short_interest",
+          description=short_interest_description,
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Stock symbol"}
+            },
+            "required": ["ticker"]
+          }
+        ),
+        Tool(
+          name="analyze_exposures",
+          description=analyze_exposures_description,
+          inputSchema={"type": "object", "properties": {}, "required": []}
+        ),
+        Tool(
+          name="backtest_signal",
+          description=backtest_signal_description,
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Stock symbol"},
+              "signal": {"type": ["object", "string"], "description": "Rule dict like {'metric':'rsi_14','op':'<','value':30} OR a named signal: oversold_rsi, overbought_rsi, big_drawdown"},
+              "hold_days": {"type": "integer", "description": "Trading days to hold after signal fires", "default": 30},
+              "cooldown_days": {"type": "integer", "description": "Bars to wait between entries to prevent overlap", "default": 0},
+              "start_date": {"type": "string", "description": "ISO date YYYY-MM-DD (optional)"},
+              "end_date": {"type": "string", "description": "ISO date YYYY-MM-DD (optional)"}
+            },
+            "required": ["ticker", "signal"]
+          }
+        ),
+        Tool(
+          name="record_thesis_evolution",
+          description=record_thesis_evolution_description,
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "thesis_id": {"type": "integer", "description": "ID of the thesis being updated"},
+              "observation": {"type": "string", "description": "What happened — the new data point that triggered a conviction shift"},
+              "conviction_delta": {"type": "number", "description": "Change in conviction (e.g. +0.05, -0.03). Will be added to current confidence and clamped to [0,1]"},
+              "tag": {"type": "string", "description": "Optional category: earnings | macro | insider | sector | sentiment | governance | other"}
+            },
+            "required": ["thesis_id", "observation", "conviction_delta"]
+          }
+        ),
+        Tool(
+          name="get_thesis_evolution",
+          description=get_thesis_evolution_description,
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "thesis_id": {"type": "integer", "description": "ID of the thesis to inspect"}
+            },
+            "required": ["thesis_id"]
+          }
+        ),
+        Tool(
+          name="get_historical_analogue",
+          description=historical_analogue_description,
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "thesis_description": {"type": "string", "description": "Free-text description of the current setup. Include structural keywords (capex_peak, supply_constrained, valuation_expansion, tech, energy, etc.) for best matches."},
+              "top_n": {"type": "integer", "description": "Number of top matches to return", "default": 3}
+            },
+            "required": ["thesis_description"]
+          }
+        ),
+        Tool(
+          name="get_industry_etfs",
+          description=industry_etfs_description,
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "theme": {"type": "string", "description": "Research theme (e.g. 'AI semis', 'cloud', 'uranium', 'biotech', 'fintech', 'EV')"},
+              "top_holdings_per_etf": {"type": "integer", "description": "Number of top holdings to return per ETF", "default": 10}
+            },
+            "required": ["theme"]
+          }
+        ),
+        Tool(
+          name="get_price_history",
+          description=price_history_description,
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Stock symbol"},
+              "period": {"type": "string", "description": "yfinance period spec (1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, ytd, max)", "default": "2y"},
+              "include_recent_bars": {"type": "integer", "description": "Number of most recent daily OHLCV bars to include", "default": 20}
+            },
+            "required": ["ticker"]
+          }
+        ),
+        Tool(
+          name="extract_13f_holdings",
+          description=extract_13f_holdings_description,
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Stock ticker symbol"},
+              "top_n": {"type": "integer", "description": "Number of top holders to return per category (default 10)", "default": 10}
+            },
+            "required": ["ticker"]
+          }
+        ),
+        Tool(
           name="comparable_company_analysis",
           description=comps_tool_description,
           inputSchema={
@@ -1205,6 +1353,26 @@ class Financial_Analysis:
       try:
         if name == "get_market_data":
           return await parent.get_market_data(args['ticker'])
+        elif name == "extract_13f_holdings":
+          return await parent.extract_13f_holdings(args['ticker'], args.get('top_n', 10))
+        elif name == "get_options_metrics":
+          return await parent.get_options_metrics(args['ticker'])
+        elif name == "get_short_interest":
+          return await parent.get_short_interest(args['ticker'])
+        elif name == "get_price_history":
+          return await parent.get_price_history(args['ticker'], args.get('period', '2y'), args.get('include_recent_bars', 20))
+        elif name == "get_industry_etfs":
+          return await parent.get_industry_etfs(args['theme'], args.get('top_holdings_per_etf', 10))
+        elif name == "get_historical_analogue":
+          return await parent.get_historical_analogue(args['thesis_description'], args.get('top_n', 3))
+        elif name == "backtest_signal":
+          return await parent.backtest_signal_tool(args)
+        elif name == "analyze_exposures":
+          return await parent.analyze_exposures_tool()
+        elif name == "record_thesis_evolution":
+          return await parent.record_thesis_evolution(args['thesis_id'], args['observation'], args['conviction_delta'], args.get('tag'))
+        elif name == "get_thesis_evolution":
+          return await parent.get_thesis_evolution(args['thesis_id'])
         elif name == "comparable_company_analysis":
           return await parent.comparable_company_analysis(args['companies'])
         elif name == "calculate_dcf":
@@ -1242,6 +1410,115 @@ class Financial_Analysis:
       else:
         clean_data[key] = value
     return [TextContent(type="text", text=json.dumps(clean_data))]
+
+  async def extract_13f_holdings(self, ticker: str, top_n: int = 10) -> List[TextContent]:
+    result = await asyncio.to_thread(get_institutional_holdings, ticker, top_n)
+    return [TextContent(type="text", text=json.dumps(_to_native(result), default=str))]
+
+  async def get_options_metrics(self, ticker: str) -> List[TextContent]:
+    result = await asyncio.to_thread(get_options_metrics, ticker)
+    return [TextContent(type="text", text=json.dumps(_to_native(result), default=str))]
+
+  async def get_short_interest(self, ticker: str) -> List[TextContent]:
+    result = await asyncio.to_thread(get_short_interest, ticker)
+    return [TextContent(type="text", text=json.dumps(_to_native(result), default=str))]
+
+  async def get_price_history(self, ticker: str, period: str = '2y', include_recent_bars: int = 20) -> List[TextContent]:
+    result = await asyncio.to_thread(get_price_history, ticker, period, include_recent_bars)
+    return [TextContent(type="text", text=json.dumps(_to_native(result), default=str))]
+
+  async def get_industry_etfs(self, theme: str, top_holdings_per_etf: int = 10) -> List[TextContent]:
+    result = await asyncio.to_thread(get_industry_etfs, theme, top_holdings_per_etf)
+    return [TextContent(type="text", text=json.dumps(_to_native(result), default=str))]
+
+  async def get_historical_analogue(self, thesis_description: str, top_n: int = 3) -> List[TextContent]:
+    result = await asyncio.to_thread(get_historical_analogue, thesis_description, top_n)
+    return [TextContent(type="text", text=json.dumps(_to_native(result), default=str))]
+
+  async def analyze_exposures_tool(self) -> List[TextContent]:
+    from agent.exposure_analyzer import analyze_exposures
+    from state.theses import active_theses
+    def _run():
+      theses = active_theses()
+      return analyze_exposures(theses)
+    result = await asyncio.to_thread(_run)
+    return [TextContent(type="text", text=json.dumps(_to_native(result), default=str))]
+
+  async def backtest_signal_tool(self, args: Dict[str, Any]) -> List[TextContent]:
+    from agent.backtest_engine import backtest_signal, NAMED_SIGNALS
+    signal = args.get('signal')
+    if isinstance(signal, str):
+      signal = NAMED_SIGNALS.get(signal)
+      if signal is None:
+        return [TextContent(type="text", text=json.dumps({
+          "success": False,
+          "error": f"Unknown named signal {args.get('signal')!r}. Available: {list(NAMED_SIGNALS.keys())}",
+        }))]
+
+    def _run():
+      r = backtest_signal(
+        ticker=args['ticker'],
+        signal=signal,
+        hold_days=int(args.get('hold_days', 30)),
+        cooldown_days=int(args.get('cooldown_days', 0)),
+        start_date=args.get('start_date'),
+        end_date=args.get('end_date'),
+        signal_name=args.get('signal') if isinstance(args.get('signal'), str) else 'custom',
+      )
+      return {
+        'ticker': r.ticker, 'signal_name': r.signal_name,
+        'date_range': r.date_range,
+        'n_trades': r.n_trades, 'hit_rate_pct': r.hit_rate,
+        'mean_return_pct': r.mean_return, 'median_return_pct': r.median_return,
+        'best_trade_pct': r.best_trade, 'worst_trade_pct': r.worst_trade,
+        'mean_hold_days': r.mean_hold_days,
+        'max_drawdown_pct_in_any_trade': r.max_drawdown_pct,
+        'sharpe_simple_annualized': r.sharpe_simple,
+        'warning': r.warning,
+        'sample_trades': [{
+          'entry_date': t.entry_date, 'exit_date': t.exit_date,
+          'entry_price': t.entry_price, 'exit_price': t.exit_price,
+          'return_pct': t.return_pct, 'hold_days': t.hold_days,
+          'max_dd_in_trade_pct': t.max_dd_in_trade,
+        } for t in r.trades[:10]],
+        'success': r.warning is None,
+      }
+    result = await asyncio.to_thread(_run)
+    return [TextContent(type="text", text=json.dumps(_to_native(result), default=str))]
+
+  async def record_thesis_evolution(self, thesis_id: int, observation: str, conviction_delta: float, tag = None) -> List[TextContent]:
+    from state.theses import record_thesis_evolution as _rec, get_thesis
+    try:
+      eid = await asyncio.to_thread(_rec, thesis_id, observation, float(conviction_delta), tag)
+      th = await asyncio.to_thread(get_thesis, thesis_id)
+      result = {
+        "success": True,
+        "evolution_id": eid,
+        "thesis_id": thesis_id,
+        "new_conviction": th['confidence'] if th else None,
+      }
+    except Exception as e:
+      result = {"success": False, "error": f"{type(e).__name__}: {e}"}
+    return [TextContent(type="text", text=json.dumps(_to_native(result), default=str))]
+
+  async def get_thesis_evolution(self, thesis_id: int) -> List[TextContent]:
+    from state.theses import get_thesis_evolution as _get, get_thesis
+    try:
+      log = await asyncio.to_thread(_get, thesis_id)
+      th = await asyncio.to_thread(get_thesis, thesis_id)
+      result = {
+        "success": True,
+        "thesis_id": thesis_id,
+        "ticker": th['ticker'] if th else None,
+        "current_conviction": th['confidence'] if th else None,
+        "falsifiers": th.get('falsifiers') if th else None,
+        "variant_perception": th.get('variant_perception') if th else None,
+        "evolution_count": len(log),
+        "evolution": log,
+      }
+    except Exception as e:
+      result = {"success": False, "error": f"{type(e).__name__}: {e}"}
+    return [TextContent(type="text", text=json.dumps(_to_native(result), default=str))]
 
   async def comparable_company_analysis(self, comparables: List[str]) -> List[TextContent]:
     tasks = [asyncio.to_thread(get_data, ticker) for ticker in comparables]
@@ -1363,11 +1640,11 @@ class Financial_Analysis:
   async def run_server(self):
     try:
       async with stdio_server() as (read_stream, write_stream):
-        await self.server.run(read_stream, write_stream, InitializationOptions(
-          server_name="financial_analysis",
-          server_version='1.0.0',
-          capabilities=ServerCapabilities()
-        ))
+        await self.server.run(
+          read_stream,
+          write_stream,
+          self.server.create_initialization_options(),
+        )
     except Exception as e:
       print(f"Financial Analysis Server error: {e}", file=sys.stderr, flush=True)
       traceback.print_exc(file=sys.stderr)
