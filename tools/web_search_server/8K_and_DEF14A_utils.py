@@ -1096,10 +1096,17 @@ class SECFilingParser:
 
         if not html: return best_execs
         try:
+            # Strip SEC's `<?xml ... ?>` processing instruction so lxml's
+            # string parser accepts the input. Same fix as in
+            # _extract_board_from_tables — see that method's comment for
+            # the full rationale (html5lib 1.1 is broken on Py>=3.10).
+            clean_html = html
+            if clean_html.lstrip().startswith('<?xml') and '?>' in clean_html:
+                clean_html = clean_html.split('?>', 1)[1].lstrip()
             try:
-                dfs = pd.read_html(StringIO(html))
-            except:
-                dfs = pd.read_html(StringIO(html), flavor='html5lib')
+                dfs = pd.read_html(StringIO(clean_html))
+            except Exception:
+                dfs = pd.read_html(StringIO(clean_html), flavor='bs4')
 
             for table_idx, df in enumerate(dfs):
                 df = flatten_dataframe(df)

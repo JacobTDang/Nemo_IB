@@ -121,23 +121,25 @@ def _build_call_plan(ticker):
   financial = [
     ("get_market_data",              {"ticker": ticker}),
     ("comparable_company_analysis",  {"companies": [ticker, "GOOGL", "AAPL"]}),
-    # calculate_dcf is the auto-resolving variant — all scalars passed as 0
-    # so the engine pulls them from get_revenue_base / get_market_data / etc.
+    # calculate_dcf: schema says "SET TO 0 -- auto-resolved" but that only
+    # works inside the LangGraph execution engine. At the MCP layer the
+    # math layer accepts zeros and returns garbage with no error key.
+    # Pass realistic MSFT inputs from the B3 pilot for an honest health check.
     ("calculate_dcf",                {
       "ticker": ticker,
-      "revenue_base": 0, "ebitda_margin": 0, "capex_pct_revenue": 0,
-      "tax_rate": 0, "depreciation": 0,
-      "revenue_growth": [0, 0, 0, 0, 0],
-      "wacc": 0, "terminal_growth": 0, "terminal_multiple": 0,
-      "cash": 0, "debt": 0, "shares_outstanding": 0,
+      "revenue_base": 281_700_000_000, "ebitda_margin": 0.556,
+      "capex_pct_revenue": 0.229, "tax_rate": 0.176,
+      "depreciation": 0.078,
+      "revenue_growth": [0.18, 0.16, 0.14, 0.12, 0.10],
+      "wacc": 0.104, "terminal_growth": 0.025, "terminal_multiple": 17.0,
+      "cash": 78_200_000_000, "debt": 125_400_000_000,
+      "shares_outstanding": 7_430_000_000,
     }),
-    # calculate_wacc is auto-resolving too; pass ticker so the engine can
-    # look up beta/cap/debt. ERP must be 0.06 explicitly.
     ("calculate_wacc",               {
       "ticker": ticker,
-      "beta": 0, "risk_free_rate": 0, "equity_risk_premium": 0.06,
-      "cost_of_debt": 0, "tax_rate": 0,
-      "market_cap": 0, "total_debt": 0,
+      "beta": 1.093, "risk_free_rate": 0.042, "equity_risk_premium": 0.06,
+      "cost_of_debt": 0.019, "tax_rate": 0.176,
+      "market_cap": 3_130_000_000_000, "total_debt": 125_400_000_000,
     }),
     ("calculate_scenario_dcf",       {
       "ticker": ticker,
