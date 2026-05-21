@@ -43,13 +43,20 @@ async def _with_mock_broker(handler, fn):
 
 
 def test_credentials_required():
-  for k in ("ALPACA_PAPER_KEY", "ALPACA_PAPER_SECRET"):
+  # AsyncBroker now also falls back to ALPACA_API_KEY/ALPACA_SECRET
+  # (the legacy Alpaca defaults), so clearing only the PAPER_* names
+  # leaves the fallback path intact. Clear both pairs and stub load_dotenv
+  # so the .env file on disk doesn't reintroduce them.
+  from unittest.mock import patch
+  for k in ("ALPACA_PAPER_KEY", "ALPACA_PAPER_SECRET",
+            "ALPACA_API_KEY", "ALPACA_SECRET"):
     os.environ.pop(k, None)
-  try:
-    AsyncBroker(paper=True)
-    raise AssertionError("should have raised on missing creds")
-  except RuntimeError as e:
-    assert "ALPACA_PAPER_KEY" in str(e)
+  with patch("tools.alpaca.async_broker.load_dotenv", lambda: None):
+    try:
+      AsyncBroker(paper=True)
+      raise AssertionError("should have raised on missing creds")
+    except RuntimeError as e:
+      assert "ALPACA_PAPER_KEY" in str(e)
   print("PASS: missing creds raises RuntimeError")
 
 

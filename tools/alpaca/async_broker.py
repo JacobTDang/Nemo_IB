@@ -42,8 +42,14 @@ class AsyncBroker:
   """Minimal async client for Alpaca paper trading.
 
   Construct with `paper=True` (default) for paper, `False` for live.
-  Credentials are read from env: `ALPACA_PAPER_KEY` + `ALPACA_PAPER_SECRET`
-  in paper mode, or `ALPACA_LIVE_KEY` + `ALPACA_LIVE_SECRET` in live.
+  Paper credentials are read from env in priority order:
+    1. `ALPACA_PAPER_KEY` + `ALPACA_PAPER_SECRET` (preferred — explicit)
+    2. `ALPACA_API_KEY` + `ALPACA_SECRET` (legacy fallback — Alpaca's default
+       env-var names; only honored for paper mode)
+  Live mode requires `ALPACA_LIVE_KEY` + `ALPACA_LIVE_SECRET` and never
+  falls back to legacy names — that prevents an unintended live-trade
+  configuration from any account whose credentials happen to live under
+  the generic `ALPACA_API_KEY` pair.
 
   Always use via `async with AsyncBroker() as broker:` so the underlying
   httpx.AsyncClient is closed properly.
@@ -53,15 +59,19 @@ class AsyncBroker:
     load_dotenv()
     self.paper = paper
     if paper:
-      self.key = os.getenv("ALPACA_PAPER_KEY")
-      self.secret = os.getenv("ALPACA_PAPER_SECRET")
+      self.key = os.getenv("ALPACA_PAPER_KEY") or os.getenv("ALPACA_API_KEY")
+      self.secret = os.getenv("ALPACA_PAPER_SECRET") or os.getenv("ALPACA_SECRET")
     else:
       self.key = os.getenv("ALPACA_LIVE_KEY")
       self.secret = os.getenv("ALPACA_LIVE_SECRET")
     if not self.key or not self.secret:
+      if paper:
+        hint = ("Set ALPACA_PAPER_KEY + ALPACA_PAPER_SECRET (preferred) or "
+                "ALPACA_API_KEY + ALPACA_SECRET (legacy) in .env")
+      else:
+        hint = "Set ALPACA_LIVE_KEY + ALPACA_LIVE_SECRET in .env"
       raise RuntimeError(
-        f"Missing Alpaca {'paper' if paper else 'LIVE'} credentials. "
-        f"Set ALPACA_{'PAPER' if paper else 'LIVE'}_KEY and SECRET in .env"
+        f"Missing Alpaca {'paper' if paper else 'LIVE'} credentials. {hint}"
       )
     self.base_url = _PAPER_BASE if paper else _LIVE_BASE
     self._timeout = timeout or _DEFAULT_TIMEOUT
