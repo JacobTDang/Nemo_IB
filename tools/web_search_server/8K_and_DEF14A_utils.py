@@ -1124,18 +1124,66 @@ class SECFilingParser:
 
                 target_year = None
                 if cols['year'] is not None:
-                    try:
-                        years = pd.to_numeric(df.iloc[:, cols['year']], errors='coerce').dropna()
-                        if not years.empty:
-                            target_year = int(years.max())
-                    except: pass
+                    # Probe the identified column AND its merged-duplicate
+                    # neighbors (same fallback logic used per-row below)
+                    yr_idx = cols['year']
+                    yr_lookup = [yr_idx]
+                    yr_header = str(df.columns[yr_idx]).lower().strip()
+                    for j in range(max(0, yr_idx - 1), min(len(df.columns), yr_idx + 3)):
+                        if j != yr_idx and str(df.columns[j]).lower().strip() == yr_header:
+                            yr_lookup.append(j)
+                    for j in yr_lookup:
+                        try:
+                            years = pd.to_numeric(df.iloc[:, j], errors='coerce').dropna()
+                            if not years.empty:
+                                target_year = int(years.max())
+                                break
+                        except: pass
+
+                # Build a list of fallback column indices for `total_comp`
+                # in case the identifier picked a merged-cell duplicate that
+                # holds NaN. SEC tables sometimes split a single header into
+                # two adjacent columns where only one carries values.
+                total_comp_idx = cols['total_comp']
+                total_comp_candidates = [total_comp_idx]
+                if total_comp_idx is not None:
+                    target_header = str(df.columns[total_comp_idx]).lower().strip()
+                    for j in range(max(0, total_comp_idx - 1),
+                                    min(len(df.columns), total_comp_idx + 3)):
+                        if j == total_comp_idx:
+                            continue
+                        if str(df.columns[j]).lower().strip() == target_header:
+                            total_comp_candidates.append(j)
+
+                # Same fallback for year — MSFT's table puts the year value
+                # in the duplicate of two adjacent 'Year' headers.
+                year_idx = cols['year']
+                year_candidates = [year_idx] if year_idx is not None else []
+                if year_idx is not None:
+                    target_header = str(df.columns[year_idx]).lower().strip()
+                    for j in range(max(0, year_idx - 1),
+                                    min(len(df.columns), year_idx + 3)):
+                        if j == year_idx:
+                            continue
+                        if str(df.columns[j]).lower().strip() == target_header:
+                            year_candidates.append(j)
+
+                def _first_non_nan(row, idx_list):
+                    for j in idx_list:
+                        if j is None:
+                            continue
+                        v = str(row.iloc[j]).strip()
+                        if v and v.lower() != 'nan':
+                            return v, j
+                    return '', None
 
                 current_table: List[Dict[str, Any]] = []
                 for row_idx, row in df.iterrows():
                     try:
-                        if target_year and cols['year'] is not None:
+                        if target_year and year_candidates:
+                            yr_raw, _ = _first_non_nan(row, year_candidates)
                             try:
-                                row_year = int(float(str(row.iloc[cols['year']]).strip()))
+                                row_year = int(float(yr_raw))
                                 if row_year != target_year: continue
                             except: pass
 
@@ -1147,7 +1195,7 @@ class SECFilingParser:
 
                         name = name_obj.full_name
 
-                        val_raw = str(row.iloc[cols['total_comp']])
+                        val_raw, _ = _first_non_nan(row, total_comp_candidates)
                         val_str = re.sub(r'[^\d.]', '', val_raw)
                         if not val_str: continue
                         total = float(val_str)
