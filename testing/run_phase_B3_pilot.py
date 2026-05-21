@@ -428,8 +428,23 @@ async def run(ticker: str) -> dict:
     cf_latest = cf_periods[0] if cf_periods else {}
     dividends_paid = cf_latest.get("dividendsPaid") or 0
     shares_repurchased = cf_latest.get("repurchaseOfCapitalStock") or 0
+    cap_returns_source = "cf_statement" if dividends_paid or shares_repurchased else "none"
+
+    # Yield-based fallback when CF statement is unavailable (e.g. Finnhub
+    # free tier returns 403 for /stock/financials). currentDividendYieldTTM
+    # is available on free tier, so impute dividends_paid from it.
+    # No equivalent free-tier buyback metric exists, so buybacks stay 0
+    # until a paid data source provides them.
+    if not dividends_paid and market_cap:
+      div_yield_pct = _scrape(
+        vendor_results.get("get_basic_financials", {}) or {},
+        "data", "metric", "currentDividendYieldTTM",
+      )
+      if div_yield_pct and isinstance(div_yield_pct, (int, float)):
+        dividends_paid = round(market_cap * (div_yield_pct / 100.0), 2)
+        cap_returns_source = "imputed_from_yield"
     if ebitda_abs and capex_abs and tax_rate and dep_abs:
-      calc_results["calculate_capital_returns"] = await _call(
+      result = await _call(
         mcp, "calculate_capital_returns",
         {
           "ticker": ticker,
@@ -444,6 +459,10 @@ async def run(ticker: str) -> dict:
         },
         log,
       )
+      # Tag the source so the write-up can disclose imputed vs sourced figures.
+      if isinstance(result, dict):
+        result.setdefault("_driver_meta", {})["capital_returns_source"] = cap_returns_source
+      calc_results["calculate_capital_returns"] = result
     else:
       calc_results["calculate_capital_returns"] = {
         "skipped": "missing scalar inputs"
