@@ -276,6 +276,17 @@ async def run(ticker: str) -> dict:
     for tool, args in vendor_calls:
       vendor_results[tool] = await _call(mcp, tool, args, log)
 
+    # Cash-flow + balance-sheet variants of get_financial_statements — needed
+    # for real buyback / dividend yields in calculate_capital_returns;
+    # otherwise both report 0% (B3 pilot finding). Stored under separate
+    # dict keys so they don't overwrite the income-statement result.
+    vendor_results["get_financial_statements_cf"] = await _call(
+      mcp, "get_financial_statements",
+      {"ticker": ticker, "statement": "cf", "freq": "annual"}, log)
+    vendor_results["get_financial_statements_bs"] = await _call(
+      mcp, "get_financial_statements",
+      {"ticker": ticker, "statement": "bs", "freq": "annual"}, log)
+
     # =========================
     # Phase 3 -- Calculations (comps + DCF + credit + capital returns)
     # =========================
@@ -410,9 +421,13 @@ async def run(ticker: str) -> dict:
         "skipped": "missing scalar inputs (ebitda/dep/capex/tax)"
       }
 
-    fin_data = _scrape(fin_stmt, "data") or {}
-    dividends_paid = fin_data.get("dividends_paid") or 0
-    shares_repurchased = fin_data.get("shares_repurchased") or 0
+    # Cash-flow data drives buyback + dividend yields in capital returns.
+    # Finnhub returns camelCase keys; calculate_capital_returns wants snake_case.
+    cf_stmt = vendor_results.get("get_financial_statements_cf", {}) or {}
+    cf_periods = _scrape(cf_stmt, "data", "periods") or []
+    cf_latest = cf_periods[0] if cf_periods else {}
+    dividends_paid = cf_latest.get("dividendsPaid") or 0
+    shares_repurchased = cf_latest.get("repurchaseOfCapitalStock") or 0
     if ebitda_abs and capex_abs and tax_rate and dep_abs:
       calc_results["calculate_capital_returns"] = await _call(
         mcp, "calculate_capital_returns",
