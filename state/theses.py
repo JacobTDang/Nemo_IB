@@ -24,22 +24,91 @@ def insert_thesis(
   data_gaps: List[str],
   full_report_md: str,
   arbiter_verdict_id: Optional[int] = None,
+  falsifiers: Optional[List[str]] = None,
+  variant_perception: Optional[str] = None,
 ) -> int:
-  """Insert a new thesis row. Returns thesis_id."""
+  """Insert a new thesis row. Returns thesis_id.
+
+  `falsifiers` is the Soros-discipline required field — what specific
+  observable would prove this thesis wrong? Cannot be empty for analyst
+  workflow integrity.
+
+  `variant_perception` is the differentiated view vs consensus.
+  """
   conn = get_connection()
   try:
     cur = conn.execute("""
       INSERT INTO theses
         (ticker, thesis_date, recommendation, signal, target_price, stop_loss,
          confidence, analysis_summary, key_assumptions, data_gaps,
-         full_report_md, arbiter_verdict_id, superseded_by)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL)
+         full_report_md, arbiter_verdict_id, superseded_by,
+         falsifiers, variant_perception)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,?)
     """, (ticker.upper(), datetime.now().isoformat(),
           recommendation, signal, target_price, stop_loss, confidence,
           analysis_summary, json.dumps(key_assumptions or []),
-          json.dumps(data_gaps or []), full_report_md, arbiter_verdict_id))
+          json.dumps(data_gaps or []), full_report_md, arbiter_verdict_id,
+          json.dumps(falsifiers or []), variant_perception))
     conn.commit()
     return cur.lastrowid
+  finally:
+    conn.close()
+
+
+def record_thesis_evolution(
+  thesis_id: int,
+  observation: str,
+  conviction_delta: float,
+  tag: Optional[str] = None,
+) -> int:
+  """Record a check-in against an existing thesis. Returns evolution_id.
+
+  Use after new data arrives (earnings print, news, macro shift) to log
+  how the analyst's conviction shifted and why. The cumulative evolution
+  log is the Soros-style reflexivity trace.
+
+  `observation`: free text — what happened, what the data showed
+  `conviction_delta`: positive = conviction up, negative = down (in 0.0-1.0 units)
+  `tag`: optional category — 'earnings', 'macro', 'insider', 'sector', etc.
+  """
+  conn = get_connection()
+  try:
+    # Resolve current conviction
+    row = conn.execute("SELECT ticker, confidence FROM theses WHERE thesis_id = ?",
+                       (thesis_id,)).fetchone()
+    if not row:
+      raise ValueError(f"thesis {thesis_id} not found")
+    ticker = row['ticker']
+    prev_conviction = float(row['confidence'] or 0)
+    # Compute new conviction (clamped 0-1)
+    new_conviction = max(0.0, min(1.0, prev_conviction + conviction_delta))
+
+    cur = conn.execute("""
+      INSERT INTO thesis_evolution
+        (thesis_id, ticker, timestamp, observation, conviction_delta,
+         new_conviction, tag)
+      VALUES (?,?,?,?,?,?,?)
+    """, (thesis_id, ticker, datetime.now().isoformat(),
+          observation, conviction_delta, new_conviction, tag))
+    # Update the thesis's current confidence
+    conn.execute("UPDATE theses SET confidence = ? WHERE thesis_id = ?",
+                 (new_conviction, thesis_id))
+    conn.commit()
+    return cur.lastrowid
+  finally:
+    conn.close()
+
+
+def get_thesis_evolution(thesis_id: int) -> List[Dict[str, Any]]:
+  """Full chronological evolution log for a thesis — the reflexivity trace."""
+  conn = get_connection()
+  try:
+    rows = conn.execute("""
+      SELECT * FROM thesis_evolution
+      WHERE thesis_id = ?
+      ORDER BY timestamp ASC
+    """, (thesis_id,)).fetchall()
+    return [dict(r) for r in rows]
   finally:
     conn.close()
 
@@ -58,6 +127,11 @@ def latest_thesis(ticker: str) -> Optional[Dict[str, Any]]:
     d = dict(row)
     d['key_assumptions'] = json.loads(d.get('key_assumptions') or '[]')
     d['data_gaps'] = json.loads(d.get('data_gaps') or '[]')
+    if d.get('falsifiers'):
+      try:
+        d['falsifiers'] = json.loads(d['falsifiers'])
+      except (TypeError, ValueError):
+        d['falsifiers'] = []
     return d
   finally:
     conn.close()
@@ -100,6 +174,11 @@ def get_thesis(thesis_id: int) -> Optional[Dict[str, Any]]:
     d = dict(row)
     d['key_assumptions'] = json.loads(d.get('key_assumptions') or '[]')
     d['data_gaps'] = json.loads(d.get('data_gaps') or '[]')
+    if d.get('falsifiers'):
+      try:
+        d['falsifiers'] = json.loads(d['falsifiers'])
+      except (TypeError, ValueError):
+        d['falsifiers'] = []
     return d
   finally:
     conn.close()
@@ -118,6 +197,11 @@ def active_theses(limit: int = 100) -> List[Dict[str, Any]]:
       d = dict(r)
       d['key_assumptions'] = json.loads(d.get('key_assumptions') or '[]')
       d['data_gaps'] = json.loads(d.get('data_gaps') or '[]')
+      if d.get('falsifiers'):
+        try:
+          d['falsifiers'] = json.loads(d['falsifiers'])
+        except (TypeError, ValueError):
+          d['falsifiers'] = []
       out.append(d)
     return out
   finally:

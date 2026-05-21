@@ -99,23 +99,120 @@ CREATE_SCHEMA = [
         arbiter_verdict_id  INTEGER,
         paper               BOOLEAN DEFAULT 1
     )""",
+
+    # --- Phase 11: thesis_evolution (Soros reflexivity log) ---
+    # Tracks how a thesis's conviction evolves over time as new
+    # observations arrive. Each row is a check-in against the originating
+    # thesis_id with a conviction delta and a free-text observation.
+    """CREATE TABLE IF NOT EXISTS thesis_evolution(
+        evolution_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        thesis_id           INTEGER NOT NULL,
+        ticker              TEXT,
+        timestamp           TIMESTAMP,
+        observation         TEXT,
+        conviction_delta    REAL,
+        new_conviction      REAL,
+        tag                 TEXT,
+        FOREIGN KEY (thesis_id) REFERENCES theses(thesis_id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_thesis_evolution_thesis ON thesis_evolution(thesis_id, timestamp)",
+
+    # --- RAG: chunked text documents for retrieval-augmented generation ---
+    # Each row stores a chunk of source text (filing section, news body, etc).
+    # The companion `rag_chunk_embeddings` vec0 virtual table holds a 384-dim
+    # float embedding keyed by rowid == chunk_id (paired INSERT keeps them in
+    # sync). Created in init_schema() because vec0 needs the loaded extension.
+    """CREATE TABLE IF NOT EXISTS rag_chunks(
+        chunk_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        doc_id          TEXT NOT NULL,
+        ticker          TEXT,
+        source_tool     TEXT,
+        doc_type        TEXT,
+        filing_date     TIMESTAMP,
+        item_number     TEXT,
+        section_heading TEXT,
+        chunk_text      TEXT NOT NULL,
+        chunk_offset    INTEGER,
+        chunk_sequence  INTEGER,
+        created_at      TIMESTAMP,
+        UNIQUE(doc_id, chunk_sequence)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_rag_chunks_ticker ON rag_chunks(ticker, doc_type, filing_date)",
+    "CREATE INDEX IF NOT EXISTS idx_rag_chunks_doc ON rag_chunks(doc_id)",
+]
+
+
+# Soros reflexivity columns added to theses via ALTER TABLE (migration).
+# Old DBs lacking these columns will get them on next init_schema() call.
+_THESES_MIGRATIONS = [
+    ("falsifiers",          "TEXT"),
+    ("variant_perception",  "TEXT"),
 ]
 
 
 def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
-    """Open a connection with row factory set for dict-like access."""
+    """Open a connection with row factory set for dict-like access.
+
+    Also loads the sqlite-vec extension on every connection so the
+    `rag_chunk_embeddings` virtual table is usable. If sqlite-vec is not
+    installed (e.g. in a minimal environment) the import is skipped silently
+    so non-RAG code paths continue to work.
+    """
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+    try:
+        import sqlite_vec
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+    except (ImportError, AttributeError, sqlite3.OperationalError):
+        # sqlite-vec not installed or platform doesn't support extension
+        # loading; RAG features will fail loudly at query time which is
+        # the correct behavior.
+        pass
     return conn
 
 
 def init_schema(db_path: str = DB_PATH) -> None:
-    """Create all autonomous-system tables if they don't exist."""
+    """Create all autonomous-system tables if they don't exist, and run
+    additive ALTER TABLE migrations for new columns on existing rows.
+
+    Also creates the sqlite-vec virtual table `rag_chunk_embeddings` so
+    chunk_id rows in `rag_chunks` can be paired with a 384-dim float
+    embedding (rowid == chunk_id by convention).
+    """
     conn = get_connection(db_path)
     try:
         for stmt in CREATE_SCHEMA:
             conn.execute(stmt)
+
+        # Additive migrations: ALTER TABLE ADD COLUMN is a no-op error if
+        # the column already exists. SQLite raises an OperationalError we
+        # catch and ignore.
+        existing_cols = {row['name'] for row in
+                         conn.execute("PRAGMA table_info(theses)").fetchall()}
+        for col_name, col_type in _THESES_MIGRATIONS:
+            if col_name not in existing_cols:
+                try:
+                    conn.execute(f"ALTER TABLE theses ADD COLUMN {col_name} {col_type}")
+                except sqlite3.OperationalError:
+                    pass
+
+        # vec0 virtual table for chunk embeddings. Requires the sqlite-vec
+        # extension to be loaded on this connection (handled by
+        # get_connection above). all-MiniLM-L6-v2 produces 384-dim vectors.
+        try:
+            import sqlite_vec  # noqa: F401  (presence check)
+            conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS rag_chunk_embeddings "
+                "USING vec0(embedding float[384])"
+            )
+        except (ImportError, sqlite3.OperationalError) as exc:
+            # If sqlite-vec is missing the RAG feature is unusable but the
+            # rest of the schema is still valid. Print a single warning
+            # rather than failing the whole init.
+            print(f"[Schema] WARNING: rag_chunk_embeddings not created: {exc}")
         conn.commit()
     finally:
         conn.close()
