@@ -221,7 +221,14 @@ Required checks:
   (above)?
 - SBC dilution rate
 - Insider ownership level
-- Insider buying / selling pattern
+- Insider buying / selling pattern — **MUST** cite
+  `current_vs_baseline_ratio` from `get_insider_transactions`.
+  Qualitative descriptors ("loud", "heavy", "significant",
+  "concerning", "alarming") are permitted ONLY when the ratio
+  exceeds 1.5x. Below 1.5x, describe activity as "in line with
+  baseline" and treat it as non-signal. If the ratio is `None`
+  (< 30 days of prior coverage), state `data_gap` and move on —
+  do not improvise a qualitative claim from raw counts.
 - CFO / COO / key technical role turnover
 - Compensation incentive structure
 
@@ -290,6 +297,11 @@ Output:
 
 Hard rule: do not skip positioning. Deep fundamental work can still
 lose money if the setup is already crowded.
+
+Hard rule (insider activity): the same baseline-ratio discipline from
+Step 9 applies here. If Step 11 cites insider buying / selling, the
+narrative MUST reference `current_vs_baseline_ratio`. Soft language
+without the ratio is a Step 11 violation.
 
 ## Step 12 — Valuation and expectations
 
@@ -437,13 +449,30 @@ Required sections (in this order):
 4. **Why now** — catalyst path and timing
 5. **Bull case** — 3-5 cited factors
 6. **Bear case** — 3-5 cited factors
-7. **Valuation / expectations** — from Step 12 companion output
+7. **Valuation / expectations** — from Step 12 companion output.
+   If the upstream `/scenario-builder` envelope contains a
+   `terminal_sensitivity` field, render it as a 3-row x N-column
+   markdown table here (bear / base / bull across the five
+   multiples). Any price target cited in Section 2 (Decision) or
+   Section 14 (Position sizing) MUST reference a corresponding
+   cell. Citing a price target without showing the sensitivity
+   table is a Section 7 violation. If the field is absent because
+   scenario DCF was run in perpetuity-only mode, state that
+   explicitly.
 8. **Scenario analysis** — from Step 16 companion output
 9. **Positioning** — crowding, ownership, short interest, activist
-   risk
+   risk. Any insider-activity narrative MUST cite
+   `current_vs_baseline_ratio` per the Step 9 / Step 11 rules.
 10. **Portfolio fit** — from Step 18 `/portfolio-fit` companion output
-11. **Factor exposure** — from Step 18 `/factor-exposure-check`;
-    include stock-specific-alpha estimate and factor reversal risks
+11. **Factor exposure** — from Step 18 `/factor-exposure-check`.
+    MUST contain the literal verdict tag from the companion envelope
+    (`mostly_alpha` / `partial_alpha` / `mostly_factor`) on its own
+    line, AND render the 6-row factor table verbatim (Market beta,
+    Momentum, Theme beta, Rate sensitivity, Commodity sensitivity,
+    USD strength). Paraphrased "exposure" or "correlation" paragraphs
+    are not a substitute and will fail the Step 19 verification.
+    Always include factor reversal risks for any factor classified
+    `high`.
 12. **Expectations setup** — from Step 18 `/expectations-hurdle-check`
     + `/estimate-revision-watch`; one paragraph synthesizing both
 13. **Pre-entry kill-switch** — from Step 18 `/thesis-kill-switch`;
@@ -455,6 +484,28 @@ Required sections (in this order):
     exit. Without these, the position cannot be stopped out rationally.
 17. **Data gaps** — tools / sources that failed or were unavailable
 18. **Next monitoring checklist** — what to check next and when
+
+### Verification before save
+
+Before writing the file or calling `record_thesis_evolution`, re-read
+the synthesis once and confirm each of the following. Missing any of
+these → patch the synthesis in place, do NOT save yet.
+
+(a) **Section 7** cites the `terminal_sensitivity` table if the
+    scenario DCF ran with `terminal_multiple > 0`. Any cited price
+    target traces to a sensitivity cell.
+
+(b) **Section 11** contains the literal `mostly_alpha` /
+    `partial_alpha` / `mostly_factor` verdict tag from
+    `/factor-exposure-check` AND the 6-row factor table verbatim.
+
+(c) Every insider-activity claim in Sections 9 (Positioning) and
+    elsewhere cites `current_vs_baseline_ratio`. No "loud" / "heavy"
+    / "concerning" without ratio > 1.5x.
+
+If any item fails the check, the synthesis is incomplete. Fix it
+before saving — silently writing an under-specified report is a
+discipline failure, not a graceful degradation.
 
 Save the synthesis to:
 `testing/fixtures/research_<TICKER>_<DATE>.md`
