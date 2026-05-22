@@ -9,6 +9,14 @@ After every closed position — winner or loser — write a structured
 postmortem. The goal is NOT to feel good about wins or bad about
 losses. The goal is to update the priors used in future research.
 
+**Companion**: invoke `/post-mortem-attribution` for the quantitative
+return decomposition (selection vs sector vs multiple vs earnings vs
+beta). This skill handles the qualitative "what was the lesson"
+pass; the companion captures the math. The combination catches the
+dangerous case where the position was "right for the wrong reason"
+(e.g., the thesis called for multiple expansion but the actual return
+was 80% market beta).
+
 ## Inputs
 
 - The ticker

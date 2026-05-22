@@ -383,7 +383,47 @@ a recommendation: keep / reduce confidence / reduce size / no_position.
 Hard rule: if the red team finds a stronger argument than the bull
 thesis, downgrade confidence or output `no_position`.
 
-## Step 18 — Final synthesis and thesis recording
+## Step 18 — Portfolio, expectations, and kill-switch layer
+
+For any thesis with sizing >= cautious (i.e., not `no_position`),
+DELEGATE the following five companion skills **in parallel** via the
+Skill tool. Each returns a structured envelope that gets folded into
+the final synthesis.
+
+1. **`/portfolio-fit`** — does this fit the current paper book?
+   Returns: `strong / acceptable / weak / reject` + recommended max
+   size + duplicate exposure flag.
+2. **`/factor-exposure-check`** — is this stock-specific alpha or
+   factor beta? Returns: `mostly alpha / partial alpha / mostly
+   factor` + factor reversal risks.
+3. **`/estimate-revision-watch`** — will sell-side analysts revise
+   numbers on this thesis? Returns: predicted revision direction +
+   sell-side-vs-data alignment.
+4. **`/expectations-hurdle-check`** — what does the buyside whisper
+   imply vs published consensus? Returns: setup classification
+   (`easy / balanced / difficult`).
+5. **`/thesis-kill-switch`** (pre-entry mode) — would any of the
+   declared falsifiers trigger on day 1 with current data? Returns:
+   per-falsifier status + kill-switch verdict.
+
+Pass each companion the synthesis context built in Steps 1-17.
+
+**Hard rules — these can override the upstream thesis sizing**:
+
+- If `/portfolio-fit` returns `reject` → downgrade sizing to
+  `watchlist` regardless of standalone thesis quality.
+- If `/factor-exposure-check` returns `mostly factor` AND the variant
+  perception is itself factor-directional (rather than stock-
+  specific) → downgrade or output `no_position`. The thesis is just
+  disguised beta.
+- If `/thesis-kill-switch` reports ANY proposed falsifier would
+  trigger on day 1 → do NOT enter. The thesis is born broken;
+  rework the falsifier list or reframe the thesis.
+- If `/expectations-hurdle-check` returns `difficult` AND
+  `/estimate-revision-watch` predicts downward revisions → reduce
+  size by at least 50%, even if the standalone thesis is strong.
+
+## Step 19 — Final synthesis and thesis recording
 
 Compose the final synthesis. Target ≤ 2 pages of markdown unless the
 user explicitly asks for more.
@@ -401,12 +441,20 @@ Required sections (in this order):
 8. **Scenario analysis** — from Step 16 companion output
 9. **Positioning** — crowding, ownership, short interest, activist
    risk
-10. **Position sizing** — aggressive / normal / cautious / no_position
-11. **Confidence** — 0.0 to 1.0
-12. **Falsifiers** — REQUIRED. Specific observables that would force
+10. **Portfolio fit** — from Step 18 `/portfolio-fit` companion output
+11. **Factor exposure** — from Step 18 `/factor-exposure-check`;
+    include stock-specific-alpha estimate and factor reversal risks
+12. **Expectations setup** — from Step 18 `/expectations-hurdle-check`
+    + `/estimate-revision-watch`; one paragraph synthesizing both
+13. **Pre-entry kill-switch** — from Step 18 `/thesis-kill-switch`;
+    per-falsifier status table
+14. **Position sizing** — aggressive / normal / cautious / no_position
+    (must honor any downgrade from Step 18 hard rules)
+15. **Confidence** — 0.0 to 1.0
+16. **Falsifiers** — REQUIRED. Specific observables that would force
     exit. Without these, the position cannot be stopped out rationally.
-13. **Data gaps** — tools / sources that failed or were unavailable
-14. **Next monitoring checklist** — what to check next and when
+17. **Data gaps** — tools / sources that failed or were unavailable
+18. **Next monitoring checklist** — what to check next and when
 
 Save the synthesis to:
 `testing/fixtures/research_<TICKER>_<DATE>.md`
@@ -443,6 +491,20 @@ row in `state.theses` and assign an ID; out of scope here.)
   even if the story sounds strong.
 - If the red-team argument is stronger than the thesis, output
   `no_position` or reduce sizing.
+- **Paper-only context**: never propose strategies that only make
+  sense with real capital (dividend capture, tax-loss harvesting,
+  wash-sale-driven structuring, real-money options writing). If a
+  strategy is surfaced that only works with real capital, mark it
+  "paper-only thought exercise" and do not size into it.
+- **Time budget**: a full run should target 10-20 minutes wall
+  clock. If any single tool call has been pending > 60 seconds, log
+  the slow tool as `data_gap` and continue without it. Do not block
+  synthesis on slow SEC fetches.
+- **Step 18 overrides Step 17**: if `/portfolio-fit` returns `reject`
+  OR `/factor-exposure-check` returns `mostly factor` AND variant
+  perception is factor-directional, the final sizing must be
+  downgraded regardless of how strong the standalone red-team-cleared
+  thesis looks. Portfolio reality wins.
 
 ## Output discipline
 
