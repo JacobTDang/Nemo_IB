@@ -1,20 +1,39 @@
 from typing import Any, Dict, Optional
 from edgar import Company, set_identity
 from edgar.xbrl import XBRL
+from collections import OrderedDict
 import pandas as pd
 import os
 import re
 import sys
+import threading
 # useful documentation for edgartools xbrl: https://edgartools.readthedocs.io/en/latest/getting-xbrl/
 
 # set identity first
 NAME = os.getenv('NAME', 'Investment Analyst')
 SEC_EMAIL = os.getenv('SEC_EMAIL', 'analyst@example.com')
 
-# Module-level cache: prevents the 4 SEC tools (ebitda, capex, tax, depreciation) from each
-# downloading and parsing the same 10-K XBRL independently. Within one MCP server process
-# lifetime the filing content doesn't change, so caching is safe.
-_filing_cache: Dict[tuple, Any] = {}
+# Single-flight LRU cache for SEC filing fetches. The previous plain-dict cache
+# had a check-then-fill race: N concurrent threads asking for the same
+# (ticker, form_type) all saw "miss" and all hit SEC EDGAR in parallel, which
+# triggers rate limiting on heavy 10-Ks (AMD, MSFT). Now a per-key lock
+# serializes concurrent callers — only one thread fetches, the rest block and
+# return the cached result. OrderedDict bounds growth across long sessions.
+_FILING_CACHE_MAX = 32
+_filing_cache_lru: "OrderedDict[tuple, Any]" = OrderedDict()
+_filing_key_locks: Dict[tuple, threading.Lock] = {}
+_filing_locks_master = threading.Lock()
+
+
+def _get_filing_lock(key: tuple) -> threading.Lock:
+  """Return (creating if needed) the per-key lock for a cache key. The master
+  lock is held only for the dict insert, so it never blocks an SEC fetch."""
+  with _filing_locks_master:
+    lock = _filing_key_locks.get(key)
+    if lock is None:
+      lock = threading.Lock()
+      _filing_key_locks[key] = lock
+    return lock
 
 
 def filter_instant_data(xbrl, concept: str) -> Optional[Dict[str, Any]]:
@@ -114,53 +133,65 @@ def filter_annual_data(xbrl, concept: str, form_type: str = '10-K') -> Optional[
 def get_latest_filing(ticker: str, form_type: str = '10-K') -> Optional[Dict[str, Any]]:
   """Get latest SEC filing with XBRL data.
 
-  Results are cached in-process by (ticker, form_type) key.
-  When multiple SEC tools run in the same parallel batch (e.g. get_ebitda_margin,
-  get_capex_pct_revenue, get_tax_rate, get_depreciation all called concurrently),
-  the cache prevents 4 duplicate 10-K downloads that would trigger SEC rate limiting.
+  Single-flight LRU cache: when N tools call this concurrently for the same
+  (ticker, form_type), only one thread performs the SEC download; the rest
+  block on a per-key lock and return the cached result. Cache is bounded to
+  _FILING_CACHE_MAX entries (LRU eviction) so long deep-research sessions
+  don't grow memory indefinitely. Failures are also cached to avoid retry
+  storms within one process lifetime.
   """
   cache_key = (ticker.upper(), form_type)
-  if cache_key in _filing_cache:
-    return _filing_cache[cache_key]
 
-  result = None
-  try:
-    # Set identity globally first
-    set_identity(f"{NAME} {SEC_EMAIL}")
+  # Fast path: cache hit, no lock acquisition needed.
+  if cache_key in _filing_cache_lru:
+    _filing_cache_lru.move_to_end(cache_key)
+    return _filing_cache_lru[cache_key]
 
-    # Create company object and get filings
-    company = Company(ticker)
-    filings = company.get_filings(form=form_type)
+  lock = _get_filing_lock(cache_key)
+  with lock:
+    # Re-check inside the lock — a peer thread may have filled the cache
+    # while we were waiting on the lock.
+    if cache_key in _filing_cache_lru:
+      _filing_cache_lru.move_to_end(cache_key)
+      return _filing_cache_lru[cache_key]
 
-    if filings:
-      latest_filing = filings[0]
-
-      # Get XBRL data
-      try:
-        xbrl_data = latest_filing.xbrl()
-      except Exception:
-        xbrl_data = None
-
-      # Get filing URL
-      url = None
-      for attr in ['filing_url', 'url', 'filing_details_url', 'document_url']:
-        if hasattr(latest_filing, attr):
-          url = getattr(latest_filing, attr)
-          break
-
-      result = {
-        'filing_date': latest_filing.filing_date,
-        'url': url,
-        'accession_number': latest_filing.accession_number,
-        'filing_object': latest_filing,
-        'xbrl_data': xbrl_data
-      }
-
-  except Exception:
     result = None
+    try:
+      set_identity(f"{NAME} {SEC_EMAIL}")
+      company = Company(ticker)
+      filings = company.get_filings(form=form_type)
 
-  _filing_cache[cache_key] = result
-  return result
+      if filings:
+        latest_filing = filings[0]
+        try:
+          xbrl_data = latest_filing.xbrl()
+        except Exception:
+          xbrl_data = None
+
+        url = None
+        for attr in ['filing_url', 'url', 'filing_details_url', 'document_url']:
+          if hasattr(latest_filing, attr):
+            url = getattr(latest_filing, attr)
+            break
+
+        result = {
+          'filing_date': latest_filing.filing_date,
+          'url': url,
+          'accession_number': latest_filing.accession_number,
+          'filing_object': latest_filing,
+          'xbrl_data': xbrl_data,
+        }
+    except Exception:
+      result = None
+
+    _filing_cache_lru[cache_key] = result
+    # LRU eviction: drop oldest entries (and their per-key locks) above cap.
+    while len(_filing_cache_lru) > _FILING_CACHE_MAX:
+      evicted_key, _ = _filing_cache_lru.popitem(last=False)
+      with _filing_locks_master:
+        _filing_key_locks.pop(evicted_key, None)
+
+    return result
 
 def get_disclosures_names(ticker:str, form_type: str = '10-K') -> Dict[str, Any]:
   # get the disclosure name for agent to use
