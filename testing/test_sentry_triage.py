@@ -178,6 +178,51 @@ def test_schema_idempotent():
   _check("init_schema called twice without error", True)
 
 
+def test_misclassified_ticker_not_enqueued():
+  """The AAPL-in-ECB-payments-story regression: when the classifier has no
+  primary_ticker and the raw event.ticker is NOT in affected_tickers, the
+  triage daemon must skip with no_clear_ticker rather than enqueue under
+  the loose news-provider tag."""
+  print("\n== misclassified ticker (raw != affected) is NOT enqueued ==")
+  _cleanup()
+  import json as _json
+
+  # Inject an event shaped exactly like the production AAPL bug:
+  #   raw ticker = 'AAPL'      (news provider's loose tag)
+  #   primary_ticker = NULL    (classifier had no clear primary)
+  #   affected_tickers = [V, MA]  (real subjects per classifier)
+  conn = get_connection()
+  try:
+    conn.execute(
+      """INSERT INTO events
+         (event_id, source, ticker, headline, body, url, published_at, ingested_at,
+          materiality, category, affected_tickers, primary_ticker,
+          directional_signal, urgency, classifier_reason, processed)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)""",
+      (f'{_TEST_PREFIX_EVENT}MC', 'finnhub:Yahoo', f'{_TEST_PREFIX_TICKER}AAPL',
+       'ECB / Visa / Mastercard payments rift story',
+       'unrelated body', 'http://x',
+       datetime.now(timezone.utc).isoformat(),
+       datetime.now(timezone.utc).isoformat(),
+       'high', 'regulatory',
+       _json.dumps([f'{_TEST_PREFIX_TICKER}V', f'{_TEST_PREFIX_TICKER}MA']),
+       None,  # primary_ticker
+       'mixed', 'days', 'test'),
+    )
+    conn.commit()
+  finally:
+    conn.close()
+
+  counts = tick(skip_discovery=True)
+  _check("no_clear_ticker >= 1 (raw ticker not corroborated)",
+         counts.get('no_clear_ticker', 0) >= 1,
+         f"counts={counts}")
+  pending = sentry_queue.dequeue_top(10)
+  bad = [r for r in pending if r['ticker'] == f'{_TEST_PREFIX_TICKER}AAPL']
+  _check("misclassified AAPL NOT in queue",
+         len(bad) == 0, f"unexpected queue rows: {bad}")
+
+
 def main():
   print("\nSentry triage integration tests\n")
   test_schema_idempotent()
@@ -186,6 +231,7 @@ def main():
   test_cooldown_skip()
   test_idempotency()
   test_no_ticker_event()
+  test_misclassified_ticker_not_enqueued()
   _cleanup()
 
   print(f"\n== Summary ==\n  PASS: {_results['pass']}\n  FAIL: {_results['fail']}")
