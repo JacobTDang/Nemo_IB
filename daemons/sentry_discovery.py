@@ -59,7 +59,9 @@ DEFAULT_THEMES = [
 IPO_LOOKAHEAD_DAYS = 10
 IPO_MIN_MKT_CAP_USD = 1_000_000_000    # $1B floor to filter micro-cap noise
 IPO_SCORE = 0.70                       # high — new listings are decay-fresh signal
-IPO_VALID_EXCHANGES = {'NASDAQ', 'NYSE', 'NYSE ARCA', 'NYSE AMERICAN'}
+# Finnhub returns full exchange names like "NASDAQ Capital", "NASDAQ Global",
+# "NYSE MKT", "NYSE Arca". Use prefix match so all sub-tiers count as US.
+IPO_VALID_EXCHANGE_PREFIXES = ('NASDAQ', 'NYSE')
 
 # Universe insider cluster tuning
 UNIVERSE_INSIDER_SCORE = 0.68          # below watchlist version (less context)
@@ -952,7 +954,7 @@ def scan_ipo_calendar(lookahead_days: int = IPO_LOOKAHEAD_DAYS,
       continue
 
     exchange = (entry.get('exchange') or '').upper()
-    if exchange not in IPO_VALID_EXCHANGES:
+    if not any(exchange.startswith(p) for p in IPO_VALID_EXCHANGE_PREFIXES):
       counts['wrong_exchange'] += 1
       continue
 
