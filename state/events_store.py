@@ -64,7 +64,7 @@ def seen(source: str, headline: str, published_at: str) -> bool:
     conn.close()
 
 
-_MATERIALITY_RANK = {'high': 3, 'medium': 2, 'low': 1, 'noise': 0}
+_MATERIALITY_RANK = {'critical': 4, 'high': 3, 'medium': 2, 'low': 1, 'noise': 0}
 
 
 def unprocessed_events(min_materiality: str = 'medium', limit: int = 100) -> List[Dict[str, Any]]:

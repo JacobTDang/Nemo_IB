@@ -139,6 +139,49 @@ CREATE_SCHEMA = [
     )""",
     "CREATE INDEX IF NOT EXISTS idx_rag_chunks_ticker ON rag_chunks(ticker, doc_type, filing_date)",
     "CREATE INDEX IF NOT EXISTS idx_rag_chunks_doc ON rag_chunks(doc_id)",
+
+    # --- Sentry: evaluation log (every ticker the autonomous loop considers) ---
+    # The eval log is the system's memory. Sentry checks it before queueing to
+    # avoid re-researching the same name during a cooldown window. Each row
+    # captures: which channel triggered the consideration, the decision, the
+    # verdict if researched, and a computed next_review_at timestamp based on
+    # cooldown rules (acted/buy=7d, watchlist=14d, avoid/no_position=30d).
+    """CREATE TABLE IF NOT EXISTS sentry_evaluation_log(
+        eval_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticker            TEXT NOT NULL,
+        evaluated_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        triggered_by      TEXT NOT NULL,
+        trigger_event_id  TEXT,
+        decision          TEXT NOT NULL,
+        verdict           TEXT,
+        confidence        REAL,
+        sizing            TEXT,
+        factor_buckets    TEXT,
+        skip_reason       TEXT,
+        next_review_at    TIMESTAMP,
+        notes             TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_eval_ticker_date ON sentry_evaluation_log(ticker, evaluated_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_eval_next_review ON sentry_evaluation_log(next_review_at) WHERE next_review_at IS NOT NULL",
+
+    # --- Sentry: triage queue (candidates awaiting Claude review) ---
+    # The triage daemon writes pending rows; the /sentry-tick skill reads top-N
+    # by score and processes them. The unique index on (ticker) WHERE status='pending'
+    # enforces deduplication at the DB layer — same ticker can't be queued twice
+    # simultaneously across discovery channels.
+    """CREATE TABLE IF NOT EXISTS sentry_queue(
+        queue_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticker            TEXT NOT NULL,
+        source_event_id   TEXT,
+        triggered_by      TEXT NOT NULL,
+        score             REAL NOT NULL,
+        queued_at         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        status            TEXT NOT NULL DEFAULT 'pending',
+        processed_at      TIMESTAMP,
+        notes             TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_queue_status_score ON sentry_queue(status, score DESC)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_ticker_pending ON sentry_queue(ticker) WHERE status = 'pending'",
 ]
 
 
