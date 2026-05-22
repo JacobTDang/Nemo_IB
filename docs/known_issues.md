@@ -134,3 +134,90 @@ PATH, falls back to `$HOME/.bun/bin/bun.exe`, and fails loudly with an
 install URL if neither is found.
 
 **Priority:** low (handled).
+
+## MCP stdio hangs on long-lived nemo_openbb / nemo_sentry processes (overnight 2026-05-22)
+
+**Surfaced by:** Several MCP tool invocations hung indefinitely from the
+Claude Code client side: `mcp__nemo_openbb__obb_insider_trading`,
+`mcp__nemo_openbb__obb_analyst_consensus`, `mcp__nemo_sentry__sentry_get_queue`.
+User reported "they have been calling/hanging the whole night".
+
+**What I measured:** invoking each handler directly via Python (bypassing
+MCP stdio) completes cleanly:
+- `sentry_get_queue`: 1.5s
+- `obb_insider_trading`: 6.6s
+- `obb_analyst_consensus`: 7.4s
+
+So the handler logic is fine. The hang is somewhere in the MCP stdio
+transport between Claude Code's MCP client and the long-lived server
+process. `claude mcp list` reports all servers as "Connected" because
+that health-check probably spawns a fresh process; the actual server
+the session is communicating with may be in a stuck state.
+
+**Likely causes (most → least probable):**
+1. OpenBB SDK state accumulation. OpenBB auto-loads ~50 extensions at
+   import. Over hours of uptime per-process state (cookies, cached
+   tokens, connection pools) likely grows and slows or wedges.
+2. yfinance backing the OpenBB calls rate-limiting on the per-process
+   request count. A long-lived process accumulates a high request
+   count.
+3. Claude Code's MCP client lost sync with the server's stdio buffer
+   (one side wrote more than the other consumed; deadlock).
+
+**Workaround:** restart the Claude Code session, which respawns the MCP
+server processes fresh. Symptoms returned after several hours of
+uptime; not immediate.
+
+**Real fix candidates:**
+- Add a per-call timeout in the MCP servers themselves so a hung
+  upstream call doesn't lock the entire stdio loop.
+- Use the existing `_BROKER_READ_TIMEOUT_S` pattern from
+  `tools/alpaca/server.py` for the long-tail tools.
+- Investigate whether OpenBB has a way to reset its internal state
+  without re-importing.
+
+**Priority:** medium. Workaround (restart) is cheap; bug only surfaces
+after extended uptime.
+
+## IPO exchange filter was over-strict (fixed)
+
+**Surfaced by:** live testing on 2026-05-22 — 4 IPOs returned from the
+5-day calendar, all dropped as `wrong_exchange`.
+
+**Root cause:** `IPO_VALID_EXCHANGES` was a set
+`{'NASDAQ', 'NYSE', 'NYSE ARCA', 'NYSE AMERICAN'}` doing exact
+membership check. Finnhub actually returns full exchange names like
+`'NASDAQ Capital'`, `'NASDAQ Global'`, `'NYSE MKT'`, `'NYSE Arca'` —
+none of which match the set exactly.
+
+**Fix:** switched to `IPO_VALID_EXCHANGE_PREFIXES = ('NASDAQ', 'NYSE')`
+with `exchange.startswith(prefix)` check. Re-tested: 4 IPOs now pass
+the exchange filter (all correctly drop to `below_min_cap` because
+they're micro-caps below the $1B floor). Shipped on
+`discovery-expansion-followup` branch.
+
+**Priority:** done.
+
+## Sentry daemons are running mixed-version code (overnight 2026-05-22)
+
+**Surfaced by:** querying `sentry_get_discovery_status` showed all 5
+new per-channel counters at 0 even though `sentry_queue` has 2 new
+rag_analogue candidates (NVDA + MSFT) that landed at 08:52:59 today.
+
+**Why it happens:** The triage daemon's `_maybe_run_daily_discovery`
+calls `sentry_discovery.run_all()` via a fresh import — so it picks up
+the NEW channels (rag_analogue, ipo, universe_insider, screener). But
+the same daemon's `_record_discovery_run` was loaded at daemon startup
+hours ago, before the new code shipped, so it doesn't know how to
+write the new counter columns. Net effect: new channels run, queue
+gets new candidates, but the audit row in `sentry_discovery_runs`
+shows zeros for the new counters.
+
+**Workaround:** restart the daemons via nemo.bat. Once restarted, the
+daemon process picks up the new code and the counters land correctly.
+
+**Real fix:** not required — this is expected behavior of mid-flight
+code deployment. The lesson is to restart daemons after any commit
+touching `daemons/*.py`.
+
+**Priority:** none. Expected behavior.
