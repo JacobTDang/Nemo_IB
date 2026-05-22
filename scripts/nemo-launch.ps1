@@ -42,9 +42,10 @@ if ($bootstrapExit -ne 0) {
 
 # Step 2: launch Claude Code in the project directory. Stay in the foreground
 # so the user has a normal interactive session in this window.
-#   --dangerously-skip-permissions: trusted personal box, skip per-tool prompts
-#   --remote-control:               enable monitoring/driving from claude.ai/code
+#   --dangerously-skip-permissions:               trusted personal box, skip per-tool prompts
+#   --remote-control:                             enable monitoring/driving from claude.ai/code
+#   --dangerously-load-development-channels:     load the local slack channel plugin
 Write-Host ''
-Write-Host 'Launching Claude Code (--remote-control --dangerously-skip-permissions)...' -ForegroundColor Cyan
+Write-Host 'Launching Claude Code (--remote-control + slack channel)...' -ForegroundColor Cyan
 Set-Location $projectRoot
-& claude --dangerously-skip-permissions --remote-control
+& claude --dangerously-skip-permissions --remote-control --dangerously-load-development-channels server:slack
