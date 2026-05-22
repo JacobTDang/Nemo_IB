@@ -2,7 +2,7 @@
 __pycache__
 CLAUDE.md
 .pytest_cache
-.CLAUDE
+.claude/settings.local.json
 .vscode
 rules
 db_cache/
