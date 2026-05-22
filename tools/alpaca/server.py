@@ -28,6 +28,17 @@ def _json_default(obj):
   raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
 
 
+# -- Broker call timeouts ---------------------------------------------------
+# Without these, a hung HTTP request to Alpaca will block the MCP stdio
+# pipe indefinitely. Phase D smoke tests surfaced a real case where
+# get_paper_positions hung > 30s via MCP while the same code returned in
+# 0.36s when called directly from Python — likely a stdio buffering quirk
+# under load. Timeouts surface the hang as `error: timeout` so the caller
+# gets a fast response and can decide what to do.
+_BROKER_READ_TIMEOUT_S  = 10.0   # get_account, get_all_positions, get_open_position
+_BROKER_WRITE_TIMEOUT_S = 20.0   # submit_market_order, close_position
+
+
 def _safe_dumps(obj) -> str:
   return json.dumps(obj, default=_json_default)
 
@@ -320,11 +331,13 @@ class AlpacaServer:
       }
     else:
       try:
-        async with AsyncBroker(paper=True) as broker:
-          order = await broker.submit_market_order(
-            symbol=ticker_u, qty=effective_qty, side=side,
-            client_order_id=client_order_id,
-          )
+        async def _submit():
+          async with AsyncBroker(paper=True) as broker:
+            return await broker.submit_market_order(
+              symbol=ticker_u, qty=effective_qty, side=side,
+              client_order_id=client_order_id,
+            )
+        order = await asyncio.wait_for(_submit(), timeout=_BROKER_WRITE_TIMEOUT_S)
         record_order(
           order_id=str(order["id"]), client_order_id=client_order_id,
           ticker=ticker_u, side=side, order_type="market",
@@ -375,15 +388,19 @@ class AlpacaServer:
 
     ticker_u = ticker.upper()
     try:
-      async with AsyncBroker(paper=True) as broker:
-        # First check the broker for an open position; if none, return 404 quickly
-        existing = await broker.get_open_position(ticker_u)
-        if existing is None:
-          return [TextContent(type="text", text=_safe_dumps({
-            "success": False, "error": "no_open_position",
-            "ticker": ticker_u,
-          }))]
-        order = await broker.close_position(ticker_u)
+      async def _close():
+        async with AsyncBroker(paper=True) as broker:
+          # First check the broker for an open position; if none, return 404 quickly
+          existing = await broker.get_open_position(ticker_u)
+          if existing is None:
+            return None
+          return await broker.close_position(ticker_u)
+      order = await asyncio.wait_for(_close(), timeout=_BROKER_WRITE_TIMEOUT_S)
+      if order is None:
+        return [TextContent(type="text", text=_safe_dumps({
+          "success": False, "error": "no_open_position",
+          "ticker": ticker_u,
+        }))]
       # Close the local audit row too (if present)
       local_pos = position_for_ticker(ticker_u, paper=True)
       if local_pos:
@@ -408,13 +425,19 @@ class AlpacaServer:
   async def get_paper_positions(self) -> List[TextContent]:
     """Reconcile broker positions against the local SQLite audit log.
     Either side failing surfaces as `error` but the other side's data is
-    still returned so callers can decide what to trust."""
+    still returned so callers can decide what to trust. Broker call is
+    bounded by _BROKER_READ_TIMEOUT_S — a hung HTTP request will surface
+    as `error: broker_timeout` and the local SQLite data is still returned."""
     from tools.alpaca.async_broker import AsyncBroker
     broker_positions: List[Dict[str, Any]] = []
     broker_error: str | None = None
     try:
-      async with AsyncBroker(paper=True) as broker:
-        broker_positions = await broker.get_all_positions()
+      async def _fetch():
+        async with AsyncBroker(paper=True) as broker:
+          return await broker.get_all_positions()
+      broker_positions = await asyncio.wait_for(_fetch(), timeout=_BROKER_READ_TIMEOUT_S)
+    except asyncio.TimeoutError:
+      broker_error = f"broker_timeout after {_BROKER_READ_TIMEOUT_S}s"
     except Exception as e:
       broker_error = f"{type(e).__name__}: {e}"
 
@@ -455,11 +478,16 @@ class AlpacaServer:
     return [TextContent(type="text", text=_safe_dumps(out))]
 
   async def get_paper_account(self) -> List[TextContent]:
-    """Account summary via AsyncBroker."""
+    """Account summary via AsyncBroker. Bounded by _BROKER_READ_TIMEOUT_S
+    to prevent hung HTTP requests from blocking the MCP stdio pipe."""
     from tools.alpaca.async_broker import AsyncBroker
     try:
-      async with AsyncBroker(paper=True) as broker:
-        summary = await broker.get_account()
+      async def _fetch():
+        async with AsyncBroker(paper=True) as broker:
+          return await broker.get_account()
+      summary = await asyncio.wait_for(_fetch(), timeout=_BROKER_READ_TIMEOUT_S)
+    except asyncio.TimeoutError:
+      summary = {"paper": True, "error": f"broker_timeout after {_BROKER_READ_TIMEOUT_S}s"}
     except Exception as e:
       summary = {"paper": True, "error": f"{type(e).__name__}: {e}"}
     return [TextContent(type="text", text=_safe_dumps(summary))]
