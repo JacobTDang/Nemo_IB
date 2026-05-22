@@ -509,7 +509,55 @@ def _scenario_dcf_math(base_inputs: dict,
     }
 
   prices = [results[c]['price_per_share'] for c in ('bear', 'base', 'bull')]
-  return {
+
+  # Terminal-multiple sensitivity: re-run each scenario at five terminal
+  # multiples spaced around the base assumption. Uses pure exit-multiple
+  # terminal value (no perpetuity floor) so the analyst sees what the
+  # multiple alone implies. The main bear/base/bull PT above remains the
+  # conservative min(perpetuity, exit) figure; the diff between the two
+  # reveals how much of the conservativeness comes from the perpetuity floor.
+  base_multiple = base_inputs.get('terminal_multiple', 0)
+  sensitivity = None
+  if base_multiple and base_multiple > 0:
+    raw_multiples = [base_multiple - 4, base_multiple - 2,
+                     base_multiple, base_multiple + 2, base_multiple + 4]
+    # Clamp to positive; a 0x or negative exit multiple is meaningless
+    multiples = [m for m in raw_multiples if m > 0]
+    sensitivity = {}
+    for case_name, growth, margin in (
+      ('bear', bear_growth, bear_margin),
+      ('base', base_growth, base_margin),
+      ('bull', bull_growth, bull_margin),
+    ):
+      # One _dcf_math call per scenario gives us pv_fcfs and the
+      # exit-multiple terminal at the original multiple, from which we
+      # scale by m / original_multiple.
+      probe_inputs = dict(base_inputs)
+      probe_inputs['revenue_growth'] = growth
+      probe_inputs['ebitda_margin'] = margin
+      r = _dcf_math(**probe_inputs)
+
+      pv_fcfs_sum = sum(r['pv_fcfs'])
+      original_multiple = r['assumptions']['terminal_multiple']
+      unit_terminal = (r['terminal_value_exit_multiple'] / original_multiple
+                       if original_multiple > 0 else 0)
+      wacc = r['assumptions']['wacc']
+      n_years = len(growth)
+      cash_v = r['assumptions']['cash']
+      debt_v = r['assumptions']['debt']
+      shares_v = r['assumptions']['shares_outstanding']
+
+      row = {}
+      for m in multiples:
+        terminal_value_m = unit_terminal * m
+        pv_terminal_m = terminal_value_m / ((1 + wacc) ** n_years)
+        ev = pv_fcfs_sum + pv_terminal_m
+        eq = ev + cash_v - debt_v
+        px = eq / shares_v if shares_v > 0 else 0
+        row[f"{m}x"] = round(px, 2)
+      sensitivity[case_name] = row
+
+  output = {
     'bear': results['bear'],
     'base': results['base'],
     'bull': results['bull'],
@@ -519,6 +567,10 @@ def _scenario_dcf_math(base_inputs: dict,
       'high': round(max(prices), 2),
     }
   }
+  if sensitivity is not None:
+    output['terminal_sensitivity'] = sensitivity
+    output['terminal_sensitivity_base_multiple'] = base_multiple
+  return output
 
 
 def _capital_returns_math(market_cap: float, ebitda: float, capex_abs: float,

@@ -100,6 +100,9 @@ def _condense_insider_data(raw: Dict[str, Any]) -> Dict[str, Any]:
             "buy_count": 0, "sell_count": 0, "top_insiders": [],
             "recent_30d": {"bought": 0, "sold": 0, "net": 0},
             "recent_90d": {"bought": 0, "sold": 0, "net": 0},
+            "prior_90d": {"bought": 0, "sold": 0, "net": 0},
+            "prior_period_avg_per_90d_sold": None,
+            "current_vs_baseline_ratio": None,
             "period_start": None, "period_end": None,
             "signal": "neutral"}
 
@@ -111,10 +114,12 @@ def _condense_insider_data(raw: Dict[str, Any]) -> Dict[str, Any]:
   # Per-insider accumulator: {name: {"net": int, "count": int}}
   insider_activity = defaultdict(lambda: {"net": 0, "count": 0})
 
-  # Recency buckets
+  # Recency buckets. prior_90 covers days 91-180 — the immediate baseline
+  # comparison window for the current 90 days.
   now = datetime.now(timezone.utc).date()
   r30 = {"bought": 0, "sold": 0}
   r90 = {"bought": 0, "sold": 0}
+  prior_90 = {"bought": 0, "sold": 0}
 
   for txn in transactions:
     code = txn.get("transactionCode", "")
@@ -131,28 +136,33 @@ def _condense_insider_data(raw: Dict[str, Any]) -> Dict[str, Any]:
         pass
 
     abs_change = abs(change)
+    days_ago = (now - txn_date).days if txn_date else None
 
     if code == "P":  # Purchase
       total_bought += abs_change
       buy_count += 1
       insider_activity[name]["net"] += abs_change
       insider_activity[name]["count"] += 1
-      if txn_date:
-        if (now - txn_date) <= timedelta(days=30):
+      if days_ago is not None:
+        if days_ago <= 30:
           r30["bought"] += abs_change
-        if (now - txn_date) <= timedelta(days=90):
+        if days_ago <= 90:
           r90["bought"] += abs_change
+        if 90 < days_ago <= 180:
+          prior_90["bought"] += abs_change
 
     elif code in ("S", "F"):  # Sale or tax withholding
       total_sold += abs_change
       sell_count += 1
       insider_activity[name]["net"] -= abs_change
       insider_activity[name]["count"] += 1
-      if txn_date:
-        if (now - txn_date) <= timedelta(days=30):
+      if days_ago is not None:
+        if days_ago <= 30:
           r30["sold"] += abs_change
-        if (now - txn_date) <= timedelta(days=90):
+        if days_ago <= 90:
           r90["sold"] += abs_change
+        if 90 < days_ago <= 180:
+          prior_90["sold"] += abs_change
 
   # Top 5 insiders by absolute net activity
   sorted_insiders = sorted(
@@ -187,6 +197,22 @@ def _condense_insider_data(raw: Dict[str, Any]) -> Dict[str, Any]:
   period_start = min(valid_dates).isoformat() if valid_dates else None
   period_end = max(valid_dates).isoformat() if valid_dates else None
 
+  # Baseline: extrapolate avg shares sold per 90 days from the pre-recent-90
+  # window, so the consumer can ground claims like "loud selling" in a ratio
+  # rather than vibes. Programmatic 10b5-1 selling is steady — only deviations
+  # from baseline carry signal.
+  prior_period_avg_per_90d_sold = None
+  current_vs_baseline_ratio = None
+  if len(valid_dates) >= 2:
+    total_period_days = (max(valid_dates) - min(valid_dates)).days
+    prior_days_covered = total_period_days - 90
+    if prior_days_covered >= 30:
+      prior_window_sold = total_sold - r90["sold"]
+      # Scale prior-window sold to a 90-day equivalent
+      prior_period_avg_per_90d_sold = round(prior_window_sold * 90 / prior_days_covered, 2)
+      if prior_period_avg_per_90d_sold > 0:
+        current_vs_baseline_ratio = round(r90["sold"] / prior_period_avg_per_90d_sold, 3)
+
   return {
     "total_bought": total_bought,
     "total_sold": total_sold,
@@ -196,6 +222,10 @@ def _condense_insider_data(raw: Dict[str, Any]) -> Dict[str, Any]:
     "top_insiders": top_insiders,
     "recent_30d": {"bought": r30["bought"], "sold": r30["sold"], "net": r30["bought"] - r30["sold"]},
     "recent_90d": {"bought": r90["bought"], "sold": r90["sold"], "net": r90["bought"] - r90["sold"]},
+    "prior_90d": {"bought": prior_90["bought"], "sold": prior_90["sold"],
+                  "net": prior_90["bought"] - prior_90["sold"]},
+    "prior_period_avg_per_90d_sold": prior_period_avg_per_90d_sold,
+    "current_vs_baseline_ratio": current_vs_baseline_ratio,
     "period_start": period_start,
     "period_end": period_end,
     "signal": signal

@@ -139,6 +139,95 @@ CREATE_SCHEMA = [
     )""",
     "CREATE INDEX IF NOT EXISTS idx_rag_chunks_ticker ON rag_chunks(ticker, doc_type, filing_date)",
     "CREATE INDEX IF NOT EXISTS idx_rag_chunks_doc ON rag_chunks(doc_id)",
+
+    # --- Sentry: evaluation log (every ticker the autonomous loop considers) ---
+    # The eval log is the system's memory. Sentry checks it before queueing to
+    # avoid re-researching the same name during a cooldown window. Each row
+    # captures: which channel triggered the consideration, the decision, the
+    # verdict if researched, and a computed next_review_at timestamp based on
+    # cooldown rules (acted/buy=7d, watchlist=14d, avoid/no_position=30d).
+    """CREATE TABLE IF NOT EXISTS sentry_evaluation_log(
+        eval_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticker            TEXT NOT NULL,
+        evaluated_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        triggered_by      TEXT NOT NULL,
+        trigger_event_id  TEXT,
+        decision          TEXT NOT NULL,
+        verdict           TEXT,
+        confidence        REAL,
+        sizing            TEXT,
+        factor_buckets    TEXT,
+        skip_reason       TEXT,
+        next_review_at    TIMESTAMP,
+        notes             TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_eval_ticker_date ON sentry_evaluation_log(ticker, evaluated_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_eval_next_review ON sentry_evaluation_log(next_review_at) WHERE next_review_at IS NOT NULL",
+
+    # --- Sentry: triage queue (candidates awaiting Claude review) ---
+    # The triage daemon writes pending rows; the /sentry-tick skill reads top-N
+    # by score and processes them. The unique index on (ticker) WHERE status='pending'
+    # enforces deduplication at the DB layer — same ticker can't be queued twice
+    # simultaneously across discovery channels.
+    """CREATE TABLE IF NOT EXISTS sentry_queue(
+        queue_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticker            TEXT NOT NULL,
+        source_event_id   TEXT,
+        triggered_by      TEXT NOT NULL,
+        score             REAL NOT NULL,
+        queued_at         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        status            TEXT NOT NULL DEFAULT 'pending',
+        processed_at      TIMESTAMP,
+        notes             TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_queue_status_score ON sentry_queue(status, score DESC)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_ticker_pending ON sentry_queue(ticker) WHERE status = 'pending'",
+
+    # --- Sentry: daily budget counters (resets at 00:00 ET each day) ---
+    # One row per ET day; INSERT OR IGNORE on read+increment. The budget gate
+    # in /sentry-tick consults these counters before allowing the next action.
+    # `day` is YYYY-MM-DD in America/New_York timezone.
+    """CREATE TABLE IF NOT EXISTS sentry_daily_actions(
+        day                TEXT PRIMARY KEY,
+        research_runs      INTEGER NOT NULL DEFAULT 0,
+        slack_messages     INTEGER NOT NULL DEFAULT 0,
+        paper_orders       INTEGER NOT NULL DEFAULT 0,
+        new_positions      INTEGER NOT NULL DEFAULT 0,
+        adds_or_trims      INTEGER NOT NULL DEFAULT 0,
+        first_action_at    TIMESTAMP,
+        last_action_at     TIMESTAMP
+    )""",
+
+    # --- Sentry: ETF AUM history (for theme-flow discovery channel) ---
+    # Daily snapshot of AUM + top holdings per theme ETF. Theme-flow scan
+    # compares today vs 7 days ago to detect rotations. top_holdings stored
+    # as JSON list of {symbol, weight_pct} dicts.
+    """CREATE TABLE IF NOT EXISTS etf_aum_history(
+        snapshot_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+        etf_symbol       TEXT NOT NULL,
+        snapshot_date    TEXT NOT NULL,
+        theme            TEXT,
+        total_assets     REAL,
+        top_holdings     TEXT,
+        captured_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_etf_aum_etf_date ON etf_aum_history(etf_symbol, snapshot_date)",
+    "CREATE INDEX IF NOT EXISTS idx_etf_aum_date ON etf_aum_history(snapshot_date DESC)",
+
+    # --- Sentry: discovery run tracker (one row per ET day) ---
+    # sentry_triage checks this on every tick — if no row for today exists,
+    # it triggers sentry_discovery.run_all() and inserts a row. Prevents
+    # discovery from re-running every tick of the day.
+    """CREATE TABLE IF NOT EXISTS sentry_discovery_runs(
+        day                   TEXT PRIMARY KEY,
+        ran_at                TIMESTAMP NOT NULL,
+        catalyst_enqueued     INTEGER NOT NULL DEFAULT 0,
+        insider_enqueued      INTEGER NOT NULL DEFAULT 0,
+        activist_enqueued     INTEGER NOT NULL DEFAULT 0,
+        theme_flow_enqueued   INTEGER NOT NULL DEFAULT 0,
+        total_enqueued        INTEGER NOT NULL DEFAULT 0,
+        errors                TEXT
+    )""",
 ]
 
 
