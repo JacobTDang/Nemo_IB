@@ -228,6 +228,21 @@ CREATE_SCHEMA = [
         total_enqueued        INTEGER NOT NULL DEFAULT 0,
         errors                TEXT
     )""",
+
+    # --- Sentry: universe of tickers from theme ETF holdings ---
+    # Built by daemons/sentry_universe.py: refresh_universe() unions the top
+    # holdings across all curated theme ETFs into this table. Discovery
+    # channels that need a universe-wide ticker set (universe_insider_cluster,
+    # fundamental_screener) read from here.
+    """CREATE TABLE IF NOT EXISTS sentry_universe(
+        ticker                TEXT PRIMARY KEY,
+        last_seen_in_themes   TEXT,
+        first_seen_at         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        refreshed_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        excluded              INTEGER NOT NULL DEFAULT 0,
+        excluded_reason       TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_sentry_universe_active ON sentry_universe(excluded, refreshed_at)",
 ]
 
 
@@ -249,6 +264,20 @@ _EVAL_LOG_MIGRATIONS = [
     ("contradiction_check_passed", "INTEGER"), # 0/1/NULL
     ("provenance_filing_count",    "INTEGER"),
     ("provenance_press_count",     "INTEGER"),
+]
+
+
+# Per-channel counters added to sentry_discovery_runs as new discovery
+# channels ship. Each is ADD COLUMN with a NULL/0 default so legacy rows
+# stay valid. screener_last_ran is the only TEXT column — it stores the
+# ET date of the most recent screener run so the weekly cadence gate can
+# compare against today.
+_DISCOVERY_RUNS_MIGRATIONS = [
+    ("universe_insider_enqueued",  "INTEGER DEFAULT 0"),
+    ("rag_analogue_enqueued",      "INTEGER DEFAULT 0"),
+    ("ipo_enqueued",               "INTEGER DEFAULT 0"),
+    ("screener_last_ran",          "TEXT"),
+    ("screener_enqueued",          "INTEGER DEFAULT 0"),
 ]
 
 
@@ -309,6 +338,18 @@ def init_schema(db_path: str = DB_PATH) -> None:
                 try:
                     conn.execute(
                         f"ALTER TABLE sentry_evaluation_log ADD COLUMN {col_name} {col_type}"
+                    )
+                except sqlite3.OperationalError:
+                    pass
+
+        # Same pattern for sentry_discovery_runs per-channel counters.
+        existing_cols = {row['name'] for row in
+                         conn.execute("PRAGMA table_info(sentry_discovery_runs)").fetchall()}
+        for col_name, col_type in _DISCOVERY_RUNS_MIGRATIONS:
+            if col_name not in existing_cols:
+                try:
+                    conn.execute(
+                        f"ALTER TABLE sentry_discovery_runs ADD COLUMN {col_name} {col_type}"
                     )
                 except sqlite3.OperationalError:
                     pass
