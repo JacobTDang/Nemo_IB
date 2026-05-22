@@ -239,6 +239,19 @@ _THESES_MIGRATIONS = [
 ]
 
 
+# Discipline audit columns added to sentry_evaluation_log so the eval row
+# itself records whether each pre-save discipline check was satisfied.
+# Validator in state/sentry_eval_log.py:record_eval enforces presence
+# conditional on (decision, verdict). Legacy rows stay NULL on these cols.
+_EVAL_LOG_MIGRATIONS = [
+    ("analogue_considered",        "TEXT"),    # name of analogue or 'none'
+    ("terminal_sensitivity_ran",   "INTEGER"), # 0/1/NULL
+    ("contradiction_check_passed", "INTEGER"), # 0/1/NULL
+    ("provenance_filing_count",    "INTEGER"),
+    ("provenance_press_count",     "INTEGER"),
+]
+
+
 def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
     """Open a connection with row factory set for dict-like access.
 
@@ -285,6 +298,18 @@ def init_schema(db_path: str = DB_PATH) -> None:
             if col_name not in existing_cols:
                 try:
                     conn.execute(f"ALTER TABLE theses ADD COLUMN {col_name} {col_type}")
+                except sqlite3.OperationalError:
+                    pass
+
+        # Same pattern for sentry_evaluation_log discipline audit columns.
+        existing_cols = {row['name'] for row in
+                         conn.execute("PRAGMA table_info(sentry_evaluation_log)").fetchall()}
+        for col_name, col_type in _EVAL_LOG_MIGRATIONS:
+            if col_name not in existing_cols:
+                try:
+                    conn.execute(
+                        f"ALTER TABLE sentry_evaluation_log ADD COLUMN {col_name} {col_type}"
+                    )
                 except sqlite3.OperationalError:
                     pass
 

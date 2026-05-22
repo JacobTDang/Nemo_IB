@@ -324,11 +324,115 @@ def test_tool_recent_evals_returns_list():
     ticker, 'researched',
     triggered_by='event_score',
     verdict='watchlist', confidence=0.6, sizing='cautious',
+    # Discipline audit fields required for researched/watchlist
+    factor_buckets=['market_beta'],
+    contradiction_check_passed=True,
   )
   env = _read_envelope(srv.tool_recent_evals({'ticker': ticker, 'days': 1}))
   _check("success", env['success'] is True)
   _check("at least 1 eval row", env['data']['count'] >= 1,
          str(env['data']))
+
+
+def test_record_eval_audit_buy_with_all_fields_ok():
+  print("\n== eval audit: researched/buy with full audit fields succeeds ==")
+  _cleanup()
+  ticker = f'{_TICKER_PREFIX}AUDIT_OK'
+  eval_id = sentry_eval_log.record_eval(
+    ticker, 'researched',
+    triggered_by='event_score',
+    verdict='buy', confidence=0.72, sizing='cautious',
+    factor_buckets=['market_beta', 'theme_ai'],
+    analogue_considered='2010-2012: Smartphone / Mobile Cycle',
+    terminal_sensitivity_ran=True,
+    contradiction_check_passed=True,
+    provenance_filing_count=4,
+    provenance_press_count=1,
+  )
+  _check("eval row inserted (id > 0)", eval_id > 0, f'got {eval_id}')
+
+
+def test_record_eval_audit_buy_missing_analogue_rejects():
+  print("\n== eval audit: researched/buy missing analogue_considered raises ==")
+  _cleanup()
+  ticker = f'{_TICKER_PREFIX}AUDIT_FAIL_A'
+  try:
+    sentry_eval_log.record_eval(
+      ticker, 'researched',
+      triggered_by='event_score',
+      verdict='buy', confidence=0.72, sizing='cautious',
+      factor_buckets=['market_beta'],
+      # analogue_considered intentionally missing
+      terminal_sensitivity_ran=True,
+      contradiction_check_passed=True,
+    )
+    _check("validator raised ValueError", False, 'no exception raised')
+  except ValueError as e:
+    _check("validator raised ValueError with analogue_considered in msg",
+           'analogue_considered' in str(e), str(e))
+
+
+def test_record_eval_audit_watchlist_minimum_fields_ok():
+  print("\n== eval audit: researched/watchlist with minimum fields succeeds ==")
+  _cleanup()
+  ticker = f'{_TICKER_PREFIX}AUDIT_WL'
+  eval_id = sentry_eval_log.record_eval(
+    ticker, 'researched',
+    triggered_by='event_score',
+    verdict='watchlist', confidence=0.5, sizing='no_position',
+    factor_buckets=['market_beta'],
+    contradiction_check_passed=True,
+    # analogue_considered and terminal_sensitivity_ran NOT required for watchlist
+  )
+  _check("watchlist eval inserted (id > 0)", eval_id > 0, f'got {eval_id}')
+
+
+def test_record_eval_audit_watchlist_missing_contradiction_rejects():
+  print("\n== eval audit: researched/watchlist missing contradiction check raises ==")
+  _cleanup()
+  ticker = f'{_TICKER_PREFIX}AUDIT_WL_FAIL'
+  try:
+    sentry_eval_log.record_eval(
+      ticker, 'researched',
+      triggered_by='event_score',
+      verdict='watchlist', confidence=0.5, sizing='no_position',
+      factor_buckets=['market_beta'],
+      # contradiction_check_passed missing
+    )
+    _check("validator raised ValueError", False, 'no exception raised')
+  except ValueError as e:
+    _check("validator raised with contradiction_check_passed in msg",
+           'contradiction_check_passed' in str(e), str(e))
+
+
+def test_record_eval_audit_skipped_decision_no_validation():
+  print("\n== eval audit: skipped_* decisions bypass discipline validation ==")
+  _cleanup()
+  ticker = f'{_TICKER_PREFIX}AUDIT_SKIP'
+  # No audit fields supplied; decision is skipped_cooldown -> validator should skip
+  eval_id = sentry_eval_log.record_eval(
+    ticker, 'skipped_cooldown',
+    triggered_by='event_score',
+    skip_reason='in cooldown from prior eval',
+  )
+  _check("skipped_cooldown insert succeeds without audit fields",
+         eval_id > 0, f'got {eval_id}')
+
+
+def test_eval_log_migration_idempotent():
+  print("\n== eval_log audit columns present after init_schema ==")
+  init_schema()
+  init_schema()  # second call must be safe
+  conn = get_connection()
+  try:
+    cols = {r['name'] for r in
+            conn.execute('PRAGMA table_info(sentry_evaluation_log)').fetchall()}
+  finally:
+    conn.close()
+  for c in ('analogue_considered', 'terminal_sensitivity_ran',
+            'contradiction_check_passed', 'provenance_filing_count',
+            'provenance_press_count'):
+    _check(f"column '{c}' present", c in cols, f"actual cols: {cols}")
 
 
 def test_tool_should_skip_after_cooldown_recorded():
@@ -454,6 +558,13 @@ def main() -> int:
   test_tool_validate_candidate_via_server()
   test_tool_mark_queue_status_round_trip()
   test_tool_recent_evals_returns_list()
+  # Discipline audit field validation
+  test_eval_log_migration_idempotent()
+  test_record_eval_audit_buy_with_all_fields_ok()
+  test_record_eval_audit_buy_missing_analogue_rejects()
+  test_record_eval_audit_watchlist_minimum_fields_ok()
+  test_record_eval_audit_watchlist_missing_contradiction_rejects()
+  test_record_eval_audit_skipped_decision_no_validation()
   test_tool_should_skip_after_cooldown_recorded()
   test_tool_budget_summary_shape()
   test_tool_can_act_known_action()

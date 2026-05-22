@@ -44,6 +44,56 @@ def _compute_next_review(verdict: Optional[str], decision: str) -> Optional[str]
   return (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
 
 
+def _validate_audit_fields(decision: str, verdict: Optional[str],
+                            analogue_considered: Optional[str],
+                            terminal_sensitivity_ran: Optional[bool],
+                            contradiction_check_passed: Optional[bool],
+                            factor_buckets: Optional[List[str]]) -> None:
+  """Enforce decision-conditional discipline audit fields.
+
+  For decision='researched':
+    - verdict in {buy, short}: ALL of analogue_considered,
+      terminal_sensitivity_ran, contradiction_check_passed, factor_buckets
+      must be set. analogue_considered='none' is an explicit attestation
+      that the analyst checked and no analogue applied (vs None which
+      means the field was never set).
+    - verdict in {watchlist, no_position}: only contradiction_check_passed
+      and factor_buckets are required (the heavy checks are vacuous for
+      decisions that don't commit capital).
+
+  Raises ValueError when any required field is missing.
+  """
+  if decision != 'researched':
+    return  # skip-decisions don't carry discipline audit fields
+
+  if verdict in ('buy', 'short'):
+    missing = []
+    if analogue_considered is None:
+      missing.append('analogue_considered')
+    if terminal_sensitivity_ran is None:
+      missing.append('terminal_sensitivity_ran')
+    if contradiction_check_passed is None:
+      missing.append('contradiction_check_passed')
+    if not factor_buckets:
+      missing.append('factor_buckets')
+    if missing:
+      raise ValueError(
+        f"researched/{verdict} eval requires discipline audit fields: "
+        f"{missing}"
+      )
+  elif verdict in ('watchlist', 'no_position'):
+    missing = []
+    if contradiction_check_passed is None:
+      missing.append('contradiction_check_passed')
+    if not factor_buckets:
+      missing.append('factor_buckets')
+    if missing:
+      raise ValueError(
+        f"researched/{verdict} eval requires discipline audit fields: "
+        f"{missing}"
+      )
+
+
 def record_eval(
     ticker: str,
     decision: str,
@@ -56,25 +106,47 @@ def record_eval(
     factor_buckets: Optional[List[str]] = None,
     skip_reason: Optional[str] = None,
     notes: Optional[str] = None,
+    analogue_considered: Optional[str] = None,
+    terminal_sensitivity_ran: Optional[bool] = None,
+    contradiction_check_passed: Optional[bool] = None,
+    provenance_filing_count: Optional[int] = None,
+    provenance_press_count: Optional[int] = None,
 ) -> int:
   """Insert an eval row. Computes next_review_at from cooldown rules.
 
   Args:
     ticker: stock symbol (uppercased)
     decision: one of {researched, skipped_cooldown, skipped_recent_verdict,
-              acted, skipped_budget}
+              acted, skipped_budget, skipped_misclassified}
     triggered_by: which discovery channel queued it (event_score, theme_flow,
                   insider_cluster, catalyst_calendar, manual)
     verdict: required if decision='researched' or 'acted' — one of
-             {buy, watchlist, avoid, no_position}
+             {buy, short, watchlist, avoid, no_position}
     confidence: 0.0-1.0 from the synthesis (required when verdict is set)
     sizing: aggressive / normal / cautious / no_position
     factor_buckets: list of factor tags from factor-exposure-check
     skip_reason: free text if decision starts with 'skipped_'
     notes: any additional context worth recording
+    analogue_considered: discipline audit — name of analogue invoked
+                        or 'none'; required when decision='researched' and
+                        verdict in {buy, short}
+    terminal_sensitivity_ran: discipline audit — True if scenario_dcf
+                              produced a terminal_sensitivity table,
+                              False otherwise; required for buy/short
+    contradiction_check_passed: discipline audit — result from the
+                                red-team sub-agent in Step 19a;
+                                required for any researched verdict
+    provenance_filing_count: discipline audit — number of [filing:...]
+                             tags in Sections 5 / 6
+    provenance_press_count: discipline audit — number of [press-reported]
+                            tags in Sections 5 / 6
 
-  Returns the eval_id of the new row.
+  Returns the eval_id of the new row. Raises ValueError when required
+  discipline audit fields are missing.
   """
+  _validate_audit_fields(decision, verdict, analogue_considered,
+                          terminal_sensitivity_ran,
+                          contradiction_check_passed, factor_buckets)
   next_review_at = _compute_next_review(verdict, decision)
   conn = get_connection()
   try:
@@ -82,8 +154,11 @@ def record_eval(
       """INSERT INTO sentry_evaluation_log
          (ticker, evaluated_at, triggered_by, trigger_event_id, decision,
           verdict, confidence, sizing, factor_buckets, skip_reason,
-          next_review_at, notes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+          next_review_at, notes,
+          analogue_considered, terminal_sensitivity_ran,
+          contradiction_check_passed, provenance_filing_count,
+          provenance_press_count)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
       (
         ticker.upper(),
         datetime.now(timezone.utc).isoformat(),
@@ -97,6 +172,11 @@ def record_eval(
         skip_reason,
         next_review_at,
         notes,
+        analogue_considered,
+        1 if terminal_sensitivity_ran else (0 if terminal_sensitivity_ran is False else None),
+        1 if contradiction_check_passed else (0 if contradiction_check_passed is False else None),
+        provenance_filing_count,
+        provenance_press_count,
       ),
     )
     conn.commit()
