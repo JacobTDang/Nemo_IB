@@ -10,9 +10,38 @@ a generic company report — the goal is a decision-ready, falsifiable
 investment thesis with valuation, scenario math, red-team review, and
 cross-company read-throughs.
 
-Run all 18 steps in order. Steps 12, 14, 16, and 17 delegate to
-companion skills; invoke them inline via the Skill tool and fold their
-output into the final synthesis. Skipping steps defeats the discipline.
+Run all 19 steps in order (Step 0 may no-op). Steps 12, 14, 16,
+and 17 delegate to companion skills; invoke them inline via the
+Skill tool and fold their output into the final synthesis. Skipping
+steps defeats the discipline.
+
+## Step 0 — Reconcile prior same-day output
+
+Before Step 1, check whether
+`testing/fixtures/research_<TICKER>_<TODAY>.md` already exists. If
+it does, you've previously run this skill or a sibling skill on the
+same ticker today and produced a file. Read it and extract the
+headline numerics that any analyst reading both files would expect
+to agree:
+
+- TTM revenue, gross margin, operating margin, EBITDA margin, FCF
+- Forward consensus revenue and EPS estimates (FY+1, FY+2)
+- Per-segment YoY growth rates (if a segment view is in scope)
+- Key valuation multiples (P/E TTM, fwd P/E, EV/EBITDA)
+
+If a number you produce on this pass differs by **> 2% relative**
+from the prior-pass figure, the analyst is going to notice. Resolve
+the divergence before continuing: identify which source is correct
+(usually SEC > Finnhub > yfinance), use it, and document the
+reconciliation in a `### Reconciliation with earlier pass` block at
+the top of Step 1's output. State the prior figure, the new figure,
+and which source you adopted and why.
+
+Do NOT silently use a different number from a same-day prior pass.
+If you produce different op margins (60.4% vs 64.0%) without
+acknowledging it, the analyst's confidence in the system collapses.
+
+If no prior file exists, this step is a no-op — proceed to Step 1.
 
 ## Step 1 — Probe and frame
 
@@ -357,17 +386,42 @@ Tool: `get_historical_analogue(thesis_description, top_n=3)`. Include
 structural tags in the description (capex_peak, valuation_expansion,
 supply_constrained, insider_selling, etc.) for better matches.
 
+The tool now surfaces a structured `drawdown_pct`, `duration_months`,
+and `direction` (`bear` / `bull` / `setup`) per match. Use these
+fields to calibrate the bear case downstream; do not regex-parse
+the body excerpt.
+
 Output:
-- Top analogues (named)
+- Top analogues (named) — include each match's `drawdown_pct` and
+  `direction` from the tool output verbatim
 - Relevant similarities
 - Important differences
 - Failure modes from prior cycles
 - Lessons that apply
 - What would make this analogue invalid
 
-Hard rule: historical analogues are hypothesis generators, NOT proof.
-Do not say "this is just like 1999." Instead say "this shares the
-following failure modes with prior capex cycles: 1, 2, 3."
+**Hard rule (qualitative)**: historical analogues are hypothesis
+generators, NOT proof. Do not say "this is just like 1999." Instead
+say "this shares the following failure modes with prior capex
+cycles: 1, 2, 3."
+
+**Hard rule (calibration)**: if the top match is a `bear` analogue
+with `drawdown_pct = D%` (negative), the bear price target produced
+by Step 16 / surfaced in Section 6 / Section 8 MUST imply at least
+`0.6 × |D|%` downside from current spot. Invoking 1999-Cisco
+(D = -86%) with a -39% bear PT is a calibration failure — either
+strengthen the bear PT (use ≥ -52%) or drop the analogue from
+Section 15 and pick a softer match. The same rule applies upward to
+`bull` analogues: a bull PT must imply at least `0.6 × D%` upside
+when a bull analogue is invoked. `setup` analogues (no completed
+move) have `drawdown_pct = None` and impose no calibration
+constraint — but they also cannot be used to justify aggressive
+bear or bull cases.
+
+When Step 16 emits its scenario PTs, cross-check them against this
+rule before continuing. If they fail, return to Step 16 with a note
+that the bear / bull case needs strengthening, or downgrade the
+Step 15 analogue selection.
 
 ## Step 16 — Scenario analysis
 
@@ -447,8 +501,18 @@ Required sections (in this order):
 3. **Variant perception** — what does this view understand that
    consensus may be missing?
 4. **Why now** — catalyst path and timing
-5. **Bull case** — 3-5 cited factors
-6. **Bear case** — 3-5 cited factors
+5. **Bull case** — 3-5 cited factors. Every direct quote,
+   statistic, or specific corporate claim ("the CEO said X", "the
+   company guided to Y", "the 10-K discloses Z") must trace to a
+   `rag_search` hit on the filing corpus (result's `doc_type`
+   starts with `10K_` / `10Q_` / `8K_`, or equals `earnings_release`
+   / `mda` / `risk_factors`). If the only supporting hit came from
+   `get_company_news` or `search` (web), append the
+   `[press-reported]` tag to that bullet so the reader knows it
+   isn't filing-grounded. Unlabeled quotes are presumed
+   filing-sourced and will fail the Verification (e) check.
+6. **Bear case** — 3-5 cited factors. Same provenance rule as
+   Section 5.
 7. **Valuation / expectations** — from Step 12 companion output.
    If the upstream `/scenario-builder` envelope contains a
    `terminal_sensitivity` field, render it as a 3-row x N-column
@@ -503,9 +567,34 @@ these → patch the synthesis in place, do NOT save yet.
     elsewhere cites `current_vs_baseline_ratio`. No "loud" / "heavy"
     / "concerning" without ratio > 1.5x.
 
-If any item fails the check, the synthesis is incomplete. Fix it
-before saving — silently writing an under-specified report is a
-discipline failure, not a graceful degradation.
+(d) **No two claims argue opposite directions on the same KPI within
+    the same horizon.** Scan Sections 5 and 6 (Bull / Bear). If
+    Section 5 says "Compute & Networking growth is the law of large
+    numbers, not a thesis break" and Section 6 says "C&N
+    deceleration is the leading indicator the cycle is past peak,"
+    these are contradictory framings of the same data — pick one,
+    do not paper over with hedging. Same for: revenue growth direction,
+    margin direction, insider activity, capex direction, customer
+    concentration. The bull and bear cases may pull on different KPIs;
+    they may NOT pull on the same KPI in opposite directions.
+
+(e) **Press-vs-filing provenance.** Every direct quote, executive
+    statement, or specific corporate fact in Sections 5 / 6 is
+    either (i) traceable to a `rag_search` hit with a
+    filing-corpus `doc_type` (`10K_*`, `10Q_*`, `8K_*`,
+    `earnings_release`, `mda`, `risk_factors`), or (ii) explicitly
+    labeled `[press-reported]`. Unlabeled press-only quotes fail
+    this check.
+
+(f) **Analogue calibration.** If Step 15 invoked a `bear` analogue
+    with `drawdown_pct = D%`, the bear case PT cited in Sections 6
+    and 8 implies at least `0.6 × |D|%` downside. Same for `bull`
+    analogues upward. `setup` analogues impose no calibration but
+    also cannot back aggressive cases.
+
+If any item (a)-(f) fails the check, the synthesis is incomplete.
+Fix it before saving — silently writing an under-specified report
+is a discipline failure, not a graceful degradation.
 
 Save the synthesis to:
 `testing/fixtures/research_<TICKER>_<DATE>.md`
