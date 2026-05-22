@@ -74,6 +74,12 @@ RAG_ANALOGUE_MIN_SIMILARITY = 0.45     # minimum similarity to count a chunk
 RAG_ANALOGUE_MIN_HITS_PER_TICKER = 3   # chunk count threshold per ticker
 RAG_ANALOGUE_MIN_ANALOGUES_PER_TICKER = 2  # number of distinct analogues
 
+# Fundamental screener tuning
+SCREENER_SCORE = 0.65                  # mid signal — fundamentals are slow-moving
+SCREENER_CADENCE_DAYS = 7              # weekly, not daily
+SCREENER_PACE_S = 1.0                  # 60 RPM ceiling on Finnhub basic_financials
+SCREENER_DEFAULT_TOP_N = 5             # max enqueues per screener
+
 
 # ============================================================================
 # Channel 1: catalyst calendar (pre-earnings deep-context trigger)
@@ -682,7 +688,204 @@ def scan_rag_analogues(
 
 
 # ============================================================================
-# Channel 6: IPO / new listing calendar
+# Channel 6: fundamental screener (weekly)
+# ============================================================================
+
+_SCREENER_OPS = {
+  'gt':  lambda m, v: m >  v,
+  'lt':  lambda m, v: m <  v,
+  'gte': lambda m, v: m >= v,
+  'lte': lambda m, v: m <= v,
+  'ne':  lambda m, v: m != v,
+}
+
+
+def _evaluate_screener(metrics: Dict[str, Any], conditions: List[Dict[str, Any]]) -> bool:
+  """Return True if all conditions pass against the metric dict."""
+  for cond in conditions:
+    metric = cond.get('metric')
+    op = cond.get('op')
+    value = cond.get('value')
+    if metric is None or op is None:
+      return False
+    raw = metrics.get(metric)
+    if raw is None:
+      return False  # missing metric = fail (we don't want partial matches)
+    try:
+      raw_f = float(raw)
+    except (TypeError, ValueError):
+      return False
+    fn = _SCREENER_OPS.get(op)
+    if fn is None:
+      return False
+    if not fn(raw_f, value):
+      return False
+  return True
+
+
+def _screener_should_run_today(force: bool = False) -> bool:
+  """Check sentry_discovery_runs.screener_last_ran for the cadence gate.
+
+  Returns True iff (a) force OR (b) no row exists / screener_last_ran is NULL
+  OR (c) screener_last_ran is older than SCREENER_CADENCE_DAYS days.
+  """
+  if force:
+    return True
+  from datetime import timedelta as _td
+  today_et = (datetime.now(timezone.utc) + _td(hours=-5)).strftime('%Y-%m-%d')
+  cutoff = (datetime.now(timezone.utc) + _td(hours=-5)
+            - _td(days=SCREENER_CADENCE_DAYS)).strftime('%Y-%m-%d')
+  conn = get_connection()
+  try:
+    row = conn.execute(
+      "SELECT MAX(screener_last_ran) AS last_ran FROM sentry_discovery_runs"
+    ).fetchone()
+  finally:
+    conn.close()
+  last = row['last_ran'] if row else None
+  if last is None:
+    return True
+  return last < cutoff
+
+
+def scan_fundamental_screener(
+  screeners_yaml: Optional[str] = None,
+  universe: Optional[List[str]] = None,
+  force: bool = False,
+  _fetch_financials_fn=None,
+) -> Dict[str, int]:
+  """Weekly fundamental screener.
+
+  Loads YAML screener configs from daemons/screeners.yaml (or override),
+  iterates the universe, evaluates each ticker's get_basic_financials
+  response against each screener's conditions, and enqueues the top-N
+  matches per screener at score 0.65 with
+  triggered_by='screener:<name>'.
+
+  Cadence: runs at most once per SCREENER_CADENCE_DAYS (7 by default)
+  unless force=True. Gate is sentry_discovery_runs.screener_last_ran.
+
+  Args:
+    screeners_yaml: path to YAML config; default daemons/screeners.yaml
+    universe: ticker list; default sentry_universe
+    force: bypass the weekly cadence gate
+    _fetch_financials_fn: test-only injection (async ticker -> raw dict)
+  """
+  import time as _t
+  import yaml as _yaml
+  from datetime import timedelta as _td
+
+  counts = {
+    'universe_size': 0,
+    'screeners_loaded': 0,
+    'screeners_evaluated': 0,
+    'tickers_evaluated': 0,
+    'metric_fetch_errors': 0,
+    'enqueued': 0,
+    'skipped': 0,
+    'ran_today': None,           # set to ET-date string when actually executed
+    'cadence_gated': False,
+  }
+
+  if not _screener_should_run_today(force=force):
+    counts['cadence_gated'] = True
+    return counts
+
+  if screeners_yaml is None:
+    screeners_yaml = os.path.join(os.path.dirname(__file__), 'screeners.yaml')
+
+  try:
+    with open(screeners_yaml, 'r', encoding='utf-8') as f:
+      cfg = _yaml.safe_load(f) or {}
+  except Exception as exc:
+    print(f"[discovery.screener] config load failed: {exc}",
+          file=sys.stderr, flush=True)
+    return counts
+
+  screeners = cfg.get('screeners', []) or []
+  counts['screeners_loaded'] = len(screeners)
+  if not screeners:
+    return counts
+
+  if universe is None:
+    try:
+      from daemons.sentry_universe import get_universe
+      universe = get_universe()
+    except Exception as exc:
+      print(f"[discovery.screener] universe load failed: {exc}",
+            file=sys.stderr, flush=True)
+      return counts
+
+  counts['universe_size'] = len(universe)
+  if not universe:
+    return counts
+
+  # -- Pre-fetch each ticker's metrics ONCE; reuse across all screeners --
+  async def _default_fetch(ticker: str):
+    from tools.news_agregator.finnhub_utils import FinnhubClient
+    client = FinnhubClient()
+    try:
+      return await client.get('/stock/metric', {'symbol': ticker, 'metric': 'all'})
+    finally:
+      await client.close()
+
+  fetch = _fetch_financials_fn or _default_fetch
+
+  ticker_metrics: Dict[str, Dict[str, Any]] = {}
+  for ticker in universe:
+    counts['tickers_evaluated'] += 1
+    try:
+      raw = asyncio.run(fetch(ticker))
+    except Exception:
+      counts['metric_fetch_errors'] += 1
+      continue
+    metrics = (raw.get('metric') if isinstance(raw, dict) else None) or {}
+    if metrics:
+      ticker_metrics[ticker] = metrics
+    if _fetch_financials_fn is None:
+      _t.sleep(SCREENER_PACE_S)
+
+  # -- Run each screener; enqueue top-N matches --
+  for screener in screeners:
+    counts['screeners_evaluated'] += 1
+    name = screener.get('name', 'unnamed')
+    conditions = screener.get('conditions', []) or []
+    top_n = int(screener.get('top_n') or SCREENER_DEFAULT_TOP_N)
+    sort_by = screener.get('sort_by')
+
+    matches = []
+    for ticker, metrics in ticker_metrics.items():
+      if _evaluate_screener(metrics, conditions):
+        tiebreaker = 0.0
+        if sort_by and metrics.get(sort_by) is not None:
+          try:
+            tiebreaker = float(metrics[sort_by])
+          except (TypeError, ValueError):
+            tiebreaker = 0.0
+        matches.append((ticker, tiebreaker))
+
+    # Sort by tiebreaker descending and cap to top_n
+    matches.sort(key=lambda x: x[1], reverse=True)
+    for ticker, tiebreaker in matches[:top_n]:
+      skip, _ = should_skip(ticker)
+      if skip:
+        counts['skipped'] += 1
+        continue
+      qid = sentry_queue.enqueue(
+        ticker, score=SCREENER_SCORE,
+        triggered_by=f'screener:{name}',
+        notes=f"matched {name} screener; {sort_by}={tiebreaker:.3f}" if sort_by else f"matched {name} screener",
+      )
+      if qid:
+        counts['enqueued'] += 1
+
+  today_et = (datetime.now(timezone.utc) + _td(hours=-5)).strftime('%Y-%m-%d')
+  counts['ran_today'] = today_et
+  return counts
+
+
+# ============================================================================
+# Channel 7: IPO / new listing calendar
 # ============================================================================
 
 def scan_ipo_calendar(lookahead_days: int = IPO_LOOKAHEAD_DAYS,
@@ -799,6 +1002,8 @@ def run_all() -> Dict[str, Dict[str, int]]:
     ('ipo_calendar',              scan_ipo_calendar),
     ('universe_insider_cluster',  scan_universe_insider_cluster),
     ('rag_analogue',              scan_rag_analogues),
+    # screener self-gates by SCREENER_CADENCE_DAYS; safe to call every day
+    ('screener',                  scan_fundamental_screener),
   ]
   total = len(steps)
   for i, (name, fn) in enumerate(steps, start=1):
@@ -824,8 +1029,10 @@ def main():
   parser.add_argument('--channel', choices=['catalyst_calendar', 'insider_cluster',
                                              'theme_flow', 'ipo_calendar',
                                              'universe_insider_cluster',
-                                             'rag_analogue', 'all'],
+                                             'rag_analogue', 'screener', 'all'],
                       default='all', help='Run a specific channel or all')
+  parser.add_argument('--force-screener', action='store_true',
+                      help='Bypass the weekly cadence gate on the screener channel')
   args = parser.parse_args()
 
   init_schema()
@@ -844,6 +1051,9 @@ def main():
     print(scan_universe_insider_cluster(), file=sys.stderr, flush=True)
   elif args.channel == 'rag_analogue':
     print(scan_rag_analogues(), file=sys.stderr, flush=True)
+  elif args.channel == 'screener':
+    print(scan_fundamental_screener(force=args.force_screener),
+          file=sys.stderr, flush=True)
 
 
 if __name__ == '__main__':

@@ -424,6 +424,159 @@ def test_rag_analogue_setup_entries_skipped():
          called['count'] == 1, f"called {called['count']}")
 
 
+def _fake_financials(ticker_to_metrics):
+  """Async stub for /stock/metric."""
+  async def fetch(ticker):
+    metrics = ticker_to_metrics.get(ticker, {})
+    return {'metric': metrics}
+  return fetch
+
+
+def _write_screener_yaml(tmpdir, screeners):
+  import yaml as _yaml
+  path = os.path.join(tmpdir, 'screeners_test.yaml')
+  with open(path, 'w') as f:
+    _yaml.safe_dump({'screeners': screeners}, f)
+  return path
+
+
+def test_screener_match_enqueues():
+  print("\n== screener: ticker meeting all conditions is enqueued ==")
+  _cleanup()
+  import tempfile
+  # Reset screener_last_ran so cadence gate opens
+  conn = get_connection()
+  try:
+    conn.execute("UPDATE sentry_discovery_runs SET screener_last_ran = NULL")
+    conn.execute("DELETE FROM sentry_discovery_runs")
+    conn.commit()
+  finally:
+    conn.close()
+
+  screeners = [{
+    'name': 'compounder_test',
+    'top_n': 5,
+    'sort_by': 'roeTTM',
+    'conditions': [
+      {'metric': 'roeTTM',         'op': 'gte', 'value': 20},
+      {'metric': 'revenueGrowth5Y','op': 'gte', 'value': 5},
+    ],
+  }]
+
+  ticker_metrics = {
+    'ZZSA': {'roeTTM': 25.0, 'revenueGrowth5Y': 10.0},  # passes
+    'ZZSB': {'roeTTM': 15.0, 'revenueGrowth5Y': 10.0},  # fails roeTTM
+    'ZZSC': {'roeTTM': 22.0, 'revenueGrowth5Y': 8.0},   # passes
+  }
+  with tempfile.TemporaryDirectory() as tmpdir:
+    yaml_path = _write_screener_yaml(tmpdir, screeners)
+    counts = sentry_discovery.scan_fundamental_screener(
+      screeners_yaml=yaml_path,
+      universe=list(ticker_metrics.keys()),
+      force=True,
+      _fetch_financials_fn=_fake_financials(ticker_metrics),
+    )
+  _check("tickers_evaluated == 3", counts['tickers_evaluated'] == 3, str(counts))
+  _check("enqueued == 2 (ZZSA + ZZSC)", counts['enqueued'] == 2, str(counts))
+
+
+def test_screener_cadence_gate_blocks_re_run():
+  print("\n== screener: same-week re-run is blocked by cadence gate ==")
+  _cleanup()
+  # Insert a recent screener_last_ran row
+  conn = get_connection()
+  try:
+    from datetime import timedelta as _td
+    today_et = (datetime.now(timezone.utc) + _td(hours=-5)).strftime('%Y-%m-%d')
+    conn.execute("DELETE FROM sentry_discovery_runs")
+    conn.execute(
+      """INSERT INTO sentry_discovery_runs (day, ran_at, screener_last_ran, total_enqueued)
+         VALUES (?, ?, ?, 0)""",
+      (today_et, datetime.now(timezone.utc).isoformat(), today_et),
+    )
+    conn.commit()
+  finally:
+    conn.close()
+
+  counts = sentry_discovery.scan_fundamental_screener(
+    universe=['ZZSD'],
+    force=False,
+    _fetch_financials_fn=_fake_financials({'ZZSD': {}}),
+  )
+  _check("cadence_gated = True", counts['cadence_gated'] is True, str(counts))
+  _check("enqueued == 0", counts['enqueued'] == 0)
+  _check("tickers_evaluated == 0 (no fetch performed)",
+         counts['tickers_evaluated'] == 0)
+
+
+def test_screener_top_n_cap():
+  print("\n== screener: top_n caps the enqueues per screener ==")
+  _cleanup()
+  import tempfile
+  conn = get_connection()
+  try:
+    conn.execute("DELETE FROM sentry_discovery_runs")
+    conn.commit()
+  finally:
+    conn.close()
+
+  screeners = [{
+    'name': 'simple_test',
+    'top_n': 2,
+    'sort_by': 'roeTTM',
+    'conditions': [{'metric': 'roeTTM', 'op': 'gte', 'value': 10}],
+  }]
+  # 5 passers, only top 2 by ROE should enqueue
+  ticker_metrics = {
+    f'ZZS{c}': {'roeTTM': 10.0 + i}
+    for i, c in enumerate(['E', 'F', 'G', 'H', 'I'])
+  }
+  with tempfile.TemporaryDirectory() as tmpdir:
+    yaml_path = _write_screener_yaml(tmpdir, screeners)
+    counts = sentry_discovery.scan_fundamental_screener(
+      screeners_yaml=yaml_path,
+      universe=list(ticker_metrics.keys()),
+      force=True,
+      _fetch_financials_fn=_fake_financials(ticker_metrics),
+    )
+  _check("enqueued capped at top_n=2", counts['enqueued'] == 2, str(counts))
+  pending = sentry_queue.dequeue_top(10)
+  enqueued = sorted(r['ticker'] for r in pending if r['ticker'].startswith('ZZS'))
+  # Top 2 ROEs were 14 (ZZSI) and 13 (ZZSH)
+  _check("top 2 ROE tickers selected", set(enqueued) == {'ZZSH', 'ZZSI'},
+         f"got {enqueued}")
+
+
+def test_screener_missing_metric_excludes_ticker():
+  print("\n== screener: missing metric values fail the ticker silently ==")
+  _cleanup()
+  import tempfile
+  conn = get_connection()
+  try:
+    conn.execute("DELETE FROM sentry_discovery_runs")
+    conn.commit()
+  finally:
+    conn.close()
+
+  screeners = [{
+    'name': 'strict',
+    'conditions': [{'metric': 'roeTTM', 'op': 'gte', 'value': 10}],
+  }]
+  ticker_metrics = {
+    'ZZSJ': {},  # empty metric -- should be filtered out
+    'ZZSK': {'roeTTM': 50.0},
+  }
+  with tempfile.TemporaryDirectory() as tmpdir:
+    yaml_path = _write_screener_yaml(tmpdir, screeners)
+    counts = sentry_discovery.scan_fundamental_screener(
+      screeners_yaml=yaml_path,
+      universe=list(ticker_metrics.keys()),
+      force=True,
+      _fetch_financials_fn=_fake_financials(ticker_metrics),
+    )
+  _check("enqueued == 1 (only ZZSK)", counts['enqueued'] == 1, str(counts))
+
+
 def test_rag_analogue_query_failure_no_crash():
   print("\n== rag_analogue: rag_search raising on one query does not crash run ==")
   _cleanup()
@@ -467,6 +620,10 @@ def main() -> int:
   test_rag_analogue_too_few_distinct_analogues_skipped()
   test_rag_analogue_setup_entries_skipped()
   test_rag_analogue_query_failure_no_crash()
+  test_screener_match_enqueues()
+  test_screener_cadence_gate_blocks_re_run()
+  test_screener_top_n_cap()
+  test_screener_missing_metric_excludes_ticker()
   _cleanup()
   print(f"\n== Summary ==\n  PASS: {_results['pass']}\n  FAIL: {_results['fail']}")
   for n, h in _results['failures']:

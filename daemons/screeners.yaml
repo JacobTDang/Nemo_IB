@@ -1,0 +1,77 @@
+# Screener configuration for daemons/sentry_discovery.py:scan_fundamental_screener
+#
+# Each entry is a named screener with a set of filter conditions. Conditions
+# are evaluated against the Finnhub get_basic_financials response (the
+# `metric` dict). All conditions in a screener must be satisfied (AND logic).
+#
+# Supported operators per condition:
+#   gt:  metric > value
+#   lt:  metric < value
+#   gte: metric >= value
+#   lte: metric <= value
+#   ne:  metric != value
+#
+# Available metrics (see tools/news_agregator/finnhub_server.py:KEY_METRICS
+# for the canonical list):
+#   peTTM, forwardPE, pegTTM, evEbitdaTTM, evRevenueTTM, pbQuarterly,
+#   pfcfShareTTM, psTTM, roeTTM, roiTTM, roaTTM, operatingMarginTTM,
+#   netProfitMarginTTM, grossMarginTTM, currentRatioQuarterly, quickRatioQuarterly,
+#   longTermDebt/equityQuarterly, totalDebt/totalEquityQuarterly,
+#   netInterestCoverageTTM, revenueGrowthTTMYoy, revenueGrowth5Y,
+#   revenueGrowthQuarterlyYoy, epsGrowth5Y, ebitdaCagr5Y,
+#   marketCapitalization, currentDividendYieldTTM
+#
+# The screener runs WEEKLY (gated by sentry_discovery_runs.screener_last_ran).
+# Each screener emits its top-N (default 5) matches sorted by a tie-breaker.
+
+screeners:
+  - name: compounder
+    description: high-quality businesses with sustained growth and reasonable price
+    top_n: 5
+    sort_by: roeTTM    # tiebreaker: highest ROE wins
+    conditions:
+      - {metric: roeTTM,                  op: gte, value: 20}
+      - {metric: revenueGrowth5Y,         op: gte, value: 8}
+      - {metric: forwardPE,               op: lte, value: 30}
+      - {metric: netInterestCoverageTTM,  op: gte, value: 5}
+
+  - name: deep_value
+    description: low multiples with positive operating margin and manageable debt
+    top_n: 5
+    sort_by: evEbitdaTTM
+    conditions:
+      - {metric: evEbitdaTTM,                op: lte, value: 8}
+      - {metric: operatingMarginTTM,         op: gte, value: 5}
+      - {metric: currentRatioQuarterly,      op: gte, value: 1.0}
+      - {metric: totalDebt/totalEquityQuarterly, op: lte, value: 1.5}
+      - {metric: marketCapitalization,       op: gte, value: 500}
+
+  - name: cash_machines
+    description: high free-cash-flow yield with low leverage
+    top_n: 5
+    sort_by: pfcfShareTTM
+    conditions:
+      - {metric: pfcfShareTTM,            op: lte, value: 15}
+      - {metric: roeTTM,                  op: gte, value: 12}
+      - {metric: totalDebt/totalEquityQuarterly, op: lte, value: 1.0}
+      - {metric: marketCapitalization,    op: gte, value: 1000}
+
+  - name: growth_at_reasonable_price
+    description: GARP — peg under 1.5 with positive momentum
+    top_n: 5
+    sort_by: pegTTM
+    conditions:
+      - {metric: pegTTM,                  op: lte, value: 1.5}
+      - {metric: revenueGrowthTTMYoy,     op: gte, value: 15}
+      - {metric: roeTTM,                  op: gte, value: 10}
+      - {metric: marketCapitalization,    op: gte, value: 500}
+
+  - name: turnaround_signal
+    description: low valuation with positive recent revenue inflection
+    top_n: 3
+    sort_by: revenueGrowthQuarterlyYoy
+    conditions:
+      - {metric: revenueGrowthQuarterlyYoy, op: gte, value: 5}
+      - {metric: revenueGrowth5Y,           op: lte, value: 0}
+      - {metric: pbQuarterly,               op: lte, value: 2.0}
+      - {metric: marketCapitalization,      op: gte, value: 250}
