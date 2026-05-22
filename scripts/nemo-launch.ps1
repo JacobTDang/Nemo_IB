@@ -104,6 +104,21 @@ Write-Host '== Nemo IB launcher ==' -ForegroundColor Cyan
 Write-Host "Project: $projectRoot"
 Write-Host ''
 
+# Step 0: kick off the sentry discovery warm-up in the background. Runs in
+# parallel with the SearxNG bootstrap below and any other startup checks.
+# Idempotent thanks to the sentry_discovery_runs row: ~40s on a fresh ET
+# day, no-op on subsequent same-day launches.
+if (Test-Path $pythonExe) {
+  $warmupJob = Start-Job -Name 'sentry-warmup' -ScriptBlock {
+    param($pythonExe, $projectRoot)
+    Set-Location $projectRoot
+    & $pythonExe -m daemons.sentry_triage --once 2>&1
+  } -ArgumentList $pythonExe, $projectRoot
+  Write-Host "sentry warm-up: started in background (job $($warmupJob.Id))" -ForegroundColor DarkCyan
+} else {
+  $warmupJob = $null
+}
+
 # Step 1: ensure Docker + SearxNG are up. start_searxng.ps1 is idempotent —
 # fast path is ~50ms when SearxNG already responds.
 Write-Host 'Starting Docker + SearxNG (idempotent)...' -ForegroundColor Yellow
@@ -172,6 +187,23 @@ if ((Test-Path $slackDir) -and (Get-Command bun -ErrorAction SilentlyContinue)) 
 
 # Step 3: clean up any stale daemons from a crashed previous session
 Stop-StalePids
+
+# Step 3b: collect the sentry warm-up before launching the triage daemon.
+# Guarantees the discovery row is in sentry_discovery_runs before the
+# daemon's first tick — no race on the same-day insert. Most of the time
+# it has already finished while SearxNG was booting.
+if ($warmupJob) {
+  Write-Host ''
+  Write-Host 'Waiting for sentry warm-up to finish...' -ForegroundColor Yellow
+  $warmupOut = $warmupJob | Wait-Job | Receive-Job
+  $warmupJob | Remove-Job
+  $tail = ($warmupOut | Select-Object -Last 2) -join ' | '
+  if ($tail) {
+    Write-Host "  $tail" -ForegroundColor DarkGreen
+  } else {
+    Write-Host '  (warm-up produced no output)' -ForegroundColor DarkGray
+  }
+}
 
 # Step 4: start the four Python daemons in the background
 Write-Host ''
