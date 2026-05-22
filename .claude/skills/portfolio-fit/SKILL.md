@@ -3,15 +3,11 @@ name: portfolio-fit
 description: Check whether a proposed new position fits the current paper book. Detects sector / factor / theme overlap with existing holdings, flags duplicate exposure, recommends maximum size given diversification constraints. Use before sizing into any new position, especially when the proposed thesis sounds similar to existing ones (e.g., another AI capex name when book already has 3).
 ---
 
-# /portfolio-fit — Does this belong in the book?
+# /portfolio-fit
 
-The discipline: a bullish thesis on NVDA may NOT justify adding if the
-book already has heavy AI capex exposure through TSM, AMD, AVGO, MSFT,
-and power/data-center names. The marginal exposure is the question, not
-the standalone thesis.
-
-This skill answers: given the current book, does this new position add
-diversification, duplicate existing bets, or concentrate sector risk?
+A bullish NVDA thesis may not justify adding if the book already has
+heavy AI capex via TSM/AMD/AVGO/MSFT. Marginal exposure is the
+question, not standalone thesis quality.
 
 ## Inputs
 
@@ -86,7 +82,16 @@ For each existing position in the same factor buckets:
 
 ## Output
 
-```
+```yaml
+---
+skill: portfolio-fit
+ticker: <TICKER>
+verdict: <strong / acceptable / weak / reject>
+confidence: 0.0-1.0
+key_finding: <one sentence on duplicate exposure or concentration finding>
+data_gaps: [<list — may include empty_book>]
+---
+
 ## /portfolio-fit — {TICKER}
 
 **Proposed**: BUY {TICKER} at {N}% of book

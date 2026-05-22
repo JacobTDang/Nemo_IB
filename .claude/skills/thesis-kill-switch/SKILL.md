@@ -3,17 +3,12 @@ name: thesis-kill-switch
 description: Make falsifiers actionable. Evaluates all active theses against their declared falsifiers using current data, classifies each as intact / approaching / triggered, and recommends required action (continue / review / reduce / exit). Distinct from /thesis-monitor (broader thesis health) — this skill specifically operationalizes the falsifiers list into a kill-switch decision. Use before any new entry, on a daily/weekly schedule, or whenever a falsifier observable updates.
 ---
 
-# /thesis-kill-switch — Make falsifiers actionable
+# /thesis-kill-switch
 
-A thesis without an actionable kill-switch is a faith claim. This skill
-turns the falsifiers list (declared in `/equity-deep-research` Step 18)
-into structured decisions: continue, review within 24h, reduce size,
-or exit.
-
-The backing engine is `daemons/falsifier_watcher.py`, which already does
-the heavy lifting (loads active theses, evaluates falsifiers, records
-triggered alerts to `thesis_evolution` with a negative conviction delta).
-This skill is the synchronous, on-demand front-end to that daemon.
+Synchronous front-end to `daemons/falsifier_watcher.py`. Turns the
+declared falsifiers list into structured decisions (continue / monitor
+/ review-24h / reduce / exit). A thesis without actionable kill-switch
+is a faith claim.
 
 ## Inputs
 
@@ -84,7 +79,16 @@ falsifier on day 1" sanity check.
 
 ## Output
 
-```
+```yaml
+---
+skill: thesis-kill-switch
+ticker: <TICKER or null for system-wide>
+verdict: <intact / approaching / triggered_one_major / triggered_multiple>
+confidence: 0.0-1.0
+key_finding: <one sentence on the most-at-risk thesis or worst-triggered falsifier>
+data_gaps: [<list>]
+---
+
 ## /thesis-kill-switch
 
 **Tick date**: {ISO timestamp}

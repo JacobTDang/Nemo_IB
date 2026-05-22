@@ -5,14 +5,10 @@ description: Estimate the gap between published sell-side consensus and the unst
 
 # /expectations-hurdle-check
 
-A company can beat consensus EPS by 5% and still sell off if the
-buyside whisper was 12% above consensus. This skill estimates the
-gap using price action + options skew + CFO tone.
-
-**Scope (disjoint from /estimate-revision-watch)**: this skill does
-NOT pull `get_forward_estimates` or `get_analyst_revisions_history`.
-Consumes the consensus number from upstream `/equity-deep-research`
-Step 13 OR from `/estimate-revision-watch` if running standalone.
+Estimates the buyside whisper gap vs published consensus using price
+action + options skew + CFO tone. Disjoint from
+`/estimate-revision-watch` (does NOT pull `get_forward_estimates` or
+`get_analyst_revisions_history` — consumes consensus from upstream).
 
 ## Inputs
 

@@ -3,16 +3,12 @@ name: red-team-thesis
 description: Attack an investment thesis before capital commitment. Restates the thesis, builds the strongest bear case, surfaces what smart shorts would argue, identifies what consensus may already know, and recommends keep / reduce confidence / reduce size / no_position. Use whenever a /equity-deep-research synthesis is about to be acted on or when sizing up. Distinct from /premortem (which writes 3 explicit failure scenarios) in that this attacks the thesis logic itself rather than mapping failure modes.
 ---
 
-# /red-team-thesis — Adversarial review
+# /red-team-thesis
 
-The discipline: write the strongest case AGAINST your own thesis
-before sizing into it. This is not /premortem — premortem writes
-failure scenarios; red-team attacks the bull-case logic itself.
-
-If the red-team argument turns out stronger than the original bull
-thesis, the hard rule is to downgrade confidence or output
-no_position. Letting the bull thesis stand unchallenged is how
-analysts overpay.
+Attack the bull case using the SAME evidence the thesis used. Distinct
+from /premortem (which writes failure scenarios); this attacks the
+logic itself. If the red-team argument is stronger than the bull, the
+hard rule is downgrade or no_position.
 
 ## Inputs
 
@@ -106,7 +102,16 @@ Choose one:
 
 ## Output
 
-```
+```yaml
+---
+skill: red-team-thesis
+ticker: <TICKER>
+verdict: <keep / reduce_confidence / reduce_size / no_position>
+confidence: 0.0-1.0
+key_finding: <one sentence on strongest bear argument>
+data_gaps: [<list>]
+---
+
 ## /red-team-thesis — {TICKER}
 
 **Restated thesis** (verbatim):

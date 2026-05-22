@@ -73,7 +73,16 @@ return. State explicitly: "Expected return is most sensitive to
 
 ## Output
 
-```
+```yaml
+---
+skill: scenario-builder
+ticker: <TICKER>
+verdict: <attractive / balanced / poor>
+confidence: 0.0-1.0
+key_finding: <one sentence with expected return + dominant assumption>
+data_gaps: [<list>]
+---
+
 ## /scenario-builder — {TICKER}
 
 **Current price**: $X.XX

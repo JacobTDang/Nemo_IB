@@ -93,7 +93,16 @@ happens to fair-value calc? Surface the sensitivity explicitly.
 
 ## Output
 
-```
+```yaml
+---
+skill: valuation-check
+ticker: <TICKER>
+verdict: <cheap / fair / expensive / bubble_like / value_trap>
+confidence: 0.0-1.0
+key_finding: <one sentence on what the market is pricing in>
+data_gaps: [<list>]
+---
+
 ## /valuation-check — {TICKER}
 
 **Current price**: $X.XX

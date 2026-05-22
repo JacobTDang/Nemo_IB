@@ -5,15 +5,9 @@ description: Track whether a signal or new data point is likely to force sell-si
 
 # /estimate-revision-watch
 
-Stocks move on expectation changes, not absolute business quality. A
-great quarter doesn't matter to the price if analysts already
-believe it. This skill measures revision trajectory and predicts
-whether new data forces analyst numbers up or down.
-
-**Scope (disjoint from /expectations-hurdle-check)**: this skill
-focuses on sell-side revisions and beat/miss history. It does NOT
-pull options skew, pre-earnings price action, or buyside whisper —
-those live in `/expectations-hurdle-check`.
+Stocks move on expectation changes, not absolute quality. Measures
+sell-side revision trajectory + beat/miss history. Disjoint from
+`/expectations-hurdle-check` (which owns buyside whisper).
 
 ## Inputs
 

@@ -3,14 +3,10 @@ name: signal-backtest
 description: Backtest a quantitative signal (technical indicator, fundamental ratio, multi-condition rule) over historical data to measure hit rate, average return, holding period, and drawdown. Use to validate a thesis pattern before sizing, or to answer "does this signal actually work?" Distinct from /scenario-builder, which projects forward; this looks backward.
 ---
 
-# /signal-backtest — Historical signal validation
+# /signal-backtest
 
-The discipline: before sizing into a thesis pattern (RSI oversold, FCF
-yield above X, revenue acceleration above Y, insider cluster buying),
-test whether the pattern has actually worked historically on the
-relevant universe.
-
-Without this, the system is just narrative.
+Validate a thesis pattern historically before sizing. Without this,
+the thesis is just narrative.
 
 ## Inputs
 
@@ -90,7 +86,16 @@ The MCP tool returns:
 
 ### 5. Output
 
-```
+```yaml
+---
+skill: signal-backtest
+ticker: <null — universe-level>
+verdict: <reliable / weak / noisy / overfit_suspect>
+confidence: 0.0-1.0
+key_finding: <one sentence on hit rate + holding period + caveats>
+data_gaps: [<list>]
+---
+
 ## /signal-backtest
 
 **Signal**:
