@@ -213,6 +213,21 @@ CREATE_SCHEMA = [
     )""",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_etf_aum_etf_date ON etf_aum_history(etf_symbol, snapshot_date)",
     "CREATE INDEX IF NOT EXISTS idx_etf_aum_date ON etf_aum_history(snapshot_date DESC)",
+
+    # --- Sentry: discovery run tracker (one row per ET day) ---
+    # sentry_triage checks this on every tick — if no row for today exists,
+    # it triggers sentry_discovery.run_all() and inserts a row. Prevents
+    # discovery from re-running every tick of the day.
+    """CREATE TABLE IF NOT EXISTS sentry_discovery_runs(
+        day                   TEXT PRIMARY KEY,
+        ran_at                TIMESTAMP NOT NULL,
+        catalyst_enqueued     INTEGER NOT NULL DEFAULT 0,
+        insider_enqueued      INTEGER NOT NULL DEFAULT 0,
+        activist_enqueued     INTEGER NOT NULL DEFAULT 0,
+        theme_flow_enqueued   INTEGER NOT NULL DEFAULT 0,
+        total_enqueued        INTEGER NOT NULL DEFAULT 0,
+        errors                TEXT
+    )""",
 ]
 
 

@@ -74,7 +74,8 @@ def scan_catalyst_calendar(watchlist: Optional[List[str]] = None) -> Dict[str, i
   counts = {'fetched': 0, 'in_watchlist': 0, 'enqueued': 0, 'skipped': 0}
 
   if watchlist is None:
-    watchlist = [w['ticker'].upper() for w in get_watchlist()]
+    # get_watchlist() returns plain ticker strings, not dicts
+    watchlist = [t.upper() for t in get_watchlist()]
   watchlist_set = set(watchlist)
 
   if not watchlist_set:
@@ -184,7 +185,8 @@ def scan_insider_cluster(watchlist: Optional[List[str]] = None) -> Dict[str, int
   }
 
   if watchlist is None:
-    watchlist = [w['ticker'].upper() for w in get_watchlist()]
+    # get_watchlist() returns plain ticker strings, not dicts
+    watchlist = [t.upper() for t in get_watchlist()]
 
   # -- 2a. Insider cluster scan on watchlist --
   async def _fetch_insider(ticker: str):

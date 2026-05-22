@@ -83,7 +83,7 @@ def test_end_to_end_basic():
   _inject_event(f'{_TEST_PREFIX_EVENT}3', f'{_TEST_PREFIX_TICKER}C',
                 source='finnhub', category='general_news', materiality='low', urgency='low')
 
-  counts = tick()
+  counts = tick(skip_discovery=True)
   _check("enqueued >= 2 (TST_A and TST_B)", counts['enqueued'] >= 2,
          f"got {counts['enqueued']}")
   _check("below_threshold >= 1 (TST_C)", counts['below_thr'] >= 1,
@@ -104,7 +104,7 @@ def test_dedup_same_ticker():
   _inject_event(f'{_TEST_PREFIX_EVENT}5', f'{_TEST_PREFIX_TICKER}D',
                 source='finnhub', category='guidance_cut', materiality='high', urgency='high')
 
-  tick()
+  tick(skip_discovery=True)
   pending = sentry_queue.dequeue_top(10)
   d_rows = [r for r in pending if r['ticker'] == f'{_TEST_PREFIX_TICKER}D']
   _check("TST_D appears exactly once (dedup)", len(d_rows) == 1, f"got {len(d_rows)}")
@@ -123,7 +123,7 @@ def test_cooldown_skip():
   # Now inject a high-signal event for TST_E
   _inject_event(f'{_TEST_PREFIX_EVENT}6', f'{_TEST_PREFIX_TICKER}E')
 
-  counts = tick()
+  counts = tick(skip_discovery=True)
   _check("event was skipped due to cooldown", counts['skipped'] >= 1,
          f"got {counts['skipped']}")
 
@@ -136,8 +136,8 @@ def test_idempotency():
   print("\n== idempotency: rerun tick without new events ==")
   _cleanup()
   _inject_event(f'{_TEST_PREFIX_EVENT}7', f'{_TEST_PREFIX_TICKER}F')
-  counts1 = tick()
-  counts2 = tick()
+  counts1 = tick(skip_discovery=True)
+  counts2 = tick(skip_discovery=True)
   _check("first tick enqueued >= 1",
          counts1['enqueued'] >= 1, f"got {counts1['enqueued']}")
   _check("second tick enqueues 0 (all events already processed)",
@@ -166,7 +166,7 @@ def test_no_ticker_event():
   finally:
     conn.close()
 
-  counts = tick()
+  counts = tick(skip_discovery=True)
   _check("no_ticker count >= 1", counts['no_ticker'] >= 1, f"got {counts['no_ticker']}")
   _check("tick didn't crash", True)
 

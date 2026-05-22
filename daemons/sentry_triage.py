@@ -34,7 +34,7 @@ from typing import Any, Dict, List
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from state.schema import init_schema
+from state.schema import init_schema, get_connection
 from state.events_store import unprocessed_events, mark_processed
 from state.sentry_eval_log import record_eval, should_skip
 from state import sentry_queue
@@ -48,7 +48,88 @@ ENQUEUE_THRESHOLD = 0.50        # below this, log only
 HIGH_SIGNAL_THRESHOLD = 0.70    # at this and above, force-enqueue even past cap
 EVENTS_PER_TICK = 100           # max events to process per tick
 
+_ET_OFFSET_HOURS = -5          # ET = UTC-5 (approximation; see agent/sentry_budget.py)
+
 _running = True
+
+
+def _today_et() -> str:
+  """Today's date in ET as YYYY-MM-DD."""
+  from datetime import timedelta as _td
+  return (datetime.now(timezone.utc) + _td(hours=_ET_OFFSET_HOURS)).strftime('%Y-%m-%d')
+
+
+def _discovery_ran_today() -> bool:
+  """Check whether discovery channels have already run today."""
+  conn = get_connection()
+  try:
+    row = conn.execute(
+      "SELECT 1 FROM sentry_discovery_runs WHERE day = ?",
+      (_today_et(),),
+    ).fetchone()
+    return row is not None
+  finally:
+    conn.close()
+
+
+def _record_discovery_run(results: Dict[str, Dict[str, int]]) -> None:
+  """Insert today's discovery run row with per-channel enqueue counts."""
+  catalyst = results.get('catalyst_calendar', {}).get('enqueued', 0)
+  insider = results.get('insider_cluster', {}).get('insider_clusters', 0)
+  activist = results.get('insider_cluster', {}).get('activist_enqueued', 0)
+  theme = results.get('theme_flow', {}).get('enqueued', 0)
+  total = catalyst + insider + activist + theme
+
+  conn = get_connection()
+  try:
+    conn.execute(
+      """INSERT OR REPLACE INTO sentry_discovery_runs
+         (day, ran_at, catalyst_enqueued, insider_enqueued, activist_enqueued,
+          theme_flow_enqueued, total_enqueued, errors)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+      (
+        _today_et(), datetime.now(timezone.utc).isoformat(),
+        catalyst, insider, activist, theme, total, None,
+      ),
+    )
+    conn.commit()
+  finally:
+    conn.close()
+
+
+def _maybe_run_daily_discovery() -> bool:
+  """If discovery hasn't run today, run all 3 channels and record the result.
+  Returns True if discovery ran this call, False if it was already done today."""
+  if _discovery_ran_today():
+    return False
+
+  print(f"[sentry_triage] running daily discovery scan (day={_today_et()})...",
+        file=sys.stderr, flush=True)
+  try:
+    # Import here to avoid heavy imports when triage is event-only
+    from daemons import sentry_discovery
+    results = sentry_discovery.run_all()
+    _record_discovery_run(results)
+    return True
+  except Exception as exc:
+    import traceback
+    print(f"[sentry_triage] discovery scan crashed: {type(exc).__name__}: {exc}",
+          file=sys.stderr, flush=True)
+    traceback.print_exc(file=sys.stderr)
+    # Still record a row so we don't retry on every tick; mark errors
+    conn = get_connection()
+    try:
+      conn.execute(
+        """INSERT OR REPLACE INTO sentry_discovery_runs
+           (day, ran_at, total_enqueued, errors)
+           VALUES (?, ?, 0, ?)""",
+        (_today_et(), datetime.now(timezone.utc).isoformat(),
+         f"{type(exc).__name__}: {exc}"),
+      )
+      conn.commit()
+    finally:
+      conn.close()
+    return False
 
 
 def _install_signal_handlers() -> None:
@@ -67,17 +148,32 @@ def _resolve_ticker(event: Dict[str, Any]) -> str | None:
   return event.get('primary_ticker') or event.get('ticker')
 
 
-def tick(max_queue: int = DEFAULT_MAX_QUEUE) -> Dict[str, int]:
-  """Run one triage pass. Returns counts dict for logging/testing."""
+def tick(max_queue: int = DEFAULT_MAX_QUEUE,
+         skip_discovery: bool = False) -> Dict[str, int]:
+  """Run one triage pass. Returns counts dict for logging/testing.
+
+  On the first tick of each ET day, runs the 3 discovery channels
+  (catalyst_calendar, insider_cluster, theme_flow) before processing
+  events. Subsequent ticks the same day skip discovery (already done).
+
+  Args:
+    max_queue: trim pending queue to at most this size after the tick
+    skip_discovery: set True in tests to bypass the daily discovery run
+  """
   counts = {
-    'fetched':    0,
-    'no_ticker':  0,
-    'skipped':    0,
-    'scored':     0,
-    'enqueued':   0,
-    'below_thr':  0,
-    'processed':  0,
+    'fetched':           0,
+    'no_ticker':         0,
+    'skipped':           0,
+    'scored':            0,
+    'enqueued':          0,
+    'below_thr':         0,
+    'processed':         0,
+    'discovery_ran':     False,
   }
+
+  # 1. Day rollover: run discovery channels once per day
+  if not skip_discovery:
+    counts['discovery_ran'] = _maybe_run_daily_discovery()
 
   events = unprocessed_events(min_materiality='low', limit=EVENTS_PER_TICK)
   counts['fetched'] = len(events)
