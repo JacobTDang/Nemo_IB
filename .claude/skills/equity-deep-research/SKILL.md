@@ -549,52 +549,135 @@ Required sections (in this order):
 17. **Data gaps** — tools / sources that failed or were unavailable
 18. **Next monitoring checklist** — what to check next and when
 
+### Step 19a — Pre-save semantic red-team
+
+Before running the Verification block below, invoke an `Agent`
+sub-agent to scan the draft synthesis for semantic defects that the
+precondition / schema checks cannot reach. The sub-agent uses the LLM's
+judgment to detect framings that argue against each other on the same
+KPI, untraceable numbers, or conclusions inconsistent with the cited
+weights.
+
+Use the `Agent` tool with `subagent_type='general-purpose'` and pass
+the full draft synthesis markdown in the prompt. Example shape:
+
+```
+Agent(
+  description='Synthesis red-team',
+  subagent_type='general-purpose',
+  prompt=<<<
+Read this draft equity-research synthesis and flag in JSON any of:
+
+  1. Adjacent claims arguing opposite directions on the same KPI
+     within the same horizon (e.g., calling something both "cheap"
+     and a "value trap" without resolving the framing in one place)
+  2. Numbers cited in Sections 5 or 6 without a traceable tool source
+  3. Bull-case bullets that are functionally bearish, or vice versa
+  4. Conclusion in Section 2 inconsistent with the bear / bull
+     weights or scenario PTs cited
+
+Return JSON: {"ok": bool,
+              "violations": [{"section": str, "claim": str,
+                              "conflict": str}]}.
+
+<SYNTHESIS DRAFT>
+{paste full synthesis markdown here}
+</SYNTHESIS DRAFT>
+  >>>
+)
+```
+
+Handle the result:
+
+- `ok: true, violations: []` → set
+  `contradiction_check_passed = True`. Proceed to the Verification
+  block.
+- `violations` non-empty AND iteration < 2 → patch the synthesis to
+  resolve each violation (rewrite the offending sentence, drop the
+  bullet, or reconcile the framing in-place). Re-run Step 19a.
+  Maximum 2 iterations.
+- Still violating after iteration 2 → downgrade the Section 2
+  verdict to `watchlist`, set
+  `contradiction_check_passed = False`, document the unresolved
+  conflicts in Section 17 (Data gaps). Save.
+
+When you finally call `sentry_record_evaluation` (from
+`/sentry-tick`) or `record_thesis_evolution` (standalone), include
+the audit fields gathered during the workflow:
+
+- `analogue_considered`: the analogue name returned by Step 15, or
+  the literal `'none'` if Step 15 returned no match
+- `terminal_sensitivity_ran`: `True` if Step 16's
+  `calculate_scenario_dcf` produced a `terminal_sensitivity` field,
+  `False` if it ran in perpetuity-only mode or was skipped entirely
+- `contradiction_check_passed`: the boolean from this step
+- `provenance_filing_count` / `provenance_press_count`: the count
+  of `[filing:...]` and `[press-reported]` tags in Sections 5 / 6
+
+These fields gate `sentry_record_evaluation`'s validator: omitting
+them when verdict is buy/short will cause the insert to be
+rejected.
+
 ### Verification before save
 
 Before writing the file or calling `record_thesis_evolution`, re-read
-the synthesis once and confirm each of the following. Missing any of
-these → patch the synthesis in place, do NOT save yet.
+the synthesis once and apply each check below. Every check declares
+a **PRECONDITION** — the check only fires when the precondition is
+met. If the precondition isn't met, the check is *vacuously
+satisfied*; do not invent the missing data just to make the check
+pass. Heavy checks (a) and (f) further apply only when the verdict
+is action-worthy (buy / short); for watchlist / no_position they
+are vacuous because the data was never decision-relevant.
 
-(a) **Section 7** cites the `terminal_sensitivity` table if the
-    scenario DCF ran with `terminal_multiple > 0`. Any cited price
-    target traces to a sensitivity cell.
+(a) **Terminal-sensitivity table in Section 7**
+    - PRECONDITION: `calculate_scenario_dcf` ran with
+      `terminal_multiple > 0` AND verdict ∈ {buy, short}
+    - CHECK: Section 7 renders the `terminal_sensitivity` field as
+      a markdown table (3 scenarios × N multiples). Any PT cited in
+      Section 2 or 14 references a cell from this table.
 
-(b) **Section 11** contains the literal `mostly_alpha` /
-    `partial_alpha` / `mostly_factor` verdict tag from
-    `/factor-exposure-check` AND the 6-row factor table verbatim.
+(b) **Factor-exposure verdict tag in Section 11**
+    - PRECONDITION: `/factor-exposure-check` was invoked
+    - CHECK: Section 11 contains the literal verdict (`mostly_alpha`
+      / `partial_alpha` / `mostly_factor`) on its own line AND
+      renders the 6-row factor table verbatim.
 
-(c) Every insider-activity claim in Sections 9 (Positioning) and
-    elsewhere cites `current_vs_baseline_ratio`. No "loud" / "heavy"
-    / "concerning" without ratio > 1.5x.
+(c) **Insider current_vs_baseline_ratio citation**
+    - PRECONDITION: `get_insider_transactions` was called for this
+      ticker
+    - CHECK: every insider-activity narrative cites the ratio
+      explicitly. Soft descriptors (loud, heavy, concerning) are
+      only valid when the cited ratio exceeds 1.5x.
 
-(d) **No two claims argue opposite directions on the same KPI within
-    the same horizon.** Scan Sections 5 and 6 (Bull / Bear). If
-    Section 5 says "Compute & Networking growth is the law of large
-    numbers, not a thesis break" and Section 6 says "C&N
-    deceleration is the leading indicator the cycle is past peak,"
-    these are contradictory framings of the same data — pick one,
-    do not paper over with hedging. Same for: revenue growth direction,
-    margin direction, insider activity, capex direction, customer
-    concentration. The bull and bear cases may pull on different KPIs;
-    they may NOT pull on the same KPI in opposite directions.
+(d) **Semantic contradiction sweep**
+    - PRECONDITION: always (this is the universal check)
+    - CHECK: delegated to the red-team sub-agent in Step 19a. The
+      sub-agent flags adjacent claims that argue opposite directions
+      on the same KPI within the same horizon; pick one or reconcile
+      explicitly.
 
-(e) **Press-vs-filing provenance.** Every direct quote, executive
-    statement, or specific corporate fact in Sections 5 / 6 is
-    either (i) traceable to a `rag_search` hit with a
-    filing-corpus `doc_type` (`10K_*`, `10Q_*`, `8K_*`,
-    `earnings_release`, `mda`, `risk_factors`), or (ii) explicitly
-    labeled `[press-reported]`. Unlabeled press-only quotes fail
-    this check.
+(e) **Press-vs-filing provenance tagging**
+    - PRECONDITION: Sections 5 or 6 contain a direct quote,
+      executive statement, or specific corporate claim
+    - CHECK: each such item is either (i) traceable to a
+      `rag_search` hit with a filing-corpus `doc_type` (`10K_*`,
+      `10Q_*`, `8K_*`, `earnings_release`, `mda`, `risk_factors`),
+      or (ii) explicitly labeled `[press-reported]`. Unlabeled
+      press-only quotes fail this check.
 
-(f) **Analogue calibration.** If Step 15 invoked a `bear` analogue
-    with `drawdown_pct = D%`, the bear case PT cited in Sections 6
-    and 8 implies at least `0.6 × |D|%` downside. Same for `bull`
-    analogues upward. `setup` analogues impose no calibration but
-    also cannot back aggressive cases.
+(f) **Historical-analogue calibration**
+    - PRECONDITION: `get_historical_analogue` returned a `bear` or
+      `bull` analogue with non-null `drawdown_pct` AND verdict ∈
+      {buy, short}
+    - CHECK: the bear / bull PT in Sections 6 and 8 implies at
+      least `0.6 × |drawdown_pct|` move from spot in the analogue's
+      direction. `setup` analogues impose no calibration but also
+      cannot back aggressive cases.
 
-If any item (a)-(f) fails the check, the synthesis is incomplete.
-Fix it before saving — silently writing an under-specified report
-is a discipline failure, not a graceful degradation.
+If any check whose precondition is met fails, the synthesis is
+incomplete. Patch in place before saving — silently writing an
+under-specified report is a discipline failure, not graceful
+degradation. If a check's precondition is unmet, move on.
 
 Save the synthesis to:
 `testing/fixtures/research_<TICKER>_<DATE>.md`

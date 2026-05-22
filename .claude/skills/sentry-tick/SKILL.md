@@ -121,7 +121,13 @@ verdict=..., skip_reason=...)`
 
 **Verdict watchlist / no_position**
 → `sentry_record_evaluation(decision='researched', verdict=...,
-sizing=...)`
+sizing=..., factor_buckets=[...], contradiction_check_passed=...)`.
+The audit fields `factor_buckets` and `contradiction_check_passed`
+(from `/equity-deep-research` Step 19a) are REQUIRED for researched
+verdicts — the tool will reject the insert otherwise. Optionally
+also pass `analogue_considered`, `terminal_sensitivity_ran`,
+`provenance_filing_count`, `provenance_press_count` when the
+upstream tools ran.
 → Post Slack `research_synthesis` card
 → `sentry_record_action(action_type='slack_messages')`
 → `sentry_mark_queue_status(queue_id, 'completed')`
@@ -146,7 +152,15 @@ sizing=...)`
    - `sentry_record_action(action_type='new_positions')` OR
      `sentry_record_action(action_type='adds_or_trims')`
 6. `sentry_record_evaluation(decision='acted', verdict='buy',
-   sizing=..., confidence=..., factor_buckets=[...])`
+   sizing=..., confidence=..., factor_buckets=[...])`.
+   The `acted` decision does NOT require the discipline audit fields
+   — those are gated on `decision='researched'`. If you ALSO want to
+   land a researched-row attestation for this buy (e.g., because the
+   pipeline goes Sentry → /equity-deep-research → buy), call
+   `sentry_record_evaluation(decision='researched', verdict='buy',
+   ...)` separately with the full audit fields BEFORE the acted row.
+   The validator REQUIRES analogue_considered, terminal_sensitivity_ran,
+   contradiction_check_passed, factor_buckets for researched/buy.
 7. Post Slack `trade_placed` card via `post_notification`.
 8. `sentry_record_action(action_type='slack_messages')`
 9. `sentry_mark_queue_status(queue_id, 'completed')`

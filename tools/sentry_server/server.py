@@ -228,7 +228,15 @@ class SentryServer:
           description=(
             'Insert an eval row recording the outcome of a Sentry '
             'evaluation. Computes next_review_at from cooldown rules. '
-            'Call ONCE per candidate per tick.'
+            'Call ONCE per candidate per tick. '
+            'When decision=researched AND verdict in (buy, short): the '
+            'discipline audit fields (analogue_considered, '
+            'terminal_sensitivity_ran, contradiction_check_passed, '
+            'factor_buckets) are REQUIRED. The validator will reject '
+            'the insert if any is missing. For watchlist / no_position '
+            'verdicts only contradiction_check_passed and factor_buckets '
+            'are required (the heavy checks are vacuous for decisions '
+            'that do not commit capital).'
           ),
           inputSchema={
             'type': 'object',
@@ -241,14 +249,25 @@ class SentryServer:
                                     'description': 'event_score / theme_flow / insider_cluster / catalyst_calendar / manual'},
               'trigger_event_id':  {'type': 'string'},
               'verdict':           {'type': 'string',
-                                    'description': 'buy / watchlist / avoid / no_position'},
+                                    'description': 'buy / short / watchlist / avoid / no_position'},
               'confidence':        {'type': 'number'},
               'sizing':            {'type': 'string',
                                     'description': 'aggressive / normal / cautious / no_position'},
               'factor_buckets':    {'type': 'array',
-                                    'items': {'type': 'string'}},
+                                    'items': {'type': 'string'},
+                                    'description': 'Factor tags from factor-exposure-check. Required for any researched verdict.'},
               'skip_reason':       {'type': 'string'},
               'notes':             {'type': 'string'},
+              'analogue_considered':       {'type': 'string',
+                                            'description': 'Name of historical analogue considered, or the literal "none" if checked and none applied. Required for researched buy/short.'},
+              'terminal_sensitivity_ran':  {'type': 'boolean',
+                                            'description': 'True if calculate_scenario_dcf produced a terminal_sensitivity table. Required for researched buy/short.'},
+              'contradiction_check_passed':{'type': 'boolean',
+                                            'description': 'Result of the Step 19a red-team sub-agent. Required for any researched verdict.'},
+              'provenance_filing_count':   {'type': 'integer',
+                                            'description': 'Count of [filing:...] tags in Sections 5/6.'},
+              'provenance_press_count':    {'type': 'integer',
+                                            'description': 'Count of [press-reported] tags in Sections 5/6.'},
             },
           },
         ),
@@ -586,6 +605,11 @@ class SentryServer:
       factor_buckets=args.get('factor_buckets'),
       skip_reason=args.get('skip_reason'),
       notes=args.get('notes'),
+      analogue_considered=args.get('analogue_considered'),
+      terminal_sensitivity_ran=args.get('terminal_sensitivity_ran'),
+      contradiction_check_passed=args.get('contradiction_check_passed'),
+      provenance_filing_count=args.get('provenance_filing_count'),
+      provenance_press_count=args.get('provenance_press_count'),
     )
     return _ok('sentry_record_evaluation',
                {'eval_id': eval_id, 'ticker': ticker.upper(),
