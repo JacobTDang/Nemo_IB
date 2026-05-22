@@ -174,6 +174,146 @@ def test_ipo_empty_calendar():
   _check("enqueued = 0", counts['enqueued'] == 0)
 
 
+# ============================================================================
+# scan_universe_insider_cluster
+# ============================================================================
+
+def _fake_sentiment(ticker_to_msprs):
+  """Async stub for /stock/insider-sentiment.
+
+  Args:
+    ticker_to_msprs: dict ticker -> list of float MSPR values (most recent
+                     first). Empty list = no data row.
+  """
+  async def fetch(ticker):
+    values = ticker_to_msprs.get(ticker, [])
+    data = []
+    for i, m in enumerate(values):
+      data.append({'year': 2026, 'month': 5 - i, 'mspr': m,
+                   'change': 1000, 'msprChange': 0})
+    return {'data': data}
+  return fetch
+
+
+def _fake_transactions(ticker_to_txns):
+  """Async stub for /stock/insider-transactions."""
+  async def fetch(ticker):
+    txns = ticker_to_txns.get(ticker, [])
+    return {'data': txns}
+  return fetch
+
+
+def _open_market_buy(name, change, price, days_ago):
+  return {
+    'name': name,
+    'transactionCode': 'P',
+    'change': change,
+    'transactionPrice': price,
+    'transactionDate': (datetime.now(timezone.utc).date()
+                          - __import__('datetime').timedelta(days=days_ago)).isoformat(),
+  }
+
+
+def test_universe_insider_pre_filter_drops_low_mspr():
+  print("\n== universe_insider: low-MSPR tickers excluded from deep-dive ==")
+  _cleanup()
+  universe = ['ZZJA', 'ZZJB']
+  sentiment = _fake_sentiment({
+    'ZZJA': [0.4, 0.5, 0.6],   # passes
+    'ZZJB': [0.0, 0.1, -0.1],  # below threshold
+  })
+  txns = _fake_transactions({
+    'ZZJA': [_open_market_buy(f'i{i}', 10000, 50, 5) for i in range(3)],
+    # No txns for ZZJB so the test fails loudly if we deep-dive it
+  })
+  counts = sentry_discovery.scan_universe_insider_cluster(
+    universe=universe,
+    _fetch_sentiment_fn=sentiment,
+    _fetch_transactions_fn=txns,
+  )
+  _check("sentiment_scanned == 2", counts['sentiment_scanned'] == 2, str(counts))
+  _check("sentiment_positive == 1", counts['sentiment_positive'] == 1, str(counts))
+  _check("deep_dives == 1", counts['deep_dives'] == 1, str(counts))
+  _check("clusters_detected == 1", counts['clusters_detected'] == 1)
+  _check("enqueued == 1", counts['enqueued'] == 1)
+
+
+def test_universe_insider_cluster_detection():
+  print("\n== universe_insider: 3+ insiders @>$100k -> cluster enqueued ==")
+  _cleanup()
+  universe = ['ZZJC']
+  sentiment = _fake_sentiment({'ZZJC': [0.5, 0.6]})
+  # 3 distinct insiders, each $500k purchase, all in last 30 days
+  txns = _fake_transactions({
+    'ZZJC': [
+      _open_market_buy('Alice', 10000, 50, 3),   # $500k
+      _open_market_buy('Bob',   10000, 50, 7),   # $500k
+      _open_market_buy('Carol', 10000, 50, 14),  # $500k
+    ],
+  })
+  counts = sentry_discovery.scan_universe_insider_cluster(
+    universe=universe, _fetch_sentiment_fn=sentiment,
+    _fetch_transactions_fn=txns,
+  )
+  _check("clusters_detected == 1", counts['clusters_detected'] == 1, str(counts))
+  _check("enqueued == 1", counts['enqueued'] == 1)
+  pending = sentry_queue.dequeue_top(10)
+  hit = [r for r in pending if r['ticker'] == 'ZZJC']
+  if hit:
+    _check("triggered_by = universe_insider_cluster",
+           hit[0]['triggered_by'] == 'universe_insider_cluster')
+    _check("score = UNIVERSE_INSIDER_SCORE",
+           hit[0]['score'] == sentry_discovery.UNIVERSE_INSIDER_SCORE)
+
+
+def test_universe_insider_insufficient_cluster_not_enqueued():
+  print("\n== universe_insider: only 2 insiders -> not a cluster ==")
+  _cleanup()
+  universe = ['ZZJD']
+  sentiment = _fake_sentiment({'ZZJD': [0.5]})
+  txns = _fake_transactions({
+    'ZZJD': [
+      _open_market_buy('Alice', 10000, 50, 3),
+      _open_market_buy('Bob',   10000, 50, 7),
+      # Only 2 -- below threshold of 3
+    ],
+  })
+  counts = sentry_discovery.scan_universe_insider_cluster(
+    universe=universe, _fetch_sentiment_fn=sentiment,
+    _fetch_transactions_fn=txns,
+  )
+  _check("deep_dives == 1 (pre-filter passed)", counts['deep_dives'] == 1)
+  _check("clusters_detected == 0", counts['clusters_detected'] == 0)
+  _check("enqueued == 0", counts['enqueued'] == 0)
+
+
+def test_universe_insider_max_deep_dives_cap():
+  print("\n== universe_insider: max_deep_dives caps the deep scan ==")
+  _cleanup()
+  universe = [f'ZZJE{i}'[:4] for i in range(10)]  # 10 tickers, all 4-char
+  # Make all 10 pass the pre-filter; verify only 3 get deep-dived
+  sentiment = _fake_sentiment({t: [0.6, 0.7] for t in universe})
+  txns = _fake_transactions({t: [] for t in universe})
+  counts = sentry_discovery.scan_universe_insider_cluster(
+    universe=universe, max_deep_dives=3,
+    _fetch_sentiment_fn=sentiment, _fetch_transactions_fn=txns,
+  )
+  _check("sentiment_positive == 10", counts['sentiment_positive'] == 10, str(counts))
+  _check("deep_dives capped at 3", counts['deep_dives'] == 3, str(counts))
+
+
+def test_universe_insider_empty_universe():
+  print("\n== universe_insider: empty universe -> no work, no crash ==")
+  _cleanup()
+  counts = sentry_discovery.scan_universe_insider_cluster(
+    universe=[],
+    _fetch_sentiment_fn=_fake_sentiment({}),
+    _fetch_transactions_fn=_fake_transactions({}),
+  )
+  _check("universe_size == 0", counts['universe_size'] == 0)
+  _check("enqueued == 0", counts['enqueued'] == 0)
+
+
 def main() -> int:
   print("\nSentry discovery new channels tests\n")
   init_schema()
@@ -183,6 +323,11 @@ def main() -> int:
   test_ipo_dedup_on_rerun()
   test_ipo_missing_price_skipped()
   test_ipo_empty_calendar()
+  test_universe_insider_pre_filter_drops_low_mspr()
+  test_universe_insider_cluster_detection()
+  test_universe_insider_insufficient_cluster_not_enqueued()
+  test_universe_insider_max_deep_dives_cap()
+  test_universe_insider_empty_universe()
   _cleanup()
   print(f"\n== Summary ==\n  PASS: {_results['pass']}\n  FAIL: {_results['fail']}")
   for n, h in _results['failures']:

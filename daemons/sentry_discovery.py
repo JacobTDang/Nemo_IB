@@ -61,6 +61,12 @@ IPO_MIN_MKT_CAP_USD = 1_000_000_000    # $1B floor to filter micro-cap noise
 IPO_SCORE = 0.70                       # high — new listings are decay-fresh signal
 IPO_VALID_EXCHANGES = {'NASDAQ', 'NYSE', 'NYSE ARCA', 'NYSE AMERICAN'}
 
+# Universe insider cluster tuning
+UNIVERSE_INSIDER_SCORE = 0.68          # below watchlist version (less context)
+UNIVERSE_INSIDER_MSPR_MIN = 0.3        # MSPR threshold for the pre-filter
+UNIVERSE_INSIDER_MAX_DEEP_DIVES = 50   # hard cap on transactions calls per run
+UNIVERSE_INSIDER_PACE_S = 1.0          # sleep between Finnhub calls (60 RPM ceiling)
+
 
 # ============================================================================
 # Channel 1: catalyst calendar (pre-earnings deep-context trigger)
@@ -413,7 +419,144 @@ def scan_theme_flow(themes: Optional[List[str]] = None) -> Dict[str, int]:
 
 
 # ============================================================================
-# Channel 4: IPO / new listing calendar
+# Channel 4: universe-wide insider cluster
+# ============================================================================
+
+def scan_universe_insider_cluster(
+  universe: Optional[List[str]] = None,
+  max_deep_dives: int = UNIVERSE_INSIDER_MAX_DEEP_DIVES,
+  _fetch_sentiment_fn=None,
+  _fetch_transactions_fn=None,
+) -> Dict[str, int]:
+  """Universe-wide insider cluster discovery.
+
+  Two-stage filter to fit inside the Finnhub free-tier rate budget:
+    1. **Fast MSPR pre-filter**: for each ticker in the universe, call
+       /stock/insider-sentiment (cheap, one row per month). Keep
+       tickers where avg MSPR over recent months exceeds the threshold.
+    2. **Bounded deep-dive**: for the top N MSPR-positive tickers
+       (default 50), call /stock/insider-transactions and apply the
+       same 3+ insiders / >$100k / 30d cluster heuristic as the
+       watchlist version. Enqueue clusters with score
+       UNIVERSE_INSIDER_SCORE (0.68 vs 0.72 watchlist).
+
+  Both Finnhub call sites pace at UNIVERSE_INSIDER_PACE_S (1.0s) to
+  stay under the 60 RPM ceiling. With ~2000 universe tickers the
+  pre-filter takes ~33 minutes; the deep-dive adds ~1 minute. Runs
+  async in the daemon, does not block triage ticks.
+
+  Args:
+    universe: ticker list (default: read from sentry_universe table).
+    max_deep_dives: cap on transactions-call count after pre-filter.
+    _fetch_sentiment_fn / _fetch_transactions_fn: test-only injection.
+  """
+  import time as _t
+  from tools.news_agregator.finnhub_utils import FinnhubClient
+
+  counts = {
+    'universe_size': 0,
+    'sentiment_scanned': 0,
+    'sentiment_positive': 0,
+    'sentiment_errors': 0,
+    'deep_dives': 0,
+    'clusters_detected': 0,
+    'enqueued': 0,
+    'skipped': 0,
+  }
+
+  if universe is None:
+    # Defer the import so we don't form a circular reference at module load
+    try:
+      from daemons.sentry_universe import get_universe
+      universe = get_universe()
+    except Exception as exc:
+      print(f"[discovery.universe_insider] universe load failed: {exc}",
+            file=sys.stderr, flush=True)
+      return counts
+
+  counts['universe_size'] = len(universe)
+  if not universe:
+    return counts
+
+  # -- Stage 1: MSPR pre-filter ----------------------------------------
+  async def _default_sentiment(ticker: str):
+    client = FinnhubClient()
+    try:
+      return await client.get('/stock/insider-sentiment', {'symbol': ticker})
+    finally:
+      await client.close()
+
+  fetch_sent = _fetch_sentiment_fn or _default_sentiment
+
+  candidates = []  # tickers passing the MSPR threshold, ordered by avg_mspr desc
+  for ticker in universe:
+    counts['sentiment_scanned'] += 1
+    try:
+      raw = asyncio.run(fetch_sent(ticker))
+    except Exception:
+      counts['sentiment_errors'] += 1
+      continue
+    if not isinstance(raw, dict):
+      continue
+    data = raw.get('data') or []
+    if not data:
+      continue
+    # Compute avg MSPR over last 6 months (mirror the condense helper)
+    sorted_data = sorted(data, key=lambda x: (x.get('year', 0), x.get('month', 0)),
+                          reverse=True)[:6]
+    msprs = [r.get('mspr') for r in sorted_data if r.get('mspr') is not None]
+    if not msprs:
+      continue
+    avg_mspr = sum(msprs) / len(msprs)
+    if avg_mspr >= UNIVERSE_INSIDER_MSPR_MIN:
+      counts['sentiment_positive'] += 1
+      candidates.append((ticker, avg_mspr))
+    if _fetch_sentiment_fn is None:
+      _t.sleep(UNIVERSE_INSIDER_PACE_S)
+
+  candidates.sort(key=lambda x: x[1], reverse=True)
+  top_candidates = candidates[:max_deep_dives]
+
+  # -- Stage 2: bounded deep-dive --------------------------------------
+  async def _default_txns(ticker: str):
+    client = FinnhubClient()
+    try:
+      return await client.get('/stock/insider-transactions', {'symbol': ticker})
+    finally:
+      await client.close()
+
+  fetch_txns = _fetch_transactions_fn or _default_txns
+
+  for ticker, avg_mspr in top_candidates:
+    counts['deep_dives'] += 1
+    try:
+      raw = asyncio.run(fetch_txns(ticker))
+    except Exception:
+      continue
+    if not _detect_insider_cluster(raw):
+      continue
+    counts['clusters_detected'] += 1
+
+    skip, _ = should_skip(ticker)
+    if skip:
+      counts['skipped'] += 1
+      continue
+
+    qid = sentry_queue.enqueue(
+      ticker, score=UNIVERSE_INSIDER_SCORE,
+      triggered_by='universe_insider_cluster',
+      notes=f"avg_mspr={avg_mspr:.3f} over 6mo; >=3 insider buys >$100k/30d",
+    )
+    if qid:
+      counts['enqueued'] += 1
+    if _fetch_transactions_fn is None:
+      _t.sleep(UNIVERSE_INSIDER_PACE_S)
+
+  return counts
+
+
+# ============================================================================
+# Channel 5: IPO / new listing calendar
 # ============================================================================
 
 def scan_ipo_calendar(lookahead_days: int = IPO_LOOKAHEAD_DAYS,
@@ -523,21 +666,25 @@ def run_all() -> Dict[str, Dict[str, int]]:
         file=sys.stderr, flush=True)
   results = {}
 
-  print("[discovery] channel 1/4: catalyst_calendar", file=sys.stderr, flush=True)
+  print("[discovery] channel 1/5: catalyst_calendar", file=sys.stderr, flush=True)
   results['catalyst_calendar'] = scan_catalyst_calendar()
   print(f"  -> {results['catalyst_calendar']}", file=sys.stderr, flush=True)
 
-  print("[discovery] channel 2/4: insider_cluster", file=sys.stderr, flush=True)
+  print("[discovery] channel 2/5: insider_cluster", file=sys.stderr, flush=True)
   results['insider_cluster'] = scan_insider_cluster()
   print(f"  -> {results['insider_cluster']}", file=sys.stderr, flush=True)
 
-  print("[discovery] channel 3/4: theme_flow", file=sys.stderr, flush=True)
+  print("[discovery] channel 3/5: theme_flow", file=sys.stderr, flush=True)
   results['theme_flow'] = scan_theme_flow()
   print(f"  -> {results['theme_flow']}", file=sys.stderr, flush=True)
 
-  print("[discovery] channel 4/4: ipo_calendar", file=sys.stderr, flush=True)
+  print("[discovery] channel 4/5: ipo_calendar", file=sys.stderr, flush=True)
   results['ipo_calendar'] = scan_ipo_calendar()
   print(f"  -> {results['ipo_calendar']}", file=sys.stderr, flush=True)
+
+  print("[discovery] channel 5/5: universe_insider_cluster", file=sys.stderr, flush=True)
+  results['universe_insider_cluster'] = scan_universe_insider_cluster()
+  print(f"  -> {results['universe_insider_cluster']}", file=sys.stderr, flush=True)
 
   print(f"[discovery] full scan complete at {datetime.now(timezone.utc).isoformat()}",
         file=sys.stderr, flush=True)
@@ -549,7 +696,8 @@ def main():
   parser.add_argument('--once', action='store_true', required=True,
                       help='Run once and exit (no continuous mode for discovery)')
   parser.add_argument('--channel', choices=['catalyst_calendar', 'insider_cluster',
-                                             'theme_flow', 'ipo_calendar', 'all'],
+                                             'theme_flow', 'ipo_calendar',
+                                             'universe_insider_cluster', 'all'],
                       default='all', help='Run a specific channel or all')
   args = parser.parse_args()
 
@@ -565,6 +713,8 @@ def main():
     print(scan_theme_flow(), file=sys.stderr, flush=True)
   elif args.channel == 'ipo_calendar':
     print(scan_ipo_calendar(), file=sys.stderr, flush=True)
+  elif args.channel == 'universe_insider_cluster':
+    print(scan_universe_insider_cluster(), file=sys.stderr, flush=True)
 
 
 if __name__ == '__main__':
