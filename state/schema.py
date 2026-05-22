@@ -182,6 +182,21 @@ CREATE_SCHEMA = [
     )""",
     "CREATE INDEX IF NOT EXISTS idx_queue_status_score ON sentry_queue(status, score DESC)",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_ticker_pending ON sentry_queue(ticker) WHERE status = 'pending'",
+
+    # --- Sentry: daily budget counters (resets at 00:00 ET each day) ---
+    # One row per ET day; INSERT OR IGNORE on read+increment. The budget gate
+    # in /sentry-tick consults these counters before allowing the next action.
+    # `day` is YYYY-MM-DD in America/New_York timezone.
+    """CREATE TABLE IF NOT EXISTS sentry_daily_actions(
+        day                TEXT PRIMARY KEY,
+        research_runs      INTEGER NOT NULL DEFAULT 0,
+        slack_messages     INTEGER NOT NULL DEFAULT 0,
+        paper_orders       INTEGER NOT NULL DEFAULT 0,
+        new_positions      INTEGER NOT NULL DEFAULT 0,
+        adds_or_trims      INTEGER NOT NULL DEFAULT 0,
+        first_action_at    TIMESTAMP,
+        last_action_at     TIMESTAMP
+    )""",
 ]
 
 

@@ -59,6 +59,7 @@ const mcp = new Server(
       'Messages from Slack arrive as <channel source="slack" channel="..." user="..." user_id="..." thread_ts="..." ts="...">.',
       'Reply by calling the reply tool. Always pass back the channel attribute from the inbound message.',
       'Pass thread_ts from the inbound tag to keep the reply threaded under the user\'s message; omit thread_ts only when starting a new top-level conversation.',
+      'For proactive notifications (no inbound message — Sentry findings, alerts, briefs), use post_notification. It opens a DM with SLACK_ALLOWED_USER_ID and posts there.',
       'mrkdwn=true (default) renders Slack-flavored markdown (bold, code blocks, etc.).',
       'Very long replies are chunked at 40000 characters across multiple messages — keep responses focused.',
     ].join('\n'),
@@ -79,32 +80,77 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         mrkdwn:    { type: 'boolean', description: 'Render Slack-flavored markdown. Default true.' },
       },
     },
+  }, {
+    name: 'post_notification',
+    description: 'Proactively send a Slack DM to the allowed user. Use for autonomous notifications (Sentry findings, kill-switch alerts, morning briefs) where there is no inbound message to reply to. Opens a DM channel with SLACK_ALLOWED_USER_ID and posts there.',
+    inputSchema: {
+      type: 'object',
+      required: ['text'],
+      properties: {
+        text:   { type: 'string', description: 'Message body. Chunked at 40000 chars. mrkdwn supported.' },
+        mrkdwn: { type: 'boolean', description: 'Render Slack-flavored markdown. Default true.' },
+        user:   { type: 'string', description: 'Override target user id. Defaults to SLACK_ALLOWED_USER_ID env var.' },
+      },
+    },
   }],
 }))
 
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
-  if (req.params.name !== 'reply') {
-    throw new Error(`unknown tool: ${req.params.name}`)
+  if (req.params.name === 'reply') {
+    const args = (req.params.arguments ?? {}) as {
+      channel?: string
+      text?: string
+      thread_ts?: string
+      mrkdwn?: boolean
+    }
+    if (!args.channel || !args.text) {
+      throw new Error('reply requires channel and text')
+    }
+    const parts = chunkText(args.text, 40000)
+    for (const part of parts) {
+      await app.client.chat.postMessage({
+        channel: args.channel,
+        text: part,
+        thread_ts: args.thread_ts,
+        mrkdwn: args.mrkdwn ?? true,
+      })
+    }
+    return { content: [{ type: 'text', text: `sent ${parts.length} message(s)` }] }
   }
-  const args = (req.params.arguments ?? {}) as {
-    channel?: string
-    text?: string
-    thread_ts?: string
-    mrkdwn?: boolean
+
+  if (req.params.name === 'post_notification') {
+    const args = (req.params.arguments ?? {}) as {
+      text?: string
+      mrkdwn?: boolean
+      user?: string
+    }
+    if (!args.text) {
+      throw new Error('post_notification requires text')
+    }
+    const targetUser = args.user ?? process.env.SLACK_ALLOWED_USER_ID
+    if (!targetUser) {
+      throw new Error('post_notification requires user arg or SLACK_ALLOWED_USER_ID env var')
+    }
+    // Open (or fetch existing) DM channel with the target user, then post.
+    // conversations.open is idempotent and returns the same channel id on
+    // repeated calls. Requires the bot to have im:write scope.
+    const openResp = await app.client.conversations.open({ users: targetUser })
+    const dmChannel = openResp.channel?.id
+    if (!dmChannel) {
+      throw new Error(`could not open DM channel with user ${targetUser}: ${JSON.stringify(openResp)}`)
+    }
+    const parts = chunkText(args.text, 40000)
+    for (const part of parts) {
+      await app.client.chat.postMessage({
+        channel: dmChannel,
+        text: part,
+        mrkdwn: args.mrkdwn ?? true,
+      })
+    }
+    return { content: [{ type: 'text', text: `posted ${parts.length} notification message(s) to ${targetUser}` }] }
   }
-  if (!args.channel || !args.text) {
-    throw new Error('reply requires channel and text')
-  }
-  const parts = chunkText(args.text, 40000)
-  for (const part of parts) {
-    await app.client.chat.postMessage({
-      channel: args.channel,
-      text: part,
-      thread_ts: args.thread_ts,
-      mrkdwn: args.mrkdwn ?? true,
-    })
-  }
-  return { content: [{ type: 'text', text: `sent ${parts.length} message(s)` }] }
+
+  throw new Error(`unknown tool: ${req.params.name}`)
 })
 
 const app = new App({
