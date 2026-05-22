@@ -197,6 +197,22 @@ CREATE_SCHEMA = [
         first_action_at    TIMESTAMP,
         last_action_at     TIMESTAMP
     )""",
+
+    # --- Sentry: ETF AUM history (for theme-flow discovery channel) ---
+    # Daily snapshot of AUM + top holdings per theme ETF. Theme-flow scan
+    # compares today vs 7 days ago to detect rotations. top_holdings stored
+    # as JSON list of {symbol, weight_pct} dicts.
+    """CREATE TABLE IF NOT EXISTS etf_aum_history(
+        snapshot_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+        etf_symbol       TEXT NOT NULL,
+        snapshot_date    TEXT NOT NULL,
+        theme            TEXT,
+        total_assets     REAL,
+        top_holdings     TEXT,
+        captured_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_etf_aum_etf_date ON etf_aum_history(etf_symbol, snapshot_date)",
+    "CREATE INDEX IF NOT EXISTS idx_etf_aum_date ON etf_aum_history(snapshot_date DESC)",
 ]
 
 
