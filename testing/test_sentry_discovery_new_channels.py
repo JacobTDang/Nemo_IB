@@ -314,6 +314,141 @@ def test_universe_insider_empty_universe():
   _check("enqueued == 0", counts['enqueued'] == 0)
 
 
+# ============================================================================
+# scan_rag_analogues
+# ============================================================================
+
+def _fake_analogues(entries):
+  """Return a fn returning the provided analogue list."""
+  def loader():
+    return entries
+  return loader
+
+
+def _fake_rag_search(query_to_results):
+  """Return a stub that maps query-string -> rag_search result dict.
+
+  query keys are matched by substring (caller doesn't need to know exact
+  tag ordering).
+  """
+  def search(query, ticker=None, doc_type=None, top_k=15, min_score=0.0):
+    for key, results in query_to_results.items():
+      if key in query:
+        return {'results': results, 'results_count': len(results)}
+    return {'results': [], 'results_count': 0}
+  return search
+
+
+def test_rag_analogue_above_thresholds_enqueues():
+  print("\n== rag_analogue: ticker with hits across 2 analogues -> enqueue ==")
+  _cleanup()
+
+  analogues = [
+    {'name': 'A1', 'direction': 'bear', 'drawdown_pct': -50.0,
+     'tags': ['capex_peak', 'valuation_expansion']},
+    {'name': 'A2', 'direction': 'bear', 'drawdown_pct': -40.0,
+     'tags': ['supply_constrained', 'concentrated_buyers']},
+  ]
+  # Both analogue queries return hits for ZZRA (3 hits across 2 analogues)
+  rag_search = _fake_rag_search({
+    'capex_peak valuation_expansion': [
+      {'ticker': 'ZZRA', 'similarity': 0.7, 'chunk_text_preview': '...'},
+      {'ticker': 'ZZRA', 'similarity': 0.65, 'chunk_text_preview': '...'},
+    ],
+    'supply_constrained concentrated_buyers': [
+      {'ticker': 'ZZRA', 'similarity': 0.72, 'chunk_text_preview': '...'},
+    ],
+  })
+  counts = sentry_discovery.scan_rag_analogues(
+    _rag_search_fn=rag_search,
+    _load_analogues_fn=_fake_analogues(analogues),
+  )
+  _check("analogues_queried == 2", counts['analogues_queried'] == 2, str(counts))
+  _check("tickers_with_hits == 1", counts['tickers_with_hits'] == 1, str(counts))
+  _check("enqueued == 1", counts['enqueued'] == 1, str(counts))
+  pending = sentry_queue.dequeue_top(10)
+  hit = [r for r in pending if r['ticker'] == 'ZZRA']
+  if hit:
+    _check("triggered_by = rag_analogue",
+           hit[0]['triggered_by'] == 'rag_analogue')
+
+
+def test_rag_analogue_too_few_distinct_analogues_skipped():
+  print("\n== rag_analogue: 3 hits but all from 1 analogue -> NOT enqueued ==")
+  _cleanup()
+
+  analogues = [
+    {'name': 'A1', 'direction': 'bear', 'drawdown_pct': -50.0,
+     'tags': ['capex_peak']},
+    {'name': 'A2', 'direction': 'bear', 'drawdown_pct': -40.0,
+     'tags': ['supply_glut']},
+  ]
+  rag_search = _fake_rag_search({
+    'capex_peak': [
+      {'ticker': 'ZZRB', 'similarity': 0.7, 'chunk_text_preview': '...'},
+      {'ticker': 'ZZRB', 'similarity': 0.71, 'chunk_text_preview': '...'},
+      {'ticker': 'ZZRB', 'similarity': 0.72, 'chunk_text_preview': '...'},
+    ],
+    'supply_glut': [],
+  })
+  counts = sentry_discovery.scan_rag_analogues(
+    _rag_search_fn=rag_search,
+    _load_analogues_fn=_fake_analogues(analogues),
+  )
+  _check("enqueued == 0 (only 1 distinct analogue)",
+         counts['enqueued'] == 0, str(counts))
+
+
+def test_rag_analogue_setup_entries_skipped():
+  print("\n== rag_analogue: setup-direction analogues are skipped ==")
+  _cleanup()
+
+  analogues = [
+    {'name': 'SETUP', 'direction': 'setup', 'drawdown_pct': None,
+     'tags': ['capex_trough']},
+    {'name': 'B1', 'direction': 'bull', 'drawdown_pct': 200.0,
+     'tags': ['growth_acceleration']},
+  ]
+  called = {'count': 0}
+  def rag_search(query, **kw):
+    called['count'] += 1
+    return {'results': []}
+  counts = sentry_discovery.scan_rag_analogues(
+    _rag_search_fn=rag_search,
+    _load_analogues_fn=_fake_analogues(analogues),
+  )
+  # Only the bull (B1) should be queried; SETUP is skipped
+  _check("analogues_queried == 1 (setup skipped)",
+         counts['analogues_queried'] == 1, str(counts))
+  _check("rag_search called exactly once",
+         called['count'] == 1, f"called {called['count']}")
+
+
+def test_rag_analogue_query_failure_no_crash():
+  print("\n== rag_analogue: rag_search raising on one query does not crash run ==")
+  _cleanup()
+
+  analogues = [
+    {'name': 'A1', 'direction': 'bear', 'drawdown_pct': -50.0,
+     'tags': ['boom']},
+    {'name': 'A2', 'direction': 'bear', 'drawdown_pct': -40.0,
+     'tags': ['bust']},
+  ]
+  def rag_search(query, **kw):
+    if 'boom' in query:
+      raise RuntimeError('simulated embedding failure')
+    return {'results': [
+      {'ticker': 'ZZRC', 'similarity': 0.7, 'chunk_text_preview': '...'},
+    ]}
+  counts = sentry_discovery.scan_rag_analogues(
+    _rag_search_fn=rag_search,
+    _load_analogues_fn=_fake_analogues(analogues),
+  )
+  # Should have continued past the boom failure and queried bust
+  _check("analogues_queried == 2 (failure tolerated)",
+         counts['analogues_queried'] == 2, str(counts))
+
+
 def main() -> int:
   print("\nSentry discovery new channels tests\n")
   init_schema()
@@ -328,11 +463,17 @@ def main() -> int:
   test_universe_insider_insufficient_cluster_not_enqueued()
   test_universe_insider_max_deep_dives_cap()
   test_universe_insider_empty_universe()
+  test_rag_analogue_above_thresholds_enqueues()
+  test_rag_analogue_too_few_distinct_analogues_skipped()
+  test_rag_analogue_setup_entries_skipped()
+  test_rag_analogue_query_failure_no_crash()
   _cleanup()
   print(f"\n== Summary ==\n  PASS: {_results['pass']}\n  FAIL: {_results['fail']}")
   for n, h in _results['failures']:
     print(f"  - {n}: {h}")
   return 0 if _results['fail'] == 0 else 1
+
+
 
 
 if __name__ == '__main__':

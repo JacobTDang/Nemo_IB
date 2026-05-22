@@ -67,6 +67,13 @@ UNIVERSE_INSIDER_MSPR_MIN = 0.3        # MSPR threshold for the pre-filter
 UNIVERSE_INSIDER_MAX_DEEP_DIVES = 50   # hard cap on transactions calls per run
 UNIVERSE_INSIDER_PACE_S = 1.0          # sleep between Finnhub calls (60 RPM ceiling)
 
+# RAG analogue scanner tuning
+RAG_ANALOGUE_SCORE = 0.66              # exploratory channel; mid signal
+RAG_ANALOGUE_TOP_K_PER_QUERY = 15      # k-NN limit per analogue query
+RAG_ANALOGUE_MIN_SIMILARITY = 0.45     # minimum similarity to count a chunk
+RAG_ANALOGUE_MIN_HITS_PER_TICKER = 3   # chunk count threshold per ticker
+RAG_ANALOGUE_MIN_ANALOGUES_PER_TICKER = 2  # number of distinct analogues
+
 
 # ============================================================================
 # Channel 1: catalyst calendar (pre-earnings deep-context trigger)
@@ -556,7 +563,126 @@ def scan_universe_insider_cluster(
 
 
 # ============================================================================
-# Channel 5: IPO / new listing calendar
+# Channel 5: RAG analogue scanner
+# ============================================================================
+
+def scan_rag_analogues(
+  top_k_per_query: int = RAG_ANALOGUE_TOP_K_PER_QUERY,
+  min_similarity: float = RAG_ANALOGUE_MIN_SIMILARITY,
+  min_hits_per_ticker: int = RAG_ANALOGUE_MIN_HITS_PER_TICKER,
+  min_analogues_per_ticker: int = RAG_ANALOGUE_MIN_ANALOGUES_PER_TICKER,
+  _rag_search_fn=None,
+  _load_analogues_fn=None,
+) -> Dict[str, int]:
+  """Match filing chunks in the RAG corpus to historical analogue tag
+  signatures via semantic search.
+
+  For each analogue in knowledge/analogues.md with a non-null
+  drawdown_pct, build a query string from its structural tags
+  (capex_peak, valuation_expansion, supply_constrained, etc.) and run
+  rag_search over the full corpus. Group hits by ticker; enqueue
+  tickers whose chunks match >= min_analogues_per_ticker different
+  analogues AND >= min_hits_per_ticker total chunks.
+
+  This channel is exploratory — semantic match is not the same as
+  pattern recognition. The thresholds filter most noise but expect to
+  tune in Phase 5.
+
+  Args:
+    top_k_per_query: k-NN limit per analogue (default 15)
+    min_similarity: minimum similarity to count a chunk (default 0.45)
+    min_hits_per_ticker: total chunks needed (default 3)
+    min_analogues_per_ticker: distinct analogues needed (default 2)
+    _rag_search_fn / _load_analogues_fn: test-only injection
+  """
+  # Imports kept local so the daemon's startup cost is not dominated by
+  # the embedding model load when the channel isn't in use.
+  if _rag_search_fn is None:
+    from agent.rag.search import rag_search as _rag_search_fn
+  if _load_analogues_fn is None:
+    from tools.financial_modeling_engine.utils import _load_analogues as _load_analogues_fn
+
+  counts = {
+    'analogues_queried': 0,
+    'total_chunks_returned': 0,
+    'tickers_with_hits': 0,
+    'enqueued': 0,
+    'skipped': 0,
+  }
+
+  analogues = _load_analogues_fn()
+  if not analogues:
+    return counts
+
+  # ticker -> {analogue_name -> hit_count}
+  ticker_analogue_hits: Dict[str, Dict[str, int]] = {}
+
+  for analogue in analogues:
+    direction = analogue.get('direction')
+    drawdown = analogue.get('drawdown_pct')
+    # Skip setup entries with no completed move
+    if direction not in ('bear', 'bull') or drawdown is None:
+      continue
+    tags = analogue.get('tags') or []
+    if not tags:
+      continue
+    query = ' '.join(tags)
+    counts['analogues_queried'] += 1
+
+    try:
+      result = _rag_search_fn(
+        query=query,
+        ticker=None,
+        doc_type=None,
+        top_k=top_k_per_query,
+        min_score=min_similarity,
+      )
+    except Exception as exc:
+      print(f"[discovery.rag_analogue] query failed for {analogue['name']}: {exc}",
+            file=sys.stderr, flush=True)
+      continue
+
+    results = result.get('results', []) if isinstance(result, dict) else []
+    counts['total_chunks_returned'] += len(results)
+    for hit in results:
+      ticker = (hit.get('ticker') or '').upper()
+      if not ticker:
+        continue
+      ticker_analogue_hits.setdefault(ticker, {}).setdefault(analogue['name'], 0)
+      ticker_analogue_hits[ticker][analogue['name']] += 1
+
+  counts['tickers_with_hits'] = len(ticker_analogue_hits)
+
+  # Apply thresholds + enqueue
+  for ticker, analogue_counts in ticker_analogue_hits.items():
+    total_hits = sum(analogue_counts.values())
+    distinct_analogues = len(analogue_counts)
+    if total_hits < min_hits_per_ticker:
+      continue
+    if distinct_analogues < min_analogues_per_ticker:
+      continue
+
+    skip, _ = should_skip(ticker)
+    if skip:
+      counts['skipped'] += 1
+      continue
+
+    notes_analogues = ', '.join(sorted(analogue_counts.keys())[:3])
+    qid = sentry_queue.enqueue(
+      ticker, score=RAG_ANALOGUE_SCORE, triggered_by='rag_analogue',
+      notes=(
+        f"{total_hits} chunks across {distinct_analogues} analogues "
+        f"({notes_analogues})"
+      ),
+    )
+    if qid:
+      counts['enqueued'] += 1
+
+  return counts
+
+
+# ============================================================================
+# Channel 6: IPO / new listing calendar
 # ============================================================================
 
 def scan_ipo_calendar(lookahead_days: int = IPO_LOOKAHEAD_DAYS,
@@ -666,25 +792,25 @@ def run_all() -> Dict[str, Dict[str, int]]:
         file=sys.stderr, flush=True)
   results = {}
 
-  print("[discovery] channel 1/5: catalyst_calendar", file=sys.stderr, flush=True)
-  results['catalyst_calendar'] = scan_catalyst_calendar()
-  print(f"  -> {results['catalyst_calendar']}", file=sys.stderr, flush=True)
-
-  print("[discovery] channel 2/5: insider_cluster", file=sys.stderr, flush=True)
-  results['insider_cluster'] = scan_insider_cluster()
-  print(f"  -> {results['insider_cluster']}", file=sys.stderr, flush=True)
-
-  print("[discovery] channel 3/5: theme_flow", file=sys.stderr, flush=True)
-  results['theme_flow'] = scan_theme_flow()
-  print(f"  -> {results['theme_flow']}", file=sys.stderr, flush=True)
-
-  print("[discovery] channel 4/5: ipo_calendar", file=sys.stderr, flush=True)
-  results['ipo_calendar'] = scan_ipo_calendar()
-  print(f"  -> {results['ipo_calendar']}", file=sys.stderr, flush=True)
-
-  print("[discovery] channel 5/5: universe_insider_cluster", file=sys.stderr, flush=True)
-  results['universe_insider_cluster'] = scan_universe_insider_cluster()
-  print(f"  -> {results['universe_insider_cluster']}", file=sys.stderr, flush=True)
+  steps = [
+    ('catalyst_calendar',         scan_catalyst_calendar),
+    ('insider_cluster',           scan_insider_cluster),
+    ('theme_flow',                scan_theme_flow),
+    ('ipo_calendar',              scan_ipo_calendar),
+    ('universe_insider_cluster',  scan_universe_insider_cluster),
+    ('rag_analogue',              scan_rag_analogues),
+  ]
+  total = len(steps)
+  for i, (name, fn) in enumerate(steps, start=1):
+    print(f"[discovery] channel {i}/{total}: {name}",
+          file=sys.stderr, flush=True)
+    try:
+      results[name] = fn()
+    except Exception as exc:
+      print(f"[discovery] {name} crashed: {type(exc).__name__}: {exc}",
+            file=sys.stderr, flush=True)
+      results[name] = {'error': f'{type(exc).__name__}: {exc}'}
+    print(f"  -> {results[name]}", file=sys.stderr, flush=True)
 
   print(f"[discovery] full scan complete at {datetime.now(timezone.utc).isoformat()}",
         file=sys.stderr, flush=True)
@@ -697,7 +823,8 @@ def main():
                       help='Run once and exit (no continuous mode for discovery)')
   parser.add_argument('--channel', choices=['catalyst_calendar', 'insider_cluster',
                                              'theme_flow', 'ipo_calendar',
-                                             'universe_insider_cluster', 'all'],
+                                             'universe_insider_cluster',
+                                             'rag_analogue', 'all'],
                       default='all', help='Run a specific channel or all')
   args = parser.parse_args()
 
@@ -715,6 +842,8 @@ def main():
     print(scan_ipo_calendar(), file=sys.stderr, flush=True)
   elif args.channel == 'universe_insider_cluster':
     print(scan_universe_insider_cluster(), file=sys.stderr, flush=True)
+  elif args.channel == 'rag_analogue':
+    print(scan_rag_analogues(), file=sys.stderr, flush=True)
 
 
 if __name__ == '__main__':
