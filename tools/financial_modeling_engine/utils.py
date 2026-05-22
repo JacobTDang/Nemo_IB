@@ -192,8 +192,54 @@ _THEME_TO_ETFS: Dict[str, List[str]] = {
 _ANALOGUES_CACHE: List[Dict[str, Any]] = []
 
 
+def _parse_magnitude(body: str):
+  """Extract the **Magnitude:** line per the schema documented in
+  knowledge/analogues.md and return (drawdown_pct, duration_months,
+  direction). drawdown_pct is a signed int (negative for bear analogues
+  that lose value, positive for bull analogues that gain) or None when
+  the entry is a setup with no completed move yet.
+  """
+  import re as _re
+  m = _re.search(r'\*\*Magnitude:\*\*\s*([^\n]+(?:\n[^\n*]+)*)', body)
+  if not m:
+    return None, None, None
+  line = m.group(1).strip()
+
+  # Direction: trailing "(bear analogue)" / "(bull analogue)" / "(setup)".
+  # Permit continuation text inside the parens (e.g. "(bear analogue —
+  # use for the post-pull-forward case)").
+  direction = None
+  if _re.search(r'\(bear analogue\b[^)]*\)', line, _re.IGNORECASE):
+    direction = 'bear'
+  elif _re.search(r'\(bull analogue\b[^)]*\)', line, _re.IGNORECASE):
+    direction = 'bull'
+  elif _re.search(r'\(setup\b[^)]*\)|\(setup\)', line, _re.IGNORECASE):
+    direction = 'setup'
+
+  # If setup or explicit N/A, magnitude is None
+  if direction == 'setup' or line.lstrip().startswith('N/A'):
+    return None, None, direction
+
+  # Drawdown percentage: first signed number followed by %
+  pct_match = _re.search(r'([+-]?\d+(?:\.\d+)?)\s*%', line)
+  drawdown_pct = float(pct_match.group(1)) if pct_match else None
+
+  # If no explicit sign but direction is bear, treat as negative
+  if drawdown_pct is not None and direction == 'bear' and drawdown_pct > 0:
+    # Catalog convention is to write "-86%" explicitly but be defensive
+    if not _re.search(r'[+-]\d', line):
+      drawdown_pct = -drawdown_pct
+
+  # Duration in months
+  dur_match = _re.search(r'(\d+)\s*months?', line)
+  duration_months = int(dur_match.group(1)) if dur_match else None
+
+  return drawdown_pct, duration_months, direction
+
+
 def _load_analogues() -> List[Dict[str, Any]]:
-  """Load the analogues knowledge file into a list of {name, tags, body}.
+  """Load the analogues knowledge file into a list of
+  {name, tags, body, drawdown_pct, duration_months, direction}.
   Cached in-process — file is checked into the repo, doesn't change at
   runtime."""
   global _ANALOGUES_CACHE
@@ -220,10 +266,14 @@ def _load_analogues() -> List[Dict[str, Any]]:
       tags = [t.strip().rstrip(',').lower()
               for t in tag_match.group(1).split(',')]
       tags = [t for t in tags if t]
+    drawdown_pct, duration_months, direction = _parse_magnitude(body)
     out.append({
       'name': title,
       'tags': tags,
       'body': body.strip(),
+      'drawdown_pct': drawdown_pct,
+      'duration_months': duration_months,
+      'direction': direction,
     })
   _ANALOGUES_CACHE = out
   return out
@@ -285,6 +335,9 @@ def get_historical_analogue(thesis_description: str,
         'matched_tags': matches,
         'all_tags': a['tags'],
         'body_excerpt': a['body'][:1500],
+        'drawdown_pct': a.get('drawdown_pct'),
+        'duration_months': a.get('duration_months'),
+        'direction': a.get('direction'),
       })
 
   scored.sort(key=lambda r: r['score'], reverse=True)
@@ -294,7 +347,7 @@ def get_historical_analogue(thesis_description: str,
     'thesis_description': thesis_description,
     'top_matches': scored[:top_n],
     'analogues_catalog_size': len(analogues),
-    'note': "Matching is by tag-token overlap, not semantic similarity. Tag taxonomy is documented in knowledge/analogues.md preamble. Adjust thesis description to include structural tags (capex_cycle, valuation_expansion, supply_constrained, etc.) for better matches.",
+    'note': "Matching is by tag-token overlap, not semantic similarity. Tag taxonomy is documented in knowledge/analogues.md preamble. drawdown_pct is signed (-X for bear analogues, +X for bull, None for setup) and feeds the /equity-deep-research Step 15 analogue-calibration rule. Adjust thesis description to include structural tags (capex_cycle, valuation_expansion, supply_constrained, etc.) for better matches.",
   }
 
 

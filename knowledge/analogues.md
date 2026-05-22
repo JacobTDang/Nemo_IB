@@ -21,6 +21,15 @@ Tag schema (canonical):
 - **insider_selling** | **insider_buying**
 - **retail_frenzy** | **institutional_distribution**
 
+Magnitude schema (per-entry, parsed by `get_historical_analogue`):
+- `**Magnitude:**` line carries `-XX% peak-to-trough drawdown over YY
+  months. (bear analogue)` for bust periods, or `+XX% peak gain over
+  YY months. (bull analogue)` for rally periods. Use `(setup)` when
+  the entry describes a precondition without a completed price move
+  yet. The numeric magnitude is what `/equity-deep-research` Step 15
+  uses to calibrate bear case price targets — invoking an analogue
+  forces the bear PT to imply at least 60% of the drawdown magnitude.
+
 ---
 
 ## 1. 1999-2000: Dot-Com Bubble
@@ -28,6 +37,9 @@ Tag schema (canonical):
 **Period:** Q4 1998 to Q1 2000 (peak), through Q3 2002 (trough)
 **Tags:** tech, capex_peak, valuation_expansion, supply_constrained,
   rate_rising, retail_frenzy, growth_acceleration
+**Magnitude:** -86% peak-to-trough drawdown over 31 months (Cisco
+  CSCO from $80 March 2000 to $8 Oct 2002; NDX -78% over the same
+  window). (bear analogue)
 
 **Setup:** Internet adoption inflection. Tech capex surged as telecom
 build-out (fiber, switches, routers) and corporate IT prepared for "the
@@ -59,6 +71,9 @@ EV/EBITDA at top quintile + customer base concentrated in 5 firms.
 **Period:** Peak Q2 2007, trough Q1 2009
 **Tags:** financials, real_estate, valuation_compression, regulatory_loosening,
   rate_rising, supply_constrained, insider_selling
+**Magnitude:** -83% peak-to-trough drawdown over 17 months (XLF
+  financials ETF from ~$38 May 2007 to ~$6 March 2009; S&P 500
+  -57% over the same window). (bear analogue)
 
 **Setup:** Subprime mortgage origination peaked 2005-06. Housing prices
 peaked Q2 2006 then plateaued. Wall Street levered into structured
@@ -83,6 +98,9 @@ real estate writedowns rising + private credit defaults rising.
 **Period:** Peak June 2014, trough Feb 2016 (WTI from $107 to $26)
 **Tags:** energy, commodities, supply_glut, capex_peak, valuation_compression,
   dollar_strong
+**Magnitude:** -71% peak-to-trough drawdown over 20 months (XOP
+  E&P ETF; WTI crude itself fell 76% over the same window; many
+  pure-play E&Ps fell 80-95%). (bear analogue)
 
 **Setup:** US shale output doubled 2011-2014. OPEC refused to cut.
 Saudi Arabia chose to defend market share, not price. WTI fell 75%.
@@ -109,6 +127,9 @@ deadly; pure-play with weak balance sheet is uninvestable in a glut.
 **Period:** iPhone 4 (2010) through iPhone 5S (2013)
 **Tags:** tech, consumer, capex_cycle, supply_constrained, growth_acceleration,
   margin_expansion
+**Magnitude:** +233% peak gain over 36 months (AAPL from ~$30 mid-2010
+  to ~$100 split-adjusted late 2012; TSM and Samsung memory both +100%
+  over the window). (bull analogue)
 
 **Setup:** Smartphone adoption inflected to >50% of mobile phones.
 Apple ramped chip orders to TSMC, Samsung memory orders, Foxconn
@@ -132,9 +153,15 @@ HBM/CoWoS lead times stretching out + customer prepayments rising.
 
 ## 5. 2020-2021: COVID Cloud Acceleration
 
-**Period:** March 2020 trough through Q4 2021 peak
+**Period:** March 2020 trough through Q4 2021 peak; bust phase
+  through Oct 2022
 **Tags:** tech, growth_acceleration, valuation_expansion, margin_expansion,
   rate_falling, retail_frenzy
+**Magnitude:** -70% peak-to-trough drawdown over 24 months on the
+  bust phase (WCLD cloud ETF from ~$69 Feb 2021 to ~$24 Oct 2022;
+  marquee names SHOP / DDOG / NET fell 75-85%). (bear analogue —
+  use for the post-pull-forward exhaustion case, not the 2020-21
+  rally itself)
 
 **Setup:** Remote work pulled forward 3-5 years of cloud adoption into
 24 months. Snowflake IPO'd at peak frenzy. SaaS multiples hit 30x+
@@ -161,6 +188,9 @@ visibly Q3 2021 in many names.
 demand collapse
 **Tags:** commodities, real_estate, growth_acceleration, supply_constrained,
   dollar_weak
+**Magnitude:** +200% peak gain over 30 months (copper $1.50 → $4.50;
+  BHP / RIO / FCX all roughly tripled off late-2008 lows by mid-2011).
+  (bull analogue)
 
 **Setup:** China's 4T RMB stimulus drove commodity demand. Copper went
 from $1.50 to $4.50. Iron ore peaked. BHP, RIO, Vale, Freeport ramped
@@ -185,6 +215,11 @@ capacity-constrained commodities + low capex history.
 **Period:** 2015-2020 (after the 2014 collapse)
 **Tags:** energy, capex_trough, valuation_compression, supply_constrained
   (future)
+**Magnitude:** N/A — this is a precondition / setup analogue, not a
+  completed price move. The drawdown belongs to entry #3
+  (2014-2016 collapse); the subsequent uranium / copper rallies
+  (2018-2024) belong to a follow-on analogue not yet catalogued.
+  (setup)
 
 **Setup:** After the 2014-16 crash, oil majors slashed capex. Long-cycle
 projects (deepwater, oil sands, Russia frontier) were canceled. Reserve
@@ -210,6 +245,9 @@ EV transition).
 **Period:** 2018 peak through Q2 2019 trough (DRAM ASP fell ~50%)
 **Tags:** tech, commodities, supply_glut, valuation_compression,
   capex_peak
+**Magnitude:** -52% peak-to-trough drawdown over 7 months (MU from
+  ~$63 May 2018 to ~$30 Dec 2018; SK Hynix similar; DRAM ASP itself
+  -50%). (bear analogue)
 
 **Setup:** Micron and SK Hynix had ramped DRAM capacity 2016-2018
 chasing peak prices. Hyperscaler buyers (AWS, Azure, GCP) had pulled
@@ -233,6 +271,9 @@ adding HBM capacity + AI capex pace decelerating.
 **Period:** Q1 2007 through 2009 (subprime auto delinquencies peaked
 2009)
 **Tags:** financials, consumer, regulatory_loosening, insider_selling
+**Magnitude:** -70% peak-to-trough drawdown over 18 months (COF
+  Capital One from ~$80 mid-2007 to ~$8 early-2009; consumer-credit
+  cohort 60-85% range). (bear analogue)
 
 **Setup:** Subprime auto lending hit record originations 2005-07.
 Securitization of auto loans peaked. Capital One, Santander Consumer,
@@ -248,6 +289,9 @@ multi-year highs.
 
 **Period:** Q4 2020 peak, through 2022 collapse
 **Tags:** tech, valuation_expansion, retail_frenzy, regulatory_loosening
+**Magnitude:** -85% peak-to-trough drawdown over 20 months (de-SPAC
+  index from Feb 2021 peak through Oct 2022; marquee names LCID -85%,
+  NKLA -97%, QS -90%). (bear analogue)
 
 **Setup:** SPAC issuance hit $160B in 2020-21. Pre-revenue companies
 (Lucid, Nikola, QuantumScape) went public at $10B+ valuations.
@@ -269,6 +313,10 @@ spending committed against non-binding customer commitments.
 **Period:** Mid-2023 (NVDA Q1 FY24) through ongoing
 **Tags:** tech, capex_peak, growth_acceleration, valuation_expansion,
   supply_constrained, concentrated_buyers
+**Magnitude:** N/A — cycle still active as of writing. No completed
+  drawdown to calibrate against. For analyst purposes, use the
+  composite of analogues 1 (Cisco, -86%), 4 (smartphone, +233%
+  upside) and 8 (memory, -52%) to bound bear / bull cases. (setup)
 
 **Setup:** ChatGPT triggered hyperscaler AI capex acceleration. Big 4
 CSPs (MSFT, GOOGL, META, AMZN) capex went from $130B to $300B in 24
