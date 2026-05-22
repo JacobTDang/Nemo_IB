@@ -853,6 +853,19 @@ class WebSearchServer:
     return [TextContent(type='text', text=safe_json_dumps(result))]
 
   async def run_server(self):
+    # Block briefly for the embedder warmup so the first rag_search call
+    # doesn't pay the ~10s sentence-transformers cold-start cost. The
+    # daemon thread started in __init__ has been loading torch + the model
+    # while the MCP handshake was being prepared, so this wait usually
+    # finishes inside a few seconds. Cap at 15s — if the load is still
+    # not done, fall through and let the first rag_search caller take
+    # the remainder of the hit.
+    try:
+      from agent.rag.embedder import await_loaded
+      await asyncio.to_thread(await_loaded, 15.0)
+    except Exception:
+      pass
+
     try:
       async with stdio_server() as (read_stream, write_stream):
         await self.server.run(
