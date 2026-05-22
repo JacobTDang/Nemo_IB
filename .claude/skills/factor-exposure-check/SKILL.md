@@ -3,224 +3,136 @@ name: factor-exposure-check
 description: Determine whether a thesis is stock-specific alpha or just disguised factor beta. Lite version — uses beta, sector, and theme-ETF membership instead of a full Barra-style factor model. Classifies primary factor exposures (market beta, momentum, AI/capex theme, rate sensitivity, commodity sensitivity, USD direction) and computes a stock-specific-alpha estimate. Use to prevent the "I'm long alpha, but actually just buying AI beta" mistake.
 ---
 
-# /factor-exposure-check — Alpha or just factor beta?
+# /factor-exposure-check
 
-The discipline: a +30% return on an "AI capex thesis" during a year
-when SOXX returned +28% is not alpha. The analyst was just long
-AI/semis beta dressed up as a stock-specific thesis. The next bet on
-the same pattern in a flat-beta environment will disappoint.
-
-This is a **lite** factor model. Without Barra / Axioma data, we can't
-do a proper PCA-based decomposition. We can do something useful with
-beta + sector + theme-ETF membership, and we call it what it is — a
-heuristic, not a rigorous model.
+Prevents the "+30% on an AI thesis while SOXX returned +28% — that's
+not alpha" mistake. This is a LITE factor model (no Barra / no PCA);
+heuristic, not institutional-grade.
 
 ## Inputs
 
 - Primary ticker
-- Thesis summary (one sentence — the "variant perception" claim)
-- Optional: time horizon
+- Thesis summary (one sentence — the variant perception claim)
 
 ## Workflow
 
-### 1. Pull beta and sector
+### 1. Pull beta, sector, market cap
 
-- Beta: `mcp__nemo_financial__get_market_data(ticker)` → beta field
-- Sector: `mcp__nemo_finnhub__get_company_profile(ticker)` → sector +
-  industry
+`get_market_data(ticker)` → beta, market cap.
+`get_company_profile(ticker)` → sector / industry.
 
-### 2. Identify theme exposures via ETF membership
+### 2. Theme exposures via ETF membership
 
-Call `mcp__nemo_financial__get_industry_etfs` for the relevant themes:
+`get_industry_etfs` for relevant themes:
 - AI / data center: AIQ, SOXX, BOTZ, SMH
-- Memory cycle: SOXX
-- Cloud / SaaS: WCLD, IGV
-- Cybersecurity: HACK, CIBR
-- Clean energy / battery: LIT, BATT, ICLN, TAN
-- Robotics / automation: BOTZ, ROBO
-- Genomics / biotech: ARKG, XBI, IBB
-- Fintech: FINX, ARKF
-- Defense: ITA, XAR, PPA
-- Energy / oil: XLE, XOP, OIH
-- Banks: KBE, KRE, XLF
+- Memory: SOXX | Cloud / SaaS: WCLD, IGV | Cybersecurity: HACK, CIBR
+- Clean energy / battery: LIT, BATT, ICLN, TAN | Robotics: BOTZ, ROBO
+- Biotech: ARKG, XBI, IBB | Fintech: FINX, ARKF | Defense: ITA, XAR, PPA
+- Energy: XLE, XOP, OIH | Banks: KBE, KRE, XLF
 
-For each ETF, check if the primary ticker appears in the top
-holdings. Record:
-- Themes the ticker is in
-- Weight of the ticker in each ETF (proxy for theme purity)
+Check if ticker appears in top holdings. 2+ thematic ETFs at >2%
+weight = high theme beta. Only in broad sector ETFs (XLK, XLF) =
+lower theme beta.
 
-If ticker is heavy in 2+ thematic ETFs → high theme beta.
-If ticker is only in broad sector ETFs (XLK, XLF) → lower theme beta,
-more idiosyncratic.
+### 3. Classify each factor as high / medium / low
 
-### 3. Classify factor exposures (lite taxonomy)
+| Factor | high | medium | low |
+|---|---|---|---|
+| Market beta | β > 1.3 | 0.7-1.3 | < 0.7 |
+| Momentum | +25% / 90d | +10-25% | flat or down |
+| Theme beta | 2+ thematic ETFs >2% | 1 thematic ETF | broad sector only |
+| Rate sensitivity | long-duration tech, REITs, utilities, biotech | most equities | banks, short-duration value |
+| Commodity sensitivity | energy, materials, agri | industrials, transports | tech, staples |
+| USD strength | tech mega-caps >$500B (AAPL, MSFT, GOOG, NVDA), staples mega-caps (KO, PG, PEP), multi-national pharma (PFE, JNJ, MRK, LLY) | large-cap industrials, large-cap discretionary, sub-mega semis | small/mid-cap US-domestic, banks, utilities, REITs, US-only services |
 
-For each factor, classify as `high / medium / low / n/a` based on
-heuristics:
+USD sensitivity is determined by **sector + market cap only** — do
+NOT parse the company description for intl-revenue language; that
+field is marketing text and rarely has the info.
 
-**Market beta**:
-- high: beta > 1.3
-- medium: beta 0.7-1.3
-- low: beta < 0.7
+### 4. Stock-specific alpha estimate
 
-**Momentum**:
-- high: stock up > 25% in last 90 days
-- medium: stock up 10-25%
-- low: flat to down
+- All factors low/medium → `mostly alpha`
+- One factor high → `partial alpha`
+- 2+ factors high → `mostly factor`
 
-**Theme beta (AI / cloud / battery / etc.)**:
-- high: ticker in 2+ thematic ETFs with weight > 2%
-- medium: ticker in 1 thematic ETF
-- low: only in broad sector ETF
+### 5. Variant perception cross-check
 
-**Rate sensitivity**:
-- high: long-duration tech, REITs, utilities, biotech (sector match)
-- medium: most equities
-- low: short-duration value, banks (negative rate sensitivity)
-
-**Commodity sensitivity**:
-- high: energy, materials, agriculture sectors
-- medium: industrials, transports
-- low: tech, consumer staples
-
-**USD strength sensitivity** (deterministic sector + market-cap
-proxy — do NOT parse the company description for international
-revenue language; that field is marketing text and rarely contains
-the relevant info):
-- high: tech mega-caps with mkt cap > $500B in IT sector (typically
-  derive > 50% revenue internationally — AAPL, MSFT, GOOG, NVDA);
-  consumer staples mega-caps (KO, PG, PEP); multinational pharma
-  (PFE, JNJ, MRK, LLY)
-- medium: large-cap industrials, large-cap consumer discretionary,
-  semis below mega-cap
-- low: small/mid-cap US-domestic, financials (banks especially),
-  utilities, REITs, US-only services
-
-Inputs: market cap from `get_market_data`, sector from
-`get_company_profile`. Classify based on the sector + mkt-cap
-combination; do not attempt to read intl-revenue % from any narrative
-text field.
-
-### 4. Compute stock-specific alpha estimate
-
-This is the punch line. Given the factor exposures, what fraction of
-the thesis is genuinely stock-specific?
-
-Heuristic:
-- If ALL factor exposures are low/medium → `mostly alpha`. The
-  thesis stands on its own.
-- If ONE factor is high (e.g., AI theme) → `partial alpha`. The
-  thesis has alpha but also rides a factor.
-- If 2+ factors are high (e.g., AI theme + high momentum + high
-  beta) → `mostly factor`. The thesis is largely disguised factor
-  exposure.
-
-### 5. Cross-reference with the variant perception
-
-Read the variant perception from the thesis. If the variant is
-itself a factor bet ("I think AI continues for another year"), call
-this out — variant perception should be stock-specific, not factor-
-directional.
-
-If the variant is stock-specific ("AMD's MI400 win rate at hyperscaler
-X is underappreciated"), AND the factor exposure check shows mostly
-alpha → the thesis is in the strongest shape.
+Is the thesis variant perception itself a factor bet ("I think AI
+continues another year")? Then variant is factor-directional, not
+stock-specific — call it out. The variant should be stock-specific
+("AMD's MI400 win rate at hyperscaler X is underappreciated") AND
+factor exposure should be mostly alpha for the strongest shape.
 
 ### 6. Factor reversal risk
 
-For each high factor exposure, ask: what happens to the thesis if
-the factor goes the OTHER way?
+For each high factor exposure: what happens if the factor reverses?
+- High AI theme → if hyperscaler capex guides down, position loses
+  15-30% regardless of company performance
+- High rate sensitivity (long-duration tech) → 10Y to 5.5% means
+  15-25% multiple compression
+- High momentum → factor reversal can give back 90 days of gains in
+  3 weeks
 
-Examples:
-- High AI theme exposure → what if hyperscaler capex guides DOWN
-  next quarter? Position loses 15-30% regardless of company-specific
-  performance.
-- High rate sensitivity (long-duration tech) → what if 10Y goes to
-  5.5%? Multiple compression of 15-25%.
-- High momentum → what if momentum factor reverses? Stock can give
-  back 90 days of gains in 3 weeks.
-
-This is the **catalyst-independent risk** the analyst is taking.
+This is the catalyst-independent risk the analyst is taking.
 
 ## Output
 
-```
-## /factor-exposure-check — {TICKER}
+```yaml
+---
+skill: factor-exposure-check
+ticker: <TICKER>
+verdict: <mostly_alpha / partial_alpha / mostly_factor>
+confidence: 0.0-1.0
+key_finding: <one sentence on dominant factor exposure>
+data_gaps: [<list>]
+---
 
-**Beta**: X.XX (market exposure: high / medium / low)
-**Sector**: {sector / industry}
+**Beta**: X.XX | **Sector**: {sector} | **Mkt cap**: $X
+
 **Themes** (via ETF membership):
 - {ETF}: weight X.X%
-- {ETF}: weight X.X%
 
-**Factor exposure classification**:
+**Factor exposure**:
 | Factor | Level | Note |
-|--------|-------|------|
-| Market beta | high/medium/low | beta {X.XX} |
-| Momentum | high/medium/low | 90-day return {X%} |
-| Theme beta ({theme}) | high/medium/low | in {N} thematic ETFs |
-| Rate sensitivity | high/medium/low | {duration / sector reasoning} |
-| Commodity sensitivity | high/medium/low | {sector reasoning} |
-| USD strength | high/medium/low | {international revenue context} |
+|---|---|---|
+| Market beta | h/m/l | β {X.XX} |
+| Momentum | h/m/l | 90d return {X%} |
+| Theme beta ({theme}) | h/m/l | in {N} thematic ETFs |
+| Rate sensitivity | h/m/l | {sector reasoning} |
+| Commodity sensitivity | h/m/l | {sector reasoning} |
+| USD strength | h/m/l | {sector + mkt cap reasoning} |
 
-**Variant perception type**:
-- Stock-specific: [variant perception claim]
-- OR
-- Factor-directional: [variant perception is itself a factor bet]
+**Variant perception type**: stock-specific / factor-directional
 
 **Stock-specific alpha estimate**: mostly alpha / partial alpha / mostly factor
 
-**Reasoning** (one paragraph):
-[why this estimate, given the factor exposure profile]
+**Reasoning** (one paragraph)
 
-**Factor reversal risks**:
-For each high-exposure factor:
-- {factor}: what happens if it reverses, and how much does the position
-  lose independent of the thesis playing out
+**Factor reversal risks** (per high-exposure factor):
+- {factor}: {what happens if reverses, % position loss}
 
-**Implication for thesis**:
-[paragraph: if the thesis is mostly factor, sizing should be smaller
-AND the analyst should explicitly understand they are taking the
-factor risk. If mostly alpha, the thesis is in the strongest shape.]
+**Implication for thesis**: [paragraph]
 
-**Data gaps**:
-- [any tool that failed; international revenue may not be available]
+**Data gaps**: [any]
 ```
 
 ## Hard rules
 
-- Do not claim `mostly alpha` if the thesis is just "I think [theme]
-  continues." That's a factor bet, regardless of which ticker you
-  pick to express it.
-- Do not skip the reversal risk section. The whole point is to
-  surface how much of the position is at risk from forces independent
-  of the company.
-- Be explicit that this is a LITE factor model. No Barra. No PCA.
-  No actual factor regression. The analyst should not treat the
-  output as institutional-grade — it's a sanity check.
-- If ticker doesn't appear in any thematic ETFs, the theme-beta
-  classification is `low / unclear` not `mostly alpha`. Absence of
-  ETF membership ≠ absence of factor exposure (it just means thematic
-  ETFs haven't found the name yet).
+- Do not claim `mostly alpha` if the thesis is "I think [theme]
+  continues." That's a factor bet regardless of ticker pick.
+- Do not skip reversal risk — that's the whole point.
+- This is a LITE model. No Barra / no PCA / no factor regression.
+  Sanity check, not institutional-grade output.
+- If ticker doesn't appear in any thematic ETFs, theme-beta is
+  `low / unclear`, not `mostly alpha`. Absence of ETF membership
+  ≠ absence of factor exposure (thematic ETFs may not have found
+  the name yet).
 
-## When to invoke
+## When to invoke / skip
 
-- /equity-deep-research Step 18 (always)
-- Before sizing into any name that fits an obvious theme (AI, clean
-  energy, China consumer)
-- When the user pitches a "stock-specific" thesis that smells like
-  factor
-
-## When to skip
-
-- For pure event-driven positions (M&A spread, regulatory binary)
-  where factor exposure is dominated by the binary outcome
-- For closed positions (use /post-mortem-attribution instead)
-
-## Save output
-
-If invoked standalone:
-`testing/fixtures/factor_exposure_<TICKER>_<DATE>.md`
-
-If invoked from /equity-deep-research, return the classification +
-reversal risks inline.
+Invoke: `/equity-deep-research` Step 18 (always); before sizing into
+any obvious-theme name; when user pitches "stock-specific" thesis
+that smells like factor. Skip: pure event-driven (M&A spread, FDA
+binary) where factor exposure is dominated by the binary; closed
+positions (use `/post-mortem-attribution`). Standalone runs save to
+`testing/fixtures/factor_exposure_<TICKER>_<DATE>.md`.

@@ -27,7 +27,15 @@ diversification, duplicate existing bets, or concentrate sector risk?
 Call `mcp__nemo_alpaca__get_paper_positions` — returns current paper
 positions with ticker, quantity, market value, and current price.
 
-Compute:
+**Empty-book early return:**
+If `positions == []` OR total portfolio value == 0:
+- Output the envelope with `verdict: strong`, `note: empty_book`,
+  `key_finding: "No existing positions; portfolio fit check is
+  informational only — no concentration risk possible at zero book."`
+- Recommended max size = proposed size (no constraint applies)
+- Skip Steps 2-6 entirely; return immediately
+
+Otherwise compute:
 - Total portfolio value
 - Existing position weights (% of book)
 - Existing sector concentrations (group by sector)
