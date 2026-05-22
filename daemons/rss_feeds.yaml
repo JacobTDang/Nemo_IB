@@ -1,0 +1,86 @@
+# RSS feed config for daemons/rss_aggregator.py.
+#
+# Per-entry schema:
+#   name           (str)   human label; used to derive event source slug
+#   url            (str)   feed endpoint
+#   materiality    (str)   'high' | 'medium' | 'low' | 'classify'
+#                          when 'classify', each entry runs through
+#                          Materiality_Classifier (Groq) and is mapped
+#                          per news_watcher.py:160-161
+#   category       (str)   pass-through to store_event (overridden by
+#                          classifier when materiality=='classify')
+#   default_ticker (opt)   set for single-issuer feeds (IR feeds)
+#   watchlist_only (opt)   when true, drop entries whose tickers don't
+#                          intersect the watchlist
+#   is_sec         (opt)   when true, send the SEC-required User-Agent
+#                          header; required for *.sec.gov feeds
+#
+# Add new feeds by appending here. The daemon picks them up on next launch.
+
+feeds:
+  # -----------------------------------------------------------------------
+  # Typed deterministic feeds -- hardcoded materiality, no classifier
+  # -----------------------------------------------------------------------
+
+  - name: SEC EDGAR 8-K only
+    url: https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&output=atom
+    materiality: high
+    category: corporate_event
+    is_sec: true
+    watchlist_only: false
+
+  - name: SEC EDGAR 13D
+    url: https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=SC+13D&output=atom
+    materiality: high
+    category: activist
+    is_sec: true
+    watchlist_only: false
+
+  - name: Federal Reserve press releases
+    url: https://www.federalreserve.gov/feeds/press_all.xml
+    materiality: high
+    category: macro
+
+  - name: BLS employment situation
+    url: https://www.bls.gov/feed/empsit.rss
+    materiality: high
+    category: macro
+
+  - name: BEA news releases
+    url: https://apps.bea.gov/rss/rss.xml
+    materiality: medium
+    category: macro
+
+  - name: FDA press announcements
+    url: https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/press-announcements/rss.xml
+    materiality: high
+    category: regulatory
+
+  - name: Federal Register agency announcements
+    url: https://www.federalregister.gov/api/v1/articles.atom
+    materiality: medium
+    category: regulatory
+
+  - name: Treasury press releases
+    url: https://home.treasury.gov/rss/press
+    materiality: medium
+    category: macro
+
+  # -----------------------------------------------------------------------
+  # General news feeds -- classifier-gated. Watchlist-only to bound cost.
+  # -----------------------------------------------------------------------
+
+  - name: Reuters business
+    url: https://feeds.reuters.com/reuters/businessNews
+    materiality: classify
+    watchlist_only: true
+
+  - name: SeekingAlpha market currents
+    url: https://seekingalpha.com/market_currents.xml
+    materiality: classify
+    watchlist_only: true
+
+  - name: MarketWatch top stories
+    url: https://feeds.content.dowjones.io/public/rss/mw_topstories
+    materiality: classify
+    watchlist_only: true

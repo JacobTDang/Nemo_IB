@@ -25,7 +25,9 @@ $daemons = @(
   @{ Name = 'edgar_firehose';    Module = 'daemons.edgar_firehose' },
   @{ Name = 'news_watcher';      Module = 'daemons.news_watcher' },
   @{ Name = 'falsifier_watcher'; Module = 'daemons.falsifier_watcher' },
-  @{ Name = 'sentry_triage';     Module = 'daemons.sentry_triage' }
+  @{ Name = 'sentry_triage';     Module = 'daemons.sentry_triage' },
+  @{ Name = 'rss_aggregator';    Module = 'daemons.rss_aggregator' },
+  @{ Name = 'gdelt_poller';      Module = 'daemons.gdelt_poller' }
 )
 
 function Stop-StalePids {
