@@ -60,30 +60,79 @@ Compute:
 `mcp__nemo_financial__get_market_data(ticker)` returns the beta. Use
 this for the market-attribution piece.
 
-### 5. Decompose the return
+### 5. Decompose the return — TWO independent frameworks
 
-Standard equity attribution:
+These are different decompositions of the same realized return. Do
+NOT add them together. Present them side-by-side; the dominant driver
+is the largest absolute component across either table.
+
+**Framework A — Fundamental (multiplicative price decomposition):**
 
 ```
-Total return = Market beta × SPY return                 (market effect)
-             + Sector beta × (Sector ETF - SPY) return  (sector effect)
-             + Multiple change × (1 + earnings growth)  (multiple effect)
-             + Earnings growth × M_entry / P_entry      (earnings effect)
-             + Residual                                  (alpha / selection)
+P_exit / P_entry = (EPS_exit / EPS_entry) × (PE_exit / PE_entry)
+
+In log form (additive, exact):
+ln(1 + r_total) = ln(1 + r_eps) + ln(1 + r_pe)
+
+Linear approximation (when returns are small, < ~25%):
+r_total ≈ r_eps + r_pe + r_dividend
 ```
 
-Simplified for the skill output:
+For unprofitable names, substitute EV/Revenue for PE and revenue
+growth for EPS growth — same multiplicative identity holds.
 
-| Component | Contribution to return | % of total |
-|-----------|------------------------|-----------|
-| Market (beta × SPY) | X% | A% |
-| Sector (sector beta × (sector ETF - SPY)) | X% | B% |
-| Multiple expansion / contraction | X% | C% |
-| Earnings growth | X% | D% |
-| Stock-specific alpha (residual) | X% | E% |
-| **Total realized** | **X%** | **100%** |
+**Framework B — Benchmark attribution (cross-sectional):**
 
-The largest absolute component is the dominant driver.
+```
+r_total = β_market × r_spy
+        + β_sector × (r_sector_ETF − r_spy)
+        + α_stock_specific
+```
+
+Where α (stock-specific alpha) is the **residual** — what's left after
+subtracting the market and sector contributions from realized return.
+
+**Worked example (sanity check the math):**
+
+Synthetic: stock returns +30% over the holding period. Reported
+fundamentals: EPS grew 12%, PE expanded from 20x to 23.4x (+17%). No
+dividend. Benchmark: SPY +10%, sector ETF +15%, stock beta = 1.2.
+
+- Framework A: r_eps + r_pe = 12% + 17% ≈ **29.4%** ≈ 30% ✓
+- Framework B: β×r_spy + β_sector×(r_sector − r_spy) + α
+             = 1.2×10% + 1.0×(15%−10%) + α = 12% + 5% + α
+             → α = 30% − 17% = **13%** (stock-specific alpha)
+
+Both decompositions sum (within rounding) to the realized 30%. Use
+the framework that produces the most informative answer for the
+specific position; usually that's Framework A for thesis-driver
+checks and Framework B for "was this really alpha or beta."
+
+**Output table** (both frameworks side-by-side):
+
+| Framework A — Fundamental | Contribution | % of total |
+|---------------------------|--------------|-----------|
+| EPS / revenue growth | X% | A% |
+| Multiple change (PE or EV/Rev) | X% | B% |
+| Dividend yield | X% | C% |
+| **A + B + C** | **≈ total** | (sanity check) |
+
+| Framework B — Benchmark | Contribution | % of total |
+|-------------------------|--------------|-----------|
+| Market beta (β × SPY) | X% | D% |
+| Sector beta (above market) | X% | E% |
+| Stock-specific alpha (residual) | X% | F% |
+| **D + E + F** | **≈ total** | (sanity check) |
+
+The dominant driver is the largest absolute value across both tables.
+
+**Math sanity check before publishing the output:**
+- Framework A components must sum to within 2% of total return
+- Framework B components must sum to within 2% of total return
+- If either sum is off by > 2%, mark `data_gap: attribution_imprecise`
+  and surface the discrepancy in the output rather than hiding it.
+  The most common cause is missing EPS data on one of the endpoints —
+  fall back to the framework where the data is clean.
 
 ### 6. Compare predicted vs actual driver
 
@@ -132,19 +181,25 @@ For each alignment outcome:
 - Stock vs SPY: +/- X% (alpha vs market)
 - Stock vs sector: +/- X% (alpha vs sector)
 
-**Return decomposition**:
+**Return decomposition (two independent frameworks)**:
 
-| Component | Contribution | % of total |
-|-----------|--------------|-----------|
-| Market (beta × SPY) | X% | A% |
-| Sector (above market) | X% | B% |
-| Multiple change | X% (entry {M_e}x → exit {M_x}x) | C% |
-| Earnings growth | X% | D% |
-| Stock-specific alpha | X% | E% |
-| **Total** | **X%** | **100%** |
+| Framework A — Fundamental | Contribution | % of total |
+|---------------------------|--------------|-----------|
+| EPS / revenue growth | X% | A% |
+| Multiple change (entry {M_e}x → exit {M_x}x) | X% | B% |
+| Dividend yield | X% | C% |
+| **A + B + C sum** | **≈ X% (vs total realized X%)** | sanity-check OK / OFF |
 
-**Dominant driver**: [market beta / sector beta / multiple expansion
-/ earnings growth / stock alpha]
+| Framework B — Benchmark | Contribution | % of total |
+|-------------------------|--------------|-----------|
+| Market beta (β × SPY) | X% | D% |
+| Sector beta (above market) | X% | E% |
+| Stock-specific alpha (residual) | X% | F% |
+| **D + E + F sum** | **≈ X% (vs total realized X%)** | sanity-check OK / OFF |
+
+**Dominant driver** (largest absolute across BOTH frameworks):
+[EPS growth / multiple expansion / dividend / market beta / sector beta
+/ stock alpha]
 
 **Predicted driver** (per original thesis): [...]
 **Driver alignment**: correct / partially / wrong

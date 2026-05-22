@@ -173,7 +173,7 @@ into this print? Should sizing be reduced ahead of the catalyst?]
 
 ## When to invoke
 
-- /equity-deep-research Step 18.5 (always for any thesis with held
+- /equity-deep-research Step 18 (always for any thesis with held
   position OR proposed entry within 4 weeks of next earnings)
 - 1-2 weeks before each quarterly earnings print of held positions
 - Whenever the thesis depends on "beats expectations" as a catalyst

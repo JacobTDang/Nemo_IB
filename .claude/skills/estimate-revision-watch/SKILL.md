@@ -133,7 +133,7 @@ If sell-side is behind, the thesis has more room to play out.]
 
 ## When to invoke
 
-- /equity-deep-research Step 18.5 (always)
+- /equity-deep-research Step 18 (always)
 - After a major earnings print to assess revision momentum
 - When sizing into a thesis that depends on consensus catching up
 - When the thesis depends on a re-rate (the multiple expansion

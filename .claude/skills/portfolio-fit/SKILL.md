@@ -127,7 +127,7 @@ correlation if computed]
 
 ## When to invoke
 
-- /equity-deep-research Step 18.5 (always, for any thesis with sizing
+- /equity-deep-research Step 18 (always, for any thesis with sizing
   >= cautious)
 - Before any paper trade is submitted via /place_paper_order
 - When user asks "should I add to my book" / "does X fit"

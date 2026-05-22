@@ -140,7 +140,7 @@ For each thesis with approaching/triggered status:
 
 ## When to invoke
 
-- /equity-deep-research Step 18.5 (pre-entry mode, for proposed new
+- /equity-deep-research Step 18 (pre-entry mode, for proposed new
   thesis)
 - Daily / weekly cron schedule via `/loop 24h /thesis-kill-switch`
 - Whenever a major macro event hits (Fed decision, CPI print, geopolitical)
@@ -160,7 +160,7 @@ If invoked standalone:
 `testing/fixtures/kill_switch_<DATE>.md` (system-wide) or
 `testing/fixtures/kill_switch_<TICKER>_<DATE>.md` (single thesis)
 
-If invoked from /equity-deep-research Step 18.5 pre-entry mode, return
+If invoked from /equity-deep-research Step 18 pre-entry mode, return
 the per-thesis status inline so the caller can fold it into the
 synthesis. If any falsifier would trigger on day 1, the caller MUST
 honor the no-entry recommendation.

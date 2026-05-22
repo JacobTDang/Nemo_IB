@@ -83,15 +83,23 @@ heuristics:
 - medium: industrials, transports
 - low: tech, consumer staples
 
-**USD strength sensitivity**:
-- high: large-cap multinationals with > 50% international revenue
-  (typically tech mega-caps, consumer staples mega-caps)
-- medium: domestic large-caps
-- low: pure-play domestic small/mid-caps
+**USD strength sensitivity** (deterministic sector + market-cap
+proxy — do NOT parse the company description for international
+revenue language; that field is marketing text and rarely contains
+the relevant info):
+- high: tech mega-caps with mkt cap > $500B in IT sector (typically
+  derive > 50% revenue internationally — AAPL, MSFT, GOOG, NVDA);
+  consumer staples mega-caps (KO, PG, PEP); multinational pharma
+  (PFE, JNJ, MRK, LLY)
+- medium: large-cap industrials, large-cap consumer discretionary,
+  semis below mega-cap
+- low: small/mid-cap US-domestic, financials (banks especially),
+  utilities, REITs, US-only services
 
-(For USD sensitivity, look at the company description from
-`get_company_profile` for international revenue language. If unclear,
-mark `medium` and add a `data_gap` note.)
+Inputs: market cap from `get_market_data`, sector from
+`get_company_profile`. Classify based on the sector + mkt-cap
+combination; do not attempt to read intl-revenue % from any narrative
+text field.
 
 ### 4. Compute stock-specific alpha estimate
 
@@ -197,7 +205,7 @@ factor risk. If mostly alpha, the thesis is in the strongest shape.]
 
 ## When to invoke
 
-- /equity-deep-research Step 18.5 (always)
+- /equity-deep-research Step 18 (always)
 - Before sizing into any name that fits an obvious theme (AI, clean
   energy, China consumer)
 - When the user pitches a "stock-specific" thesis that smells like
