@@ -27,3 +27,6 @@ NUL
 # SearXNG runtime data (settings.yml IS tracked)
 searxng/data/
 searxng/cache/
+
+# Slack channel plugin: bun-installed deps
+tools/slack_channel/node_modules/
