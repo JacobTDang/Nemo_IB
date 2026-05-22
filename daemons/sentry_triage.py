@@ -74,23 +74,37 @@ def _discovery_ran_today() -> bool:
 
 
 def _record_discovery_run(results: Dict[str, Dict[str, int]]) -> None:
-  """Insert today's discovery run row with per-channel enqueue counts."""
+  """Insert today's discovery run row with per-channel enqueue counts.
+
+  The new channels (ipo_calendar, universe_insider, rag_analogue,
+  screener) write to additional columns added via the
+  _DISCOVERY_RUNS_MIGRATIONS in state/schema.py.
+  """
   catalyst = results.get('catalyst_calendar', {}).get('enqueued', 0)
   insider = results.get('insider_cluster', {}).get('insider_clusters', 0)
   activist = results.get('insider_cluster', {}).get('activist_enqueued', 0)
   theme = results.get('theme_flow', {}).get('enqueued', 0)
-  total = catalyst + insider + activist + theme
+  ipo = results.get('ipo_calendar', {}).get('enqueued', 0)
+  universe_insider = results.get('universe_insider_cluster', {}).get('enqueued', 0)
+  rag_analogue = results.get('rag_analogue', {}).get('enqueued', 0)
+  screener = results.get('screener', {}).get('enqueued', 0)
+  screener_ran = results.get('screener', {}).get('ran_today')
+  total = catalyst + insider + activist + theme + ipo + universe_insider + rag_analogue + screener
 
   conn = get_connection()
   try:
     conn.execute(
       """INSERT OR REPLACE INTO sentry_discovery_runs
          (day, ran_at, catalyst_enqueued, insider_enqueued, activist_enqueued,
-          theme_flow_enqueued, total_enqueued, errors)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+          theme_flow_enqueued, ipo_enqueued, universe_insider_enqueued,
+          rag_analogue_enqueued, screener_enqueued, screener_last_ran,
+          total_enqueued, errors)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
       (
         _today_et(), datetime.now(timezone.utc).isoformat(),
-        catalyst, insider, activist, theme, total, None,
+        catalyst, insider, activist, theme,
+        ipo, universe_insider, rag_analogue, screener, screener_ran,
+        total, None,
       ),
     )
     conn.commit()

@@ -47,6 +47,10 @@ earnings_calendar_description = """Retrieves upcoming and recent earnings dates 
 Should use: When you need to know when a company reports earnings, consensus EPS estimates, or to identify earnings catalysts in a date range.
 Should NOT use: For actual reported financial results (use SEC tools or get_market_data instead)."""
 
+ipo_calendar_description = """Retrieves upcoming and recent IPO listings in a date range.
+Should use: When discovering new public companies that may be misunderstood for 6-12 months post-listing. Each entry includes symbol, company name, IPO date, exchange, expected price range, share count, and expected market cap.
+Should NOT use: For already-public companies (use get_market_data). For S-1 / prospectus content (use SEC tools)."""
+
 analyst_recommendations_description = """Retrieves analyst recommendation trends (buy/hold/sell/strong buy/strong sell) over time for a company.
 Should use: When you need Wall Street consensus sentiment, analyst rating changes, or to gauge institutional opinion on a stock.
 Should NOT use: For price targets or detailed analyst reports. This provides aggregate recommendation counts."""
@@ -346,6 +350,60 @@ def _condense_earnings_calendar(raw: Dict[str, Any]) -> Dict[str, Any]:
     "total_companies": len(events),
     "by_date": by_date,
     "events": slimmed_events
+  }
+
+
+def _condense_ipo_calendar(raw: Dict[str, Any]) -> Dict[str, Any]:
+  """Condense Finnhub /calendar/ipo response.
+
+  Input: {"ipoCalendar": [list]} where each entry has symbol, name, date,
+  exchange, numberOfShares, totalSharesValue, price (e.g. "10.00-12.00"),
+  status (expected/priced/filed/withdrawn).
+
+  Computes expected_market_cap = price_mid * numberOfShares so downstream
+  filters (e.g., >= $1B) can apply without re-parsing the price field.
+  """
+  events = raw.get("ipoCalendar", []) or []
+  out_events = []
+
+  def _parse_price_mid(p):
+    if not p:
+      return None
+    s = str(p)
+    # Finnhub returns "10.00-12.00" or "10.00" or null
+    try:
+      if '-' in s:
+        lo, hi = s.split('-', 1)
+        return (float(lo) + float(hi)) / 2.0
+      return float(s)
+    except (ValueError, TypeError):
+      return None
+
+  for event in events:
+    symbol = event.get('symbol', '')
+    if not symbol:
+      continue
+    shares = event.get('numberOfShares') or 0
+    price_mid = _parse_price_mid(event.get('price'))
+    expected_mcap = (price_mid * shares) if (price_mid and shares) else None
+
+    slim = {
+      'symbol':              symbol,
+      'name':                event.get('name', ''),
+      'ipo_date':            event.get('date', ''),
+      'exchange':            event.get('exchange', ''),
+      'status':              event.get('status', ''),
+      'price_range':         event.get('price', ''),
+      'price_mid':           round(price_mid, 4) if price_mid else None,
+      'shares_outstanding':  shares,
+      'total_shares_value':  event.get('totalSharesValue'),
+      'expected_market_cap': round(expected_mcap, 2) if expected_mcap else None,
+    }
+    out_events.append(slim)
+
+  return {
+    'total_listings': len(out_events),
+    'events': out_events,
   }
 
 
@@ -905,6 +963,24 @@ class FinnhubServer:
           }
         ),
         Tool(
+          name="get_ipo_calendar",
+          description=ipo_calendar_description,
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "from_date": {
+                "type": "string",
+                "description": "Start date in YYYY-MM-DD format"
+              },
+              "to_date": {
+                "type": "string",
+                "description": "End date in YYYY-MM-DD format"
+              }
+            },
+            "required": ["from_date", "to_date"]
+          }
+        ),
+        Tool(
           name="get_analyst_recommendations",
           description=analyst_recommendations_description,
           inputSchema={
@@ -1054,6 +1130,10 @@ class FinnhubServer:
           return await parent.get_earnings_calendar(
             arguments["from_date"], arguments["to_date"]
           )
+        case "get_ipo_calendar":
+          return await parent.get_ipo_calendar(
+            arguments["from_date"], arguments["to_date"]
+          )
         case "get_analyst_recommendations":
           return await parent.get_analyst_recommendations(arguments["ticker"])
         case "get_analyst_revisions_history":
@@ -1114,6 +1194,17 @@ class FinnhubServer:
     })
     condensed = _condense_earnings_calendar(result) if isinstance(result, dict) else result
     envelope = build_envelope(condensed, "calendar", "get_earnings_calendar")
+    return [TextContent(type="text", text=safe_json_dumps(envelope))]
+
+  async def get_ipo_calendar(self, from_date: str, to_date: str) -> List[TextContent]:
+    """Wraps Finnhub's /calendar/ipo. Returns per-entry symbol, name,
+    date, exchange, expected price range, share count, and computed
+    expected market cap (price_mid * shares)."""
+    result = await self.client.get("/calendar/ipo", {
+      "from": from_date, "to": to_date
+    })
+    condensed = _condense_ipo_calendar(result) if isinstance(result, dict) else result
+    envelope = build_envelope(condensed, "calendar", "get_ipo_calendar")
     return [TextContent(type="text", text=safe_json_dumps(envelope))]
 
   async def get_analyst_recommendations(self, ticker: str) -> List[TextContent]:

@@ -55,6 +55,12 @@ DEFAULT_THEMES = [
   'biotech', 'fintech', 'defense', 'energy', 'banks',
 ]
 
+# IPO calendar tuning
+IPO_LOOKAHEAD_DAYS = 10
+IPO_MIN_MKT_CAP_USD = 1_000_000_000    # $1B floor to filter micro-cap noise
+IPO_SCORE = 0.70                       # high — new listings are decay-fresh signal
+IPO_VALID_EXCHANGES = {'NASDAQ', 'NYSE', 'NYSE ARCA', 'NYSE AMERICAN'}
+
 
 # ============================================================================
 # Channel 1: catalyst calendar (pre-earnings deep-context trigger)
@@ -407,26 +413,131 @@ def scan_theme_flow(themes: Optional[List[str]] = None) -> Dict[str, int]:
 
 
 # ============================================================================
+# Channel 4: IPO / new listing calendar
+# ============================================================================
+
+def scan_ipo_calendar(lookahead_days: int = IPO_LOOKAHEAD_DAYS,
+                      min_mkt_cap_usd: float = IPO_MIN_MKT_CAP_USD,
+                      _fetch_fn=None) -> Dict[str, int]:
+  """Enqueue upcoming IPOs above a market-cap floor.
+
+  IPO calendar is fetched from Finnhub /calendar/ipo via FinnhubClient.
+  Filters: US exchange, expected market cap >= min_mkt_cap_usd. Same IPO
+  surfaces every day until its date passes — relies on sentry_queue
+  unique partial index to keep one pending row per ticker.
+
+  Args:
+    lookahead_days: how many days forward to scan (default 10)
+    min_mkt_cap_usd: skip listings below this expected market cap
+    _fetch_fn: test-only injection; async callable taking (from_date,
+               to_date) and returning the Finnhub-shaped dict
+  """
+  from tools.news_agregator.finnhub_utils import FinnhubClient
+
+  counts = {
+    'fetched': 0, 'eligible': 0, 'below_min_cap': 0,
+    'wrong_exchange': 0, 'enqueued': 0, 'skipped': 0,
+  }
+
+  today = datetime.now(timezone.utc).date()
+  from_date = today.isoformat()
+  to_date = (today + timedelta(days=lookahead_days)).isoformat()
+
+  async def _fetch():
+    if _fetch_fn is not None:
+      return await _fetch_fn(from_date, to_date)
+    client = FinnhubClient()
+    try:
+      return await client.get('/calendar/ipo', {'from': from_date, 'to': to_date})
+    finally:
+      await client.close()
+
+  try:
+    raw = asyncio.run(_fetch())
+  except Exception as exc:
+    print(f"[discovery.ipo_calendar] fetch error: {type(exc).__name__}: {exc}",
+          file=sys.stderr, flush=True)
+    return counts
+
+  entries = raw.get('ipoCalendar', []) if isinstance(raw, dict) else []
+  counts['fetched'] = len(entries)
+
+  def _parse_price_mid(p):
+    if not p:
+      return None
+    s = str(p)
+    try:
+      if '-' in s:
+        lo, hi = s.split('-', 1)
+        return (float(lo) + float(hi)) / 2.0
+      return float(s)
+    except (ValueError, TypeError):
+      return None
+
+  for entry in entries:
+    ticker = (entry.get('symbol') or '').upper()
+    if not ticker:
+      continue
+
+    exchange = (entry.get('exchange') or '').upper()
+    if exchange not in IPO_VALID_EXCHANGES:
+      counts['wrong_exchange'] += 1
+      continue
+
+    shares = entry.get('numberOfShares') or 0
+    price_mid = _parse_price_mid(entry.get('price'))
+    expected_mcap = (price_mid * shares) if (price_mid and shares) else 0
+    if expected_mcap < min_mkt_cap_usd:
+      counts['below_min_cap'] += 1
+      continue
+
+    counts['eligible'] += 1
+
+    skip, _ = should_skip(ticker)
+    if skip:
+      counts['skipped'] += 1
+      continue
+
+    ipo_date = entry.get('date', '?')
+    qid = sentry_queue.enqueue(
+      ticker, score=IPO_SCORE, triggered_by='ipo_listing',
+      notes=(
+        f"IPO {ipo_date} on {exchange}; "
+        f"price ~${price_mid:.2f}; shares {shares:,}; "
+        f"expected mcap ${expected_mcap/1e9:.2f}B"
+      ),
+    )
+    if qid:
+      counts['enqueued'] += 1
+
+  return counts
+
+
+# ============================================================================
 # Orchestration
 # ============================================================================
 
 def run_all() -> Dict[str, Dict[str, int]]:
-  """Run all 3 channels in sequence and return per-channel counts."""
+  """Run all daily channels in sequence and return per-channel counts."""
   print(f"[discovery] starting full scan at {datetime.now(timezone.utc).isoformat()}",
         file=sys.stderr, flush=True)
   results = {}
 
-  print("[discovery] channel 1/3: catalyst_calendar", file=sys.stderr, flush=True)
+  print("[discovery] channel 1/4: catalyst_calendar", file=sys.stderr, flush=True)
   results['catalyst_calendar'] = scan_catalyst_calendar()
-  print(f"  → {results['catalyst_calendar']}", file=sys.stderr, flush=True)
+  print(f"  -> {results['catalyst_calendar']}", file=sys.stderr, flush=True)
 
-  print("[discovery] channel 2/3: insider_cluster", file=sys.stderr, flush=True)
+  print("[discovery] channel 2/4: insider_cluster", file=sys.stderr, flush=True)
   results['insider_cluster'] = scan_insider_cluster()
-  print(f"  → {results['insider_cluster']}", file=sys.stderr, flush=True)
+  print(f"  -> {results['insider_cluster']}", file=sys.stderr, flush=True)
 
-  print("[discovery] channel 3/3: theme_flow", file=sys.stderr, flush=True)
+  print("[discovery] channel 3/4: theme_flow", file=sys.stderr, flush=True)
   results['theme_flow'] = scan_theme_flow()
-  print(f"  → {results['theme_flow']}", file=sys.stderr, flush=True)
+  print(f"  -> {results['theme_flow']}", file=sys.stderr, flush=True)
+
+  print("[discovery] channel 4/4: ipo_calendar", file=sys.stderr, flush=True)
+  results['ipo_calendar'] = scan_ipo_calendar()
+  print(f"  -> {results['ipo_calendar']}", file=sys.stderr, flush=True)
 
   print(f"[discovery] full scan complete at {datetime.now(timezone.utc).isoformat()}",
         file=sys.stderr, flush=True)
@@ -438,7 +549,7 @@ def main():
   parser.add_argument('--once', action='store_true', required=True,
                       help='Run once and exit (no continuous mode for discovery)')
   parser.add_argument('--channel', choices=['catalyst_calendar', 'insider_cluster',
-                                             'theme_flow', 'all'],
+                                             'theme_flow', 'ipo_calendar', 'all'],
                       default='all', help='Run a specific channel or all')
   args = parser.parse_args()
 
@@ -452,6 +563,8 @@ def main():
     print(scan_insider_cluster(), file=sys.stderr, flush=True)
   elif args.channel == 'theme_flow':
     print(scan_theme_flow(), file=sys.stderr, flush=True)
+  elif args.channel == 'ipo_calendar':
+    print(scan_ipo_calendar(), file=sys.stderr, flush=True)
 
 
 if __name__ == '__main__':
