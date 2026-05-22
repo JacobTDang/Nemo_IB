@@ -25,6 +25,7 @@ Stop via Ctrl+C — signal handler shuts down cleanly.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import signal
 import sys
@@ -144,8 +145,33 @@ def _install_signal_handlers() -> None:
 
 
 def _resolve_ticker(event: Dict[str, Any]) -> str | None:
-  """Return the primary ticker for an event, preferring primary_ticker then ticker."""
-  return event.get('primary_ticker') or event.get('ticker')
+  """Resolve the ticker the queue should enqueue under.
+
+  When primary_ticker is set, trust the classifier. When primary_ticker
+  is NULL, the raw event.ticker field is just the news provider's loose
+  tagging -- it must be cross-checked against affected_tickers before
+  being used, or we end up enqueuing misclassified candidates (the
+  AAPL-in-ECB-payments-story case from 2026-05-22).
+  """
+  primary = event.get('primary_ticker')
+  if primary:
+    return primary
+
+  raw_ticker = event.get('ticker')
+  if not raw_ticker:
+    return None
+
+  affected = event.get('affected_tickers') or []
+  if isinstance(affected, str):
+    try:
+      affected = json.loads(affected)
+    except (json.JSONDecodeError, TypeError):
+      affected = []
+  affected_set = {t.upper() for t in (affected or []) if t}
+  if raw_ticker.upper() in affected_set:
+    return raw_ticker
+
+  return None  # ticker not corroborated by classifier; skip enqueue
 
 
 def tick(max_queue: int = DEFAULT_MAX_QUEUE,
@@ -163,6 +189,7 @@ def tick(max_queue: int = DEFAULT_MAX_QUEUE,
   counts = {
     'fetched':           0,
     'no_ticker':         0,
+    'no_clear_ticker':   0,  # event.ticker present but not in affected_tickers
     'skipped':           0,
     'scored':            0,
     'enqueued':          0,
@@ -187,8 +214,13 @@ def tick(max_queue: int = DEFAULT_MAX_QUEUE,
     ticker = _resolve_ticker(ev)
 
     # 1. Resolve ticker — skip events with no ticker (e.g., pure macro events)
+    # vs. events whose raw ticker was rejected because it's not corroborated
+    # by the classifier's affected_tickers (the misclassification case).
     if not ticker:
-      counts['no_ticker'] += 1
+      if ev.get('ticker'):
+        counts['no_clear_ticker'] += 1
+      else:
+        counts['no_ticker'] += 1
       processed_event_ids.append(eid)
       continue
 
@@ -247,7 +279,8 @@ def _format_counts(counts: Dict[str, int]) -> str:
     f"enqueued={counts['enqueued']} "
     f"skipped={counts['skipped']} "
     f"below_thr={counts['below_thr']} "
-    f"no_ticker={counts['no_ticker']}"
+    f"no_ticker={counts['no_ticker']} "
+    f"no_clear_ticker={counts.get('no_clear_ticker', 0)}"
     + (f" trimmed={counts['trimmed']}" if counts.get('trimmed') else '')
   )
 
