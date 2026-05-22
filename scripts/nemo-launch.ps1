@@ -135,6 +135,41 @@ if (-not (Test-Path $pythonExe)) {
   exit 2
 }
 
+# Step 2b: verify bun is available (required by the slack channel plugin).
+# Claude Code launches the slack channel via `bun server.ts`; if bun isn't on
+# PATH the channel silently fails to load. Check explicitly so the user gets
+# a clear error instead of a mysterious retry loop.
+$bunCmd = Get-Command bun -ErrorAction SilentlyContinue
+if (-not $bunCmd) {
+  # Fallback to the standard install location
+  $bunFallback = Join-Path $env:USERPROFILE '.bun\bin\bun.exe'
+  if (Test-Path $bunFallback) {
+    $env:PATH = "$(Split-Path $bunFallback);$env:PATH"
+    Write-Host "bun: found at $bunFallback, added to PATH for this launch" -ForegroundColor DarkGreen
+  } else {
+    Write-Host ''
+    Write-Host 'WARNING: bun not on PATH and not at default location.' -ForegroundColor Yellow
+    Write-Host '         Slack channel will silently fail to load.'
+    Write-Host '         Install: https://bun.sh — then restart this launcher.'
+    Write-Host '         Continuing without slack channel.' -ForegroundColor Yellow
+  }
+} else {
+  Write-Host "bun: $($bunCmd.Source) ($($bunCmd.Version))" -ForegroundColor DarkGreen
+}
+
+# Pre-warm slack channel deps so the channel start doesn't pay install latency.
+# Idempotent and fast (~100ms when already cached) — skip silently if it fails.
+$slackDir = Join-Path $projectRoot 'tools\slack_channel'
+if ((Test-Path $slackDir) -and (Get-Command bun -ErrorAction SilentlyContinue)) {
+  try {
+    Push-Location $slackDir
+    & bun install --no-summary --silent 2>$null | Out-Null
+    Pop-Location
+  } catch {
+    Pop-Location -ErrorAction SilentlyContinue
+  }
+}
+
 # Step 3: clean up any stale daemons from a crashed previous session
 Stop-StalePids
 
