@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 import sys
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -34,15 +35,64 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-# Import openbb at module load. The SDK auto-discovers installed extensions
-# and prints a one-line greeting to stderr; that's fine, MCP only watches
-# stdout.
-from openbb import obb
+# Each tool call runs in a fresh child process (runner.py) so the OpenBB SDK
+# never shares an asyncio event loop with the MCP framework.  This avoids the
+# Windows asyncio/thread deadlock that caused indefinite hangs when the SDK
+# was invoked via asyncio.to_thread inside the MCP server process.
+_RUNNER = os.path.join(os.path.dirname(__file__), 'runner.py')
+
+# The MCP manager may spawn this server with the uv-managed Python rather than
+# the project venv, and that Python may not have OpenBB installed.  Always
+# invoke runner.py with the venv Python so OpenBB is guaranteed to be present.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_VENV_PYTHON = os.path.join(_REPO_ROOT, '.venv', 'Scripts', 'python.exe')
+if not os.path.isfile(_VENV_PYTHON):
+    # Non-Windows fallback (bin/python)
+    _VENV_PYTHON = os.path.join(_REPO_ROOT, '.venv', 'bin', 'python')
+if not os.path.isfile(_VENV_PYTHON):
+    _VENV_PYTHON = sys.executable  # last resort
+
+# subprocess.run timeout (slightly shorter than the asyncio.wait_for cap so
+# the inner timeout fires first and we get a clean error rather than a
+# TimeoutExpired exception propagating up)
+_OBB_SUBPROCESS_TIMEOUT_S = 43.0
+_OBB_CALL_TIMEOUT_S = 45.0
+
+
+def _run_subprocess(tool_name: str, kwargs: dict) -> dict:
+    """Run an OpenBB tool in runner.py as a fresh child process.
+
+    Returns a dict: {"success": bool, "data": any}  on success
+                 or {"success": bool, "error": str}  on failure.
+    """
+    try:
+        proc = subprocess.run(
+            [_VENV_PYTHON, _RUNNER, tool_name, json.dumps(kwargs)],
+            capture_output=True,
+            stdin=subprocess.DEVNULL,   # prevent openbb interactive prompts from blocking
+            text=True,
+            timeout=_OBB_SUBPROCESS_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return {'success': False,
+                'error': f'subprocess timed out after {_OBB_SUBPROCESS_TIMEOUT_S}s'}
+
+    stdout = (proc.stdout or '').strip()
+    if not stdout:
+        stderr_snippet = (proc.stderr or '').strip()[:300]
+        return {'success': False,
+                'error': (f'subprocess produced no output '
+                          f'(exit {proc.returncode}): {stderr_snippet}')}
+
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError:
+        return {'success': False,
+                'error': f'subprocess output not valid JSON: {stdout[:300]}'}
 
 
 # ---------------------------------------------------------------------------
-# Envelope (matches the shape used by other Nemo MCP tools so the analyst
-# skills get a consistent response shape)
+# Envelope
 # ---------------------------------------------------------------------------
 
 def build_envelope(
@@ -65,37 +115,8 @@ def build_envelope(
   }
 
 
-def _to_records(obbject) -> List[Dict[str, Any]]:
-  """Unwrap an OBBject into a list of plain dicts (for JSON-serializable
-  responses). Handles list-of-models, single-model, and weirdly-shaped
-  results gracefully."""
-  if obbject is None:
-    return []
-  d = None
-  if hasattr(obbject, 'model_dump'):
-    d = obbject.model_dump()
-  elif isinstance(obbject, dict):
-    d = obbject
-  if not d:
-    return []
-  results = d.get('results')
-  if isinstance(results, list):
-    out = []
-    for r in results:
-      if hasattr(r, 'model_dump'):
-        out.append(r.model_dump())
-      elif isinstance(r, dict):
-        out.append(r)
-    return out
-  if isinstance(results, dict):
-    return [results]
-  return []
-
-
 def _serialize_safe(obj):
-  """JSON-safe serializer: date/datetime -> isoformat; everything else
-  passes through json.dumps default-handling."""
-  if isinstance(obj, (datetime,)):
+  if isinstance(obj, datetime):
     return obj.isoformat()
   if hasattr(obj, 'isoformat'):
     return obj.isoformat()
@@ -109,17 +130,7 @@ def _serialize_safe(obj):
 class OpenBBServer:
   def __init__(self):
     self.server = Server("openbb")
-    # Login to OpenBB Hub if PAT set; many endpoints work without it
-    pat = os.getenv('OPENBB_PAT')
-    if pat:
-      try:
-        obb.account.login(pat=pat)
-      except Exception as exc:
-        print(f"[openbb] OPENBB_PAT login failed: {exc}",
-              file=sys.stderr, flush=True)
     self._setup_handlers()
-
-  # -- handlers -----------------------------------------------------------
 
   def _setup_handlers(self):
     parent = self
@@ -213,88 +224,65 @@ class OpenBBServer:
         return await parent.analyst_consensus(args)
       raise ValueError(f"unknown tool: {name}")
 
-  # -- tool methods (sync OpenBB calls wrapped in to_thread) ---------------
+  # -- tool methods ----------------------------------------------------------
+  # Each spawns runner.py as a child process via asyncio.to_thread so the
+  # blocking subprocess.run call doesn't stall the MCP server's event loop.
 
   async def insider_trading(self, args: Dict[str, Any]) -> List[TextContent]:
     ticker = (args.get('ticker') or '').upper()
     limit = int(args.get('limit') or 50)
     if not ticker:
-      return self._error('obb_insider_trading', ticker,
-                         'ticker is required')
-    try:
-      r = await asyncio.to_thread(
-        obb.equity.ownership.insider_trading,
-        symbol=ticker, limit=limit,
-      )
-      records = _to_records(r)
-      env = build_envelope(records, ticker, 'obb_insider_trading')
-      return [TextContent(type='text',
-                          text=json.dumps(env, default=_serialize_safe))]
-    except Exception as exc:
-      return self._error('obb_insider_trading', ticker,
-                         f"{type(exc).__name__}: {str(exc)[:200]}")
+      return self._error('obb_insider_trading', ticker, 'ticker is required')
+    return await self._dispatch(
+      'obb_insider_trading', ticker,
+      {'ticker': ticker, 'limit': limit},
+    )
 
   async def news_company(self, args: Dict[str, Any]) -> List[TextContent]:
     ticker = (args.get('ticker') or '').upper()
     limit = int(args.get('limit') or 30)
     if not ticker:
-      return self._error('obb_news_company', ticker,
-                         'ticker is required')
-    try:
-      r = await asyncio.to_thread(
-        obb.news.company,
-        symbol=ticker, limit=limit,
-      )
-      records = _to_records(r)
-      env = build_envelope(records, ticker, 'obb_news_company')
-      return [TextContent(type='text',
-                          text=json.dumps(env, default=_serialize_safe))]
-    except Exception as exc:
-      return self._error('obb_news_company', ticker,
-                         f"{type(exc).__name__}: {str(exc)[:200]}")
+      return self._error('obb_news_company', ticker, 'ticker is required')
+    return await self._dispatch(
+      'obb_news_company', ticker,
+      {'ticker': ticker, 'limit': limit},
+    )
 
   async def options_chain(self, args: Dict[str, Any]) -> List[TextContent]:
     ticker = (args.get('ticker') or '').upper()
     if not ticker:
-      return self._error('obb_options_chain', ticker,
-                         'ticker is required')
-    try:
-      r = await asyncio.to_thread(
-        obb.derivatives.options.chains,
-        symbol=ticker,
-      )
-      records = _to_records(r)
-      # Truncate by default -- options chains are huge (2000+ rows for
-      # large-cap names). Keep the first 200 rows; downstream skills can
-      # filter further via separate calls if they need the full chain.
-      truncated = records[:200]
-      env = build_envelope(
-        {'rows': truncated, 'total_rows': len(records), 'returned': len(truncated)},
-        ticker, 'obb_options_chain',
-      )
-      return [TextContent(type='text',
-                          text=json.dumps(env, default=_serialize_safe))]
-    except Exception as exc:
-      return self._error('obb_options_chain', ticker,
-                         f"{type(exc).__name__}: {str(exc)[:200]}")
+      return self._error('obb_options_chain', ticker, 'ticker is required')
+    return await self._dispatch('obb_options_chain', ticker, {'ticker': ticker})
 
   async def analyst_consensus(self, args: Dict[str, Any]) -> List[TextContent]:
     ticker = (args.get('ticker') or '').upper()
     if not ticker:
-      return self._error('obb_analyst_consensus', ticker,
-                         'ticker is required')
+      return self._error('obb_analyst_consensus', ticker, 'ticker is required')
+    return await self._dispatch('obb_analyst_consensus', ticker, {'ticker': ticker})
+
+  async def _dispatch(
+    self, tool: str, ticker: str, kwargs: dict,
+  ) -> List[TextContent]:
+    """Spawn runner.py in a thread and return the MCP TextContent response."""
     try:
-      r = await asyncio.to_thread(
-        obb.equity.estimates.consensus,
-        symbol=ticker,
+      result = await asyncio.wait_for(
+        asyncio.to_thread(_run_subprocess, tool, kwargs),
+        timeout=_OBB_CALL_TIMEOUT_S,
       )
-      records = _to_records(r)
-      env = build_envelope(records, ticker, 'obb_analyst_consensus')
-      return [TextContent(type='text',
-                          text=json.dumps(env, default=_serialize_safe))]
+    except asyncio.TimeoutError:
+      return self._error(tool, ticker,
+                         f'openbb_timeout: subprocess did not return within '
+                         f'{_OBB_CALL_TIMEOUT_S}s')
     except Exception as exc:
-      return self._error('obb_analyst_consensus', ticker,
+      return self._error(tool, ticker,
                          f"{type(exc).__name__}: {str(exc)[:200]}")
+
+    if not result.get('success'):
+      return self._error(tool, ticker, result.get('error', 'unknown error'))
+
+    env = build_envelope(result['data'], ticker, tool)
+    return [TextContent(type='text',
+                        text=json.dumps(env, default=_serialize_safe))]
 
   def _error(self, tool: str, ticker: str, msg: str) -> List[TextContent]:
     env = build_envelope([], ticker, tool, errors=[msg])

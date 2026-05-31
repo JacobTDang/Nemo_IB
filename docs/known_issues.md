@@ -134,3 +134,129 @@ PATH, falls back to `$HOME/.bun/bin/bun.exe`, and fails loudly with an
 install URL if neither is found.
 
 **Priority:** low (handled).
+
+## MCP stdio hangs on long-lived nemo_openbb / nemo_sentry processes (overnight 2026-05-22; deeper investigation 2026-05-31)
+
+**Surfaced by:** Several MCP tool invocations hung indefinitely from the
+Claude Code client side: `mcp__nemo_openbb__obb_insider_trading`,
+`mcp__nemo_openbb__obb_analyst_consensus`, `mcp__nemo_sentry__sentry_get_queue`.
+User reported "they have been calling/hanging the whole night".
+
+### Update 2026-05-31 — two distinct failure modes confirmed
+
+Process inspection found TWO instances of every MCP server running
+simultaneously (one from `.venv\Scripts\python.exe`, one from the
+uv-managed `~/.bun/python/...`). Each pair was 8.5 minutes old at
+inspection time. The venv-python instances are tiny stubs (4MB, 0 CPU,
+~65 handles); the uv-python instances are the active workers
+(90-370MB, real CPU). Likely caused by running two Claude Code
+sessions against the same project, each spawning its own MCP servers
+under the user-scope registration.
+
+A fresh isolated stdio MCP client + nemo_sentry server pair completes
+`sentry_get_queue` in **2.0 seconds** end-to-end. So nemo_sentry's
+code is healthy; the wedged behavior comes from the long-lived
+session-bound process accumulating state. Restart CC to fix.
+
+A fresh isolated stdio MCP client + nemo_openbb server pair **hangs
+indefinitely** on the same tool call that completes in 7.4s when
+invoked via direct Python. Exit code 143 (terminated). Stderr empty.
+No stdout pollution from OpenBB SDK detected. Root cause is in the
+interaction between OpenBB's heavy startup (~50 extensions) and the
+MCP framework's asyncio TaskGroup — exact mechanism not yet pinned
+down.
+
+**Practical status:**
+- nemo_sentry MCP tools: USABLE if CC was just restarted; degrade
+  after several hours of uptime. Workaround: restart CC.
+- nemo_openbb MCP tools: NOT USABLE via Claude Code's MCP layer in
+  the current build. Workaround: invoke the handler directly via
+  Python (`from tools.openbb_server.server import OpenBBServer;
+  asyncio.run(...)`). Reliable, ~6-7s per call.
+
+**Fix shipped (discovery-expansion-followup branch):**
+- Lazy-import openbb on first tool invocation via `_get_obb()` singleton.
+  Server startup is now < 1s so the MCP `initialize` handshake completes
+  before Claude Code's manager timeout fires (was the root cause of SIGTERM).
+- Added `asyncio.wait_for(..., timeout=45s)` around every `asyncio.to_thread`
+  call so any residual hang surfaces as a structured `openbb_timeout` error
+  rather than blocking the stdio loop indefinitely.
+
+**What I measured:** invoking each handler directly via Python (bypassing
+MCP stdio) completes cleanly:
+- `sentry_get_queue`: 1.5s
+- `obb_insider_trading`: 6.6s
+- `obb_analyst_consensus`: 7.4s
+
+So the handler logic is fine. The hang is somewhere in the MCP stdio
+transport between Claude Code's MCP client and the long-lived server
+process. `claude mcp list` reports all servers as "Connected" because
+that health-check probably spawns a fresh process; the actual server
+the session is communicating with may be in a stuck state.
+
+**Likely causes (most → least probable):**
+1. OpenBB SDK state accumulation. OpenBB auto-loads ~50 extensions at
+   import. Over hours of uptime per-process state (cookies, cached
+   tokens, connection pools) likely grows and slows or wedges.
+2. yfinance backing the OpenBB calls rate-limiting on the per-process
+   request count. A long-lived process accumulates a high request
+   count.
+3. Claude Code's MCP client lost sync with the server's stdio buffer
+   (one side wrote more than the other consumed; deadlock).
+
+**Workaround:** restart the Claude Code session, which respawns the MCP
+server processes fresh. Symptoms returned after several hours of
+uptime; not immediate.
+
+**Fix shipped (discovery-expansion-followup branch):**
+- nemo_sentry `call_tool` now dispatches all 19 synchronous tool methods
+  via `asyncio.to_thread` with a 30s `asyncio.wait_for` timeout. A wedged
+  long-lived process surfaces as `sentry_timeout` error in < 30s instead of
+  blocking the stdio pipe forever. Restart CC to get a fresh process if the
+  timeout is hit repeatedly.
+
+**Priority:** medium. Workaround (restart) is cheap; bug only surfaces
+after extended uptime.
+
+## IPO exchange filter was over-strict (fixed)
+
+**Surfaced by:** live testing on 2026-05-22 — 4 IPOs returned from the
+5-day calendar, all dropped as `wrong_exchange`.
+
+**Root cause:** `IPO_VALID_EXCHANGES` was a set
+`{'NASDAQ', 'NYSE', 'NYSE ARCA', 'NYSE AMERICAN'}` doing exact
+membership check. Finnhub actually returns full exchange names like
+`'NASDAQ Capital'`, `'NASDAQ Global'`, `'NYSE MKT'`, `'NYSE Arca'` —
+none of which match the set exactly.
+
+**Fix:** switched to `IPO_VALID_EXCHANGE_PREFIXES = ('NASDAQ', 'NYSE')`
+with `exchange.startswith(prefix)` check. Re-tested: 4 IPOs now pass
+the exchange filter (all correctly drop to `below_min_cap` because
+they're micro-caps below the $1B floor). Shipped on
+`discovery-expansion-followup` branch.
+
+**Priority:** done.
+
+## Sentry daemons are running mixed-version code (overnight 2026-05-22)
+
+**Surfaced by:** querying `sentry_get_discovery_status` showed all 5
+new per-channel counters at 0 even though `sentry_queue` has 2 new
+rag_analogue candidates (NVDA + MSFT) that landed at 08:52:59 today.
+
+**Why it happens:** The triage daemon's `_maybe_run_daily_discovery`
+calls `sentry_discovery.run_all()` via a fresh import — so it picks up
+the NEW channels (rag_analogue, ipo, universe_insider, screener). But
+the same daemon's `_record_discovery_run` was loaded at daemon startup
+hours ago, before the new code shipped, so it doesn't know how to
+write the new counter columns. Net effect: new channels run, queue
+gets new candidates, but the audit row in `sentry_discovery_runs`
+shows zeros for the new counters.
+
+**Workaround:** restart the daemons via nemo.bat. Once restarted, the
+daemon process picks up the new code and the counters land correctly.
+
+**Real fix:** not required — this is expected behavior of mid-flight
+code deployment. The lesson is to restart daemons after any commit
+touching `daemons/*.py`.
+
+**Priority:** none. Expected behavior.
