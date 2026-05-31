@@ -446,46 +446,43 @@ class SentryServer:
 
     @self.server.call_tool()
     async def call_tool(name: str, args: Dict[str, Any]):
-      try:
-        if name == 'sentry_get_queue':
-          return parent.tool_get_queue(args)
-        if name == 'sentry_mark_queue_status':
-          return parent.tool_mark_queue_status(args)
-        if name == 'sentry_reset_stuck_queue':
-          return parent.tool_reset_stuck_queue(args)
-        if name == 'sentry_trim_queue':
-          return parent.tool_trim_queue(args)
-        if name == 'sentry_get_event':
-          return parent.tool_get_event(args)
-        if name == 'sentry_validate_candidate':
-          return parent.tool_validate_candidate(args)
-        if name == 'sentry_recent_events_for_ticker':
-          return parent.tool_recent_events_for_ticker(args)
-        if name == 'sentry_record_evaluation':
-          return parent.tool_record_evaluation(args)
-        if name == 'sentry_recent_evals':
-          return parent.tool_recent_evals(args)
-        if name == 'sentry_should_skip':
-          return parent.tool_should_skip(args)
-        if name == 'sentry_budget_summary':
-          return parent.tool_budget_summary(args)
-        if name == 'sentry_can_act':
-          return parent.tool_can_act(args)
-        if name == 'sentry_record_action':
-          return parent.tool_record_action(args)
-        if name == 'sentry_get_watchlist':
-          return parent.tool_get_watchlist(args)
-        if name == 'sentry_get_open_positions':
-          return parent.tool_get_open_positions(args)
-        if name == 'sentry_get_active_theses':
-          return parent.tool_get_active_theses(args)
-        if name == 'sentry_latest_thesis':
-          return parent.tool_latest_thesis(args)
-        if name == 'sentry_get_discovery_status':
-          return parent.tool_get_discovery_status(args)
-        if name == 'sentry_active_falsifier_alerts':
-          return parent.tool_active_falsifier_alerts(args)
+      # All tool_* methods are synchronous SQLite operations.  Dispatching
+      # via asyncio.to_thread moves them off the event loop (correct for
+      # blocking I/O) and asyncio.wait_for ensures a wedged long-lived
+      # process surfaces as a structured error rather than blocking the
+      # stdio pipe forever.
+      _SENTRY_TOOL_TIMEOUT_S = 30.0
+      dispatch = {
+        'sentry_get_queue':               lambda: parent.tool_get_queue(args),
+        'sentry_mark_queue_status':       lambda: parent.tool_mark_queue_status(args),
+        'sentry_reset_stuck_queue':       lambda: parent.tool_reset_stuck_queue(args),
+        'sentry_trim_queue':              lambda: parent.tool_trim_queue(args),
+        'sentry_get_event':               lambda: parent.tool_get_event(args),
+        'sentry_validate_candidate':      lambda: parent.tool_validate_candidate(args),
+        'sentry_recent_events_for_ticker': lambda: parent.tool_recent_events_for_ticker(args),
+        'sentry_record_evaluation':       lambda: parent.tool_record_evaluation(args),
+        'sentry_recent_evals':            lambda: parent.tool_recent_evals(args),
+        'sentry_should_skip':             lambda: parent.tool_should_skip(args),
+        'sentry_budget_summary':          lambda: parent.tool_budget_summary(args),
+        'sentry_can_act':                lambda: parent.tool_can_act(args),
+        'sentry_record_action':           lambda: parent.tool_record_action(args),
+        'sentry_get_watchlist':           lambda: parent.tool_get_watchlist(args),
+        'sentry_get_open_positions':      lambda: parent.tool_get_open_positions(args),
+        'sentry_get_active_theses':       lambda: parent.tool_get_active_theses(args),
+        'sentry_latest_thesis':           lambda: parent.tool_latest_thesis(args),
+        'sentry_get_discovery_status':    lambda: parent.tool_get_discovery_status(args),
+        'sentry_active_falsifier_alerts': lambda: parent.tool_active_falsifier_alerts(args),
+      }
+      fn = dispatch.get(name)
+      if fn is None:
         return _err(name, f'unknown tool: {name}')
+      try:
+        return await asyncio.wait_for(asyncio.to_thread(fn),
+                                      timeout=_SENTRY_TOOL_TIMEOUT_S)
+      except asyncio.TimeoutError:
+        return _err(name,
+                    f'sentry_timeout: {name} did not complete within '
+                    f'{_SENTRY_TOOL_TIMEOUT_S}s')
       except Exception as exc:
         return _err(name, f'{type(exc).__name__}: {str(exc)[:300]}')
 
