@@ -41,6 +41,17 @@ from mcp.types import Tool, TextContent
 # was invoked via asyncio.to_thread inside the MCP server process.
 _RUNNER = os.path.join(os.path.dirname(__file__), 'runner.py')
 
+# The MCP manager may spawn this server with the uv-managed Python rather than
+# the project venv, and that Python may not have OpenBB installed.  Always
+# invoke runner.py with the venv Python so OpenBB is guaranteed to be present.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_VENV_PYTHON = os.path.join(_REPO_ROOT, '.venv', 'Scripts', 'python.exe')
+if not os.path.isfile(_VENV_PYTHON):
+    # Non-Windows fallback (bin/python)
+    _VENV_PYTHON = os.path.join(_REPO_ROOT, '.venv', 'bin', 'python')
+if not os.path.isfile(_VENV_PYTHON):
+    _VENV_PYTHON = sys.executable  # last resort
+
 # subprocess.run timeout (slightly shorter than the asyncio.wait_for cap so
 # the inner timeout fires first and we get a clean error rather than a
 # TimeoutExpired exception propagating up)
@@ -56,7 +67,7 @@ def _run_subprocess(tool_name: str, kwargs: dict) -> dict:
     """
     try:
         proc = subprocess.run(
-            [sys.executable, _RUNNER, tool_name, json.dumps(kwargs)],
+            [_VENV_PYTHON, _RUNNER, tool_name, json.dumps(kwargs)],
             capture_output=True,
             text=True,
             timeout=_OBB_SUBPROCESS_TIMEOUT_S,
