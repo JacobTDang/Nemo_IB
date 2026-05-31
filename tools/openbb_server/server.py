@@ -69,6 +69,7 @@ def _run_subprocess(tool_name: str, kwargs: dict) -> dict:
         proc = subprocess.run(
             [_VENV_PYTHON, _RUNNER, tool_name, json.dumps(kwargs)],
             capture_output=True,
+            stdin=subprocess.DEVNULL,   # prevent openbb interactive prompts from blocking
             text=True,
             timeout=_OBB_SUBPROCESS_TIMEOUT_S,
         )
