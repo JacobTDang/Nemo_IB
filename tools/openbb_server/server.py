@@ -34,10 +34,27 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-# Import openbb at module load. The SDK auto-discovers installed extensions
-# and prints a one-line greeting to stderr; that's fine, MCP only watches
-# stdout.
-from openbb import obb
+# OpenBB is NOT imported at module level.  The SDK auto-discovers ~50
+# extensions at import time which takes ~6s on cold start.  That delay
+# caused the MCP server process to be SIGTERMed (exit 143) by Claude Code's
+# MCP manager before the `initialize` handshake could complete.
+# _get_obb() below imports lazily on first tool call and caches the instance.
+_obb = None
+
+
+def _get_obb():
+    global _obb
+    if _obb is None:
+        from openbb import obb as _loaded  # noqa: PLC0415
+        _obb = _loaded
+        pat = os.getenv('OPENBB_PAT')
+        if pat:
+            try:
+                _obb.account.login(pat=pat)
+            except Exception as exc:
+                print(f"[openbb] OPENBB_PAT login failed: {exc}",
+                      file=sys.stderr, flush=True)
+    return _obb
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +119,12 @@ def _serialize_safe(obj):
   return str(obj)
 
 
+# Per-call timeout for OpenBB SDK calls.  The underlying yfinance / provider
+# calls typically complete in 7-8s.  45s gives plenty of headroom while still
+# preventing an indefinitely hung stdio loop.
+_OBB_CALL_TIMEOUT_S = 45.0
+
+
 # ---------------------------------------------------------------------------
 # Tool implementations
 # ---------------------------------------------------------------------------
@@ -109,14 +132,7 @@ def _serialize_safe(obj):
 class OpenBBServer:
   def __init__(self):
     self.server = Server("openbb")
-    # Login to OpenBB Hub if PAT set; many endpoints work without it
-    pat = os.getenv('OPENBB_PAT')
-    if pat:
-      try:
-        obb.account.login(pat=pat)
-      except Exception as exc:
-        print(f"[openbb] OPENBB_PAT login failed: {exc}",
-              file=sys.stderr, flush=True)
+    # PAT login deferred to _get_obb() on first tool call.
     self._setup_handlers()
 
   # -- handlers -----------------------------------------------------------
@@ -213,23 +229,27 @@ class OpenBBServer:
         return await parent.analyst_consensus(args)
       raise ValueError(f"unknown tool: {name}")
 
-  # -- tool methods (sync OpenBB calls wrapped in to_thread) ---------------
+  # -- tool methods (lazy OpenBB import, bounded by _OBB_CALL_TIMEOUT_S) ---
 
   async def insider_trading(self, args: Dict[str, Any]) -> List[TextContent]:
     ticker = (args.get('ticker') or '').upper()
     limit = int(args.get('limit') or 50)
     if not ticker:
-      return self._error('obb_insider_trading', ticker,
-                         'ticker is required')
+      return self._error('obb_insider_trading', ticker, 'ticker is required')
     try:
-      r = await asyncio.to_thread(
-        obb.equity.ownership.insider_trading,
-        symbol=ticker, limit=limit,
-      )
+      def _call():
+        return _get_obb().equity.ownership.insider_trading(
+          symbol=ticker, limit=limit,
+        )
+      r = await asyncio.wait_for(asyncio.to_thread(_call),
+                                 timeout=_OBB_CALL_TIMEOUT_S)
       records = _to_records(r)
       env = build_envelope(records, ticker, 'obb_insider_trading')
       return [TextContent(type='text',
                           text=json.dumps(env, default=_serialize_safe))]
+    except asyncio.TimeoutError:
+      return self._error('obb_insider_trading', ticker,
+                         f'openbb_timeout: call did not return within {_OBB_CALL_TIMEOUT_S}s')
     except Exception as exc:
       return self._error('obb_insider_trading', ticker,
                          f"{type(exc).__name__}: {str(exc)[:200]}")
@@ -238,17 +258,19 @@ class OpenBBServer:
     ticker = (args.get('ticker') or '').upper()
     limit = int(args.get('limit') or 30)
     if not ticker:
-      return self._error('obb_news_company', ticker,
-                         'ticker is required')
+      return self._error('obb_news_company', ticker, 'ticker is required')
     try:
-      r = await asyncio.to_thread(
-        obb.news.company,
-        symbol=ticker, limit=limit,
-      )
+      def _call():
+        return _get_obb().news.company(symbol=ticker, limit=limit)
+      r = await asyncio.wait_for(asyncio.to_thread(_call),
+                                 timeout=_OBB_CALL_TIMEOUT_S)
       records = _to_records(r)
       env = build_envelope(records, ticker, 'obb_news_company')
       return [TextContent(type='text',
                           text=json.dumps(env, default=_serialize_safe))]
+    except asyncio.TimeoutError:
+      return self._error('obb_news_company', ticker,
+                         f'openbb_timeout: call did not return within {_OBB_CALL_TIMEOUT_S}s')
     except Exception as exc:
       return self._error('obb_news_company', ticker,
                          f"{type(exc).__name__}: {str(exc)[:200]}")
@@ -256,13 +278,12 @@ class OpenBBServer:
   async def options_chain(self, args: Dict[str, Any]) -> List[TextContent]:
     ticker = (args.get('ticker') or '').upper()
     if not ticker:
-      return self._error('obb_options_chain', ticker,
-                         'ticker is required')
+      return self._error('obb_options_chain', ticker, 'ticker is required')
     try:
-      r = await asyncio.to_thread(
-        obb.derivatives.options.chains,
-        symbol=ticker,
-      )
+      def _call():
+        return _get_obb().derivatives.options.chains(symbol=ticker)
+      r = await asyncio.wait_for(asyncio.to_thread(_call),
+                                 timeout=_OBB_CALL_TIMEOUT_S)
       records = _to_records(r)
       # Truncate by default -- options chains are huge (2000+ rows for
       # large-cap names). Keep the first 200 rows; downstream skills can
@@ -274,6 +295,9 @@ class OpenBBServer:
       )
       return [TextContent(type='text',
                           text=json.dumps(env, default=_serialize_safe))]
+    except asyncio.TimeoutError:
+      return self._error('obb_options_chain', ticker,
+                         f'openbb_timeout: call did not return within {_OBB_CALL_TIMEOUT_S}s')
     except Exception as exc:
       return self._error('obb_options_chain', ticker,
                          f"{type(exc).__name__}: {str(exc)[:200]}")
@@ -281,17 +305,19 @@ class OpenBBServer:
   async def analyst_consensus(self, args: Dict[str, Any]) -> List[TextContent]:
     ticker = (args.get('ticker') or '').upper()
     if not ticker:
-      return self._error('obb_analyst_consensus', ticker,
-                         'ticker is required')
+      return self._error('obb_analyst_consensus', ticker, 'ticker is required')
     try:
-      r = await asyncio.to_thread(
-        obb.equity.estimates.consensus,
-        symbol=ticker,
-      )
+      def _call():
+        return _get_obb().equity.estimates.consensus(symbol=ticker)
+      r = await asyncio.wait_for(asyncio.to_thread(_call),
+                                 timeout=_OBB_CALL_TIMEOUT_S)
       records = _to_records(r)
       env = build_envelope(records, ticker, 'obb_analyst_consensus')
       return [TextContent(type='text',
                           text=json.dumps(env, default=_serialize_safe))]
+    except asyncio.TimeoutError:
+      return self._error('obb_analyst_consensus', ticker,
+                         f'openbb_timeout: call did not return within {_OBB_CALL_TIMEOUT_S}s')
     except Exception as exc:
       return self._error('obb_analyst_consensus', ticker,
                          f"{type(exc).__name__}: {str(exc)[:200]}")

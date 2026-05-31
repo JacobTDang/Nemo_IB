@@ -174,14 +174,13 @@ down.
   Python (`from tools.openbb_server.server import OpenBBServer;
   asyncio.run(...)`). Reliable, ~6-7s per call.
 
-**Real fix candidates for nemo_openbb:**
-- Run the openbb SDK calls in a true subprocess (not asyncio.to_thread)
-  so SDK state never lives in the MCP server process
-- Lazy-import openbb only on first tool invocation, not at module
-  load — keeps server startup fast and isolates any import-time
-  side effects from the MCP framework
-- Investigate whether asyncio.to_thread with OpenBB triggers a
-  deadlock specific to Windows + the openbb extension manager
+**Fix shipped (discovery-expansion-followup branch):**
+- Lazy-import openbb on first tool invocation via `_get_obb()` singleton.
+  Server startup is now < 1s so the MCP `initialize` handshake completes
+  before Claude Code's manager timeout fires (was the root cause of SIGTERM).
+- Added `asyncio.wait_for(..., timeout=45s)` around every `asyncio.to_thread`
+  call so any residual hang surfaces as a structured `openbb_timeout` error
+  rather than blocking the stdio loop indefinitely.
 
 **What I measured:** invoking each handler directly via Python (bypassing
 MCP stdio) completes cleanly:
@@ -209,13 +208,12 @@ the session is communicating with may be in a stuck state.
 server processes fresh. Symptoms returned after several hours of
 uptime; not immediate.
 
-**Real fix candidates:**
-- Add a per-call timeout in the MCP servers themselves so a hung
-  upstream call doesn't lock the entire stdio loop.
-- Use the existing `_BROKER_READ_TIMEOUT_S` pattern from
-  `tools/alpaca/server.py` for the long-tail tools.
-- Investigate whether OpenBB has a way to reset its internal state
-  without re-importing.
+**Fix shipped (discovery-expansion-followup branch):**
+- nemo_sentry `call_tool` now dispatches all 19 synchronous tool methods
+  via `asyncio.to_thread` with a 30s `asyncio.wait_for` timeout. A wedged
+  long-lived process surfaces as `sentry_timeout` error in < 30s instead of
+  blocking the stdio pipe forever. Restart CC to get a fresh process if the
+  timeout is hit repeatedly.
 
 **Priority:** medium. Workaround (restart) is cheap; bug only surfaces
 after extended uptime.
