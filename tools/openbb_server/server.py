@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 import sys
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -34,32 +35,52 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-# OpenBB is NOT imported at module level.  The SDK auto-discovers ~50
-# extensions at import time which takes ~6s on cold start.  That delay
-# caused the MCP server process to be SIGTERMed (exit 143) by Claude Code's
-# MCP manager before the `initialize` handshake could complete.
-# _get_obb() below imports lazily on first tool call and caches the instance.
-_obb = None
+# Each tool call runs in a fresh child process (runner.py) so the OpenBB SDK
+# never shares an asyncio event loop with the MCP framework.  This avoids the
+# Windows asyncio/thread deadlock that caused indefinite hangs when the SDK
+# was invoked via asyncio.to_thread inside the MCP server process.
+_RUNNER = os.path.join(os.path.dirname(__file__), 'runner.py')
+
+# subprocess.run timeout (slightly shorter than the asyncio.wait_for cap so
+# the inner timeout fires first and we get a clean error rather than a
+# TimeoutExpired exception propagating up)
+_OBB_SUBPROCESS_TIMEOUT_S = 43.0
+_OBB_CALL_TIMEOUT_S = 45.0
 
 
-def _get_obb():
-    global _obb
-    if _obb is None:
-        from openbb import obb as _loaded  # noqa: PLC0415
-        _obb = _loaded
-        pat = os.getenv('OPENBB_PAT')
-        if pat:
-            try:
-                _obb.account.login(pat=pat)
-            except Exception as exc:
-                print(f"[openbb] OPENBB_PAT login failed: {exc}",
-                      file=sys.stderr, flush=True)
-    return _obb
+def _run_subprocess(tool_name: str, kwargs: dict) -> dict:
+    """Run an OpenBB tool in runner.py as a fresh child process.
+
+    Returns a dict: {"success": bool, "data": any}  on success
+                 or {"success": bool, "error": str}  on failure.
+    """
+    try:
+        proc = subprocess.run(
+            [sys.executable, _RUNNER, tool_name, json.dumps(kwargs)],
+            capture_output=True,
+            text=True,
+            timeout=_OBB_SUBPROCESS_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return {'success': False,
+                'error': f'subprocess timed out after {_OBB_SUBPROCESS_TIMEOUT_S}s'}
+
+    stdout = (proc.stdout or '').strip()
+    if not stdout:
+        stderr_snippet = (proc.stderr or '').strip()[:300]
+        return {'success': False,
+                'error': (f'subprocess produced no output '
+                          f'(exit {proc.returncode}): {stderr_snippet}')}
+
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError:
+        return {'success': False,
+                'error': f'subprocess output not valid JSON: {stdout[:300]}'}
 
 
 # ---------------------------------------------------------------------------
-# Envelope (matches the shape used by other Nemo MCP tools so the analyst
-# skills get a consistent response shape)
+# Envelope
 # ---------------------------------------------------------------------------
 
 def build_envelope(
@@ -82,47 +103,12 @@ def build_envelope(
   }
 
 
-def _to_records(obbject) -> List[Dict[str, Any]]:
-  """Unwrap an OBBject into a list of plain dicts (for JSON-serializable
-  responses). Handles list-of-models, single-model, and weirdly-shaped
-  results gracefully."""
-  if obbject is None:
-    return []
-  d = None
-  if hasattr(obbject, 'model_dump'):
-    d = obbject.model_dump()
-  elif isinstance(obbject, dict):
-    d = obbject
-  if not d:
-    return []
-  results = d.get('results')
-  if isinstance(results, list):
-    out = []
-    for r in results:
-      if hasattr(r, 'model_dump'):
-        out.append(r.model_dump())
-      elif isinstance(r, dict):
-        out.append(r)
-    return out
-  if isinstance(results, dict):
-    return [results]
-  return []
-
-
 def _serialize_safe(obj):
-  """JSON-safe serializer: date/datetime -> isoformat; everything else
-  passes through json.dumps default-handling."""
-  if isinstance(obj, (datetime,)):
+  if isinstance(obj, datetime):
     return obj.isoformat()
   if hasattr(obj, 'isoformat'):
     return obj.isoformat()
   return str(obj)
-
-
-# Per-call timeout for OpenBB SDK calls.  The underlying yfinance / provider
-# calls typically complete in 7-8s.  45s gives plenty of headroom while still
-# preventing an indefinitely hung stdio loop.
-_OBB_CALL_TIMEOUT_S = 45.0
 
 
 # ---------------------------------------------------------------------------
@@ -132,10 +118,7 @@ _OBB_CALL_TIMEOUT_S = 45.0
 class OpenBBServer:
   def __init__(self):
     self.server = Server("openbb")
-    # PAT login deferred to _get_obb() on first tool call.
     self._setup_handlers()
-
-  # -- handlers -----------------------------------------------------------
 
   def _setup_handlers(self):
     parent = self
@@ -229,98 +212,65 @@ class OpenBBServer:
         return await parent.analyst_consensus(args)
       raise ValueError(f"unknown tool: {name}")
 
-  # -- tool methods (lazy OpenBB import, bounded by _OBB_CALL_TIMEOUT_S) ---
+  # -- tool methods ----------------------------------------------------------
+  # Each spawns runner.py as a child process via asyncio.to_thread so the
+  # blocking subprocess.run call doesn't stall the MCP server's event loop.
 
   async def insider_trading(self, args: Dict[str, Any]) -> List[TextContent]:
     ticker = (args.get('ticker') or '').upper()
     limit = int(args.get('limit') or 50)
     if not ticker:
       return self._error('obb_insider_trading', ticker, 'ticker is required')
-    try:
-      def _call():
-        return _get_obb().equity.ownership.insider_trading(
-          symbol=ticker, limit=limit,
-        )
-      r = await asyncio.wait_for(asyncio.to_thread(_call),
-                                 timeout=_OBB_CALL_TIMEOUT_S)
-      records = _to_records(r)
-      env = build_envelope(records, ticker, 'obb_insider_trading')
-      return [TextContent(type='text',
-                          text=json.dumps(env, default=_serialize_safe))]
-    except asyncio.TimeoutError:
-      return self._error('obb_insider_trading', ticker,
-                         f'openbb_timeout: call did not return within {_OBB_CALL_TIMEOUT_S}s')
-    except Exception as exc:
-      return self._error('obb_insider_trading', ticker,
-                         f"{type(exc).__name__}: {str(exc)[:200]}")
+    return await self._dispatch(
+      'obb_insider_trading', ticker,
+      {'ticker': ticker, 'limit': limit},
+    )
 
   async def news_company(self, args: Dict[str, Any]) -> List[TextContent]:
     ticker = (args.get('ticker') or '').upper()
     limit = int(args.get('limit') or 30)
     if not ticker:
       return self._error('obb_news_company', ticker, 'ticker is required')
-    try:
-      def _call():
-        return _get_obb().news.company(symbol=ticker, limit=limit)
-      r = await asyncio.wait_for(asyncio.to_thread(_call),
-                                 timeout=_OBB_CALL_TIMEOUT_S)
-      records = _to_records(r)
-      env = build_envelope(records, ticker, 'obb_news_company')
-      return [TextContent(type='text',
-                          text=json.dumps(env, default=_serialize_safe))]
-    except asyncio.TimeoutError:
-      return self._error('obb_news_company', ticker,
-                         f'openbb_timeout: call did not return within {_OBB_CALL_TIMEOUT_S}s')
-    except Exception as exc:
-      return self._error('obb_news_company', ticker,
-                         f"{type(exc).__name__}: {str(exc)[:200]}")
+    return await self._dispatch(
+      'obb_news_company', ticker,
+      {'ticker': ticker, 'limit': limit},
+    )
 
   async def options_chain(self, args: Dict[str, Any]) -> List[TextContent]:
     ticker = (args.get('ticker') or '').upper()
     if not ticker:
       return self._error('obb_options_chain', ticker, 'ticker is required')
-    try:
-      def _call():
-        return _get_obb().derivatives.options.chains(symbol=ticker)
-      r = await asyncio.wait_for(asyncio.to_thread(_call),
-                                 timeout=_OBB_CALL_TIMEOUT_S)
-      records = _to_records(r)
-      # Truncate by default -- options chains are huge (2000+ rows for
-      # large-cap names). Keep the first 200 rows; downstream skills can
-      # filter further via separate calls if they need the full chain.
-      truncated = records[:200]
-      env = build_envelope(
-        {'rows': truncated, 'total_rows': len(records), 'returned': len(truncated)},
-        ticker, 'obb_options_chain',
-      )
-      return [TextContent(type='text',
-                          text=json.dumps(env, default=_serialize_safe))]
-    except asyncio.TimeoutError:
-      return self._error('obb_options_chain', ticker,
-                         f'openbb_timeout: call did not return within {_OBB_CALL_TIMEOUT_S}s')
-    except Exception as exc:
-      return self._error('obb_options_chain', ticker,
-                         f"{type(exc).__name__}: {str(exc)[:200]}")
+    return await self._dispatch('obb_options_chain', ticker, {'ticker': ticker})
 
   async def analyst_consensus(self, args: Dict[str, Any]) -> List[TextContent]:
     ticker = (args.get('ticker') or '').upper()
     if not ticker:
       return self._error('obb_analyst_consensus', ticker, 'ticker is required')
+    return await self._dispatch('obb_analyst_consensus', ticker, {'ticker': ticker})
+
+  async def _dispatch(
+    self, tool: str, ticker: str, kwargs: dict,
+  ) -> List[TextContent]:
+    """Spawn runner.py in a thread and return the MCP TextContent response."""
     try:
-      def _call():
-        return _get_obb().equity.estimates.consensus(symbol=ticker)
-      r = await asyncio.wait_for(asyncio.to_thread(_call),
-                                 timeout=_OBB_CALL_TIMEOUT_S)
-      records = _to_records(r)
-      env = build_envelope(records, ticker, 'obb_analyst_consensus')
-      return [TextContent(type='text',
-                          text=json.dumps(env, default=_serialize_safe))]
+      result = await asyncio.wait_for(
+        asyncio.to_thread(_run_subprocess, tool, kwargs),
+        timeout=_OBB_CALL_TIMEOUT_S,
+      )
     except asyncio.TimeoutError:
-      return self._error('obb_analyst_consensus', ticker,
-                         f'openbb_timeout: call did not return within {_OBB_CALL_TIMEOUT_S}s')
+      return self._error(tool, ticker,
+                         f'openbb_timeout: subprocess did not return within '
+                         f'{_OBB_CALL_TIMEOUT_S}s')
     except Exception as exc:
-      return self._error('obb_analyst_consensus', ticker,
+      return self._error(tool, ticker,
                          f"{type(exc).__name__}: {str(exc)[:200]}")
+
+    if not result.get('success'):
+      return self._error(tool, ticker, result.get('error', 'unknown error'))
+
+    env = build_envelope(result['data'], ticker, tool)
+    return [TextContent(type='text',
+                        text=json.dumps(env, default=_serialize_safe))]
 
   def _error(self, tool: str, ticker: str, msg: str) -> List[TextContent]:
     env = build_envelope([], ticker, tool, errors=[msg])
