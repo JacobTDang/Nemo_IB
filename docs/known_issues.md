@@ -135,12 +135,53 @@ install URL if neither is found.
 
 **Priority:** low (handled).
 
-## MCP stdio hangs on long-lived nemo_openbb / nemo_sentry processes (overnight 2026-05-22)
+## MCP stdio hangs on long-lived nemo_openbb / nemo_sentry processes (overnight 2026-05-22; deeper investigation 2026-05-31)
 
 **Surfaced by:** Several MCP tool invocations hung indefinitely from the
 Claude Code client side: `mcp__nemo_openbb__obb_insider_trading`,
 `mcp__nemo_openbb__obb_analyst_consensus`, `mcp__nemo_sentry__sentry_get_queue`.
 User reported "they have been calling/hanging the whole night".
+
+### Update 2026-05-31 — two distinct failure modes confirmed
+
+Process inspection found TWO instances of every MCP server running
+simultaneously (one from `.venv\Scripts\python.exe`, one from the
+uv-managed `~/.bun/python/...`). Each pair was 8.5 minutes old at
+inspection time. The venv-python instances are tiny stubs (4MB, 0 CPU,
+~65 handles); the uv-python instances are the active workers
+(90-370MB, real CPU). Likely caused by running two Claude Code
+sessions against the same project, each spawning its own MCP servers
+under the user-scope registration.
+
+A fresh isolated stdio MCP client + nemo_sentry server pair completes
+`sentry_get_queue` in **2.0 seconds** end-to-end. So nemo_sentry's
+code is healthy; the wedged behavior comes from the long-lived
+session-bound process accumulating state. Restart CC to fix.
+
+A fresh isolated stdio MCP client + nemo_openbb server pair **hangs
+indefinitely** on the same tool call that completes in 7.4s when
+invoked via direct Python. Exit code 143 (terminated). Stderr empty.
+No stdout pollution from OpenBB SDK detected. Root cause is in the
+interaction between OpenBB's heavy startup (~50 extensions) and the
+MCP framework's asyncio TaskGroup — exact mechanism not yet pinned
+down.
+
+**Practical status:**
+- nemo_sentry MCP tools: USABLE if CC was just restarted; degrade
+  after several hours of uptime. Workaround: restart CC.
+- nemo_openbb MCP tools: NOT USABLE via Claude Code's MCP layer in
+  the current build. Workaround: invoke the handler directly via
+  Python (`from tools.openbb_server.server import OpenBBServer;
+  asyncio.run(...)`). Reliable, ~6-7s per call.
+
+**Real fix candidates for nemo_openbb:**
+- Run the openbb SDK calls in a true subprocess (not asyncio.to_thread)
+  so SDK state never lives in the MCP server process
+- Lazy-import openbb only on first tool invocation, not at module
+  load — keeps server startup fast and isolates any import-time
+  side effects from the MCP framework
+- Investigate whether asyncio.to_thread with OpenBB triggers a
+  deadlock specific to Windows + the openbb extension manager
 
 **What I measured:** invoking each handler directly via Python (bypassing
 MCP stdio) completes cleanly:
