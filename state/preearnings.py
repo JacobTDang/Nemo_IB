@@ -144,7 +144,13 @@ def record_eval(
     *,
     _db: Optional[str] = None,
 ) -> int:
-    """Upsert a pre-earnings eval row. Returns the row id."""
+    """Upsert a pre-earnings eval row. Returns the row id.
+
+    Semantics: prediction/confidence/implied_move_pct update freely while the
+    row is UNSCORED (outcome IS NULL) — 7d/3d/1d re-runs refresh the call.
+    Once scored, the prediction is FROZEN (no retroactive rewriting). The
+    actuals columns use COALESCE so a prediction-phase call with NULL actuals
+    can never wipe recorded outcomes."""
     conn = _db_conn(_db)
     try:
         cur = conn.execute(
@@ -155,12 +161,28 @@ def record_eval(
                 evaluated_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(ticker, earnings_date) DO UPDATE SET
-                 actual_eps_surprise  = excluded.actual_eps_surprise,
-                 actual_rev_surprise  = excluded.actual_rev_surprise,
-                 actual_price_move_1d = excluded.actual_price_move_1d,
-                 outcome              = excluded.outcome,
-                 prediction_correct   = excluded.prediction_correct,
-                 notes                = excluded.notes,
+                 prediction = CASE WHEN preearnings_evals.outcome IS NULL
+                                   THEN excluded.prediction
+                                   ELSE preearnings_evals.prediction END,
+                 confidence = CASE WHEN preearnings_evals.outcome IS NULL
+                                   THEN excluded.confidence
+                                   ELSE preearnings_evals.confidence END,
+                 implied_move_pct = CASE WHEN preearnings_evals.outcome IS NULL
+                                   THEN COALESCE(excluded.implied_move_pct,
+                                                 preearnings_evals.implied_move_pct)
+                                   ELSE preearnings_evals.implied_move_pct END,
+                 actual_eps_surprise  = COALESCE(excluded.actual_eps_surprise,
+                                                 preearnings_evals.actual_eps_surprise),
+                 actual_rev_surprise  = COALESCE(excluded.actual_rev_surprise,
+                                                 preearnings_evals.actual_rev_surprise),
+                 actual_price_move_1d = COALESCE(excluded.actual_price_move_1d,
+                                                 preearnings_evals.actual_price_move_1d),
+                 outcome              = COALESCE(excluded.outcome,
+                                                 preearnings_evals.outcome),
+                 prediction_correct   = COALESCE(excluded.prediction_correct,
+                                                 preearnings_evals.prediction_correct),
+                 notes                = COALESCE(excluded.notes,
+                                                 preearnings_evals.notes),
                  evaluated_at         = excluded.evaluated_at""",
             (
                 ticker.upper(),

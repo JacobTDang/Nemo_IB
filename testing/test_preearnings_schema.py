@@ -143,6 +143,63 @@ def test_is_fresh_false_when_missing():
     assert not is_fresh("ZZMISS", "2099-05-01", "guidance", max_age_hours=24, _db=_TMP_DB)
 
 
+# ---------------------------------------------------------------------------
+# record_eval upsert semantics — prediction mutable until scored, then frozen
+# ---------------------------------------------------------------------------
+
+def test_eval_prediction_updates_before_scoring():
+    """Re-running preearnings-research (7d/3d/1d out) must refresh the call.
+    (Bug surfaced live: ORCL row kept the stale in_line/0.42 prediction.)"""
+    _clean()
+    record_eval("ZZEV1", "2099-06-10", "in_line", 0.42, _db=_TMP_DB)
+    record_eval("ZZEV1", "2099-06-10", "likely_beat", 0.52,
+                implied_move_pct=0.128, _db=_TMP_DB)
+    row = get_eval("ZZEV1", "2099-06-10", _db=_TMP_DB)
+    assert row["prediction"] == "likely_beat"
+    assert row["confidence"] == 0.52
+    assert row["implied_move_pct"] == 0.128
+
+
+def test_eval_prediction_frozen_after_scoring():
+    """Once outcome is recorded, the prediction cannot be rewritten."""
+    _clean()
+    record_eval("ZZEV2", "2099-06-10", "likely_beat", 0.52, _db=_TMP_DB)
+    record_eval("ZZEV2", "2099-06-10", "likely_beat", 0.52,
+                actual_eps_surprise=5.1, outcome="beat",
+                prediction_correct=1, _db=_TMP_DB)
+    # attempt to rewrite the prediction after scoring
+    record_eval("ZZEV2", "2099-06-10", "likely_miss", 0.90, _db=_TMP_DB)
+    row = get_eval("ZZEV2", "2099-06-10", _db=_TMP_DB)
+    assert row["prediction"] == "likely_beat"      # frozen
+    assert row["confidence"] == 0.52               # frozen
+    assert row["outcome"] == "beat"                # intact
+
+
+def test_eval_actuals_not_wiped_by_prediction_rerun():
+    """A prediction-phase call (all actuals None) must never null out a
+    scored row's actuals — COALESCE guard."""
+    _clean()
+    record_eval("ZZEV3", "2099-06-10", "likely_beat", 0.6,
+                actual_eps_surprise=4.2, actual_price_move_1d=7.7,
+                outcome="beat", prediction_correct=1, _db=_TMP_DB)
+    record_eval("ZZEV3", "2099-06-10", "likely_beat", 0.6, _db=_TMP_DB)
+    row = get_eval("ZZEV3", "2099-06-10", _db=_TMP_DB)
+    assert row["outcome"] == "beat"
+    assert row["actual_eps_surprise"] == 4.2
+    assert row["actual_price_move_1d"] == 7.7
+    assert row["prediction_correct"] == 1
+
+
+def test_eval_implied_move_not_wiped_by_none_before_scoring():
+    _clean()
+    record_eval("ZZEV4", "2099-06-10", "in_line", 0.4,
+                implied_move_pct=0.10, _db=_TMP_DB)
+    record_eval("ZZEV4", "2099-06-10", "likely_beat", 0.55, _db=_TMP_DB)  # no implied passed
+    row = get_eval("ZZEV4", "2099-06-10", _db=_TMP_DB)
+    assert row["implied_move_pct"] == 0.10         # preserved via COALESCE
+    assert row["prediction"] == "likely_beat"      # but prediction refreshed
+
+
 def test_preearnings_signals_columns():
     conn = _conn()
     try:
