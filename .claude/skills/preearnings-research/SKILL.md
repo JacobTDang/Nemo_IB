@@ -17,7 +17,7 @@ quarter window are all derived at runtime.
 
 ## Layer 0 — Always (cheap structured signals)
 
-1. **Earnings date.** `get_earnings_calendar(from=today, to=today+45, symbol=ticker)` —
+1. **Earnings date.** `get_earnings_calendar(from_date=today, to_date=today+45, symbol=ticker)` —
    always pass `symbol` so the single ticker's event is confirmed directly (never
    lost to the summary cap). No entry -> output `no_upcoming_earnings` and stop.
    Record `days_to_earnings` and the `hour` (amc/bmo). If `< 2`, add
@@ -32,13 +32,15 @@ quarter window are all derived at runtime.
    `get_company_news`). Combine into one `thin_altdata` signal (majority lean).
 5. **Asymmetry inputs.**
    - `get_short_interest` (SI % float, days-to-cover), `get_options_metrics`
-     (IV skew AND put/call volume ratio), `get_options_implied_move(ticker, spot)`,
-     `get_price_history` (3M momentum + ~500 daily bars), and reuse the Layer-0
-     `get_analyst_revisions_history` pct_bullish.
-   - **Reaction history:** `get_company_filings_history(ticker, form="8-K")` for
-     report dates + `get_earnings_surprises` -> build pairs with
+     (IV skew AND put/call volume ratio), `get_options_implied_move(ticker,
+     spot_price)`, `get_price_history` (3M momentum + ~500 daily bars), and
+     reuse the Layer-0 `get_analyst_revisions_history` pct_bullish.
+   - **Reaction history:** `get_company_filings_history(ticker, form_type="8-K",
+     n=8)` for report dates + `get_earnings_surprises` -> build pairs with
      `pair_surprises_with_reactions(surprises, event_dates, bars)` -> feed
-     `reaction_profile`. Realized next-day |moves| also feed `implied_vs_realized`.
+     `reaction_profile`. For `implied_vs_realized`, divide the pairs'
+     `next_day_return` (a percent) by 100 first — both inputs must be FRACTIONS
+     to match the implied move (mixed units return verdict "unknown").
    - **Persist every asymmetry component as a layer** (`implied_move` with the
      full options result incl. quotes_stale, `positioning`, `reaction`) — flags
      buried in unpersisted tool results are invisible to /preearnings-review.

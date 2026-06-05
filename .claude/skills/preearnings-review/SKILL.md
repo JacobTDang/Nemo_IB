@@ -27,8 +27,8 @@ If there are no layers AND no eval row, output
 
 The dispersion check needs two independent reads of the same-quarter consensus:
 - `get_forward_estimates(ticker)` -> 0q EPS avg (yfinance-fallback source)
-- `get_earnings_calendar(from=today, to=today+45, symbol=ticker)` -> the
-  calendar `eps_estimate` (Finnhub source)
+- `get_earnings_calendar(from_date=today, to_date=today+45, symbol=ticker)` ->
+  the calendar `eps_estimate` (Finnhub source)
 
 These are the reviewer's ONLY network calls — everything else is inspection.
 
@@ -65,8 +65,8 @@ skill: preearnings-review
 ticker: {TICKER}
 earnings_date: {DATE}
 verdict: sound | sound_with_warnings | not_actionable
-fails: {N}
-warns: {N}
+fails: {N}      # len(result["fails"]) — run_review returns lists, not counts
+warns: {N}      # len(result["warns"])
 checks_run: {N}
 ---
 ```

@@ -28,14 +28,20 @@ were bullish/bearish.
 
 Call `get_earnings_surprises(ticker)`.
 
-Find the quarter matching `earnings_date` (±7 days). Extract:
-- `actual` EPS
-- `estimate` EPS
-- `surprise_percent` = (actual - estimate) / |estimate| × 100
+Find the quarter whose `period` is NEAREST to `earnings_date` within
+**[earnings_date − 75 days, earnings_date + 45 days]** — never a tight ±7-day
+match. Finnhub labels fiscal quarters with calendar-quarter ENDS: fiscal-offset
+companies (Nov/May FYEs like ORCL/ADBE) report ~3 weeks BEFORE their label, and
+Jan-FYE names (CRM/WDAY) report up to ~60 days AFTER it. (This mirrors the
+[-45d, +75d] event window in `pair_surprises_with_reactions`, inverted.) If two
+periods qualify, take the nearest; newest on a tie.
+
+The quarter row carries `actual_eps`, `estimate_eps`, and a precomputed
+`surprise_pct` — use them as-is.
 
 Classify outcome:
-- `surprise_percent > +3%` → outcome=`beat`
-- `surprise_percent < -3%` → outcome=`miss`
+- `surprise_pct > +3%` → outcome=`beat`
+- `surprise_pct < -3%` → outcome=`miss`
 - Otherwise → outcome=`in_line`
 
 If no surprise data available (company not in Finnhub coverage), try
@@ -44,16 +50,23 @@ Mark `actual_eps_surprise = None` if unavailable.
 
 ### Step 3 — Revenue surprise
 
-From the same `get_earnings_surprises` result or `get_financial_statements`,
-extract the revenue surprise if available:
+The Finnhub surprises endpoint is EPS-only — revenue surprise comes ONLY from
+`get_financial_statements(ticker)` vs the prior consensus (the persisted
+research layers carry the pre-print revenue consensus):
 - `actual_rev_surprise` = (actual_revenue - estimated_revenue) / estimated_revenue
+Mark None if not derivable.
 
 ### Step 4 — 1-day price move
 
-Call `get_price_history(ticker, from_date=earnings_date, to_date=earnings_date+2)`.
+Call `get_price_history(ticker, period="1mo", include_recent_bars=20)` (the
+tool takes period/bars, not date ranges). From `recent_bars`, take the close on
+the last trading day <= `earnings_date` (t) and the next trading day's close
+(t+1) — matching the close[t] -> close[t+1] convention in
+`pair_surprises_with_reactions`; AMC prints land in t+1.
 
-Extract the closing price on earnings_date and the next trading day.
-`actual_price_move_1d` = (next_day_close - earnings_day_close) / earnings_day_close
+`actual_price_move_1d` = (close[t+1] - close[t]) / close[t] × 100
+**(a PERCENT, e.g. -6.4 — `score_reaction` requires the move in percent while
+`implied_move_pct` stays a fraction; it raises on a percent-shaped implied).**
 
 ### Step 5 — Score the prediction
 
@@ -75,9 +88,11 @@ layer in `get_layers`):
 The direction model predicts the fundamental outcome; the asymmetry model
 predicts the REACTION. Grade them independently:
 
-Load the persisted `positioning` layer (`latest_component(ticker, earnings_date,
-"positioning")`). Call `score_reaction(positioning, outcome, price_move_1d_pct,
-implied_move_pct, prediction)` (`tools/preearnings/asymmetry_logic.py`):
+Load the persisted positioning layer: `layer = latest_component(ticker,
+earnings_date, "positioning")` and pass `layer["payload"]["positioning"]` (the
+string — the layer dict itself is not the argument). Call
+`score_reaction(positioning, outcome, price_move_1d_pct, implied_move_pct,
+prediction)` (`tools/preearnings/asymmetry_logic.py`):
 - `price_direction_match`: did the 1-day move agree with the prediction?
   (a correct EPS call with an opposite price move = right on fundamentals,
   wrong on the trade)
@@ -91,6 +106,10 @@ Call `record_eval(ticker, earnings_date, prediction=..., confidence=...,
 actual_eps_surprise=..., actual_rev_surprise=..., actual_price_move_1d=...,
 outcome=..., prediction_correct=..., asymmetry_correct=...,
 price_direction_match=..., notes=...)`.
+
+Pass the STORED prediction/confidence from Step 1 verbatim. (The upsert is also
+structurally guarded: a call carrying an outcome cannot rewrite the prediction —
+scoring can only append actuals.)
 
 ## Output
 
