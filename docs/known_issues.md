@@ -3,6 +3,104 @@
 Findings worth fixing but not blocking the current build. Each entry
 includes what surfaced it, what the fix looks like, and rough priority.
 
+## Pre-Earnings Pipeline — bugs, limitations, backlog (2026-06-05)
+
+Branch `preearnings-pipeline`, written at merge time. 314 tests passing.
+
+### Known bugs / limitations
+
+1. **yfinance IV sentinels** — yfinance sometimes reports implied vol as
+   a near-zero sentinel (~1e-5) on illiquid strikes. Mitigation shipped:
+   skew is set to `None` instead of a garbage number when either leg IV
+   is a sentinel; the skill treats `skew=None` as a data gap. Residual:
+   no alternative IV source, so skew coverage is thinner on small caps.
+
+2. **Short interest is 2-3 weeks stale** — FINRA publishes SI
+   bi-monthly with a lag. `classify_positioning` can call crowded_short
+   on positioning that has already partially unwound. No fix available
+   without a paid feed (Ortex — see backlog).
+
+3. **Surprise/reaction pairing residuals** — `pair_surprises_with_reactions`
+   now uses optimal max-cardinality / min-distance assignment plus the
+   `filter_earnings_cadence` pre-filter, but non-earnings 8-Ks inside the
+   cadence window can still slip through. The accurate fallback (parsing
+   each 8-K for Item 2.02) is too slow for the live pipeline and is
+   documented as a SOLO-only diagnostic.
+
+4. **`select_scoring_bar` sign-flip limits** — basis validation uses a
+   growth-bounds check (0.3–2.5x year-ago actual). A company swinging
+   from loss to profit (or vice versa) breaks the ratio logic; the
+   function flags `divergent_unverifiable` rather than guessing, which
+   is correct but means no bar validation for turnaround quarters.
+
+5. **`quotes_stale` after hours** — options chain quotes go to 0-bid /
+   0-ask after the close. Mitigation shipped: legs rebuild from
+   `last_price` and the result carries `quotes_stale=true`. Residual:
+   last_price can be hours old; event-move math inherits that staleness.
+
+6. **Put-call parity guard not live until next MCP restart** — the guard
+   (commit 22e102b) rebuilds both legs from last_price when
+   |C−P−(S−K)|/S > 5%. The running altdata server process predates the
+   commit; restart Claude Code to activate it.
+
+7. **Eval price-move attribution gap** — `/earnings-eval` grades the
+   1-day move against the EPS-surprise outcome, but the move is often
+   driven by guidance, not the printed quarter. Improvement idea: add an
+   `outcome_driver` tag (eps / guidance / multiple) to `record_eval`
+   notes so the track record can separate "right on EPS, wrong on
+   guide" cases.
+
+8. **Google Trends 429s** — pytrends gets rate-limited intermittently.
+   The skill records `data_gap` and the `na` weight redistributes, so
+   the pipeline degrades gracefully, but trends coverage is unreliable.
+
+9. **`get_earnings_transcripts` returns 8-K releases, not call
+   transcripts** — for CHWY it produced pairs_found=0 because the
+   "transcripts" were press releases. Call-sentiment signals are
+   effectively press-release-sentiment for companies without free
+   transcript sources.
+
+10. **Stale vendor calendar dates** — Finnhub's earnings calendar showed
+    GME reporting 6-08 when news proved it reported 6-02 (dropped from
+    the betting slate). Mitigation shipped: news-digest sub-agents carry
+    a `calendar_conflicts` field so digests can contradict the calendar;
+    the skill must treat a confirmed conflict as disqualifying.
+
+### Improvement backlog (ordered)
+
+1. **TIME-GATED: weight refit + /track-record skill** — after ~10 evals
+   exist, refit `DEFAULT_DIRECTION_WEIGHTS` against realized accuracy
+   and build an aggregate track-record view. First eval points land
+   6-11/6-12 (ORCL, CHWY, ADBE, RH).
+2. **BUDGET-GATED: Tier 2 data** — SimilarWeb scaffold is shipped and
+   key-gated (`tools/preearnings/web_traffic.py`); next are Panjiva
+   (shipments), AlphaSense (transcripts), Ortex (live SI), card panels.
+3. **Predict-the-guide** — model the guidance number separately from
+   the quarter print; most post-print moves are guide-driven (see bug 7).
+4. **KPI-level consensus scoring** — score KPI beats/misses against
+   KPI-level consensus where available, not just EPS.
+5. **Sentry live tick** — wire the pre-earnings escalation branch in
+   `/sentry-tick` to a scheduled daemon so research fires 5-7 days out
+   without manual invocation.
+6. **Fresh sessions for eval week** — use `run_manifest` resumability to
+   run each eval in a clean session instead of one long context.
+
+### Live predictions awaiting eval
+
+| Ticker | Earnings | Hour | Prediction | Conf | Action |
+|---|---|---|---|---|---|
+| ORCL | 2026-06-10 | amc | likely_beat | 0.52 | no_position (crowded long) |
+| CHWY | 2026-06-10 | bmo | in_line | 0.53 | no_position (in_line rule) |
+| ADBE | 2026-06-11 | amc | in_line | 0.44 | no_position (in_line rule) |
+| RH | 2026-06-11 | amc | likely_miss | 0.39 | no_position (57% SI squeeze risk; Dec −23% miss closed UP +5.7%) |
+
+Eval reminders: quarter matching window is [−75d, +45d] around the
+earnings date; use bmo/amc reaction conventions; the Finnhub calendar
+eps_estimate is THE scoring bar; the stored prediction is frozen — the
+scoring call structurally cannot rewrite it.
+
+---
+
 ## Discipline / process gaps surfaced by real runs
 
 ### `/portfolio-fit` silently skipped during /equity-deep-research
