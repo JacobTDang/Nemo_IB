@@ -1487,6 +1487,28 @@ class AltDataServer:
                         },
                     },
                 ),
+                Tool(
+                    name="get_web_traffic_signal",
+                    description=(
+                        "TIER 2 (paid): YoY web-traffic demand signal via SimilarWeb. "
+                        "Requires SIMILARWEB_API_KEY; returns a clean error if unset. "
+                        "Supersedes Google Trends as the demand proxy for digital / "
+                        "e-commerce / SaaS / marketplace names. Domain auto-resolved "
+                        "from the ticker (yfinance website) unless overridden. "
+                        "Signal: visits YoY > +10% bullish, < -10% bearish, else neutral."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "required": ["ticker"],
+                        "properties": {
+                            "ticker": {"type": "string"},
+                            "domain": {
+                                "type": "string",
+                                "description": "Optional: override the web domain (e.g. 'nvidia.com').",
+                            },
+                        },
+                    },
+                ),
             ]
 
         @self.server.call_tool()
@@ -1507,6 +1529,8 @@ class AltDataServer:
                 return await parent.policy_signals(args)
             if name == "get_capex_announcements":
                 return await parent.capex_announcements(args)
+            if name == "get_web_traffic_signal":
+                return await parent.web_traffic_signal(args)
             return _err(name, f"unknown tool: {name}")
 
     # -----------------------------------------------------------------------
@@ -1731,6 +1755,26 @@ class AltDataServer:
             return _err("get_policy_signals",
                         f"{type(exc).__name__}: {str(exc)[:200]}", ticker)
         return _ok("get_policy_signals", result, ticker)
+
+    async def web_traffic_signal(self, args: Dict[str, Any]) -> List[TextContent]:
+        ticker = str(args.get("ticker", "")).upper()
+        if not ticker:
+            return _err("get_web_traffic_signal", "ticker is required")
+        domain = args.get("domain")
+        try:
+            from tools.preearnings.web_traffic import web_traffic_signal as _wts
+            result = await asyncio.wait_for(
+                asyncio.to_thread(_wts, ticker, domain),
+                timeout=30.0,
+            )
+        except asyncio.TimeoutError:
+            return _err("get_web_traffic_signal", "SimilarWeb timed out after 30s", ticker)
+        except Exception as exc:
+            return _err("get_web_traffic_signal",
+                        f"{type(exc).__name__}: {str(exc)[:200]}", ticker)
+        if "error" in result:
+            return _err("get_web_traffic_signal", result["error"], ticker)
+        return _ok("get_web_traffic_signal", result, ticker)
 
     async def capex_announcements(self, args: Dict[str, Any]) -> List[TextContent]:
         ticker = str(args.get("ticker", "")).upper()
