@@ -61,18 +61,48 @@ def _month_str(d: date) -> str:
     return d.strftime("%Y-%m")
 
 
+def align_yoy_months(months: List[Dict[str, Any]],
+                      today: Optional[date] = None) -> Dict[str, Any]:
+    """Pick the latest COMPLETE month and its exact same-month-last-year
+    comparator by date-string match (never by index). Pure/testable.
+
+    Index-based selection was wrong three ways: SimilarWeb lags 1-2 months
+    (11 buckets -> permanent data_gap), an exactly-12-bucket window compared
+    adjacent months (off by one), and a partial current month produced a
+    massive false-bearish YoY."""
+    today = today or date.today()
+    cur_month = today.strftime("%Y-%m")
+
+    def _ym(m) -> str:
+        return str(m.get("date", ""))[:7]
+
+    complete = [m for m in months
+                if _ym(m) and _ym(m) != cur_month and m.get("visits")]
+    if not complete:
+        return {"current": None, "prior": None}
+    current = max(complete, key=_ym)
+    cy, cm = int(_ym(current)[:4]), int(_ym(current)[5:7])
+    target = f"{cy - 1:04d}-{cm:02d}"
+    prior = next((m for m in months if _ym(m) == target), None)
+    return {"current": current, "prior": prior}
+
+
 def fetch_similarweb_traffic(domain: str, api_key: str,
                               timeout: int = 20) -> Dict[str, Any]:
     """Fetch monthly visits for a domain from SimilarWeb. Requires api_key.
 
-    Returns {"months": [{date, visits}], "current_visits", "prior_visits"} where
-    prior_visits is the same month one year earlier (for a clean YoY).
+    Returns {"months": [...], "current_visits", "prior_visits"} where prior is
+    the SAME CALENDAR MONTH one year before the latest complete month — pulled
+    over a ~16-month window so the comparator exists even with vendor lag.
     """
     import requests
 
     today = date.today()
-    # Pull ~14 months so we have the latest month and its year-ago comparator.
-    start = date(today.year - 1, today.month, 1)
+    # First day of the month 16 months back (covers latest-complete + its
+    # year-ago month under 1-2 months of vendor lag).
+    total_m = today.year * 12 + (today.month - 1) - 16
+    sy, sm = divmod(total_m, 12)
+    start = date(sy, sm + 1, 1)
     url = (f"https://api.similarweb.com/v1/website/{domain}/"
            f"total-traffic-and-engagement/visits")
     params = {
@@ -89,10 +119,13 @@ def fetch_similarweb_traffic(domain: str, api_key: str,
     visits = data.get("visits", []) or []
     months = [{"date": v.get("date"), "visits": v.get("visits")} for v in visits]
 
-    current_visits = months[-1]["visits"] if months else None
-    prior_visits = months[0]["visits"] if len(months) >= 12 else None
+    aligned = align_yoy_months(months, today)
+    current, prior = aligned["current"], aligned["prior"]
     return {"domain": domain, "months": months,
-            "current_visits": current_visits, "prior_visits": prior_visits}
+            "current_month": current.get("date") if current else None,
+            "prior_month": prior.get("date") if prior else None,
+            "current_visits": current.get("visits") if current else None,
+            "prior_visits": prior.get("visits") if prior else None}
 
 
 def web_traffic_signal(ticker: str, domain: Optional[str] = None) -> Dict[str, Any]:

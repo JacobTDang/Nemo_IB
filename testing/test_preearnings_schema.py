@@ -226,6 +226,82 @@ def test_eval_reaction_scores_survive_rerun():
     assert row["notes"] == "post-mortem note"
 
 
+def test_scoring_call_cannot_rewrite_prediction_in_same_statement():
+    """The grading-your-own-homework hole: a SCORING call (outcome passed) that
+    re-derives a different prediction must NOT rewrite the stored one in the
+    same statement that freezes it."""
+    _clean()
+    record_eval("ZZFRZ", "2099-06-10", "likely_beat", 0.52, _db=_TMP_DB)
+    record_eval("ZZFRZ", "2099-06-10", "likely_miss", 0.90,    # wrong prediction
+                outcome="beat", prediction_correct=0, _db=_TMP_DB)
+    row = get_eval("ZZFRZ", "2099-06-10", _db=_TMP_DB)
+    assert row["prediction"] == "likely_beat"   # original call preserved
+    assert row["confidence"] == 0.52
+    assert row["outcome"] == "beat"             # actuals still recorded
+
+
+def test_record_eval_returns_real_id_on_update():
+    _clean()
+    rid1 = record_eval("ZZRID", "2099-06-10", "in_line", 0.4, _db=_TMP_DB)
+    rid2 = record_eval("ZZRID", "2099-06-10", "likely_beat", 0.6, _db=_TMP_DB)
+    assert rid1 == rid2 == get_eval("ZZRID", "2099-06-10", _db=_TMP_DB)["id"]
+
+
+def test_record_layer_returns_real_id_on_update():
+    _clean()
+    rid1 = record_layer("ZZRID2", "2099-06-10", 1, "guidance", payload={}, _db=_TMP_DB)
+    rid2 = record_layer("ZZRID2", "2099-06-10", 1, "guidance", payload={}, _db=_TMP_DB)
+    assert rid1 == rid2 > 0
+
+
+def test_is_fresh_false_when_created_at_in_future():
+    _clean()
+    record_layer("ZZFUT", "2099-07-01", 1, "guidance", payload={}, _db=_TMP_DB)
+    conn = _conn()
+    try:
+        from datetime import datetime, timezone, timedelta
+        future = (datetime.now(timezone.utc) + timedelta(hours=500)).isoformat()
+        conn.execute("UPDATE preearnings_research_layers SET created_at=? "
+                     "WHERE ticker='ZZFUT'", (future,))
+        conn.commit()
+    finally:
+        conn.close()
+    assert not is_fresh("ZZFUT", "2099-07-01", "guidance", max_age_hours=24, _db=_TMP_DB)
+
+
+def test_accuracy_summary_includes_asymmetry_aggregates():
+    _clean()
+    record_eval("ZZAS1", "2099-06-10", "likely_beat", 0.6, outcome="beat",
+                prediction_correct=1, asymmetry_correct=1,
+                price_direction_match=1, _db=_TMP_DB)
+    record_eval("ZZAS2", "2099-06-10", "likely_miss", 0.6, outcome="beat",
+                prediction_correct=0, asymmetry_correct=0,
+                price_direction_match=0, _db=_TMP_DB)
+    record_eval("ZZAS3", "2099-06-10", "in_line", 0.4, outcome="in_line",
+                prediction_correct=1, _db=_TMP_DB)        # no asymmetry call
+    s = eval_accuracy_summary(_db=_TMP_DB)
+    assert s["asymmetry_total"] == 2
+    assert s["asymmetry_accuracy_pct"] == 50.0
+    assert s["price_direction_total"] == 2
+    assert s["total"] >= 3
+
+
+def test_record_eval_migrates_schema_lazily():
+    """The live-DB failure: helpers must work on a DB that never ran
+    init_schema after a migration. The lazy guard in _db_conn handles it."""
+    import tempfile, uuid
+    fresh = os.path.join(tempfile.gettempdir(), f"nemo_lazy_{uuid.uuid4().hex}.db")
+    try:
+        rid = record_eval("ZZLAZY", "2099-06-10", "in_line", 0.4,
+                          asymmetry_correct=1, _db=fresh)
+        assert rid > 0
+        row = get_eval("ZZLAZY", "2099-06-10", _db=fresh)
+        assert row["asymmetry_correct"] == 1
+    finally:
+        if os.path.exists(fresh):
+            os.remove(fresh)
+
+
 def test_eval_implied_move_not_wiped_by_none_before_scoring():
     _clean()
     record_eval("ZZEV4", "2099-06-10", "in_line", 0.4,

@@ -36,11 +36,14 @@ def classify_guide_style(pairs: List[Dict[str, Any]]) -> str:
     """
     valid = []
     for p in pairs:
-        lo, hi, act = p.get("guided_low"), p.get("guided_high"), p.get("actual")
-        if lo is None or hi is None or act is None:
-            continue
+        try:
+            lo = float(p.get("guided_low"))
+            hi = float(p.get("guided_high"))
+            act = float(p.get("actual"))
+        except (TypeError, ValueError):
+            continue  # unparseable pair: skip, same as the missing-value case
         lo, hi = (lo, hi) if lo <= hi else (hi, lo)
-        valid.append(_position(float(act), float(lo), float(hi)))
+        valid.append(_position(act, lo, hi))
     if not valid:
         return "unknown"
     n = len(valid)
@@ -135,7 +138,10 @@ def rank_kpis(
         scored.append({"kpi": k, "score": round(score, 3),
                        "materiality": round(norm_mat.get(k, 0.0), 3),
                        "attention": round(norm_men.get(k, 0.0), 3)})
-    scored.sort(key=lambda x: -x["score"])
+    # Alphabetical tie-break: candidates come from a set, whose iteration order
+    # varies per process — without this, tied scores select different KPIs
+    # (and spawn different sub-agents) across runs.
+    scored.sort(key=lambda x: (-x["score"], x["kpi"]))
     return scored[:top_n]
 
 

@@ -117,6 +117,25 @@ def test_kpi_vs_consensus_zero_consensus():
     assert kpi_vs_consensus(0, 0) == "neutral"
 
 
+def test_rank_kpis_tied_scores_deterministic():
+    """Tied scores must break alphabetically — set-iteration order varies per
+    process, which previously selected different KPIs (and spawned different
+    sub-agents) across runs."""
+    out = rank_kpis([{"name": n, "revenue": 0} for n in ("Gamma", "Alpha", "Beta")],
+                    {}, top_n=2)
+    assert [o["kpi"] for o in out] == ["Alpha", "Beta"]
+
+
+def test_guide_style_skips_unparseable_pair():
+    pairs = [{"guided_low": "n/a", "guided_high": 1.2, "actual": 1.1}]
+    assert classify_guide_style(pairs) == "unknown"
+
+
+def test_bar_position_exact_bounds_are_normal():
+    assert bar_position(1.0, 1.0, 1.2) == "normal"
+    assert bar_position(1.2, 1.0, 1.2) == "normal"
+
+
 # ---------------------------------------------------------------------------
 # No-hardcoding audit
 # ---------------------------------------------------------------------------

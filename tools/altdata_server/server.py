@@ -99,11 +99,15 @@ def _run_subprocess(runner_path: str, tool_name: str, kwargs: dict,
         stderr_snippet = (proc.stderr or "").strip()[-300:]
         return {"success": False,
                 "error": f"no output (exit {proc.returncode}): {stderr_snippet}"}
+    # Runners emit exactly one JSON line LAST — parse the last non-empty line so
+    # a stray library print to stdout (yfinance/pytrends deprecation notice)
+    # can't break the protocol.
+    last_line = stdout.splitlines()[-1].strip()
     try:
-        return json.loads(stdout)
+        return json.loads(last_line)
     except json.JSONDecodeError:
         return {"success": False,
-                "error": f"output not valid JSON: {stdout[:300]}"}
+                "error": f"output not valid JSON: {last_line[:300]}"}
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +159,9 @@ def _leg_price(opt: Dict) -> Tuple[float, bool]:
     """Price of one ATM leg for the straddle. Prefer the live ask; when ask is 0
     (market closed) fall back to last_price then bid. Returns (price, used_fallback);
     used_fallback=True means the quote is stale (after-hours / illiquid)."""
-    ask = _safe_float(opt.get("ask") or opt.get("ask_price"))
+    # _safe_float each key separately: a NaN ask is truthy, so `ask or ask_price`
+    # would swallow a valid OpenBB ask_price behind a NaN yfinance ask.
+    ask = _safe_float(opt.get("ask")) or _safe_float(opt.get("ask_price"))
     if ask > 0:
         return ask, False
     for k in ("last_price", "bid"):
@@ -175,6 +181,19 @@ def compute_implied_move(spot: float, atm_call_ask: float,
 _ATM_GAP_THRESHOLD = 0.08  # nearest strike >8% from spot → treat as ATM missing
 
 
+def _us_market_today():
+    """Today's date in US-market terms. UTC is a day ahead of ET every evening
+    (00:00-05:00 UTC) — exactly when after-hours pre-earnings research runs —
+    which made a tomorrow-ET front expiry look like 'today' and get dropped."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/New_York")).date()
+    except Exception:
+        # tzdata unavailable: fixed ET-standard offset (off by 1h in summer,
+        # which only matters in the 04:00-05:00 UTC sliver)
+        return datetime.now(timezone(timedelta(hours=-5))).date()
+
+
 def _find_atm_options(rows: List[Dict], spot: float,
                       target_expiry: Optional[str] = None):
     """Find the nearest ATM call and put. Returns (None, None, None) if ATM gap > 8%."""
@@ -186,7 +205,7 @@ def _find_atm_options(rows: List[Dict], spot: float,
     if not expiries:
         return None, None, None
 
-    today = datetime.now(timezone.utc).date().isoformat()
+    today = _us_market_today().isoformat()
     future = [e for e in expiries if e > today]
     chosen_expiry = future[0] if future else expiries[-1]
     if target_expiry:
@@ -809,21 +828,28 @@ def _usa_award_count(company_name: str, start: str, end: str,
                          headers=_USA_HEADERS)
     resp.raise_for_status()
     counts = resp.json().get("results", {}) or {}
+    # NOTE: summing all categories is safe ONLY because award_type_codes filters
+    # the response server-side (contract codes -> grant buckets are zero). If
+    # award types are ever widened, restrict this sum to the requested kinds.
     return sum(int(counts.get(k, 0) or 0)
                for k in ("contracts", "grants", "idvs", "direct_payments", "other"))
 
 
-def _gov_contracts_signal(trailing_total: float, prior_total: float,
+def _gov_contracts_signal(trailing_total: float, prior_total: Optional[float],
                            yoy_pct: Optional[float]) -> str:
     """Pure signal logic. Driven by real period-flow YoY only — no absolute-size
-    override (a megacap always has $1B+ awards, which previously masked declines)."""
-    if trailing_total < 10_000_000:
-        return "not_applicable"  # essentially no federal business
+    override in EITHER direction. prior_total=None means the prior-period fetch
+    FAILED (unknown), which must never read as 'newly winning business'."""
+    if prior_total is None:
+        # prior unknown (fetch error): cannot judge trend; never bullish.
+        return "not_applicable" if trailing_total < 10_000_000 else "neutral"
+    if trailing_total < 10_000_000 and prior_total < 10_000_000:
+        return "not_applicable"  # essentially no federal business either period
     if yoy_pct is not None:
         if yoy_pct > 15:
             return "bullish"
         if yoy_pct < -15:
-            return "bearish"
+            return "bearish"   # incl. total collapse from a real prior base
         return "neutral"
     if prior_total == 0 and trailing_total >= 10_000_000:
         return "bullish"  # newly winning federal business where there was none
@@ -839,7 +865,10 @@ def _fetch_government_contracts(ticker: str, company_name: str,
     end = today.strftime("%Y-%m-%d")
     trailing_start = (today - timedelta(days=months * 30)).strftime("%Y-%m-%d")
     prior_start = (today - timedelta(days=months * 30 * 2)).strftime("%Y-%m-%d")
-    prior_end = trailing_start
+    # USASpending time_period is inclusive on both ends: end the prior window
+    # one day before the trailing window starts so the boundary day isn't
+    # double-counted into both totals.
+    prior_end = (today - timedelta(days=months * 30 + 1)).strftime("%Y-%m-%d")
 
     award_types = _CONTRACT_AWARD_TYPES + (_GRANT_AWARD_TYPES if include_grants else [])
 
@@ -871,12 +900,14 @@ def _fetch_government_contracts(ticker: str, company_name: str,
                 "ticker": ticker}
 
     trailing_total = results.get("trailing", 0) or 0
-    prior_total = results.get("prior", 0) or 0
+    # MISSING is not ZERO: a failed prior fetch must not read as "no prior
+    # business" (which would manufacture a bullish new-entrant signal).
+    prior_total = results["prior"] if "prior" in results else None
     agencies = results.get("agencies", []) or []
     award_count = results.get("count", 0) or 0
 
     yoy_pct = None
-    if prior_total > 0:
+    if prior_total is not None and prior_total > 0:
         yoy_pct = round((trailing_total - prior_total) / abs(prior_total) * 100, 1)
 
     top_agencies = [
@@ -894,7 +925,7 @@ def _fetch_government_contracts(ticker: str, company_name: str,
         "period_months": months,
         "trailing_awards_usd": round(trailing_total, 2),
         "trailing_award_count": award_count,
-        "prior_period_awards_usd": round(prior_total, 2),
+        "prior_period_awards_usd": round(prior_total, 2) if prior_total is not None else None,
         "yoy_change_pct": yoy_pct,
         "signal": signal,
         "top_agencies": top_agencies,

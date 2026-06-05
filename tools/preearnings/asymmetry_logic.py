@@ -44,10 +44,14 @@ def reaction_profile(events: List[Dict[str, Any]], surprise_tol: float = 0.0) ->
 
     avg_abs_move = round(sum(abs(r) for _, r in pairs) / n, 4)
 
-    if consistency >= 0.6:
-        pattern = "clean_repricer"
-    elif beat_fade_rate is not None and beat_fade_rate >= 0.5:
+    # beats_fade takes precedence: for a likely_beat setup, "your beats get
+    # sold" is the dangerous property even when misses track down cleanly
+    # enough to clear the consistency bar. Requires >=2 beats (one fading beat
+    # is an anecdote, not a pattern).
+    if beat_fade_rate is not None and beat_fade_rate >= 0.5 and len(beats) >= 2:
         pattern = "beats_fade"
+    elif consistency >= 0.6:
+        pattern = "clean_repricer"
     else:
         pattern = "noisy"
 
@@ -102,7 +106,9 @@ def classify_positioning(
             evidence += 1          # large run-up = late-money longs
         if analyst_pct_bullish is not None and analyst_pct_bullish > 75:
             evidence += 1          # sell-side consensus crowd
-        if (si is None or si < 5) and evidence >= 2:
+        # crowded_long REQUIRES known-low short interest — with SI unknown, a
+        # heavily-shorted name could be classified exactly backwards.
+        if si is not None and si < 5 and evidence >= 2:
             positioning = "crowded_long"
 
     if squeeze_risk in ("elevated", "high") and days_to_cover and days_to_cover >= 5:
@@ -149,41 +155,66 @@ def pair_surprises_with_reactions(
     reaction. BMO reporters are off by a session; sign/magnitude survive for
     material moves.
     """
+    def _valid_close(b) -> bool:
+        c = b.get("close")
+        try:
+            f = float(c)
+        except (TypeError, ValueError):
+            return False
+        return f == f and f > 0          # rejects NaN and non-positive
+
     parsed_bars = sorted(
-        ((d, float(b.get("close"))) for b in bars
-         if (d := _parse_d(b.get("date"))) is not None and b.get("close") is not None),
+        ((d, float(b["close"])) for b in bars
+         if _valid_close(b) and (d := _parse_d(b.get("date"))) is not None),
         key=lambda x: x[0],
     )
     if len(parsed_bars) < 2:
         return []
     bar_dates = [d for d, _ in parsed_bars]
 
-    events = sorted(d for e in event_dates if (d := _parse_d(e)) is not None)
-    used: set = set()
-    out: List[Dict[str, Any]] = []
+    events = sorted({d for e in event_dates if (d := _parse_d(e)) is not None})
 
     import bisect
     from datetime import timedelta
 
-    for s in sorted(surprises, key=lambda x: str(x.get("period") or "")):
+    # Global min-distance assignment: build every (distance, surprise, event)
+    # candidate within the window, then assign greedily by distance. A
+    # per-quarter greedy let an earlier quarter steal a later quarter's only
+    # event (and a late filer match the PRIOR quarter's report) whenever the
+    # surprise and filing histories had different lengths.
+    parsed_surprises = []
+    for i, s in enumerate(sorted(surprises, key=lambda x: str(x.get("period") or ""))):
         period_end = _parse_d(s.get("period"))
         if period_end is None or s.get("surprise_pct") is None:
             continue
+        parsed_surprises.append((i, period_end, s))
+
+    candidates = []
+    for i, period_end, s in parsed_surprises:
         window_start = period_end - timedelta(days=max_back_days)
         window_end = period_end + timedelta(days=max_gap_days)
-        candidates = [e for e in events
-                      if window_start <= e <= window_end and e not in used]
-        if not candidates:
+        for ev in events:
+            if window_start <= ev <= window_end:
+                candidates.append((abs((ev - period_end).days), i, ev, period_end, s))
+    candidates.sort(key=lambda x: (x[0], x[1]))
+
+    used_surprises: set = set()
+    used_events: set = set()
+    assigned: List[tuple] = []
+    for dist, i, ev, period_end, s in candidates:
+        if i in used_surprises or ev in used_events:
             continue
-        ev = min(candidates, key=lambda e: abs((e - period_end).days))
+        used_surprises.add(i)
+        used_events.add(ev)
+        assigned.append((period_end, ev, s))
+
+    out: List[Dict[str, Any]] = []
+    for period_end, ev, s in sorted(assigned, key=lambda x: x[0]):
         # bar at the report date, or nearest prior trading day
         idx = bisect.bisect_right(bar_dates, ev) - 1
         if idx < 0 or idx + 1 >= len(parsed_bars):
             continue
-        used.add(ev)
         c0, c1 = parsed_bars[idx][1], parsed_bars[idx + 1][1]
-        if c0 <= 0:
-            continue
         out.append({
             "surprise_pct": float(s["surprise_pct"]),
             "next_day_return": round((c1 - c0) / c0 * 100, 2),
@@ -214,8 +245,14 @@ def score_reaction(
       neutral positioning -> no asymmetry call was made -> not scored (None).
     """
     move = None if price_move_1d_pct is None else float(price_move_1d_pct)
+    # UNIT CONTRACT: implied_move_pct is a FRACTION (0.128 = 12.8%); the move is
+    # a PERCENT (-6.4 = -6.4%). Mixing them silently corrupts every grade, so a
+    # percent-shaped implied is rejected loudly.
+    if implied_move_pct is not None and not (0 <= abs(float(implied_move_pct)) < 1.0):
+        raise ValueError(
+            f"implied_move_pct must be a fraction in [0,1) e.g. 0.128, got {implied_move_pct} "
+            "(looks like a percent — divide by 100)")
     implied = None if implied_move_pct is None else abs(float(implied_move_pct)) * 100.0
-    # implied arrives as a fraction (0.128); move as a percent (e.g. -6.4)
 
     price_direction_match: Optional[int] = None
     if move is not None and prediction in ("likely_beat", "likely_miss"):
@@ -255,13 +292,23 @@ def score_reaction(
 def implied_vs_realized(
     implied_move: float, realized_abs_moves: List[float]
 ) -> Dict[str, Any]:
-    """Is the options-implied move rich or cheap vs the ticker's realized history?"""
+    """Is the options-implied move rich or cheap vs the ticker's realized history?
+
+    UNIT CONTRACT: both inputs in the SAME unit (both fractions, e.g. 0.128 and
+    [0.053, 0.076], or both percents). pair_surprises_with_reactions emits
+    next_day_return in PERCENT — divide by 100 before passing here when implied
+    is a fraction. Mixed units are detected and returned as unknown rather than
+    a silently wrong rich/cheap verdict."""
     moves = [abs(float(m)) for m in (realized_abs_moves or []) if m is not None]
     if implied_move is None or not moves:
         return {"verdict": "unknown", "implied": implied_move, "avg_realized": None}
     avg_realized = sum(moves) / len(moves)
     if avg_realized <= 0:
         return {"verdict": "unknown", "implied": implied_move, "avg_realized": avg_realized}
+    if implied_move < 1.0 and avg_realized > 2.0:
+        return {"verdict": "unknown", "implied": implied_move, "avg_realized": avg_realized,
+                "note": "unit mismatch suspected: implied looks like a fraction, "
+                        "realized like percents — convert to the same unit"}
     ratio = implied_move / avg_realized
     if ratio > 1.15:
         verdict = "rich"

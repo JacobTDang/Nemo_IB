@@ -819,6 +819,52 @@ def test_gov_signal_new_business_is_bullish():
     assert _gov_contracts_signal(50_000_000, 0, None) == "bullish"
 
 
+def test_gov_signal_collapse_from_real_base_is_bearish():
+    """Total collapse from a >=$10M prior base must read bearish — the tiny-
+    absolute gate must not mask declines (the same masking class we removed
+    on the upside)."""
+    from tools.altdata_server.server import _gov_contracts_signal
+    assert _gov_contracts_signal(0, 19_500_000, -100.0) == "bearish"
+    # but both-tiny stays not_applicable
+    assert _gov_contracts_signal(5_000_000, 2_000_000, None) == "not_applicable"
+
+
+def test_gov_signal_prior_unknown_never_bullish():
+    """A FAILED prior fetch (None) must not read as 'newly winning business'."""
+    from tools.altdata_server.server import _gov_contracts_signal
+    assert _gov_contracts_signal(50_000_000, None, None) == "neutral"
+    assert _gov_contracts_signal(5_000_000, None, None) == "not_applicable"
+
+
+def test_options_select_expiries_et_window():
+    """Pure expiry-window selection: strictly-after today, capped at 4, with
+    earliest-listed fallback (sort-order independent)."""
+    from datetime import date
+    from tools.altdata_server.options_runner import select_expiries
+    exps = ["2026-06-05", "2026-06-12", "2026-06-19", "2026-06-26",
+            "2026-07-03", "2026-07-10"]
+    out = select_expiries(exps, date(2026, 6, 5), near_days=60)
+    assert out == ["2026-06-12", "2026-06-19", "2026-06-26", "2026-07-03"]
+    # nothing in window -> earliest listed, even if input is unsorted
+    far = select_expiries(["2027-03-19", "2026-12-18"], date(2026, 6, 5), near_days=30)
+    assert far == ["2026-12-18"]
+
+
+def test_run_subprocess_tolerates_stray_stdout_lines(tmp_path):
+    """A library printing to stdout before the JSON line must not break the
+    runner protocol — the LAST line is the contract."""
+    from tools.altdata_server.server import _run_subprocess
+    stub = tmp_path / "stub_runner.py"
+    stub.write_text(
+        "import sys, json\n"
+        "print('yfinance deprecation noise')\n"
+        "print(json.dumps({'success': True, 'data': {'ok': 1}}))\n",
+        encoding="utf-8")
+    result = _run_subprocess(str(stub), "any_tool", {}, sub_timeout=15)
+    assert result["success"] is True
+    assert result["data"]["ok"] == 1
+
+
 def _skip_on_usaspending_timeout(result):
     """Skip test if USASpending.gov was unreachable (flaky free API)."""
     if "error" in result:

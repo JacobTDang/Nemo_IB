@@ -49,8 +49,11 @@ def test_quarter_window_future_last_earnings_falls_back():
 def test_reported_this_quarter_inside_and_boundary():
     w = (date(2026, 3, 1), date(2026, 6, 1))
     assert reported_this_quarter("2026-04-15", w) is True
-    assert reported_this_quarter("2026-03-01", w) is True   # inclusive
-    assert reported_this_quarter("2026-06-01", w) is True   # inclusive
+    # start is EXCLUSIVE: a peer reporting the same day as the target's previous
+    # print was reporting the cycle the target just closed (stale readthrough)
+    assert reported_this_quarter("2026-03-01", w) is False
+    assert reported_this_quarter("2026-03-02", w) is True
+    assert reported_this_quarter("2026-06-01", w) is True   # end inclusive
 
 
 def test_reported_this_quarter_outside_and_none():
@@ -147,6 +150,39 @@ def test_aggregate_mixed_cancels_to_neutral():
     ]
     out = aggregate_readthroughs(items)
     assert out["direction"] == "neutral"
+
+
+def test_aggregate_na_excluded_from_denominator():
+    """An 'na' peer (agent could not determine a read) must not dilute the
+    observed signal — absence of information is not an actively neutral print."""
+    items = [
+        {"ticker": "A", "direction": "bullish", "magnitude": 0.8, "relevance": 1.0},
+        {"ticker": "B", "direction": "na", "magnitude": 0.0, "relevance": 1.0},
+        {"ticker": "C", "direction": "na", "magnitude": 0.0, "relevance": 1.0},
+    ]
+    out = aggregate_readthroughs(items)
+    assert out["score"] == 0.8
+    assert out["n"] == 1
+    assert out["direction"] == "bullish"
+
+
+def test_aggregate_threshold_boundary_is_neutral():
+    one = aggregate_readthroughs(
+        [{"ticker": "A", "direction": "bullish", "magnitude": 0.15, "relevance": 1.0}])
+    assert one["direction"] == "neutral"          # strict > 0.15
+    two = aggregate_readthroughs(
+        [{"ticker": "A", "direction": "bullish", "magnitude": 0.151, "relevance": 1.0}])
+    assert two["direction"] == "bullish"
+
+
+def test_select_tie_break_recency_desc():
+    w = (date(2026, 3, 1), date(2026, 6, 1))
+    peers = [
+        {"ticker": "OLD", "relationship": "competitor", "report_date": "2026-04-01"},
+        {"ticker": "NEW", "relationship": "competitor", "report_date": "2026-05-25"},
+    ]
+    out = select_peers_for_fanout(peers, w)
+    assert [p["ticker"] for p in out] == ["NEW", "OLD"]
 
 
 # ---------------------------------------------------------------------------

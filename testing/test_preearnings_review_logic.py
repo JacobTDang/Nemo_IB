@@ -269,6 +269,41 @@ def test_run_review_warnings_on_stale_quotes():
     assert out["verdict"] == "sound_with_warnings"
 
 
+def test_stale_flags_pass_when_quotes_stale_false():
+    """A payload explicitly recording FRESH quotes must not be flagged."""
+    layers = [_layer("implied_move", payload={"quotes_stale": False})]
+    out = check_stale_flags(layers)
+    assert out[0]["status"] == "pass"
+
+
+def test_stale_flags_ignores_marker_in_long_prose():
+    layers = [_layer("guidance", payload={
+        "headline": "CFO suspected of leaking the stale negotiation details to press"})]
+    out = check_stale_flags(layers)
+    assert out[0]["status"] == "pass"
+
+
+def test_stale_flags_catches_enum_like_value():
+    layers = [_layer("positioning", payload={"iv_status": "suspect_iv_sentinel"})]
+    out = check_stale_flags(layers)
+    assert any(c["status"] == "warn" for c in out)
+
+
+def test_run_review_uses_eval_implied_when_synthesis_has_none():
+    """A failed options fetch persisting implied_move_pct: None must not mask
+    the eval row's real implied from the binary-event hard rule."""
+    layers = _full_layers()
+    layers[-1] = _layer("synthesis", "bullish", 0.46, payload={
+        "prediction": "likely_beat", "confidence": 0.7, "coverage": 1.0,
+        "sizing": "normal", "low_confidence": False, "implied_move_pct": None,
+    })
+    row = {"prediction": "likely_beat", "confidence": 0.7,
+           "implied_move_pct": 0.25, "outcome": None}
+    out = run_review(layers, row, now=_NOW)
+    assert out["verdict"] == "not_actionable"
+    assert any("implied" in f["detail"] for f in out["fails"])
+
+
 # ---------------------------------------------------------------------------
 # score_reaction — the grader's asymmetry scorer
 # ---------------------------------------------------------------------------

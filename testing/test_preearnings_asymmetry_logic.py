@@ -11,6 +11,7 @@ from tools.preearnings.asymmetry_logic import (
     classify_positioning,
     implied_vs_realized,
     pair_surprises_with_reactions,
+    score_reaction,
 )
 
 
@@ -223,6 +224,79 @@ def test_pairing_two_quarters_use_distinct_events():
     # feeds straight into reaction_profile
     prof = reaction_profile([{k: o[k] for k in ("surprise_pct", "next_day_return")} for o in out])
     assert prof["n"] == 2
+
+
+def test_pairing_earlier_quarter_does_not_steal_later_quarters_only_event():
+    """Global assignment: Q1's 8-K is missing from a truncated filing history;
+    Q2 (fiscal offset) reported 2026-06-10. The old per-quarter greedy let Q1
+    claim 06-10 (inside its +75d window) and drop Q2 entirely."""
+    surprises = [
+        {"period": "2026-03-31", "surprise_pct": 2.0},   # its event is missing
+        {"period": "2026-06-30", "surprise_pct": 5.0},   # reported 06-10
+    ]
+    events = ["2026-06-10"]
+    bars = _bars([("2026-06-10", 100.0), ("2026-06-11", 108.0)])
+    out = pair_surprises_with_reactions(surprises, events, bars)
+    assert len(out) == 1
+    assert out[0]["period"] == "2026-06-30"     # nearest claim wins globally
+    assert out[0]["surprise_pct"] == 5.0
+
+
+def test_pairing_skips_nan_close_bars():
+    surprises = [{"period": "2026-03-31", "surprise_pct": 1.0}]
+    events = ["2026-04-10"]
+    bars = _bars([("2026-04-09", 100.0), ("2026-04-10", float("nan")),
+                  ("2026-04-13", 105.0), ("2026-04-14", 110.5)])
+    out = pair_surprises_with_reactions(surprises, events, bars)
+    # NaN bar dropped: report bar falls back to 04-09 (nearest prior valid),
+    # next valid bar 04-13 -> +5.0%
+    assert len(out) == 1
+    assert out[0]["next_day_return"] == 5.0
+
+
+# ---------------------------------------------------------------------------
+# score_reaction unit guard + reaction precedence + positioning SI requirement
+# ---------------------------------------------------------------------------
+
+def test_score_reaction_rejects_percent_shaped_implied():
+    import pytest
+    with pytest.raises(ValueError):
+        score_reaction("crowded_long", "beat", 2.0, 12.8, "likely_beat")
+
+
+def test_implied_vs_realized_detects_mixed_units():
+    out = implied_vs_realized(0.128, [5.2, 6.1, 4.8])   # fraction vs percents
+    assert out["verdict"] == "unknown"
+    assert "unit mismatch" in out.get("note", "")
+
+
+def test_reaction_beats_fade_takes_precedence_over_clean_repricer():
+    """All beats fade while misses track down: for a likely_beat setup,
+    'your beats get sold' is the dangerous property — it must win."""
+    events = [
+        {"surprise_pct": 4.0, "next_day_return": -2.0},
+        {"surprise_pct": 3.0, "next_day_return": -1.0},
+        {"surprise_pct": -2.0, "next_day_return": -4.0},
+        {"surprise_pct": -3.0, "next_day_return": -5.0},
+        {"surprise_pct": -1.0, "next_day_return": -2.0},
+    ]
+    out = reaction_profile(events)
+    assert out["beat_fade_rate"] == 1.0
+    assert out["pattern"] == "beats_fade"
+
+
+def test_reaction_single_fading_beat_is_not_a_pattern():
+    events = [{"surprise_pct": 4.0, "next_day_return": -2.0}]
+    out = reaction_profile(events)
+    assert out["pattern"] != "beats_fade"
+
+
+def test_positioning_si_unknown_never_crowded_long():
+    """With short interest unknown, a heavily-shorted name could be classified
+    exactly backwards — crowded_long requires KNOWN low SI."""
+    out = classify_positioning(short_interest_pct_float=None,
+                               put_call_volume_ratio=0.3, momentum_3m_pct=50)
+    assert out["positioning"] == "neutral"
 
 
 # ---------------------------------------------------------------------------

@@ -39,6 +39,30 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
     return f if f == f else default
 
 
+def _us_market_today():
+    """Today in US-market terms. UTC is a day ahead of ET every evening
+    (00:00-05:00 UTC) — exactly when after-hours research runs — which made a
+    tomorrow-ET front expiry look like 'today' and get dropped."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/New_York")).date()
+    except Exception:
+        return datetime.now(timezone(timedelta(hours=-5))).date()
+
+
+def select_expiries(exps, today, near_days: int = 60) -> List[str]:
+    """Pure expiry-window selection (testable): up to 4 expiries after `today`
+    within `near_days`; fall back to the earliest listed expiry."""
+    cutoff = today + timedelta(days=near_days)
+    target = [
+        e for e in exps
+        if today < datetime.strptime(e, "%Y-%m-%d").date() <= cutoff
+    ][:4]
+    if not target:
+        target = [min(exps)]  # earliest listed (sort-order independent)
+    return target
+
+
 def fetch_options_chain(ticker: str, near_days: int = 60) -> List[Dict]:
     """Fetch a complete options chain via yfinance (no row-count cap).
 
@@ -51,14 +75,7 @@ def fetch_options_chain(ticker: str, near_days: int = 60) -> List[Dict]:
     if not exps:
         return []
 
-    today = datetime.now(timezone.utc).date()
-    cutoff = today + timedelta(days=near_days)
-    target_exps = [
-        e for e in exps
-        if today < datetime.strptime(e, "%Y-%m-%d").date() <= cutoff
-    ][:4]
-    if not target_exps:
-        target_exps = [exps[0]]  # nearest available expiry
+    target_exps = select_expiries(exps, _us_market_today(), near_days)
 
     rows: List[Dict] = []
     for exp in target_exps:

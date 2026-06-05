@@ -72,12 +72,16 @@ def quarter_window(
 
 
 def reported_this_quarter(peer_report_date: Any, window: Tuple[date, date]) -> bool:
-    """True if the peer's most recent report falls inside the window (inclusive)."""
+    """True if the peer's most recent report falls inside the window.
+
+    The start is EXCLUSIVE: a peer that reported the same day as the target's
+    previous print was reporting the cycle the target just closed — its
+    readthrough is one quarter stale."""
     d = _to_date(peer_report_date)
     if d is None:
         return False
     start, end = window
-    return start <= d <= end
+    return start < d <= end
 
 
 def rank_peer_relevance(relationship: Optional[str]) -> float:
@@ -105,8 +109,7 @@ def select_peers_for_fanout(
         rel = rank_peer_relevance(p.get("relationship"))
         d = _to_date(p.get("report_date")) or window[0]
         eligible.append({**p, "relevance": rel, "_rank_date": d})
-    eligible.sort(key=lambda x: (-x["relevance"], x["_rank_date"]), reverse=False)
-    # primary sort: relevance desc; tie-break: more recent report first
+    # relevance desc; tie-break: more recent report first
     eligible.sort(key=lambda x: (x["relevance"], x["_rank_date"]), reverse=True)
     for e in eligible:
         e.pop("_rank_date", None)
@@ -119,9 +122,13 @@ def aggregate_readthroughs(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     items: [{ticker, direction, magnitude (0..1), relevance (0..1)}]
     Returns {direction, magnitude, score, n, detail}. Empty -> neutral/na, n=0.
     """
+    # Only OBSERVED directions vote. An "na"/"data_gap" peer (agent could not
+    # determine a read) must not dilute the denominator — absence of information
+    # is not the same as an actively neutral print.
     usable = [
         it for it in items
-        if it.get("direction") in _DIR_SIGN and it.get("relevance", 0) > 0
+        if it.get("direction") in ("bullish", "bearish", "neutral")
+        and it.get("relevance", 0) > 0
     ]
     if not usable:
         return {"direction": "na", "magnitude": 0.0, "score": 0.0,
@@ -132,6 +139,7 @@ def aggregate_readthroughs(items: List[Dict[str, Any]]) -> Dict[str, Any]:
         it["relevance"] * _DIR_SIGN[it["direction"]] * float(it.get("magnitude") or 0.0)
         for it in usable
     ) / wsum if wsum else 0.0
+    score = round(score, 3)
 
     direction = "neutral"
     if score > 0.15:

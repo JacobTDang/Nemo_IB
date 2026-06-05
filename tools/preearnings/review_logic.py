@@ -9,7 +9,6 @@ all PASS -> sound. Pure functions; nothing company-specific hardcoded.
 """
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -142,6 +141,27 @@ def check_contradictions(layers: List[Dict[str, Any]],
     return [_r("contradictions", "pass", "no high-magnitude opposing signals")]
 
 
+def _stale_hits(obj: Any) -> List[str]:
+    """Structured walk: a marker KEY with a truthy value, or an enum-like short
+    string value containing a marker. Avoids the serialized-text false positives
+    (a payload recording quotes_stale: False, or 'suspected' inside a headline)."""
+    hits: List[str] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            kl = str(k).lower()
+            if kl in _STALE_MARKERS and bool(v):
+                hits.append(kl)
+            hits.extend(_stale_hits(v))
+    elif isinstance(obj, list):
+        for v in obj:
+            hits.extend(_stale_hits(v))
+    elif isinstance(obj, str):
+        vl = obj.lower()
+        if len(vl) <= 32:                      # enum-like, not prose
+            hits.extend(m for m in _STALE_MARKERS if m in vl)
+    return hits
+
+
 def check_stale_flags(layers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Degraded-input markers inside payloads must be acknowledged."""
     out = []
@@ -149,8 +169,7 @@ def check_stale_flags(layers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         comp = layer.get("component", "")
         if comp == "review":
             continue
-        blob = json.dumps(layer.get("payload", {}), default=str).lower()
-        hits = sorted({m for m in _STALE_MARKERS if m in blob})
+        hits = sorted(set(_stale_hits(layer.get("payload", {}))))
         if hits:
             out.append(_r("stale_flags", "warn",
                           f"{comp}: degraded-input markers {hits}",
@@ -249,8 +268,9 @@ def run_review(
     {eps_a, eps_b, label_a, label_b} fetched live by the orchestrating skill."""
     synthesis = next((l for l in layers if l.get("component") == "synthesis"), None)
     syn_payload = (synthesis or {}).get("payload") or {}
-    # the implied move lives on the eval row; surface it to hard rules
-    if eval_row and "implied_move_pct" not in syn_payload:
+    # the implied move lives on the eval row; surface it to hard rules — also
+    # when the synthesis payload carries an explicit None (failed options fetch)
+    if eval_row and syn_payload.get("implied_move_pct") is None:
         syn_payload = {**syn_payload, "implied_move_pct": eval_row.get("implied_move_pct")}
 
     checks: List[Dict[str, Any]] = []

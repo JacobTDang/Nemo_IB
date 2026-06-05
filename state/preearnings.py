@@ -15,8 +15,19 @@ from typing import Any, Dict, List, Optional
 from state.schema import get_connection, DB_PATH
 
 
+# Lazy schema guard: the preearnings path is driven by skills (inline Python),
+# not daemons, so nothing else guarantees init_schema/migrations have run on
+# the target DB. One idempotent pass per process per path (~ms).
+_initialized_paths: set = set()
+
+
 def _db_conn(db: Optional[str]):
-    return get_connection(db) if db else get_connection()
+    from state.schema import init_schema
+    path = db or DB_PATH
+    if path not in _initialized_paths:
+        init_schema(path)
+        _initialized_paths.add(path)
+    return get_connection(path)
 
 
 def record_signal(
@@ -146,11 +157,13 @@ def record_eval(
     *,
     _db: Optional[str] = None,
 ) -> int:
-    """Upsert a pre-earnings eval row. Returns the row id.
+    """Upsert a pre-earnings eval row. Returns the row id (also on update).
 
-    Semantics: prediction/confidence/implied_move_pct update freely while the
-    row is UNSCORED (outcome IS NULL) — 7d/3d/1d re-runs refresh the call.
-    Once scored, the prediction is FROZEN (no retroactive rewriting). The
+    Semantics: prediction/confidence/implied_move_pct update ONLY on
+    prediction-phase calls (no outcome passed) against an UNSCORED row — so
+    7d/3d/1d re-runs refresh the call, while a SCORING call (outcome passed)
+    can only append actuals and is structurally unable to rewrite the
+    prediction it is grading. Once scored, the prediction is FROZEN. The
     actuals columns use COALESCE so a prediction-phase call with NULL actuals
     can never wipe recorded outcomes."""
     conn = _db_conn(_db)
@@ -165,12 +178,15 @@ def record_eval(
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(ticker, earnings_date) DO UPDATE SET
                  prediction = CASE WHEN preearnings_evals.outcome IS NULL
+                                        AND excluded.outcome IS NULL
                                    THEN excluded.prediction
                                    ELSE preearnings_evals.prediction END,
                  confidence = CASE WHEN preearnings_evals.outcome IS NULL
+                                        AND excluded.outcome IS NULL
                                    THEN excluded.confidence
                                    ELSE preearnings_evals.confidence END,
                  implied_move_pct = CASE WHEN preearnings_evals.outcome IS NULL
+                                        AND excluded.outcome IS NULL
                                    THEN COALESCE(excluded.implied_move_pct,
                                                  preearnings_evals.implied_move_pct)
                                    ELSE preearnings_evals.implied_move_pct END,
@@ -190,7 +206,11 @@ def record_eval(
                                                  preearnings_evals.asymmetry_correct),
                  price_direction_match = COALESCE(excluded.price_direction_match,
                                                  preearnings_evals.price_direction_match),
-                 evaluated_at         = excluded.evaluated_at""",
+                 evaluated_at = CASE WHEN preearnings_evals.outcome IS NULL
+                                          OR excluded.outcome IS NOT NULL
+                                     THEN excluded.evaluated_at
+                                     ELSE preearnings_evals.evaluated_at END
+               RETURNING id""",
             (
                 ticker.upper(),
                 earnings_date,
@@ -208,8 +228,9 @@ def record_eval(
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
+        row_id = cur.fetchone()[0]
         conn.commit()
-        return cur.lastrowid
+        return row_id
     finally:
         conn.close()
 
@@ -243,12 +264,22 @@ def eval_accuracy_summary(*, _db: Optional[str] = None) -> Dict[str, Any]:
     rows = [dict(r) for r in rows]
     total = len(rows)
     correct = sum(1 for r in rows if r["prediction_correct"] == 1)
+    # The asymmetry/reaction calls are graded separately from the EPS call
+    # (NULL = no call was made; excluded from the denominator).
+    asym = [r for r in rows if r.get("asymmetry_correct") is not None]
+    pdm = [r for r in rows if r.get("price_direction_match") is not None]
     return {
         "total": total,
         "correct": correct,
         "accuracy_pct": round(correct / total * 100, 1),
         "avg_confidence_correct": _avg([r["confidence"] for r in rows if r["prediction_correct"] == 1]),
         "avg_confidence_wrong":   _avg([r["confidence"] for r in rows if r["prediction_correct"] == 0]),
+        "asymmetry_total": len(asym),
+        "asymmetry_accuracy_pct": (round(sum(r["asymmetry_correct"] for r in asym) / len(asym) * 100, 1)
+                                   if asym else None),
+        "price_direction_total": len(pdm),
+        "price_direction_pct": (round(sum(r["price_direction_match"] for r in pdm) / len(pdm) * 100, 1)
+                                if pdm else None),
     }
 
 
@@ -278,8 +309,14 @@ def record_layer(
     *,
     _db: Optional[str] = None,
 ) -> int:
-    """Upsert a research-layer component. `payload` and `sources` are JSON-encoded.
-    `sources` is a list of {claim, tool} dicts for the citation audit."""
+    """Upsert a research-layer component. Returns the row id (also on update).
+
+    `payload`/`sources` are JSON-encoded; non-JSON-native types degrade one-way
+    via str() — keep payloads JSON-native. `sources` is a list of {claim, tool}
+    dicts for the citation audit. Semantics pinned by tests: created_at means
+    "last written at" (refreshed on upsert — intentional, it drives is_fresh
+    reuse), and the component name implies the layer (the layer column is
+    denormalized and follows the latest write)."""
     conn = _db_conn(_db)
     try:
         cur = conn.execute(
@@ -294,7 +331,8 @@ def record_layer(
                  confidence   = excluded.confidence,
                  payload_json = excluded.payload_json,
                  sources_json = excluded.sources_json,
-                 created_at   = excluded.created_at""",
+                 created_at   = excluded.created_at
+               RETURNING id""",
             (
                 ticker.upper(),
                 earnings_date,
@@ -308,8 +346,9 @@ def record_layer(
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
+        row_id = cur.fetchone()[0]
         conn.commit()
-        return cur.lastrowid
+        return row_id
     finally:
         conn.close()
 
@@ -380,4 +419,6 @@ def is_fresh(
     if created.tzinfo is None:
         created = created.replace(tzinfo=timezone.utc)
     age_h = (datetime.now(timezone.utc) - created).total_seconds() / 3600.0
-    return age_h <= max_age_hours
+    # A future created_at (clock skew / bad backfill) is corrupt, not fresh —
+    # otherwise a poisoned row suppresses re-research forever.
+    return 0 <= age_h <= max_age_hours

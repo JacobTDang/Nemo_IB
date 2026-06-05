@@ -165,6 +165,51 @@ def test_final_verdict_thin_coverage_is_low_confidence():
     assert out["sizing"] == "no_position"
 
 
+def test_agreement_zero_magnitude_same_direction_is_full():
+    sigs = [_sig("guidance", "bullish", 0.0), _sig("peer_readthrough", "bullish", 0.0)]
+    assert agreement(sigs) == 1.0
+
+
+def test_agreement_weighted_by_magnitude():
+    """Two near-zero dissenters must not trim like a real disagreement."""
+    sigs = [_sig("guidance", "bullish", 0.9),
+            _sig("peer_readthrough", "bearish", 0.05),
+            _sig("kpi_vs_consensus", "bearish", 0.05)]
+    assert agreement(sigs) >= 0.8
+
+
+def test_agreement_ignores_zero_weight_signals():
+    """An unregistered signal name can't move the score — it must not be able
+    to silently change sizing via agreement either."""
+    sigs = [_sig("guidance", "bullish", 0.9), _sig("made_up_signal", "bearish", 0.9)]
+    assert agreement(sigs) == 1.0
+    plain = final_verdict([_sig("guidance", "bullish", 0.9)])
+    with_stray = final_verdict(sigs)
+    assert with_stray["confidence"] == plain["confidence"]
+
+
+def test_direction_score_none_magnitude_is_data_gap():
+    """A directional signal with unreported strength must not count as neutral."""
+    sigs = [{"name": "guidance", "direction": "bullish", "magnitude": None},
+            _sig("peer_readthrough", "bearish", 0.5)]
+    # guidance excluded entirely -> score is pure bearish renormalized
+    assert direction_score(sigs) == -0.5
+
+
+def test_coverage_all_na_is_zero():
+    sigs = [_sig(n, "na") for n in DEFAULT_DIRECTION_WEIGHTS]
+    assert coverage(sigs) == 0.0
+
+
+def test_predict_boundary_exact_threshold_is_inline():
+    assert predict_from_score(0.25) == "in_line"
+    assert predict_from_score(-0.25) == "in_line"
+
+
+def test_base_confidence_max_is_080():
+    assert base_confidence(1.0, 1.0, 1.0) == 0.80
+
+
 def test_final_verdict_crowded_long_beat_trims_size():
     sigs = [_sig("guidance", "bullish", 0.9), _sig("peer_readthrough", "bullish", 0.9),
             _sig("kpi_vs_consensus", "bullish", 0.9)]

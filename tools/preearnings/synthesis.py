@@ -56,7 +56,11 @@ def coverage(signals: List[Dict[str, Any]],
 
 def direction_score(signals: List[Dict[str, Any]],
                     weights: Optional[Dict[str, float]] = None) -> float:
-    """Weighted lean in [-1, 1], renormalized over signals that have data."""
+    """Weighted lean in [-1, 1], renormalized over signals that have data.
+
+    A bullish/bearish signal with magnitude=None is treated as a data gap
+    (excluded from numerator AND denominator) — a stated direction with an
+    unreported strength must not silently count as exactly neutral."""
     w = weights or DEFAULT_DIRECTION_WEIGHTS
     num = 0.0
     den = 0.0
@@ -66,25 +70,40 @@ def direction_score(signals: List[Dict[str, Any]],
         wt = _weight(w, s.get("name", ""))
         if wt <= 0:
             continue
-        mag = float(s.get("magnitude") or 0.0)
-        num += wt * _DIR_SIGN[s["direction"]] * mag
+        mag = s.get("magnitude")
+        if mag is None and s["direction"] != "neutral":
+            continue  # directional but strength unknown -> data gap
+        num += wt * _DIR_SIGN[s["direction"]] * float(mag or 0.0)
         den += wt
     return round(num / den, 4) if den > 0 else 0.0
 
 
-def agreement(signals: List[Dict[str, Any]]) -> float:
-    """Fraction of directional signals aligned with the net lean (1.0 if <2)."""
+def agreement(signals: List[Dict[str, Any]],
+              weights: Optional[Dict[str, float]] = None) -> float:
+    """Magnitude-weighted alignment of directional signals with the net lean.
+
+    Weighted by the same magnitudes that drive the score, so two near-zero
+    dissenters cannot trim confidence the way a real disagreement does. Signals
+    with names outside the weight dict are ignored (mirrors direction_score),
+    so a stray unregistered signal cannot silently change sizing."""
+    w = weights or DEFAULT_DIRECTION_WEIGHTS
     directional = [s for s in signals
-                   if s.get("direction") in ("bullish", "bearish")]
+                   if s.get("direction") in ("bullish", "bearish")
+                   and _weight(w, s.get("name", "")) > 0]
     if len(directional) < 2:
         return 1.0
-    score = sum(_DIR_SIGN[s["direction"]] * float(s.get("magnitude") or 0.0)
-                for s in directional)
-    net = 1 if score > 0 else (-1 if score < 0 else 0)
+    masses = [(_DIR_SIGN[s["direction"]], float(s.get("magnitude") or 0.0))
+              for s in directional]
+    total = sum(m for _, m in masses)
+    if total <= 0:
+        # no magnitude information: unanimous direction is full agreement
+        return 1.0 if len({d for d, _ in masses}) == 1 else 0.5
+    net = sum(d * m for d, m in masses)
     if net == 0:
         return 0.5
-    agree = sum(1 for s in directional if _DIR_SIGN[s["direction"]] == net)
-    return round(agree / len(directional), 3)
+    sign = 1.0 if net > 0 else -1.0
+    agree_mass = sum(m for d, m in masses if d == sign)
+    return round(agree_mass / total, 3)
 
 
 def predict_from_score(score: float) -> str:
@@ -106,6 +125,8 @@ def base_confidence(score: float, cov: float, agree: float) -> float:
     else:
         cov_factor = 1.0
     agree_factor = 0.7 + 0.3 * agree
+    # NOTE: raw maxes at 0.80 (0.45 + 0.35), so 0.85 is headroom for a future
+    # slope increase, not a binding ceiling today.
     return round(min(raw * cov_factor * agree_factor, 0.85), 3)
 
 
@@ -175,7 +196,7 @@ def final_verdict(
     """Full synthesis: direction (weighted, coverage-renormalized) x asymmetry."""
     score = direction_score(signals, weights)
     cov = coverage(signals, weights)
-    agree = agreement(signals)
+    agree = agreement(signals, weights)
     prediction = predict_from_score(score)
     conf0 = base_confidence(score, cov, agree)
     adj = asymmetry_adjust(prediction, conf0, positioning, squeeze_risk,
