@@ -72,8 +72,10 @@ checks_run: {N}
 ```
 
 Then: (1) the FAIL list with fixes (if any), (2) the WARN list with what must be
-acknowledged in the final verdict, (3) the dispersion read (which consensus is
-the bar?), (4) one line: "cleared to act" / "act only after fixes" / "do not act".
+acknowledged in the final verdict, (3) the dispersion read — note that the
+Finnhub estimate is the SCORING bar (earnings-eval grades against Finnhub
+surprise_pct); a dispersion warn means stating both bars explicitly,
+(4) one line: "cleared to act" / "act only after fixes" / "do not act".
 
 ## Hard rules
 

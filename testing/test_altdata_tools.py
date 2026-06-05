@@ -836,6 +836,19 @@ def test_gov_signal_prior_unknown_never_bullish():
     assert _gov_contracts_signal(5_000_000, None, None) == "not_applicable"
 
 
+def test_gov_windows_calendar_accurate_no_overlap():
+    """12 months = a true 365-day year (not 360), and the prior window ends one
+    day before the trailing window starts (inclusive API, no double count)."""
+    from datetime import datetime
+    from tools.altdata_server.server import _gov_windows
+    t_start, end, p_start, p_end = _gov_windows(datetime(2026, 6, 5), 12)
+    assert end == "2026-06-05"
+    assert t_start == "2025-06-05"           # exactly one year
+    assert p_end == "2025-06-04"             # day before trailing start
+    assert p_start == "2024-06-05"
+    assert p_end < t_start
+
+
 def test_options_select_expiries_et_window():
     """Pure expiry-window selection: strictly-after today, capped at 4, with
     earliest-listed fallback (sort-order independent)."""

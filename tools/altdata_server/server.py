@@ -856,19 +856,26 @@ def _gov_contracts_signal(trailing_total: float, prior_total: Optional[float],
     return "neutral"
 
 
+def _gov_windows(today, months: int):
+    """Pure: (trailing_start, trailing_end, prior_start, prior_end) date strings.
+    Calendar-accurate spans (365/12 days per month, not 30) so '12 months' is a
+    true year for the YoY. USASpending time_period is inclusive on both ends,
+    so the prior window ends one day before the trailing window starts (no
+    boundary-day double count)."""
+    span = timedelta(days=round(months * 365 / 12))
+    t_start = today - span
+    return (t_start.strftime("%Y-%m-%d"),
+            today.strftime("%Y-%m-%d"),
+            (t_start - span).strftime("%Y-%m-%d"),
+            (t_start - timedelta(days=1)).strftime("%Y-%m-%d"))
+
+
 def _fetch_government_contracts(ticker: str, company_name: str,
                                   months: int, include_grants: bool) -> Dict[str, Any]:
     if not company_name:
         company_name = _ticker_to_company_name(ticker)
 
-    today = datetime.now()
-    end = today.strftime("%Y-%m-%d")
-    trailing_start = (today - timedelta(days=months * 30)).strftime("%Y-%m-%d")
-    prior_start = (today - timedelta(days=months * 30 * 2)).strftime("%Y-%m-%d")
-    # USASpending time_period is inclusive on both ends: end the prior window
-    # one day before the trailing window starts so the boundary day isn't
-    # double-counted into both totals.
-    prior_end = (today - timedelta(days=months * 30 + 1)).strftime("%Y-%m-%d")
+    trailing_start, end, prior_start, prior_end = _gov_windows(datetime.now(), months)
 
     award_types = _CONTRACT_AWARD_TYPES + (_GRANT_AWARD_TYPES if include_grants else [])
 

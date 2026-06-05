@@ -92,6 +92,17 @@ If `{permit: false, ...}`:
 Invoke the existing skills (these are still skill invocations, not
 MCP tool calls — they're conversational instructions, not data ops):
 
+**Pre-earnings branch (check FIRST):** call
+`get_earnings_calendar(from_date=today, to_date=today+10, symbol=ticker)`.
+If the ticker reports within 10 days AND
+`should_deep_research(days_to_earnings, liquid, has_peers, has_options)`
+(`tools/preearnings/gating.py`) passes, run `/preearnings-research` instead
+of the deep-research chain — the layered pipeline IS the research for a
+near-print name, and its review gate + sizing rules subsume 3f for this
+case (no_position verdicts are recorded as watchlist outcomes). If the gate
+fails (illiquid / no deep inputs), fall through to the normal chain.
+
+**Normal chain:**
 - `/cross-company-readthrough` on the source event
 - If predicted_implication confidence >= 0.65:
   - `/equity-deep-research` on the affected ticker

@@ -209,3 +209,9 @@ explicit = true
 torch = [{ index = "pytorch-cu121" }]
 torchvision = [{ index = "pytorch-cu121" }]
 torchaudio = [{ index = "pytorch-cu121" }]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: model-loading tests (FinBERT) excluded from quick runs via -m 'not slow'",
+    "network: live-network tests skippable via SKIP_NETWORK_TESTS=1",
+]

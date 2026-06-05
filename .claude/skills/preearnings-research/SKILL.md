@@ -22,6 +22,11 @@ quarter window are all derived at runtime.
    lost to the summary cap). No entry -> output `no_upcoming_earnings` and stop.
    Record `days_to_earnings` and the `hour` (amc/bmo). If `< 2`, add
    `WARNING: < 48h — IV crush risk`. Never fabricate a date.
+   **Bar policy:** the calendar `eps_estimate` (Finnhub) is the SCORING bar —
+   `/earnings-eval` grades surprise_pct against Finnhub estimates, so the
+   prediction is a call on THAT number. Treat the yfinance 0q consensus
+   (get_forward_estimates) as secondary color; when they diverge >1%, state
+   both bars and which one the prediction is scored against.
 2. **Revision velocity.** `get_analyst_revisions_history` + `get_forward_estimates`
    -> rising/flat/falling -> signal `revision_velocity`.
 3. **Supplier / MOPS (if applicable).** `get_supply_chain`; if it contains TSMC
@@ -35,9 +40,17 @@ quarter window are all derived at runtime.
      (IV skew AND put/call volume ratio), `get_options_implied_move(ticker,
      spot_price)`, `get_price_history` (3M momentum + ~500 daily bars), and
      reuse the Layer-0 `get_analyst_revisions_history` pct_bullish.
-   - **Reaction history:** `get_company_filings_history(ticker, form_type="8-K",
-     n=8)` for report dates + `get_earnings_surprises` -> build pairs with
-     `pair_surprises_with_reactions(surprises, event_dates, bars)` -> feed
+     **IV sentinel rule:** if `get_options_metrics` reports
+     `data_quality.iv_status` as suspect (yfinance sentinel IVs), pass
+     `put_call_iv_skew=None` to `classify_positioning` — the volume ratio
+     stays usable; sentinel IVs do not.
+   - **Reaction history:** get earnings report dates by filtering 8-Ks to
+     **Item 2.02** via `extract_8k_events` (`events_by_date[date].sec_items`)
+     — never raw filing dates. Non-earnings 8-Ks routinely land CLOSER to the
+     vendor's period label than the real print (live ORCL: corporate 8-Ks at
+     -4d/-8d vs the earnings 8-K at -21d), and distance matching alone will
+     mispair them. Then `get_earnings_surprises` -> pairs via
+     `pair_surprises_with_reactions(surprises, earnings_dates, bars)` -> feed
      `reaction_profile`. For `implied_vs_realized`, divide the pairs'
      `next_day_return` (a percent) by 100 first — both inputs must be FRACTIONS
      to match the implied move (mixed units return verdict "unknown").
