@@ -1629,7 +1629,16 @@ class AltDataServer:
             yf_attempted = False
             if (not atm_call or not atm_put) and ticker:
                 yf_attempted = True
-                yf_rows = await asyncio.to_thread(_fetch_options_yfinance, ticker, spot)
+                # Bound the yfinance fallback: yfinance has no network timeout and
+                # can hang indefinitely under rate-limiting. wait_for guarantees the
+                # handler returns (the orphaned thread is harmless and short-lived).
+                try:
+                    yf_rows = await asyncio.wait_for(
+                        asyncio.to_thread(_fetch_options_yfinance, ticker, spot),
+                        timeout=20.0,
+                    )
+                except asyncio.TimeoutError:
+                    yf_rows = []
                 if yf_rows:
                     yf_call, yf_put, yf_expiry = _find_atm_options(yf_rows, spot, target_expiry)
                     if yf_call and yf_put:
