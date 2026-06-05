@@ -63,12 +63,17 @@ if not os.path.isfile(_VENV_PYTHON):
 
 _TRENDS_RUNNER = os.path.join(_HERE, "trends_runner.py")
 _FINBERT_RUNNER = os.path.join(_HERE, "finbert_runner.py")
+_OPTIONS_RUNNER = os.path.join(_HERE, "options_runner.py")
 
 # Extended timeouts: trends_runner now retries on 429 (adds up to 30s)
 _TRENDS_TIMEOUT_S = 45.0
 _FINBERT_TIMEOUT_S = 120.0
 _SUBPROCESS_TIMEOUT_S = 40.0
 _FINBERT_SUB_TIMEOUT_S = 115.0
+# Options: fresh subprocess isolates yfinance cold-start; subprocess.run kills
+# the child on hang (no leaked thread, unlike asyncio.to_thread on a hung lib).
+_OPTIONS_TIMEOUT_S = 30.0
+_OPTIONS_SUB_TIMEOUT_S = 25.0
 
 
 # ---------------------------------------------------------------------------
@@ -197,48 +202,6 @@ def _find_atm_options(rows: List[Dict], spot: float,
     atm_call = nearest_atm(calls)
     atm_put  = nearest_atm(puts)
     return atm_call, atm_put, chosen_expiry
-
-
-def _fetch_options_yfinance(ticker: str, spot: float,
-                             near_days: int = 60) -> List[Dict]:
-    """Fetch a complete options chain via yfinance. No row-count cap."""
-    import yfinance as yf
-
-    t = yf.Ticker(ticker)
-    exps = t.options  # tuple of 'YYYY-MM-DD' strings, sorted
-    if not exps:
-        return []
-
-    today = datetime.now(timezone.utc).date()
-    cutoff = today + timedelta(days=near_days)
-    target_exps = [
-        e for e in exps
-        if today < datetime.strptime(e, "%Y-%m-%d").date() <= cutoff
-    ][:4]
-    if not target_exps:
-        target_exps = [exps[0]]  # nearest available expiry
-
-    rows: List[Dict] = []
-    for exp in target_exps:
-        try:
-            chain = t.option_chain(exp)
-            for _, row in chain.calls.iterrows():
-                rows.append({
-                    "expiration": exp, "option_type": "call",
-                    "strike": _safe_float(row.get("strike")),
-                    "ask": _safe_float(row.get("ask")),
-                    "implied_volatility": _safe_float(row.get("impliedVolatility")),
-                })
-            for _, row in chain.puts.iterrows():
-                rows.append({
-                    "expiration": exp, "option_type": "put",
-                    "strike": _safe_float(row.get("strike")),
-                    "ask": _safe_float(row.get("ask")),
-                    "implied_volatility": _safe_float(row.get("impliedVolatility")),
-                })
-        except Exception:
-            continue
-    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -1629,14 +1592,18 @@ class AltDataServer:
             yf_attempted = False
             if (not atm_call or not atm_put) and ticker:
                 yf_attempted = True
-                # Bound the yfinance fallback: yfinance has no network timeout and
-                # can hang indefinitely under rate-limiting. wait_for guarantees the
-                # handler returns (the orphaned thread is harmless and short-lived).
+                # Fetch via an isolated subprocess: avoids yfinance cold-start
+                # stalls in the long-running server, and subprocess.run(timeout)
+                # hard-kills a hung fetch (no leaked thread).
                 try:
-                    yf_rows = await asyncio.wait_for(
-                        asyncio.to_thread(_fetch_options_yfinance, ticker, spot),
-                        timeout=20.0,
+                    res = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            _run_subprocess, _OPTIONS_RUNNER, "get_options_chain",
+                            {"ticker": ticker}, _OPTIONS_SUB_TIMEOUT_S,
+                        ),
+                        timeout=_OPTIONS_TIMEOUT_S,
                     )
+                    yf_rows = res.get("data", {}).get("rows", []) if res.get("success") else []
                 except asyncio.TimeoutError:
                     yf_rows = []
                 if yf_rows:

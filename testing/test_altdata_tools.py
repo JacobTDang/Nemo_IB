@@ -27,6 +27,7 @@ if not os.path.isfile(_VENV_PY):
 
 _TRENDS_RUNNER = os.path.join(_REPO, "tools", "altdata_server", "trends_runner.py")
 _FINBERT_RUNNER = os.path.join(_REPO, "tools", "altdata_server", "finbert_runner.py")
+_OPTIONS_RUNNER = os.path.join(_REPO, "tools", "altdata_server", "options_runner.py")
 
 SKIP_NETWORK = os.getenv("SKIP_NETWORK_TESTS", "0") == "1"
 network = pytest.mark.skipif(SKIP_NETWORK, reason="network tests skipped")
@@ -337,19 +338,44 @@ def test_atm_gap_guard_boundary_just_inside():
 
 
 @network
-def test_fetch_options_yfinance_returns_rows_with_atm_coverage():
-    """yfinance chain for a liquid stock must include strikes near spot."""
-    from tools.altdata_server.server import _fetch_options_yfinance, _find_atm_options
-    import yfinance as yf
-    spot = yf.Ticker("AAPL").history(period="1d")["Close"].iloc[-1]
-    rows = _fetch_options_yfinance("AAPL", spot, near_days=60)
+def test_options_runner_returns_chain_with_fields():
+    """options_runner.py (subprocess) returns a full chain with ask/bid/last_price."""
+    proc = _run(_OPTIONS_RUNNER, "get_options_chain", {"ticker": "AAPL"}, timeout=60)
+    assert proc.returncode == 0, f"stderr: {proc.stderr[-200:]}"
+    result = json.loads(proc.stdout)
+    assert result["success"] is True, result.get("error")
+    rows = result["data"]["rows"]
     assert len(rows) > 10, f"expected a full chain, got {len(rows)} rows"
-    # ATM gap guard must pass on a real chain
+    r0 = rows[0]
+    for field in ("strike", "ask", "bid", "last_price", "implied_volatility", "option_type"):
+        assert field in r0, f"row missing {field}"
+
+
+@network
+def test_options_runner_chain_has_atm_coverage():
+    """The runner's chain must contain strikes near spot (no truncation)."""
+    from tools.altdata_server.server import _find_atm_options
+    import yfinance as yf
+    spot = float(yf.Ticker("AAPL").history(period="1d")["Close"].iloc[-1])
+    proc = _run(_OPTIONS_RUNNER, "get_options_chain", {"ticker": "AAPL"}, timeout=60)
+    rows = json.loads(proc.stdout)["data"]["rows"]
     c, p, _ = _find_atm_options(rows, spot)
-    assert c is not None, f"ATM call not found near spot={spot:.2f} in {len(rows)} rows"
-    assert p is not None, "ATM put not found"
-    gap = abs(float(c["strike"]) - spot) / spot
-    assert gap <= 0.08, f"ATM gap too large: {gap:.1%}"
+    assert c is not None and p is not None, f"no ATM near spot={spot:.2f}"
+    assert abs(float(c["strike"]) - spot) / spot <= 0.08
+
+
+def test_options_runner_empty_ticker_fails_clean():
+    proc = _run(_OPTIONS_RUNNER, "get_options_chain", {"ticker": ""}, timeout=15)
+    result = json.loads(proc.stdout)
+    assert result["success"] is False
+    assert "Traceback" not in result.get("error", "")
+
+
+def test_options_runner_unknown_tool_fails_clean():
+    proc = _run(_OPTIONS_RUNNER, "bad_tool", {"ticker": "AAPL"}, timeout=15)
+    result = json.loads(proc.stdout)
+    assert result["success"] is False
+    assert "unknown tool" in result["error"]
 
 
 # ---------------------------------------------------------------------------
