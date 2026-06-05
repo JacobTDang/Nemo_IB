@@ -18,6 +18,10 @@ from state.preearnings import (
     record_eval,
     get_eval,
     eval_accuracy_summary,
+    record_layer,
+    get_layers,
+    latest_component,
+    is_fresh,
 )
 
 
@@ -44,6 +48,7 @@ def _clean():
         conn.execute("DELETE FROM preearnings_signals WHERE ticker LIKE 'ZZ%'")
         conn.execute("DELETE FROM supplier_readthroughs WHERE downstream_ticker LIKE 'ZZ%'")
         conn.execute("DELETE FROM preearnings_evals WHERE ticker LIKE 'ZZ%'")
+        conn.execute("DELETE FROM preearnings_research_layers WHERE ticker LIKE 'ZZ%'")
         conn.commit()
     finally:
         conn.close()
@@ -64,6 +69,78 @@ def test_tables_created():
     assert "supplier_readthroughs" in tables, "supplier_readthroughs table missing"
     assert "pricing_snapshots" in tables, "pricing_snapshots table missing"
     assert "preearnings_evals" in tables, "preearnings_evals table missing"
+    assert "preearnings_research_layers" in tables, "preearnings_research_layers table missing"
+
+
+# ---------------------------------------------------------------------------
+# Phase A — research layers persistence + freshness
+# ---------------------------------------------------------------------------
+
+def test_research_layers_columns():
+    conn = _conn()
+    try:
+        cols = {r["name"] for r in
+                conn.execute("PRAGMA table_info(preearnings_research_layers)").fetchall()}
+    finally:
+        conn.close()
+    required = {"id", "ticker", "earnings_date", "layer", "component", "direction",
+                "magnitude", "confidence", "payload_json", "sources_json", "created_at"}
+    assert required <= cols, f"missing columns: {required - cols}"
+
+
+def test_record_layer_roundtrip_decodes_json():
+    _clean()
+    record_layer("ZZTOP", "2099-01-15", layer=1, component="peer_readthrough",
+                 direction="bullish", magnitude=0.6, confidence=0.5,
+                 payload={"peers": ["AAA", "BBB"], "net": 0.6},
+                 sources=[{"claim": "AAA beat +5%", "tool": "get_earnings_surprises"}],
+                 _db=_TMP_DB)
+    rows = get_layers("ZZTOP", "2099-01-15", _db=_TMP_DB)
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["direction"] == "bullish"
+    assert r["payload"]["peers"] == ["AAA", "BBB"]          # decoded to list
+    assert r["sources"][0]["tool"] == "get_earnings_surprises"
+
+
+def test_record_layer_upserts_on_natural_key():
+    _clean()
+    record_layer("ZZUP", "2099-02-01", 1, "guidance", direction="neutral",
+                 payload={"v": 1}, _db=_TMP_DB)
+    record_layer("ZZUP", "2099-02-01", 1, "guidance", direction="bearish",
+                 payload={"v": 2}, _db=_TMP_DB)
+    rows = get_layers("ZZUP", "2099-02-01", _db=_TMP_DB)
+    assert len(rows) == 1, "natural key should upsert, not duplicate"
+    assert rows[0]["direction"] == "bearish"
+    assert rows[0]["payload"]["v"] == 2
+
+
+def test_latest_component_returns_none_when_absent():
+    _clean()
+    assert latest_component("ZZNONE", "2099-03-01", "kpi:cloud", _db=_TMP_DB) is None
+
+
+def test_is_fresh_true_after_write_false_when_stale():
+    _clean()
+    record_layer("ZZFRESH", "2099-04-01", 1, "positioning", payload={}, _db=_TMP_DB)
+    assert is_fresh("ZZFRESH", "2099-04-01", "positioning", max_age_hours=24, _db=_TMP_DB)
+    # Back-date the row to 48h ago -> stale under a 24h window
+    conn = _conn()
+    try:
+        from datetime import datetime, timezone, timedelta
+        old = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+        conn.execute(
+            "UPDATE preearnings_research_layers SET created_at=? WHERE ticker='ZZFRESH'",
+            (old,))
+        conn.commit()
+    finally:
+        conn.close()
+    assert not is_fresh("ZZFRESH", "2099-04-01", "positioning", max_age_hours=24, _db=_TMP_DB)
+
+
+def test_is_fresh_false_when_missing():
+    _clean()
+    assert not is_fresh("ZZMISS", "2099-05-01", "guidance", max_age_hours=24, _db=_TMP_DB)
 
 
 def test_preearnings_signals_columns():

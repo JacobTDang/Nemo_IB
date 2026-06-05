@@ -223,3 +223,130 @@ def eval_accuracy_summary(*, _db: Optional[str] = None) -> Dict[str, Any]:
 
 def _avg(values: list) -> Optional[float]:
     return round(sum(values) / len(values), 3) if values else None
+
+
+# ---------------------------------------------------------------------------
+# Deep research layers (Phase A) — sub-agent + structured component outputs.
+# Upserted on the natural key (ticker, earnings_date, component) so repeated
+# pre-earnings runs (7d/3d/1d out) reuse fresh research instead of re-paying.
+# ---------------------------------------------------------------------------
+
+import json as _json
+
+
+def record_layer(
+    ticker: str,
+    earnings_date: str,
+    layer: int,
+    component: str,
+    direction: Optional[str] = None,
+    magnitude: Optional[float] = None,
+    confidence: Optional[float] = None,
+    payload: Optional[Any] = None,
+    sources: Optional[List[Dict[str, Any]]] = None,
+    *,
+    _db: Optional[str] = None,
+) -> int:
+    """Upsert a research-layer component. `payload` and `sources` are JSON-encoded.
+    `sources` is a list of {claim, tool} dicts for the citation audit."""
+    conn = _db_conn(_db)
+    try:
+        cur = conn.execute(
+            """INSERT INTO preearnings_research_layers
+               (ticker, earnings_date, layer, component, direction, magnitude,
+                confidence, payload_json, sources_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(ticker, earnings_date, component) DO UPDATE SET
+                 layer        = excluded.layer,
+                 direction    = excluded.direction,
+                 magnitude    = excluded.magnitude,
+                 confidence   = excluded.confidence,
+                 payload_json = excluded.payload_json,
+                 sources_json = excluded.sources_json,
+                 created_at   = excluded.created_at""",
+            (
+                ticker.upper(),
+                earnings_date,
+                int(layer),
+                component,
+                direction,
+                magnitude,
+                confidence,
+                _json.dumps(payload if payload is not None else {}, default=str),
+                _json.dumps(sources or []),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def _decode_layer(row: Dict[str, Any]) -> Dict[str, Any]:
+    d = dict(row)
+    try:
+        d["payload"] = _json.loads(d.get("payload_json") or "{}")
+    except (ValueError, TypeError):
+        d["payload"] = {}
+    try:
+        d["sources"] = _json.loads(d.get("sources_json") or "[]")
+    except (ValueError, TypeError):
+        d["sources"] = []
+    return d
+
+
+def get_layers(
+    ticker: str, earnings_date: str, *, _db: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """All research-layer components for a ticker + earnings date (payload/sources decoded)."""
+    conn = _db_conn(_db)
+    try:
+        rows = conn.execute(
+            """SELECT * FROM preearnings_research_layers
+               WHERE ticker = ? AND earnings_date = ?
+               ORDER BY layer ASC, component ASC""",
+            (ticker.upper(), earnings_date),
+        ).fetchall()
+        return [_decode_layer(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def latest_component(
+    ticker: str, earnings_date: str, component: str, *, _db: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """Return the stored component for a ticker + earnings date, or None."""
+    conn = _db_conn(_db)
+    try:
+        row = conn.execute(
+            """SELECT * FROM preearnings_research_layers
+               WHERE ticker = ? AND earnings_date = ? AND component = ?""",
+            (ticker.upper(), earnings_date, component),
+        ).fetchone()
+        return _decode_layer(row) if row else None
+    finally:
+        conn.close()
+
+
+def is_fresh(
+    ticker: str,
+    earnings_date: str,
+    component: str,
+    max_age_hours: float,
+    *,
+    _db: Optional[str] = None,
+) -> bool:
+    """True if the component exists and was written within max_age_hours.
+    Lets a re-run skip re-computing a component that is still current."""
+    row = latest_component(ticker, earnings_date, component, _db=_db)
+    if not row or not row.get("created_at"):
+        return False
+    try:
+        created = datetime.fromisoformat(row["created_at"])
+    except (ValueError, TypeError):
+        return False
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    age_h = (datetime.now(timezone.utc) - created).total_seconds() / 3600.0
+    return age_h <= max_age_hours

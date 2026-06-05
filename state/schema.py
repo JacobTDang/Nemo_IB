@@ -306,6 +306,24 @@ CREATE_SCHEMA = [
         evaluated_at         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     )""",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_preearnings_evals_ticker_date ON preearnings_evals(ticker, earnings_date)",
+
+    # --- Pre-earnings: deep research layers (sub-agent + structured outputs) ---
+    # One row per (ticker, earnings_date, component). Upserted so the 7d/3d/1d
+    # re-runs reuse fresh research instead of re-paying for deep sub-agent dives.
+    """CREATE TABLE IF NOT EXISTS preearnings_research_layers(
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticker         TEXT NOT NULL,
+        earnings_date  TEXT NOT NULL,
+        layer          INTEGER NOT NULL,        -- 0 structured / 1 fan-out / 2 adversarial / 3 synthesis
+        component      TEXT NOT NULL,           -- peer_readthrough / guidance / kpi:<name> / positioning / reaction / ...
+        direction      TEXT,                    -- bullish / bearish / neutral / na
+        magnitude      REAL,                    -- 0..1 normalized strength
+        confidence     REAL,
+        payload_json   TEXT NOT NULL,           -- structured findings (json)
+        sources_json   TEXT NOT NULL,           -- [{claim, tool}] for the citation audit
+        created_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_pe_layers_natural ON preearnings_research_layers(ticker, earnings_date, component)",
 ]
 
 
