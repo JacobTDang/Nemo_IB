@@ -243,6 +243,69 @@ CREATE_SCHEMA = [
         excluded_reason       TEXT
     )""",
     "CREATE INDEX IF NOT EXISTS idx_sentry_universe_active ON sentry_universe(excluded, refreshed_at)",
+
+    # --- Pre-earnings: signals collected ahead of an earnings date ---
+    # One row per signal per ticker per earnings date. Direction and magnitude
+    # let the synthesis step weight and aggregate across signal categories.
+    """CREATE TABLE IF NOT EXISTS preearnings_signals(
+        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticker               TEXT NOT NULL,
+        earnings_date        TEXT NOT NULL,
+        signal_category      TEXT NOT NULL,
+        signal_name          TEXT NOT NULL,
+        direction            TEXT NOT NULL,
+        magnitude            REAL,
+        raw_value            TEXT,
+        source_url           TEXT,
+        collected_at         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        days_before_earnings INTEGER
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_preearnings_ticker_date ON preearnings_signals(ticker, earnings_date)",
+
+    # --- Pre-earnings: supplier readthroughs recorded per earnings cycle ---
+    """CREATE TABLE IF NOT EXISTS supplier_readthroughs(
+        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        supplier_ticker      TEXT NOT NULL,
+        downstream_ticker    TEXT NOT NULL,
+        supplier_report_date TEXT NOT NULL,
+        direction            TEXT NOT NULL,
+        key_findings         TEXT,
+        confidence           REAL,
+        triggered_at         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_supplier_readthrough_downstream ON supplier_readthroughs(downstream_ticker, triggered_at DESC)",
+
+    # --- Pre-earnings: weekly product pricing snapshots ---
+    """CREATE TABLE IF NOT EXISTS pricing_snapshots(
+        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticker               TEXT NOT NULL,
+        product_name         TEXT NOT NULL,
+        price                REAL,
+        currency             TEXT DEFAULT 'USD',
+        source_url           TEXT NOT NULL,
+        is_discounted        INTEGER DEFAULT 0,
+        discount_pct         REAL,
+        snapped_at           TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_pricing_snapshots_ticker ON pricing_snapshots(ticker, snapped_at DESC)",
+
+    # --- Pre-earnings: eval outcomes (prediction vs actual result) ---
+    """CREATE TABLE IF NOT EXISTS preearnings_evals(
+        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticker               TEXT NOT NULL,
+        earnings_date        TEXT NOT NULL,
+        prediction           TEXT NOT NULL,
+        confidence           REAL NOT NULL,
+        implied_move_pct     REAL,
+        actual_eps_surprise  REAL,
+        actual_rev_surprise  REAL,
+        actual_price_move_1d REAL,
+        outcome              TEXT,
+        prediction_correct   INTEGER,
+        notes                TEXT,
+        evaluated_at         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_preearnings_evals_ticker_date ON preearnings_evals(ticker, earnings_date)",
 ]
 
 
