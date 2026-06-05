@@ -186,6 +186,65 @@ def pair_surprises_with_reactions(
     return out
 
 
+def score_reaction(
+    positioning: Optional[str],
+    outcome: Optional[str],
+    price_move_1d_pct: Optional[float],
+    implied_move_pct: Optional[float],
+    prediction: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Score the ASYMMETRY call separately from the EPS-direction call
+    (post-earnings, used by /earnings-eval).
+
+    price_direction_match: did the 1-day price move agree with the prediction?
+      likely_beat -> up, likely_miss -> down. (None for in_line / missing data.)
+
+    asymmetry_correct: did the crowding thesis hold? Falsifiable claims:
+      crowded_long  + beat -> reward muted   (move <  +0.5 * implied) or negative
+      crowded_long  + miss -> punished hard  (move <= -0.5 * implied)
+      crowded_short + beat -> squeeze        (move >= +0.5 * implied)
+      crowded_short + miss -> cushioned      (move >  -0.5 * implied)
+      neutral positioning -> no asymmetry call was made -> not scored (None).
+    """
+    move = None if price_move_1d_pct is None else float(price_move_1d_pct)
+    implied = None if implied_move_pct is None else abs(float(implied_move_pct)) * 100.0
+    # implied arrives as a fraction (0.128); move as a percent (e.g. -6.4)
+
+    price_direction_match: Optional[int] = None
+    if move is not None and prediction in ("likely_beat", "likely_miss"):
+        if prediction == "likely_beat":
+            price_direction_match = 1 if move > 0 else 0
+        else:
+            price_direction_match = 1 if move < 0 else 0
+
+    asymmetry_correct: Optional[int] = None
+    basis = "no asymmetry call (neutral positioning)"
+    if (positioning in ("crowded_long", "crowded_short")
+            and outcome in ("beat", "miss")
+            and move is not None and implied is not None and implied > 0):
+        half = 0.5 * implied
+        if positioning == "crowded_long" and outcome == "beat":
+            asymmetry_correct = 1 if move < half else 0
+            basis = f"crowded_long+beat: muted reward expected (move {move} vs +{half:.1f} threshold)"
+        elif positioning == "crowded_long" and outcome == "miss":
+            asymmetry_correct = 1 if move <= -half else 0
+            basis = f"crowded_long+miss: hard punishment expected (move {move} vs -{half:.1f})"
+        elif positioning == "crowded_short" and outcome == "beat":
+            asymmetry_correct = 1 if move >= half else 0
+            basis = f"crowded_short+beat: squeeze expected (move {move} vs +{half:.1f})"
+        else:  # crowded_short + miss
+            asymmetry_correct = 1 if move > -half else 0
+            basis = f"crowded_short+miss: cushioned downside expected (move {move} vs -{half:.1f})"
+    elif positioning in ("crowded_long", "crowded_short"):
+        basis = "asymmetry call made but outcome/move/implied unavailable"
+
+    return {
+        "asymmetry_correct": asymmetry_correct,
+        "price_direction_match": price_direction_match,
+        "basis": basis,
+    }
+
+
 def implied_vs_realized(
     implied_move: float, realized_abs_moves: List[float]
 ) -> Dict[str, Any]:

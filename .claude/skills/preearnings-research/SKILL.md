@@ -39,6 +39,9 @@ quarter window are all derived at runtime.
      report dates + `get_earnings_surprises` -> build pairs with
      `pair_surprises_with_reactions(surprises, event_dates, bars)` -> feed
      `reaction_profile`. Realized next-day |moves| also feed `implied_vs_realized`.
+   - **Persist every asymmetry component as a layer** (`implied_move` with the
+     full options result incl. quotes_stale, `positioning`, `reaction`) — flags
+     buried in unpersisted tool results are invisible to /preearnings-review.
 
 ## Gate — should we go deep?
 
@@ -140,9 +143,14 @@ plus their own tool calls — never memory facts.)
     It returns `prediction`, `direction_score`, `coverage`, `agreement`,
     `confidence`, `sizing`, `low_confidence`, and `asymmetry_notes`.
 
-11. **Persist:** `record_layer(layer=3, component="synthesis", ...)` and
+11. **Persist:** `record_layer(layer=3, component="synthesis",
+    payload={**verdict, "signals": signals})` — include the signals list so
+    `/preearnings-review` can audit contradictions — and
     `record_eval(ticker, earnings_date, prediction, confidence, implied_move_pct)`.
     **Save:** `testing/fixtures/preearnings_{TICKER}_{DATE}.md`.
+
+12. **Review gate:** run `/preearnings-review(ticker, earnings_date)`. A verdict
+    of `not_actionable` blocks auto_trade and must be reported with its fix list.
 
 ## Output
 
@@ -169,6 +177,9 @@ pattern, implied vs realized) and what it does to sizing, (4) data gaps,
 
 ## Trading decision (mode=auto_trade only)
 
+0. **Review gate:** a `/preearnings-review` verdict of `sound` or
+   `sound_with_warnings` from within 24h is REQUIRED. `not_actionable` (or no
+   review) -> no trade, report the fix list instead.
 1. `sentry_can_act(action_type=new_position)`; stop if not permitted.
 2. Side from `prediction` + `sizing` (`likely_beat`+size!=no_position -> buy;
    `likely_miss`+size!=no_position -> sell; else no trade).

@@ -141,6 +141,8 @@ def record_eval(
     outcome: Optional[str] = None,
     prediction_correct: Optional[int] = None,
     notes: Optional[str] = None,
+    asymmetry_correct: Optional[int] = None,
+    price_direction_match: Optional[int] = None,
     *,
     _db: Optional[str] = None,
 ) -> int:
@@ -158,8 +160,9 @@ def record_eval(
                (ticker, earnings_date, prediction, confidence,
                 implied_move_pct, actual_eps_surprise, actual_rev_surprise,
                 actual_price_move_1d, outcome, prediction_correct, notes,
+                asymmetry_correct, price_direction_match,
                 evaluated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(ticker, earnings_date) DO UPDATE SET
                  prediction = CASE WHEN preearnings_evals.outcome IS NULL
                                    THEN excluded.prediction
@@ -183,6 +186,10 @@ def record_eval(
                                                  preearnings_evals.prediction_correct),
                  notes                = COALESCE(excluded.notes,
                                                  preearnings_evals.notes),
+                 asymmetry_correct    = COALESCE(excluded.asymmetry_correct,
+                                                 preearnings_evals.asymmetry_correct),
+                 price_direction_match = COALESCE(excluded.price_direction_match,
+                                                 preearnings_evals.price_direction_match),
                  evaluated_at         = excluded.evaluated_at""",
             (
                 ticker.upper(),
@@ -196,6 +203,8 @@ def record_eval(
                 outcome,
                 prediction_correct,
                 notes,
+                asymmetry_correct,
+                price_direction_match,
                 datetime.now(timezone.utc).isoformat(),
             ),
         )

@@ -190,6 +190,42 @@ def test_eval_actuals_not_wiped_by_prediction_rerun():
     assert row["prediction_correct"] == 1
 
 
+def test_eval_reaction_columns_migrated():
+    conn = _conn()
+    try:
+        cols = {r["name"] for r in
+                conn.execute("PRAGMA table_info(preearnings_evals)").fetchall()}
+    finally:
+        conn.close()
+    assert "asymmetry_correct" in cols
+    assert "price_direction_match" in cols
+
+
+def test_eval_reaction_scores_roundtrip():
+    _clean()
+    record_eval("ZZRX1", "2099-06-10", "likely_beat", 0.6,
+                actual_eps_surprise=4.0, actual_price_move_1d=2.0,
+                outcome="beat", prediction_correct=1,
+                asymmetry_correct=1, price_direction_match=1, _db=_TMP_DB)
+    row = get_eval("ZZRX1", "2099-06-10", _db=_TMP_DB)
+    assert row["asymmetry_correct"] == 1
+    assert row["price_direction_match"] == 1
+
+
+def test_eval_reaction_scores_survive_rerun():
+    """A later call without reaction scores must not wipe them (COALESCE)."""
+    _clean()
+    record_eval("ZZRX2", "2099-06-10", "likely_beat", 0.6,
+                outcome="beat", prediction_correct=1,
+                asymmetry_correct=0, price_direction_match=1, _db=_TMP_DB)
+    record_eval("ZZRX2", "2099-06-10", "likely_beat", 0.6,
+                notes="post-mortem note", _db=_TMP_DB)
+    row = get_eval("ZZRX2", "2099-06-10", _db=_TMP_DB)
+    assert row["asymmetry_correct"] == 0
+    assert row["price_direction_match"] == 1
+    assert row["notes"] == "post-mortem note"
+
+
 def test_eval_implied_move_not_wiped_by_none_before_scoring():
     _clean()
     record_eval("ZZEV4", "2099-06-10", "in_line", 0.4,

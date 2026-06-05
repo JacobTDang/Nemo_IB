@@ -362,6 +362,15 @@ _DISCOVERY_RUNS_MIGRATIONS = [
 ]
 
 
+# Reaction scoring columns added to preearnings_evals: the asymmetry call
+# (crowding thesis) and price-direction validity are graded separately from
+# the EPS-direction prediction.
+_PREEARNINGS_EVALS_MIGRATIONS = [
+    ("asymmetry_correct",     "INTEGER"),   # 1/0/NULL (NULL = no asymmetry call)
+    ("price_direction_match", "INTEGER"),   # 1/0/NULL
+]
+
+
 def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
     """Open a connection with row factory set for dict-like access.
 
@@ -431,6 +440,18 @@ def init_schema(db_path: str = DB_PATH) -> None:
                 try:
                     conn.execute(
                         f"ALTER TABLE sentry_discovery_runs ADD COLUMN {col_name} {col_type}"
+                    )
+                except sqlite3.OperationalError:
+                    pass
+
+        # Same pattern for preearnings_evals reaction-scoring columns.
+        existing_cols = {row['name'] for row in
+                         conn.execute("PRAGMA table_info(preearnings_evals)").fetchall()}
+        for col_name, col_type in _PREEARNINGS_EVALS_MIGRATIONS:
+            if col_name not in existing_cols:
+                try:
+                    conn.execute(
+                        f"ALTER TABLE preearnings_evals ADD COLUMN {col_name} {col_type}"
                     )
                 except sqlite3.OperationalError:
                     pass

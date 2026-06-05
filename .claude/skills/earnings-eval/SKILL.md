@@ -65,15 +65,32 @@ Compare `prediction` (from prior run) to `outcome` (from Step 2):
 
 ### Step 6 — Signal attribution
 
-For each signal in `signals_for_ticker`:
+For each signal in `signals_for_ticker` (and each direction-bearing research
+layer in `get_layers`):
 - Was it directionally correct? (signal.direction agrees with actual outcome)
 - Record which signals were correct and which were noise.
+
+### Step 6b — Score the ASYMMETRY call separately
+
+The direction model predicts the fundamental outcome; the asymmetry model
+predicts the REACTION. Grade them independently:
+
+Load the persisted `positioning` layer (`latest_component(ticker, earnings_date,
+"positioning")`). Call `score_reaction(positioning, outcome, price_move_1d_pct,
+implied_move_pct, prediction)` (`tools/preearnings/asymmetry_logic.py`):
+- `price_direction_match`: did the 1-day move agree with the prediction?
+  (a correct EPS call with an opposite price move = right on fundamentals,
+  wrong on the trade)
+- `asymmetry_correct`: did the crowding thesis hold? (crowded_long + beat ->
+  muted reward; crowded_long + miss -> hard punishment; crowded_short
+  mirrored). Neutral positioning -> not scored (None) — no call was made.
 
 ### Step 7 — Record and output
 
 Call `record_eval(ticker, earnings_date, prediction=..., confidence=...,
 actual_eps_surprise=..., actual_rev_surprise=..., actual_price_move_1d=...,
-outcome=..., prediction_correct=..., notes=...)`.
+outcome=..., prediction_correct=..., asymmetry_correct=...,
+price_direction_match=..., notes=...)`.
 
 ## Output
 
