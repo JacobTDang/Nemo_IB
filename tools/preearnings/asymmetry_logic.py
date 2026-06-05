@@ -131,6 +131,7 @@ def pair_surprises_with_reactions(
     event_dates: List[Any],
     bars: List[Dict[str, Any]],
     max_gap_days: int = 75,
+    max_back_days: int = 45,
 ) -> List[Dict[str, Any]]:
     """Build the (surprise, next-day reaction) pairs that reaction_profile needs.
 
@@ -138,11 +139,15 @@ def pair_surprises_with_reactions(
     event_dates: report/8-K filing dates (get_company_filings_history)
     bars:        [{date, close}] daily bars (get_price_history)
 
-    Each surprise quarter is matched to the EARLIEST event date after its period
-    end (within max_gap_days). The reaction approximates close[t+1] vs close[t],
-    where t is the report date's bar (or the nearest prior trading day) — most
-    prints land after the close, so t+1 carries the reaction. BMO reporters are
-    off by a session; sign/magnitude survive for material moves.
+    Each surprise quarter is matched to the UNUSED event date NEAREST its period
+    end, within [period_end - max_back_days, period_end + max_gap_days]. Events
+    BEFORE the labeled period end are allowed because vendors label fiscal
+    quarters with calendar-quarter ends — fiscal-offset companies (Nov/May/Jan
+    year-ends) report 2-3 weeks BEFORE their label. The reaction approximates
+    close[t+1] vs close[t], where t is the report date's bar (or nearest prior
+    trading day) — most prints land after the close, so t+1 carries the
+    reaction. BMO reporters are off by a session; sign/magnitude survive for
+    material moves.
     """
     parsed_bars = sorted(
         ((d, float(b.get("close"))) for b in bars
@@ -164,11 +169,13 @@ def pair_surprises_with_reactions(
         period_end = _parse_d(s.get("period"))
         if period_end is None or s.get("surprise_pct") is None:
             continue
+        window_start = period_end - timedelta(days=max_back_days)
         window_end = period_end + timedelta(days=max_gap_days)
-        ev = next((e for e in events
-                   if period_end < e <= window_end and e not in used), None)
-        if ev is None:
+        candidates = [e for e in events
+                      if window_start <= e <= window_end and e not in used]
+        if not candidates:
             continue
+        ev = min(candidates, key=lambda e: abs((e - period_end).days))
         # bar at the report date, or nearest prior trading day
         idx = bisect.bisect_right(bar_dates, ev) - 1
         if idx < 0 or idx + 1 >= len(parsed_bars):

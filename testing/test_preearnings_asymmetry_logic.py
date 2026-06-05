@@ -182,6 +182,30 @@ def test_pairing_skips_event_at_last_bar():
     assert pair_surprises_with_reactions(surprises, events, bars) == []
 
 
+def test_pairing_fiscal_offset_event_before_period_label():
+    """Red-green from the live ADBE run: fiscal-offset companies report BEFORE
+    the vendor's calendar-quarter period label (8-K 2026-03-12 for period
+    2026-03-31). The pairing must pick the nearest event, not skip to a later
+    non-earnings 8-K."""
+    surprises = [{"period": "2026-03-31", "surprise_pct": 1.17}]
+    events = ["2026-03-12", "2026-04-21"]   # earnings 8-K, then unrelated 8-K
+    bars = _bars([("2026-03-12", 100.0), ("2026-03-13", 95.0),
+                  ("2026-04-21", 110.0), ("2026-04-22", 111.0)])
+    out = pair_surprises_with_reactions(surprises, events, bars)
+    assert len(out) == 1
+    assert out[0]["event_date"] == "2026-03-12"     # nearest to period end
+    assert out[0]["next_day_return"] == -5.0
+
+
+def test_pairing_event_too_far_before_period_excluded():
+    """An event older than max_back_days (e.g. the PRIOR quarter's report)
+    must not be matched."""
+    surprises = [{"period": "2026-03-31", "surprise_pct": 2.0}]
+    events = ["2026-01-30"]    # 60 days before the label — prior quarter
+    bars = _bars([("2026-01-30", 100.0), ("2026-01-31", 101.0)])
+    assert pair_surprises_with_reactions(surprises, events, bars) == []
+
+
 def test_pairing_two_quarters_use_distinct_events():
     surprises = [
         {"period": "2025-12-31", "surprise_pct": 35.0},
