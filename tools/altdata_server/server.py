@@ -910,31 +910,61 @@ SECTOR_BILL_KEYWORDS: Dict[str, List[str]] = {
     "Defense":                ["NDAA", "defense authorization", "military procurement"],
 }
 
+# Pro-industry vs anti-industry bill language. Complete words/conjugations only
+# (word-boundary matched) — partial stems like "fund"/"invest"/"ban" caused
+# false friends ("refund", "investigation", "banking"). Multi-word phrases are
+# matched as substrings. Ambiguous terms (tax/tariff/regulation/mandate) are
+# deliberately omitted: their polarity depends on the company's position.
 _BILL_BULLISH = frozenset([
-    "fund", "authoriz", "invest", "incentiv", "subsidi", "credit", "grant",
-    "research", "develop", "support", "modern", "promot", "commerc", "expand",
-    "innovat", "manufactur", "rebuild", "strengthen",
+    "funding", "appropriation", "appropriations",
+    "authorize", "authorized", "authorization", "reauthorization",
+    "investment", "investments",
+    "incentive", "incentives", "tax credit", "credit", "credits",
+    "subsidy", "subsidies", "subsidize",
+    "grant", "grants",
+    "research", "development",
+    "support", "supports",
+    "modernize", "modernization",
+    "promote", "promotion",
+    "expand", "expansion",
+    "innovation", "innovate",
+    "manufacturing", "reshoring", "domestic manufacturing",
+    "rebuild", "strengthen", "strengthening",
+    "deregulation", "streamline", "streamlining",
+    "exemption", "exempt",
 ])
 _BILL_BEARISH = frozenset([
-    "ban", "restrict", "prohibit", "penalt", "investigat", "antitrust",
-    "price cap", "price control", "sanction", "tariff increase", "moratorium",
-    "export ban", "import restrict", "windfall",
+    "ban", "bans", "banned",
+    "restrict", "restriction", "restrictions",
+    "prohibit", "prohibits", "prohibition",
+    "penalty", "penalties",
+    "investigation", "investigations",
+    "antitrust",
+    "price cap", "price control", "price controls",
+    "sanction", "sanctions",
+    "moratorium",
+    "export ban", "export control", "export controls", "export restriction",
+    "windfall",
+    "breakup",
 ])
 
+# GovTrack/Congress.gov status -> probability weight (likelihood of taking effect).
 _GOVTRACK_STATUSES = {
-    "enacted_signed": 1.0, "enacted_veto_override": 1.0,
-    "passed_bill": 0.70, "passed_resolution": 0.50,
+    "enacted_signed": 1.0, "enacted_veto_override": 1.0, "enacted_tendayrule": 1.0,
+    "passed_bill": 0.70,
+    "passed_house": 0.50, "passed_senate": 0.50,
+    "pass_over_house": 0.50, "pass_over_senate": 0.50,
+    "passed_resolution": 0.45, "passed_simpleres": 0.40, "passed_concurrentres": 0.40,
     "reported": 0.25, "referred": 0.10, "introduced": 0.08,
 }
 
 
 def _score_bill_title(title: str, status: str) -> float:
-    t = title.lower()
-    pos = sum(1 for kw in _BILL_BULLISH if kw in t)
-    neg = sum(1 for kw in _BILL_BEARISH if kw in t)
-    net = pos - neg
-    weight = _GOVTRACK_STATUSES.get(status, 0.08)
-    return net * weight
+    """Net polarity of a bill (word-boundary matched) weighted by status."""
+    pos = count_matches(title, _BILL_BULLISH)
+    neg = count_matches(title, _BILL_BEARISH)
+    weight = _GOVTRACK_STATUSES.get((status or "").lower(), 0.08)
+    return (pos - neg) * weight
 
 
 def _govtrack_fetch_bills(keywords: List[str], congress: int,
@@ -955,7 +985,10 @@ def _govtrack_fetch_bills(keywords: List[str], congress: int,
             resp.raise_for_status()
             data = resp.json()
             for obj in data.get("objects", []):
-                bid = obj.get("id")
+                # GovTrack bill objects have no "id" field; dedup on the unique
+                # link (fall back to title). The old "id" key was always None,
+                # which silently dropped every bill.
+                bid = obj.get("link") or obj.get("title")
                 if bid and bid not in seen_ids:
                     seen_ids.add(bid)
                     bills.append({
@@ -963,6 +996,9 @@ def _govtrack_fetch_bills(keywords: List[str], congress: int,
                         "short_title": obj.get("short_title", ""),
                         "status": obj.get("current_status", "introduced"),
                         "introduced_date": obj.get("introduced_date", ""),
+                        # current_status_date = latest activity; best recency signal
+                        "activity_date": obj.get("current_status_date")
+                                         or obj.get("introduced_date", ""),
                         "link": obj.get("link", ""),
                         "congress": congress,
                         "source": "govtrack",
@@ -1009,6 +1045,7 @@ def _congress_api_fetch_bills(keywords: List[str], congress: int,
                     "short_title": "",
                     "status": status,
                     "introduced_date": latest.get("actionDate", ""),
+                    "activity_date": latest.get("actionDate", ""),
                     "link": "",
                     "congress": congress,
                     "source": "congress.gov",
@@ -1040,6 +1077,14 @@ def _fetch_policy_signals(ticker: str, sector: str,
         bills = _govtrack_fetch_bills(keywords, current_congress)
         if len(bills) < 3:
             bills += _govtrack_fetch_bills(keywords, prior_congress)
+
+    # Apply lookback_days: keep bills with recent legislative activity. Bills with
+    # an unparseable/missing date are kept (don't over-filter on bad metadata).
+    cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    def _recent(b: Dict) -> bool:
+        d = parse_news_date(b.get("activity_date", "") or b.get("introduced_date", ""))
+        return d is None or d >= cutoff
+    bills = [b for b in bills if _recent(b)]
 
     if not bills:
         return {

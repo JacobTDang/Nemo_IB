@@ -682,6 +682,63 @@ def test_government_contracts_defense_is_bullish_or_neutral():
     assert result["signal"] != "not_applicable"
 
 
+# ---------------------------------------------------------------------------
+# Phase 3 — policy bill scoring (pure, no network)
+# ---------------------------------------------------------------------------
+
+def test_bill_score_banking_not_bearish():
+    """'Banking Modernization Act' must not trigger the 'ban' bearish term."""
+    from tools.altdata_server.server import _score_bill_title
+    score = _score_bill_title("H.R. 100: Banking Modernization Act", "introduced")
+    assert score >= 0, f"banking bill scored bearish: {score}"
+
+
+def test_bill_score_investigation_not_double_counted():
+    """'investigation' must score bearish only, not also bullish via 'invest'."""
+    from tools.altdata_server.server import _score_bill_title
+    score = _score_bill_title("S. 50: Investigation into Drug Pricing Act", "introduced")
+    assert score < 0, f"investigation bill should be net bearish, got {score}"
+
+
+def test_bill_score_ban_whole_word_is_bearish():
+    from tools.altdata_server.server import _score_bill_title
+    score = _score_bill_title("H.R. 7: Ban on Chip Exports Act", "introduced")
+    assert score < 0
+
+
+def test_bill_score_bullish_terms():
+    from tools.altdata_server.server import _score_bill_title
+    score = _score_bill_title("S. 9: Semiconductor Manufacturing Investment Incentive Act", "introduced")
+    assert score > 0
+
+
+def test_bill_status_weighting():
+    from tools.altdata_server.server import _score_bill_title
+    enacted = _score_bill_title("Ban on Exports Act", "enacted_signed")
+    introduced = _score_bill_title("Ban on Exports Act", "introduced")
+    assert abs(enacted) > abs(introduced)  # enacted weighted far higher
+
+
+def test_bill_status_case_insensitive():
+    from tools.altdata_server.server import _score_bill_title
+    a = _score_bill_title("Investment Incentive Act", "ENACTED_SIGNED")
+    b = _score_bill_title("Investment Incentive Act", "enacted_signed")
+    assert a == b and a != 0
+
+
+def test_sector_keyword_coverage_all_gics():
+    """Regression guard: every yfinance GICS sector must have bill keywords."""
+    from tools.altdata_server.server import SECTOR_BILL_KEYWORDS
+    gics = {
+        "Technology", "Basic Materials", "Communication Services",
+        "Consumer Cyclical", "Consumer Defensive", "Energy",
+        "Financial Services", "Healthcare", "Industrials",
+        "Real Estate", "Utilities",
+    }
+    missing = gics - set(SECTOR_BILL_KEYWORDS)
+    assert not missing, f"sectors missing bill keywords: {missing}"
+
+
 @network
 def test_policy_signals_returns_required_fields():
     """Policy signals for any ticker must return the required schema fields."""
@@ -693,6 +750,9 @@ def test_policy_signals_returns_required_fields():
         assert field in result, f"missing field: {field}"
     assert result["signal"] in {"bullish", "bearish", "neutral", "data_gap"}
     assert isinstance(result["bills"], list)
+    # Regression guard: GovTrack dedup must actually return bills (the old
+    # obj.get("id") key was always None and silently dropped every bill).
+    assert result["bill_count"] > 0, "no bills found — dedup/fetch regression"
 
 
 @network
