@@ -59,10 +59,14 @@ Mark None if not derivable.
 ### Step 4 — 1-day price move
 
 Call `get_price_history(ticker, period="1mo", include_recent_bars=20)` (the
-tool takes period/bars, not date ranges). From `recent_bars`, take the close on
-the last trading day <= `earnings_date` (t) and the next trading day's close
-(t+1) — matching the close[t] -> close[t+1] convention in
-`pair_surprises_with_reactions`; AMC prints land in t+1.
+tool takes period/bars, not date ranges). The convention depends on the
+report HOUR — confirm it via `get_earnings_calendar(symbol=ticker)`:
+- **amc** (after close): move = close[t] -> close[t+1], where t is the last
+  trading day <= earnings_date — the reaction lands in the NEXT session.
+- **bmo** (before open): move = close[t-1] -> close[t] — the reaction IS the
+  report-day bar (live CHWY: +13.3% on the day; the AMC convention would have
+  read +1.7% from the wrong session).
+This matches `pair_surprises_with_reactions(..., bmo=...)`.
 
 `actual_price_move_1d` = (close[t+1] - close[t]) / close[t] × 100
 **(a PERCENT, e.g. -6.4 — `score_reaction` requires the move in percent while
