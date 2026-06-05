@@ -179,6 +179,7 @@ def compute_implied_move(spot: float, atm_call_ask: float,
 
 
 _ATM_GAP_THRESHOLD = 0.08  # nearest strike >8% from spot → treat as ATM missing
+_PARITY_TOLERANCE = 0.05   # |C-P-(S-K)|/S above this → ask quotes are junk
 
 
 def _us_market_today():
@@ -1714,6 +1715,24 @@ class AltDataServer:
             call_ask, call_stale = _leg_price(atm_call)
             put_ask,  put_stale  = _leg_price(atm_put)
             quotes_stale = call_stale or put_stale
+
+            # Put-call parity sanity: C - P ~= S - K for same-strike legs. A
+            # nonzero ask is not necessarily a SANE ask — junk wide quotes left
+            # at the close pass the >0 check (live ORCL: call 6.75 / put 28.35
+            # at 237.5 with spot 236.34, a $21 parity violation). On gross
+            # violation rebuild both legs from last_price/bid and flag stale.
+            strike_for_parity = _safe_float(atm_call.get("strike"))
+            if (call_ask > 0 and put_ask > 0 and spot > 0
+                    and abs((call_ask - put_ask) - (spot - strike_for_parity)) / spot
+                        > _PARITY_TOLERANCE):
+                def _no_ask(opt):
+                    return {k: v for k, v in opt.items()
+                            if k not in ("ask", "ask_price")}
+                c2, _ = _leg_price(_no_ask(atm_call))
+                p2, _ = _leg_price(_no_ask(atm_put))
+                if c2 > 0 and p2 > 0:
+                    call_ask, put_ask = c2, p2
+                    quotes_stale = True
             call_iv  = _safe_float(atm_call.get("implied_volatility") or atm_call.get("impliedVolatility"))
             put_iv   = _safe_float(atm_put.get("implied_volatility")  or atm_put.get("impliedVolatility"))
             strike   = _safe_float(atm_call.get("strike"))

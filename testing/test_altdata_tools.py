@@ -341,6 +341,49 @@ def test_options_handler_after_hours_uses_last_price():
     assert "NaN" not in res[0].text
 
 
+def test_options_handler_parity_violation_falls_back_to_last_price():
+    """Red-green from the live ORCL anomaly: call ask 6.75 / put ask 28.35 at
+    the same 237.5 strike with spot 236.34 — a $21 put-call parity violation
+    from a junk after-close wide quote that passed the ask>0 check. The handler
+    must rebuild both legs from last_price and flag quotes_stale."""
+    import asyncio
+    from tools.altdata_server.server import AltDataServer
+    srv = AltDataServer()
+    rows = [
+        {"expiration": "2099-01-15", "option_type": "call", "strike": 237.5,
+         "ask": 6.75, "last_price": 14.8, "bid": 6.0, "implied_volatility": 1.1},
+        {"expiration": "2099-01-15", "option_type": "put", "strike": 237.5,
+         "ask": 28.35, "last_price": 15.4, "bid": 5.9, "implied_volatility": 1.0},
+    ]
+    res = asyncio.run(srv.options_implied_move({
+        "ticker": "TEST", "spot_price": 236.34,
+        "options_chain_rows": rows, "target_expiry": "2099-01-15",
+    }))
+    d = json.loads(res[0].text)["data"]
+    assert d["quotes_stale"] is True                       # junk asks flagged
+    assert d["straddle_cost"] == pytest.approx(30.2)        # 14.8 + 15.4 (last)
+    assert d["atm_call_ask"] == 14.8 and d["atm_put_ask"] == 15.4
+
+
+def test_options_handler_sane_parity_keeps_live_asks():
+    import asyncio
+    from tools.altdata_server.server import AltDataServer
+    srv = AltDataServer()
+    rows = [
+        {"expiration": "2099-01-15", "option_type": "call", "strike": 100,
+         "ask": 3.4, "last_price": 3.0, "bid": 3.2, "implied_volatility": 0.5},
+        {"expiration": "2099-01-15", "option_type": "put", "strike": 100,
+         "ask": 3.1, "last_price": 2.8, "bid": 2.9, "implied_volatility": 0.5},
+    ]
+    res = asyncio.run(srv.options_implied_move({
+        "ticker": "TEST", "spot_price": 100.0,
+        "options_chain_rows": rows, "target_expiry": "2099-01-15",
+    }))
+    d = json.loads(res[0].text)["data"]
+    assert d["quotes_stale"] is False
+    assert d["straddle_cost"] == pytest.approx(6.5)         # live asks kept
+
+
 def test_options_handler_live_ask_not_stale():
     """Positive asks -> quotes_stale False, straddle from ask."""
     import asyncio
