@@ -133,9 +133,22 @@ def _err(tool: str, msg: str, ticker: str = "") -> List[TextContent]:
 # Options implied move — pure math
 # ---------------------------------------------------------------------------
 
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    """float() that maps None, non-numeric, and NaN to a default.
+
+    yfinance returns NaN (a truthy float) for ask/impliedVolatility on illiquid
+    strikes; `float(x or 0)` leaves NaN intact, which then poisons the straddle
+    math and serializes to invalid JSON. NaN != NaN, so `f == f` catches it."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    return f if f == f else default
+
+
 def compute_implied_move(spot: float, atm_call_ask: float,
                          atm_put_ask: float) -> Dict[str, Any]:
-    straddle = atm_call_ask + atm_put_ask
+    straddle = _safe_float(atm_call_ask) + _safe_float(atm_put_ask)
     implied_move_pct = straddle / spot if spot > 0 else 0.0
     return {"implied_move_pct": round(implied_move_pct, 4), "straddle_cost": straddle}
 
@@ -165,12 +178,19 @@ def _find_atm_options(rows: List[Dict], spot: float,
     calls = [r for r in chain if (r.get("option_type") or r.get("optionType", "")).lower() == "call"]
     puts  = [r for r in chain if (r.get("option_type") or r.get("optionType", "")).lower() == "put"]
 
+    def _ask_of(r):
+        return _safe_float(r.get("ask") or r.get("ask_price"))
+
     def nearest_atm(options):
         if not options:
             return None
-        best = min(options, key=lambda r: abs(float(r.get("strike", 0)) - spot))
+        # Prefer strikes that actually have a positive ask quote; a 0/NaN-ask
+        # ATM strike would yield a garbage straddle.
+        quoted = [o for o in options if _ask_of(o) > 0]
+        pool = quoted or options
+        best = min(pool, key=lambda r: abs(_safe_float(r.get("strike")) - spot))
         # Guard: reject if gap is too large (truncated chain)
-        if spot > 0 and abs(float(best.get("strike", 0)) - spot) / spot > _ATM_GAP_THRESHOLD:
+        if spot > 0 and abs(_safe_float(best.get("strike")) - spot) / spot > _ATM_GAP_THRESHOLD:
             return None
         return best
 
@@ -205,16 +225,16 @@ def _fetch_options_yfinance(ticker: str, spot: float,
             for _, row in chain.calls.iterrows():
                 rows.append({
                     "expiration": exp, "option_type": "call",
-                    "strike": float(row.get("strike") or 0),
-                    "ask": float(row.get("ask") or 0),
-                    "implied_volatility": float(row.get("impliedVolatility") or 0),
+                    "strike": _safe_float(row.get("strike")),
+                    "ask": _safe_float(row.get("ask")),
+                    "implied_volatility": _safe_float(row.get("impliedVolatility")),
                 })
             for _, row in chain.puts.iterrows():
                 rows.append({
                     "expiration": exp, "option_type": "put",
-                    "strike": float(row.get("strike") or 0),
-                    "ask": float(row.get("ask") or 0),
-                    "implied_volatility": float(row.get("impliedVolatility") or 0),
+                    "strike": _safe_float(row.get("strike")),
+                    "ask": _safe_float(row.get("ask")),
+                    "implied_volatility": _safe_float(row.get("impliedVolatility")),
                 })
         except Exception:
             continue
@@ -1592,17 +1612,25 @@ class AltDataServer:
         try:
             atm_call, atm_put, expiry = _find_atm_options(rows, spot, target_expiry)
 
-            # Fallback to yfinance when rows are empty or ATM gap too large
+            # Fallback to yfinance when rows are empty or ATM gap too large.
+            # Only switch source to "yfinance" if yfinance actually produced
+            # BOTH ATM legs — otherwise the error message stays accurate.
+            yf_attempted = False
             if (not atm_call or not atm_put) and ticker:
+                yf_attempted = True
                 yf_rows = await asyncio.to_thread(_fetch_options_yfinance, ticker, spot)
                 if yf_rows:
-                    atm_call, atm_put, expiry = _find_atm_options(yf_rows, spot, target_expiry)
-                    source = "yfinance"
+                    yf_call, yf_put, yf_expiry = _find_atm_options(yf_rows, spot, target_expiry)
+                    if yf_call and yf_put:
+                        atm_call, atm_put, expiry = yf_call, yf_put, yf_expiry
+                        source = "yfinance"
 
             if not atm_call or not atm_put:
                 msg = "could not find ATM options"
-                if rows and not source == "yfinance":
-                    all_strikes = [float(r.get("strike", 0)) for r in rows]
+                if yf_attempted:
+                    msg += " (yfinance fallback also lacked ATM coverage)"
+                elif rows:
+                    all_strikes = [_safe_float(r.get("strike")) for r in rows]
                     if all_strikes and spot > 0:
                         nearest = min(all_strikes, key=lambda s: abs(s - spot))
                         gap_pct = abs(nearest - spot) / spot * 100
@@ -1611,11 +1639,11 @@ class AltDataServer:
                                 f"supplied chain lacks ATM coverage)")
                 return _err("get_options_implied_move", msg, ticker)
 
-            call_ask = float(atm_call.get("ask") or atm_call.get("ask_price") or 0)
-            put_ask  = float(atm_put.get("ask")  or atm_put.get("ask_price")  or 0)
-            call_iv  = float(atm_call.get("implied_volatility") or atm_call.get("impliedVolatility") or 0)
-            put_iv   = float(atm_put.get("implied_volatility")  or atm_put.get("impliedVolatility")  or 0)
-            strike   = float(atm_call.get("strike", 0))
+            call_ask = _safe_float(atm_call.get("ask") or atm_call.get("ask_price"))
+            put_ask  = _safe_float(atm_put.get("ask")  or atm_put.get("ask_price"))
+            call_iv  = _safe_float(atm_call.get("implied_volatility") or atm_call.get("impliedVolatility"))
+            put_iv   = _safe_float(atm_put.get("implied_volatility")  or atm_put.get("impliedVolatility"))
+            strike   = _safe_float(atm_call.get("strike"))
 
             move = compute_implied_move(spot, call_ask, put_ask)
             skew_diff = put_iv - call_iv

@@ -254,6 +254,47 @@ def test_taiwan_revenue_finmind_yoy_computed():
 # Fix A — ATM gap guard (Layer 2)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Phase 4 — options NaN guard + source flag (pure, no network)
+# ---------------------------------------------------------------------------
+
+def test_safe_float_handles_nan():
+    from tools.altdata_server.server import _safe_float
+    nan = float("nan")
+    assert _safe_float(nan) == 0.0
+    assert _safe_float(None) == 0.0
+    assert _safe_float("abc") == 0.0
+    assert _safe_float("3.5") == 3.5
+    assert _safe_float(2) == 2.0
+
+
+def test_compute_implied_move_nan_ask_no_nan_output():
+    """NaN ask must not produce a NaN straddle (invalid JSON)."""
+    import json
+    from tools.altdata_server.server import compute_implied_move
+    nan = float("nan")
+    result = compute_implied_move(spot=100.0, atm_call_ask=nan, atm_put_ask=3.0)
+    # straddle = 0 (nan) + 3 = 3; must be JSON-serializable with no NaN token
+    assert result["straddle_cost"] == 3.0
+    dumped = json.dumps(result)
+    assert "NaN" not in dumped
+
+
+def test_find_atm_prefers_positive_ask():
+    """An ATM strike with 0/NaN ask should yield to a positive-ask neighbor."""
+    from tools.altdata_server.server import _find_atm_options
+    nan = float("nan")
+    rows = [
+        {"expiration": "2026-08-15", "option_type": "call", "strike": 100, "ask": nan, "implied_volatility": 0.3},
+        {"expiration": "2026-08-15", "option_type": "call", "strike": 101, "ask": 2.5, "implied_volatility": 0.3},
+        {"expiration": "2026-08-15", "option_type": "put",  "strike": 100, "ask": 0,   "implied_volatility": 0.3},
+        {"expiration": "2026-08-15", "option_type": "put",  "strike": 101, "ask": 2.2, "implied_volatility": 0.3},
+    ]
+    call, put, _ = _find_atm_options(rows, spot=100.0, target_expiry="2026-08-15")
+    assert call is not None and float(call["strike"]) == 101.0  # skipped NaN-ask 100
+    assert put is not None and float(put["strike"]) == 101.0    # skipped 0-ask 100
+
+
 def test_atm_gap_guard_returns_none_when_strike_too_far():
     """Nearest strike >8% from spot must return (None, None, None)."""
     from tools.altdata_server.server import _find_atm_options
