@@ -151,6 +151,20 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
     return f if f == f else default
 
 
+def _leg_price(opt: Dict) -> Tuple[float, bool]:
+    """Price of one ATM leg for the straddle. Prefer the live ask; when ask is 0
+    (market closed) fall back to last_price then bid. Returns (price, used_fallback);
+    used_fallback=True means the quote is stale (after-hours / illiquid)."""
+    ask = _safe_float(opt.get("ask") or opt.get("ask_price"))
+    if ask > 0:
+        return ask, False
+    for k in ("last_price", "bid"):
+        v = _safe_float(opt.get(k))
+        if v > 0:
+            return v, True
+    return 0.0, True
+
+
 def compute_implied_move(spot: float, atm_call_ask: float,
                          atm_put_ask: float) -> Dict[str, Any]:
     straddle = _safe_float(atm_call_ask) + _safe_float(atm_put_ask)
@@ -183,15 +197,21 @@ def _find_atm_options(rows: List[Dict], spot: float,
     calls = [r for r in chain if (r.get("option_type") or r.get("optionType", "")).lower() == "call"]
     puts  = [r for r in chain if (r.get("option_type") or r.get("optionType", "")).lower() == "put"]
 
-    def _ask_of(r):
-        return _safe_float(r.get("ask") or r.get("ask_price"))
+    def _effective_price(r):
+        # Ask is the right straddle cost when the market is open; after hours
+        # ask is 0, so fall back to last_price then bid for ATM selection.
+        for k in ("ask", "ask_price", "last_price", "bid"):
+            v = _safe_float(r.get(k))
+            if v > 0:
+                return v
+        return 0.0
 
     def nearest_atm(options):
         if not options:
             return None
-        # Prefer strikes that actually have a positive ask quote; a 0/NaN-ask
-        # ATM strike would yield a garbage straddle.
-        quoted = [o for o in options if _ask_of(o) > 0]
+        # Prefer strikes with a positive price signal; a 0-price ATM strike
+        # would yield a garbage straddle.
+        quoted = [o for o in options if _effective_price(o) > 0]
         pool = quoted or options
         best = min(pool, key=lambda r: abs(_safe_float(r.get("strike")) - spot))
         # Guard: reject if gap is too large (truncated chain)
@@ -1626,8 +1646,9 @@ class AltDataServer:
                                 f"supplied chain lacks ATM coverage)")
                 return _err("get_options_implied_move", msg, ticker)
 
-            call_ask = _safe_float(atm_call.get("ask") or atm_call.get("ask_price"))
-            put_ask  = _safe_float(atm_put.get("ask")  or atm_put.get("ask_price"))
+            call_ask, call_stale = _leg_price(atm_call)
+            put_ask,  put_stale  = _leg_price(atm_put)
+            quotes_stale = call_stale or put_stale
             call_iv  = _safe_float(atm_call.get("implied_volatility") or atm_call.get("impliedVolatility"))
             put_iv   = _safe_float(atm_put.get("implied_volatility")  or atm_put.get("impliedVolatility"))
             strike   = _safe_float(atm_call.get("strike"))
@@ -1654,6 +1675,7 @@ class AltDataServer:
                 "put_call_skew": round(skew_diff, 4),
                 "skew_label": skew_label,
                 "source": source,
+                "quotes_stale": quotes_stale,
                 "risk_flag": (
                     "HIGH VOLATILITY WARNING: implied move >15%"
                     if move["implied_move_pct"] > 0.15 else None

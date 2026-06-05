@@ -281,6 +281,84 @@ def test_compute_implied_move_nan_ask_no_nan_output():
     assert "NaN" not in dumped
 
 
+def test_leg_price_prefers_live_ask():
+    from tools.altdata_server.server import _leg_price
+    price, stale = _leg_price({"ask": 2.5, "last_price": 2.4, "bid": 2.3})
+    assert price == 2.5 and stale is False
+
+
+def test_leg_price_falls_back_to_last_when_ask_zero():
+    from tools.altdata_server.server import _leg_price
+    price, stale = _leg_price({"ask": 0, "last_price": 2.4, "bid": 2.3})
+    assert price == 2.4 and stale is True
+
+
+def test_leg_price_falls_back_to_bid_when_no_last():
+    from tools.altdata_server.server import _leg_price
+    price, stale = _leg_price({"ask": 0, "last_price": 0, "bid": 2.3})
+    assert price == 2.3 and stale is True
+
+
+def test_leg_price_all_zero():
+    from tools.altdata_server.server import _leg_price
+    price, stale = _leg_price({"ask": 0, "last_price": 0, "bid": 0})
+    assert price == 0.0 and stale is True
+
+
+def test_find_atm_uses_last_price_after_hours():
+    """When all asks are 0 (market closed), ATM selection uses last_price."""
+    from tools.altdata_server.server import _find_atm_options
+    rows = [
+        {"expiration": "2099-01-15", "option_type": "call", "strike": 100, "ask": 0, "last_price": 2.4, "bid": 2.3, "implied_volatility": 0.3},
+        {"expiration": "2099-01-15", "option_type": "put",  "strike": 100, "ask": 0, "last_price": 2.1, "bid": 2.0, "implied_volatility": 0.3},
+    ]
+    c, p, _ = _find_atm_options(rows, spot=100.0, target_expiry="2099-01-15")
+    assert c is not None and float(c["strike"]) == 100.0
+    assert p is not None and float(p["strike"]) == 100.0
+
+
+def test_options_handler_after_hours_uses_last_price():
+    """End-to-end (no network): ask=0 supplied rows -> straddle from last_price,
+    quotes_stale flagged, implied move non-zero."""
+    import asyncio
+    from tools.altdata_server.server import AltDataServer
+    srv = AltDataServer()
+    rows = [
+        {"expiration": "2099-01-15", "option_type": "call", "strike": 100, "ask": 0, "last_price": 2.4, "bid": 2.3, "implied_volatility": 0.30},
+        {"expiration": "2099-01-15", "option_type": "put",  "strike": 100, "ask": 0, "last_price": 2.1, "bid": 2.0, "implied_volatility": 0.34},
+    ]
+    res = asyncio.run(srv.options_implied_move({
+        "ticker": "TEST", "spot_price": 100.0,
+        "options_chain_rows": rows, "target_expiry": "2099-01-15",
+    }))
+    env = json.loads(res[0].text)
+    assert env["success"] is True, env.get("metadata")
+    d = env["data"]
+    assert d["quotes_stale"] is True
+    assert d["straddle_cost"] == pytest.approx(4.5)            # 2.4 + 2.1
+    assert d["implied_move_pct"] == pytest.approx(0.045)        # 4.5 / 100
+    assert d["source"] == "supplied"                           # no yfinance call
+    assert "NaN" not in res[0].text
+
+
+def test_options_handler_live_ask_not_stale():
+    """Positive asks -> quotes_stale False, straddle from ask."""
+    import asyncio
+    from tools.altdata_server.server import AltDataServer
+    srv = AltDataServer()
+    rows = [
+        {"expiration": "2099-01-15", "option_type": "call", "strike": 100, "ask": 3.0, "last_price": 2.4, "bid": 2.3, "implied_volatility": 0.30},
+        {"expiration": "2099-01-15", "option_type": "put",  "strike": 100, "ask": 3.2, "last_price": 2.1, "bid": 2.0, "implied_volatility": 0.34},
+    ]
+    res = asyncio.run(srv.options_implied_move({
+        "ticker": "TEST", "spot_price": 100.0,
+        "options_chain_rows": rows, "target_expiry": "2099-01-15",
+    }))
+    d = json.loads(res[0].text)["data"]
+    assert d["quotes_stale"] is False
+    assert d["straddle_cost"] == pytest.approx(6.2)
+
+
 def test_find_atm_prefers_positive_ask():
     """An ATM strike with 0/NaN ask should yield to a positive-ask neighbor."""
     from tools.altdata_server.server import _find_atm_options
