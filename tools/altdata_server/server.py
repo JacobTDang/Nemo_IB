@@ -3,13 +3,17 @@
 5 tools:
   get_google_trends          -- pytrends wrapper; YoY demand signal
   get_finbert_sentiment      -- FinBERT financial sentiment on news headlines
-  get_taiwan_monthly_revenue -- MOPS scraper for TSMC/Foxconn/MediaTek/ASE
+  get_taiwan_monthly_revenue -- FinMind API for TSMC/Foxconn/MediaTek/ASE revenue
   get_job_postings_count     -- Lever / Greenhouse public job listing JSON
   get_options_implied_move   -- ATM straddle implied move + put/call skew
 
 Heavy tools (pytrends, FinBERT) run in isolated subprocesses via the same
 pattern as tools/openbb_server/server.py to avoid asyncio conflicts on Windows.
-Light tools (MOPS, Greenhouse, options math) run directly in async handlers.
+Light tools (FinMind, Greenhouse, options math) run directly in async handlers.
+
+Taiwan revenue uses FinMind (api.finmindtrade.com) — a free JSON API for TWSE
+data, replacing the original MOPS HTML scraper which required JS rendering.
+Set FINMIND_TOKEN env var for higher rate limits (free tier: 600 req/day).
 
 Register:
   claude mcp add -s user nemo_altdata -e PYTHONPATH=<repo> -- \\
@@ -229,8 +233,8 @@ class AltDataServer:
                 Tool(
                     name="get_taiwan_monthly_revenue",
                     description=(
-                        "Fetch monthly revenue for Taiwan-listed companies from MOPS "
-                        "(Market Observation Post System). Published by the 10th of "
+                        "Fetch monthly revenue for Taiwan-listed companies via FinMind "
+                        "(TWSE monthly revenue feed). Published by the 10th of "
                         "the following month — typically 3-4 weeks before downstream "
                         "US companies report. Key company codes: TSMC=2330, "
                         "Foxconn=2317, MediaTek=2454, ASE Group=3711. "
@@ -388,11 +392,11 @@ class AltDataServer:
         months = int(args.get("months", 6))
         try:
             result = await asyncio.wait_for(
-                asyncio.to_thread(_fetch_mops_revenue, codes[:5], months),
+                asyncio.to_thread(_fetch_taiwan_revenue_finmind, codes[:5], months),
                 timeout=30.0,
             )
         except asyncio.TimeoutError:
-            return _err("get_taiwan_monthly_revenue", "MOPS request timed out after 30s")
+            return _err("get_taiwan_monthly_revenue", "FinMind request timed out after 30s")
         except Exception as exc:
             return _err("get_taiwan_monthly_revenue",
                         f"{type(exc).__name__}: {str(exc)[:200]}")
@@ -476,88 +480,93 @@ class AltDataServer:
 
 
 # ---------------------------------------------------------------------------
-# Taiwan MOPS scraper (sync, runs in thread)
+# Taiwan monthly revenue via FinMind (sync, runs in thread)
 # ---------------------------------------------------------------------------
 
-def _fetch_mops_revenue(company_codes: List[str], months: int) -> Dict[str, Any]:
-    """Scrape MOPS monthly revenue for a list of Taiwan stock codes.
+def _fetch_taiwan_revenue_finmind(company_codes: List[str], months: int) -> Dict[str, Any]:
+    """Fetch TWSE monthly revenue for Taiwan stock codes via FinMind JSON API.
 
-    MOPS endpoint: POST https://mops.twse.com.tw/mops/web/ajax_t05st10_ifrs
-    Returns HTML table; parse with BeautifulSoup.
+    FinMind endpoint: GET https://api.finmindtrade.com/api/v4/data
+    Dataset: TaiwanStockMonthRevenue
+    Revenue field is in NTD thousands (千元); we convert to NTD millions.
+    Free tier: 600 req/day — set FINMIND_TOKEN env var for higher limits.
     """
     import requests
-    from bs4 import BeautifulSoup
-    from datetime import datetime
+    from datetime import datetime, timedelta
 
-    now = datetime.now()
+    # Fetch enough history for YoY: requested months + 14 months prior-year context
+    lookback_days = (months + 14) * 31
+    start_date = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    token = os.environ.get("FINMIND_TOKEN", "")
     results = {}
 
     for code in company_codes:
+        params: Dict[str, Any] = {
+            "dataset": "TaiwanStockMonthRevenue",
+            "data_id": code,
+            "start_date": start_date,
+        }
+        if token:
+            params["token"] = token
+
         try:
-            resp = requests.post(
-                "https://mops.twse.com.tw/mops/web/ajax_t05st10_ifrs",
-                data={
-                    "encodeURIComponent": "1",
-                    "step": "1",
-                    "firstin": "1",
-                    "off": "1",
-                    "keyword4": "",
-                    "code1": "",
-                    "TYPEK2": "",
-                    "checkbtn": "",
-                    "queryName": "co_id",
-                    "inpuType": "co_id",
-                    "TYPEK": "all",
-                    "isnew": "false",
-                    "co_id": code,
-                    "year": str(now.year - 1911),  # ROC year
-                },
-                timeout=15,
-                headers={
-                    "User-Agent": "Mozilla/5.0",
-                    "Referer": "https://mops.twse.com.tw/mops/web/t05st10_ifrs",
-                },
+            resp = requests.get(
+                "https://api.finmindtrade.com/api/v4/data",
+                params=params,
+                timeout=20,
+                headers={"User-Agent": "Mozilla/5.0"},
             )
             resp.raise_for_status()
+            payload = resp.json()
         except Exception as exc:
             results[code] = {"error": f"{type(exc).__name__}: {str(exc)[:150]}"}
             continue
 
-        soup = BeautifulSoup(resp.text, "html.parser")
-        tables = soup.find_all("table")
-        if not tables:
-            results[code] = {"error": "no table found in MOPS response"}
+        if payload.get("status") != 200 or not payload.get("data"):
+            results[code] = {
+                "error": (
+                    f"FinMind status {payload.get('status')}: "
+                    f"{payload.get('msg', 'no data returned')}"
+                )
+            }
             continue
 
-        rows_data = []
-        for table in tables:
-            trs = table.find_all("tr")
-            for tr in trs[1:]:  # skip header
-                tds = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
-                if len(tds) >= 4:
-                    rows_data.append(tds)
+        raw = payload["data"]  # list of {date, stock_id, revenue, revenue_month, revenue_year}
+        raw.sort(key=lambda r: r["date"])  # ensure chronological order
 
-        if not rows_data:
-            results[code] = {"error": "table parsed but no data rows found"}
-            continue
+        # Build YoY lookup: (year, month) -> revenue
+        rev_lookup: Dict[tuple, float] = {
+            (r["revenue_year"], r["revenue_month"]): r["revenue"]
+            for r in raw
+        }
 
-        # Parse month rows: typically [year_month, revenue, MoM%, YoY%]
+        # Take the most recent `months` entries
+        recent = raw[-months:]
+
         parsed = []
-        for row in rows_data[-months:]:
-            try:
-                parsed.append({
-                    "period": row[0],
-                    "revenue_ntd_m": float(row[1].replace(",", "")) if row[1] else None,
-                    "mom_pct": row[2] if len(row) > 2 else None,
-                    "yoy_pct": row[3] if len(row) > 3 else None,
-                })
-            except (ValueError, IndexError):
-                continue
+        for r in recent:
+            yr = r["revenue_year"]
+            mo = r["revenue_month"]
+            rev_raw = r.get("revenue") or 0
+            # FinMind revenue is in plain NTD (元); convert to NTD millions
+            rev_ntd_m = round(rev_raw / 1_000_000, 1) if rev_raw else None
+            prior_rev = rev_lookup.get((yr - 1, mo))
+            yoy_pct = None
+            if prior_rev and prior_rev != 0:
+                yoy_pct = round((rev_raw - prior_rev) / abs(prior_rev) * 100, 2)
+            parsed.append({
+                "year": yr,
+                "month": mo,
+                "date": r["date"],
+                "revenue_ntd_m": rev_ntd_m,
+                "yoy_pct": yoy_pct,
+            })
 
         results[code] = {
             "company_code": code,
             "months_returned": len(parsed),
             "months": parsed,
+            "source": "finmind",
         }
 
     return {"companies": results, "codes_requested": company_codes}

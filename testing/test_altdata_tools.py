@@ -227,17 +227,24 @@ def test_job_postings_unknown_slug_returns_error():
 # ---------------------------------------------------------------------------
 
 @network
-def test_taiwan_mops_tsmc():
-    from tools.altdata_server.server import _fetch_mops_revenue
-    result = _fetch_mops_revenue(["2330"], months=3)
+def test_taiwan_revenue_finmind_tsmc():
+    from tools.altdata_server.server import _fetch_taiwan_revenue_finmind
+    result = _fetch_taiwan_revenue_finmind(["2330"], months=3)
     tsmc = result["companies"].get("2330", {})
-    # MOPS may be unreachable from some networks (Taiwanese gov server).
-    # Accept either a valid result OR a connection error (not a code bug).
-    if "error" in tsmc:
-        # MOPS may return JS-rendered pages or be blocked by network.
-        # The tool correctly returns an error envelope — skip the assertion.
-        pytest.skip(f"MOPS not parseable from this environment: {tsmc['error']}")
+    assert "error" not in tsmc, f"FinMind returned error: {tsmc.get('error')}"
     assert tsmc["months_returned"] > 0
+    assert tsmc["source"] == "finmind"
     last = tsmc["months"][-1]
     assert last["revenue_ntd_m"] is not None
     assert last["revenue_ntd_m"] > 0
+    assert last["yoy_pct"] is not None  # FinMind returns enough history for YoY
+
+
+@network
+def test_taiwan_revenue_finmind_yoy_computed():
+    from tools.altdata_server.server import _fetch_taiwan_revenue_finmind
+    result = _fetch_taiwan_revenue_finmind(["2330"], months=6)
+    tsmc = result["companies"].get("2330", {})
+    assert "error" not in tsmc, tsmc.get("error")
+    months_with_yoy = [m for m in tsmc["months"] if m["yoy_pct"] is not None]
+    assert len(months_with_yoy) > 0, "expected at least one month with YoY computed"
