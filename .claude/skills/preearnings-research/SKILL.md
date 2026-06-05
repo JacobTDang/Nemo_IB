@@ -149,6 +149,9 @@ Interpret:
   - `balanced` → neutral
 - `source`: `yfinance` means the chain was auto-fetched (normal);
   `supplied` means the caller passed rows.
+- `quotes_stale`: `true` when the market was closed and the straddle was
+  derived from last_price/bid (ask was 0). Treat the implied move as an
+  after-hours estimate; re-run during market hours before sizing a trade on it.
 
 Record signal: `signal_category=options`, `signal_name=options_implied_move`.
 
@@ -186,7 +189,7 @@ Record signal: `signal_category=sentiment`, `signal_name=finbert_news_sentiment`
 
 ### Step 11 — Policy / legislative signals
 
-Call `get_policy_signals(ticker=ticker, months=6)`.
+Call `get_policy_signals(ticker=ticker, lookback_days=180)`.
 
 The tool queries GovTrack (and Congress.gov if CONGRESS_API_KEY is set) for
 bills relevant to the company's sector. Each bill is scored for bullish/bearish
