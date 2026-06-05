@@ -132,12 +132,57 @@ def _parse_d(value: Any):
         return None
 
 
+def filter_earnings_cadence(
+    event_dates: List[Any],
+    anchor_date: Any,
+    period_days: int = 91,
+    tol_days: int = 21,
+    max_quarters: int = 8,
+) -> List[str]:
+    """Keep only 8-K dates consistent with a quarterly earnings cadence, walking
+    back from a verified anchor (the most recent known print).
+
+    Cheap alternative to full Item-2.02 text parsing: corporate non-earnings
+    8-Ks land at arbitrary offsets, but earnings 8-Ks recur every ~91 days.
+    Live cases this filter resolves: CHWY's 2026-01-20 corporate 8-K (64d from
+    the prior print — outside the cadence window; the real 2025-12-10 at 105d
+    chains) and RH's 2025-07-02 (enters the window at 71d but LOSES the
+    nearest-to-cadence selection to the real 2025-06-12 at exactly 91d).
+    tol_days=21 because fiscal year-end quarters report late (RH Q3->Q4 gap
+    is 110 days).
+    The anchor itself must be verified by the caller (news / nearest-to-label
+    for the most recent quarter, which is usually well known)."""
+    anchor = _parse_d(anchor_date)
+    if anchor is None:
+        return []
+    events = sorted({d for e in event_dates if (d := _parse_d(e)) is not None})
+    keep = [anchor]
+    cur = anchor
+    from datetime import timedelta
+    while len(keep) < max_quarters:
+        lo = cur - timedelta(days=period_days + tol_days)
+        hi = cur - timedelta(days=period_days - tol_days)
+        # allow a skipped quarter (gap of ~2 periods) when nothing chains
+        cands = [e for e in events if lo <= e <= hi]
+        if not cands:
+            lo2 = cur - timedelta(days=2 * period_days + tol_days)
+            hi2 = cur - timedelta(days=2 * period_days - tol_days)
+            cands = [e for e in events if lo2 <= e <= hi2]
+            if not cands:
+                break
+        cur = min(cands, key=lambda e: min(abs((keep[-1] - e).days - period_days),
+                                           abs((keep[-1] - e).days - 2 * period_days)))
+        keep.append(cur)
+    return [d.isoformat() for d in sorted(keep)]
+
+
 def pair_surprises_with_reactions(
     surprises: List[Dict[str, Any]],
     event_dates: List[Any],
     bars: List[Dict[str, Any]],
     max_gap_days: int = 75,
     max_back_days: int = 45,
+    bmo: bool = False,
 ) -> List[Dict[str, Any]]:
     """Build the (surprise, next-day reaction) pairs that reaction_profile needs.
 
@@ -230,9 +275,16 @@ def pair_surprises_with_reactions(
     for period_end, ev, s in sorted(assigned, key=lambda x: x[0]):
         # bar at the report date, or nearest prior trading day
         idx = bisect.bisect_right(bar_dates, ev) - 1
-        if idx < 0 or idx + 1 >= len(parsed_bars):
-            continue
-        c0, c1 = parsed_bars[idx][1], parsed_bars[idx + 1][1]
+        if bmo:
+            # before-market-open reporters: the reaction IS the report-day bar
+            # (close[t] vs close[t-1]), not the next session.
+            if idx < 1:
+                continue
+            c0, c1 = parsed_bars[idx - 1][1], parsed_bars[idx][1]
+        else:
+            if idx < 0 or idx + 1 >= len(parsed_bars):
+                continue
+            c0, c1 = parsed_bars[idx][1], parsed_bars[idx + 1][1]
         out.append({
             "surprise_pct": float(s["surprise_pct"]),
             "next_day_return": round((c1 - c0) / c0 * 100, 2),
@@ -305,6 +357,32 @@ def score_reaction(
         "price_direction_match": price_direction_match,
         "basis": basis,
     }
+
+
+def event_implied_move(
+    front_iv: Optional[float],
+    back_iv: Optional[float],
+    days_to_front: Optional[float],
+    basis_days: float = 365.0,
+) -> Optional[float]:
+    """Extract the PURE event move from the IV term structure (as a fraction).
+
+    The raw front straddle prices the event PLUS days of ordinary diffusion, so
+    comparing it to 1-day realized moves is biased rich. Standard extraction:
+    front total variance = diffusive variance (back IV proxy) + event variance,
+    so event_move = sqrt(max(T_f * (IV_f^2 - IV_b^2), 0)) with T_f in years.
+    Returns None when inputs are missing; 0.0 when the front carries no event
+    premium (front <= back).
+    """
+    if front_iv is None or back_iv is None or days_to_front is None:
+        return None
+    f, b, d = float(front_iv), float(back_iv), float(days_to_front)
+    if d <= 0 or f != f or b != b or f <= 0:
+        return None
+    ev_var = (f * f - b * b) * (d / basis_days)
+    if ev_var <= 0:
+        return 0.0
+    return round(math.sqrt(ev_var), 4)
 
 
 def implied_vs_realized(

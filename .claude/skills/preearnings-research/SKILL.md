@@ -9,6 +9,35 @@ Deterministic math lives in `tools/preearnings/` (unit-tested); this skill is th
 orchestration. **Nothing is hardcoded** — peers, KPIs, guidance style, and the
 quarter window are all derived at runtime.
 
+## Working memory — the environment (context-decay discipline)
+
+Conversation context decays; the DB does not. Three hard habits:
+
+1. **Persist as you go.** Every step's DISTILLED result (direction, magnitude,
+   the 3-5 decisive numbers, citations) is `record_layer`-ed IMMEDIATELY when
+   produced — never held in conversation memory until the end. Raw tool dumps
+   are never persisted; assessments are.
+2. **Synthesize from the DB, not from memory.** Layer 3 loads `get_layers(...)`
+   and builds the verdict from the persisted components. A resumed or fresh
+   context calls `run_manifest(get_layers(...))` first — it returns
+   present/missing/stale and the run continues from exactly there.
+3. **Bulk reading never enters the main context.** Anything over ~10 documents
+   (news batches, multi-quarter transcripts, shareholder letters) goes to a
+   DIGEST sub-agent that reads everything and returns only the assessment.
+   News-digest template:
+   ```
+   News digest for {TICKER} ahead of {EARNINGS_DATE}.
+   Read mcp__nemo_finnhub__get_company_news({TICKER}, last 30d) IN FULL, then
+   run mcp__nemo_altdata__get_finbert_sentiment on the headline+summary texts.
+   Return STRICT JSON only — no article text: {"component":"news_digest",
+   "finbert_net_score":X,"direction":"...","overhangs":["<one line each>"],
+   "catalysts":["..."],"calendar_conflicts":"<any date contradicting the
+   earnings calendar, quoted>","key_finding":"<one sentence>",
+   "sources":[{claim,tool}]}
+   ```
+   Persist as component `news_digest`. (The calendar_conflicts field exists
+   because news has now caught two stale vendor dates — GME, RH.)
+
 ## Inputs
 
 - `ticker` (required)
@@ -24,17 +53,26 @@ quarter window are all derived at runtime.
    `WARNING: < 48h — IV crush risk`. Never fabricate a date.
    **Bar policy:** the calendar `eps_estimate` (Finnhub) is the SCORING bar —
    `/earnings-eval` grades surprise_pct against Finnhub estimates, so the
-   prediction is a call on THAT number. Treat the yfinance 0q consensus
-   (get_forward_estimates) as secondary color; when they diverge >1%, state
-   both bars and which one the prediction is scored against.
+   prediction is a call on THAT number. Validate the bar with
+   `select_scoring_bar(finnhub_est, yfinance_est, same_quarter_last_year_actual)`
+   (`tools/preearnings/expectations_logic.py` — the year-ago actual is the
+   4-quarters-back entry from get_earnings_surprises, basis-consistent by
+   construction). Vendors mix GAAP and adjusted EPS (live CHWY: 67% apart);
+   the returned `basis_flag` must be stated in the output, and
+   `divergent_scoring_basis_suspect` means prediction quality is at risk.
 2. **Revision velocity.** `get_analyst_revisions_history` + `get_forward_estimates`
    -> rising/flat/falling -> signal `revision_velocity`.
 3. **Supplier / MOPS (if applicable).** `get_supply_chain`; if it contains TSMC
    (2330) / Foxconn (2317) / MediaTek (2454) / ASE (3711) call
    `get_taiwan_monthly_revenue`. Else mark signal `supplier_mops = na`.
-4. **Thin alt-data (confirmation only).** `get_google_trends`, `get_capex_announcements`,
-   `get_government_contracts`, `get_policy_signals`, `get_finbert_sentiment` (on
-   `get_company_news`). Combine into one `thin_altdata` signal (majority lean).
+4. **Thin alt-data (confirmation only).** `get_google_trends`,
+   `get_capex_announcements`, `get_government_contracts`, `get_policy_signals`,
+   the **news-digest agent** (replaces in-context news reading; carries the
+   FinBERT score), and `get_insider_transactions` (net open-market insider
+   buying in the last 90d = bullish lean; clustered selling = bearish; option
+   exercises ignored). Combine into one `thin_altdata` signal (majority lean).
+   Also pull one `get_macro_snapshot` line: note if the print lands on/adjacent
+   to a CPI/FOMC date — reaction is conditioned on the tape that day.
 5. **Asymmetry inputs.**
    - `get_short_interest` (SI % float, days-to-cover), `get_options_metrics`
      (IV skew AND put/call volume ratio), `get_options_implied_move(ticker,
@@ -44,16 +82,29 @@ quarter window are all derived at runtime.
      `data_quality.iv_status` as suspect (yfinance sentinel IVs), pass
      `put_call_iv_skew=None` to `classify_positioning` — the volume ratio
      stays usable; sentinel IVs do not.
-   - **Reaction history:** get earnings report dates by filtering 8-Ks to
-     **Item 2.02** via `extract_8k_events` (`events_by_date[date].sec_items`)
-     — never raw filing dates. Non-earnings 8-Ks routinely land CLOSER to the
-     vendor's period label than the real print (live ORCL: corporate 8-Ks at
-     -4d/-8d vs the earnings 8-K at -21d), and distance matching alone will
-     mispair them. Then `get_earnings_surprises` -> pairs via
+     **Event-move extraction:** the raw front straddle prices the event PLUS
+     days of ordinary diffusion. Compute the pure event move with
+     `event_implied_move(front_iv_7d, back_iv_30d, dte_front)` from the
+     options-metrics term structure (skip when IVs are sentinel-suspect).
+     Use the EVENT move for `implied_vs_realized` (1-day realized moves are
+     the apples-to-apples comparator); the RAW straddle keeps governing the
+     >20% binary-event hard rule (conservative).
+   - **Reaction history:** never pair against raw 8-K dates — non-earnings
+     8-Ks routinely land CLOSER to the vendor's period label than the real
+     print (live: ORCL -4d/-8d impostors, CHWY 2026-01-20 by ONE day, RH
+     2025-07-02 at 2d). Two filters, fast one first:
+     (a) DEFAULT: `get_company_filings_history(ticker, form_type="8-K", n=8)`
+     (instant metadata) -> `filter_earnings_cadence(dates, anchor)` where the
+     anchor is the verified most-recent print (news/nearest-to-label) —
+     earnings 8-Ks recur on a ~91d cadence, impostors don't chain.
+     (b) THOROUGH (slow, ~minutes — run SOLO, never parallel): Item 2.02
+     verification via `extract_8k_events` when the cadence chain is ambiguous
+     or the anchor is uncertain.
+     Then `get_earnings_surprises` -> pairs via
      `pair_surprises_with_reactions(surprises, earnings_dates, bars)` -> feed
-     `reaction_profile`. For `implied_vs_realized`, divide the pairs'
-     `next_day_return` (a percent) by 100 first — both inputs must be FRACTIONS
-     to match the implied move (mixed units return verdict "unknown").
+     `reaction_profile`. For `implied_vs_realized`, use the EVENT move (above)
+     vs the pairs' `next_day_return` / 100 — both FRACTIONS (mixed units
+     return verdict "unknown").
    - **Persist every asymmetry component as a layer** (`implied_move` with the
      full options result incl. quotes_stale, `positioning`, `reaction`) — flags
      buried in unpersisted tool results are invisible to /preearnings-review.
@@ -76,7 +127,12 @@ max_age_hours=24)` skip recompute and load via `latest_component`.
 7. **Guidance archaeology.** Spawn a sub-agent: read `get_earnings_transcripts`
    (last 4Q) + `extract_forward_signals`, extract `{guided_low, guided_high,
    actual}` per quarter, then apply `classify_guide_style` + `bar_position` +
-   `guidance_direction` (vs current `get_forward_estimates`). -> signal `guidance`.
+   `guidance_direction` (vs current `get_forward_estimates`). The agent also
+   calls `extract_call_sentiment(ticker, quarters=4)` — a deteriorating CFO
+   tonal trajectory caps guidance_direction at neutral even for a sandbagger
+   (tone leads the guide). Additionally DELEGATE `/expectations-hurdle-check`:
+   its easy/balanced/difficult setup feeds bar_position (a "difficult" whisper
+   setup overrides a "normal" consensus bar to "hard"). -> signal `guidance`.
 8. **KPI drill-down.** Build candidates from `get_segment_financials` (materiality)
    + transcript Q&A mention counts; `rank_kpis` -> top 3. Spawn one sub-agent per
    KPI to get its trajectory vs consensus (`kpi_vs_consensus`). Aggregate the KPI

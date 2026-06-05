@@ -12,6 +12,7 @@ from tools.preearnings.expectations_logic import (
     guidance_direction,
     rank_kpis,
     kpi_vs_consensus,
+    select_scoring_bar,
 )
 
 
@@ -144,6 +145,52 @@ def test_guide_style_tie_above_below_is_inline():
         {"guided_low": 1.2, "guided_high": 1.3, "actual": 1.0},   # below
     ]
     assert classify_guide_style(pairs) == "inline"
+
+
+# ---------------------------------------------------------------------------
+# select_scoring_bar — the GAAP/adjusted basis trap (live CHWY red-green)
+# ---------------------------------------------------------------------------
+
+def test_scoring_bar_chwy_live_case_flags_alt_basis():
+    """The live trap: Finnhub 0.2548 vs yfinance 0.42617 (67% apart). The
+    year-ago actual from the scoring source's own history (0.16) shows the
+    scoring bar implies sane 1.6x growth while the alt implies 2.7x — the alt
+    is on a different (adjusted) basis. Bar stays the scoring source."""
+    out = select_scoring_bar(0.2548, 0.42617, 0.16)
+    assert out["bar"] == 0.2548
+    assert out["basis_flag"] == "divergent_alt_basis_suspect"
+    assert out["divergence_pct"] > 60
+
+
+def test_scoring_bar_agreeing_sources_ok():
+    """RH live case: -2.1829 vs -2.04601 (6.7% apart) -> ok, no basis check."""
+    out = select_scoring_bar(-2.1829, -2.04601, 0.13)
+    assert out["basis_flag"] == "ok"
+    assert out["bar"] == -2.1829
+
+
+def test_scoring_bar_scoring_source_suspect():
+    """When the SCORING series itself looks basis-shifted vs its own year-ago
+    actual, the bar stays (eval grades against it) but the risk is flagged."""
+    out = select_scoring_bar(0.42617, 0.2548, 0.16)
+    assert out["bar"] == 0.42617              # policy: always the scoring source
+    assert out["basis_flag"] == "divergent_scoring_basis_suspect"
+
+
+def test_scoring_bar_sign_flip_unverifiable():
+    out = select_scoring_bar(-2.18, 1.5, 0.13)
+    assert out["basis_flag"] == "divergent_unverifiable"
+
+
+def test_scoring_bar_single_and_missing_sources():
+    assert select_scoring_bar(None, 1.5, 1.0)["basis_flag"] == "single_source"
+    assert select_scoring_bar(None, 1.5, 1.0)["bar"] == 1.5
+    assert select_scoring_bar(None, None, 1.0)["basis_flag"] == "no_consensus"
+
+
+def test_scoring_bar_both_implausible():
+    out = select_scoring_bar(1.0, 2.0, 0.1)   # 10x and 20x year-ago
+    assert out["basis_flag"] == "divergent_both_implausible"
 
 
 # ---------------------------------------------------------------------------

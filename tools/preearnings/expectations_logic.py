@@ -145,6 +145,72 @@ def rank_kpis(
     return scored[:top_n]
 
 
+def select_scoring_bar(
+    scoring_est: Optional[float],
+    alt_est: Optional[float],
+    yoy_anchor_actual: Optional[float],
+    divergence_gate: float = 0.15,
+    growth_bounds: tuple = (0.3, 2.5),
+) -> Dict[str, Any]:
+    """Validate which consensus number the prediction is a call on.
+
+    The SCORING source (Finnhub — what /earnings-eval grades surprise_pct
+    against) is always the bar. This check protects against the basis trap
+    found live: vendors mix GAAP and adjusted EPS (CHWY: 0.2548 vs 0.426, 67%
+    apart). When sources diverge past the gate, each estimate is sanity-checked
+    as a growth ratio vs the SAME fiscal quarter's year-ago ACTUAL from the
+    scoring source's own surprise history (basis-consistent by construction).
+
+    basis_flag values:
+      ok | single_source | no_consensus | divergent_alt_basis_suspect (alt is
+      off-basis; bar is safe) | divergent_scoring_basis_suspect (the scoring
+      series itself looks basis-shifted — prediction quality at risk) |
+      divergent_both_plausible | divergent_both_implausible |
+      divergent_unverifiable (sign flip / no anchor).
+    """
+    if scoring_est is None and alt_est is None:
+        return {"bar": None, "source": None, "divergence_pct": None,
+                "basis_flag": "no_consensus"}
+    if scoring_est is None or alt_est is None:
+        present = scoring_est if scoring_est is not None else alt_est
+        return {"bar": present,
+                "source": "scoring" if scoring_est is not None else "alt",
+                "divergence_pct": None, "basis_flag": "single_source"}
+
+    base = min(abs(scoring_est), abs(alt_est))
+    div = abs(scoring_est - alt_est) / base if base > 0 else float("inf")
+    out = {"bar": scoring_est, "source": "scoring",
+           "divergence_pct": round(div * 100, 1)}
+
+    if div <= divergence_gate:
+        out["basis_flag"] = "ok"
+        return out
+
+    anchor = yoy_anchor_actual
+    if (anchor is None or anchor == 0
+            or (anchor > 0) != (scoring_est > 0)
+            or (anchor > 0) != (alt_est > 0)):
+        out["basis_flag"] = "divergent_unverifiable"
+        return out
+
+    lo, hi = growth_bounds
+    r_scoring = scoring_est / anchor
+    r_alt = alt_est / anchor
+    in_s = lo <= r_scoring <= hi
+    in_a = lo <= r_alt <= hi
+    if in_s and not in_a:
+        out["basis_flag"] = "divergent_alt_basis_suspect"
+    elif in_a and not in_s:
+        out["basis_flag"] = "divergent_scoring_basis_suspect"
+    elif in_s and in_a:
+        out["basis_flag"] = "divergent_both_plausible"
+    else:
+        out["basis_flag"] = "divergent_both_implausible"
+    out["yoy_ratio_scoring"] = round(r_scoring, 2)
+    out["yoy_ratio_alt"] = round(r_alt, 2)
+    return out
+
+
 def kpi_vs_consensus(actual_or_trend: float, consensus: float,
                      tolerance: float = 0.02) -> str:
     """Direction of a single KPI vs its consensus.

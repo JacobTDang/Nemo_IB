@@ -22,6 +22,7 @@ from tools.preearnings.review_logic import (
     check_db_consistency,
     check_estimate_dispersion,
     run_review,
+    run_manifest,
 )
 from tools.preearnings.asymmetry_logic import score_reaction
 
@@ -316,6 +317,44 @@ def test_run_review_uses_eval_implied_when_synthesis_has_none():
     out = run_review(layers, row, now=_NOW)
     assert out["verdict"] == "not_actionable"
     assert any("implied" in f["detail"] for f in out["fails"])
+
+
+# ---------------------------------------------------------------------------
+# run_manifest — context-decay-proof resume state
+# ---------------------------------------------------------------------------
+
+def test_manifest_complete_run():
+    layers = _full_layers() + [_layer("implied_move")]
+    m = run_manifest(layers, now=_NOW)
+    assert m["complete"] is True
+    assert m["missing"] == []
+    assert m["resumable"] is True
+
+
+def test_manifest_partial_run_lists_missing():
+    layers = [_layer("guidance"), _layer("positioning")]
+    m = run_manifest(layers, now=_NOW)
+    assert m["resumable"] is True and m["complete"] is False
+    assert "peer_readthrough" in m["missing"]
+    assert "kpi" in m["missing"]
+    assert "synthesis" in m["missing"]
+
+
+def test_manifest_kpi_wildcard_matches():
+    layers = _full_layers() + [_layer("implied_move")]
+    m = run_manifest(layers, now=_NOW)        # _full_layers has kpi:growth
+    assert "kpi" not in m["missing"]
+
+
+def test_manifest_flags_stale_components():
+    layers = [_layer("positioning", age_hours=30)]
+    m = run_manifest(layers, now=_NOW)
+    assert "positioning" in m["stale"]
+
+
+def test_manifest_empty_not_resumable():
+    m = run_manifest([], now=_NOW)
+    assert m["resumable"] is False and m["complete"] is False
 
 
 # ---------------------------------------------------------------------------

@@ -12,6 +12,7 @@ from tools.preearnings.asymmetry_logic import (
     implied_vs_realized,
     pair_surprises_with_reactions,
     score_reaction,
+    event_implied_move,
 )
 
 
@@ -318,6 +319,89 @@ def test_positioning_si_unknown_never_crowded_long():
     out = classify_positioning(short_interest_pct_float=None,
                                put_call_volume_ratio=0.3, momentum_3m_pct=50)
     assert out["positioning"] == "neutral"
+
+
+def test_pairing_bmo_uses_report_day_bar():
+    """BMO reporters (live CHWY): the print reaction is close[t] vs close[t-1]
+    — the report-day bar itself. The AMC convention (t -> t+1) would miss the
+    move entirely (CHWY 03-25: +13.3% on the day, +1.7% the day after)."""
+    surprises = [{"period": "2026-03-31", "surprise_pct": -1.21}]
+    events = ["2026-03-25"]
+    bars = _bars([("2026-03-24", 23.45), ("2026-03-25", 26.57), ("2026-03-26", 27.01)])
+    amc = pair_surprises_with_reactions(surprises, events, bars)
+    bmo = pair_surprises_with_reactions(surprises, events, bars, bmo=True)
+    assert amc[0]["next_day_return"] == 1.66      # wrong convention for CHWY
+    assert bmo[0]["next_day_return"] == 13.3      # the real print reaction
+
+
+# ---------------------------------------------------------------------------
+# filter_earnings_cadence — quarterly-cadence 8-K filter (live red-greens)
+# ---------------------------------------------------------------------------
+
+def test_cadence_chwy_live_case_excludes_jan_corporate_8k():
+    """CHWY: the 2026-01-20 corporate 8-K beats the real 2025-12-10 print by
+    ONE day of label distance — the cadence chain from the verified 2026-03-25
+    anchor excludes it (64d gap vs the real 105d/91d chain)."""
+    from tools.preearnings.asymmetry_logic import filter_earnings_cadence
+    events = ["2026-04-28", "2026-04-08", "2026-03-25", "2026-02-24",
+              "2026-01-20", "2025-12-10", "2025-09-10", "2025-07-15"]
+    out = filter_earnings_cadence(events, "2026-03-25")
+    assert "2026-01-20" not in out
+    assert "2025-12-10" in out and "2025-09-10" in out
+
+
+def test_cadence_rh_live_case_excludes_july_corporate_8k():
+    """RH: the 2025-07-02 8-K sits 2d from the Q1 label vs the real 2025-06-12
+    at 18d — the cadence chain from 2026-03-31 keeps the real prints."""
+    from tools.preearnings.asymmetry_logic import filter_earnings_cadence
+    events = ["2026-03-31", "2026-01-26", "2025-12-11", "2025-09-11",
+              "2025-08-06", "2025-07-02", "2025-06-12", "2025-05-27"]
+    out = filter_earnings_cadence(events, "2026-03-31")
+    assert out == ["2025-06-12", "2025-09-11", "2025-12-11", "2026-03-31"]
+
+
+def test_cadence_bad_anchor_empty():
+    from tools.preearnings.asymmetry_logic import filter_earnings_cadence
+    assert filter_earnings_cadence(["2026-01-01"], None) == []
+
+
+def test_cadence_allows_one_skipped_quarter():
+    from tools.preearnings.asymmetry_logic import filter_earnings_cadence
+    # missing the ~91d event entirely; the ~182d one chains via the gap rule
+    events = ["2026-03-25", "2025-09-24"]
+    out = filter_earnings_cadence(events, "2026-03-25")
+    assert "2025-09-24" in out
+
+
+# ---------------------------------------------------------------------------
+# event_implied_move — pure event move from the IV term structure
+# ---------------------------------------------------------------------------
+
+def test_event_move_rh_live_case():
+    """RH live term structure: 7d IV 1.2819 vs 30d 0.949 -> the pure event move
+    is ~11.9%, vs the raw 17.9% straddle that includes a week of diffusion."""
+    import pytest
+    m = event_implied_move(1.2819, 0.949, 7)
+    assert m == pytest.approx(0.1193, abs=0.001)
+    assert m < 0.1787                          # strictly below the raw straddle
+
+
+def test_event_move_no_premium_is_zero():
+    assert event_implied_move(0.5, 0.6, 7) == 0.0   # back above front
+    assert event_implied_move(0.5, 0.5, 7) == 0.0
+
+
+def test_event_move_missing_inputs_none():
+    assert event_implied_move(None, 0.5, 7) is None
+    assert event_implied_move(0.5, None, 7) is None
+    assert event_implied_move(0.5, 0.4, None) is None
+    assert event_implied_move(0.5, 0.4, 0) is None
+
+
+def test_event_move_scales_with_gap():
+    small = event_implied_move(0.7, 0.65, 7)
+    big = event_implied_move(1.2, 0.65, 7)
+    assert big > small > 0
 
 
 # ---------------------------------------------------------------------------

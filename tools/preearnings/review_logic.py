@@ -267,6 +267,40 @@ def check_estimate_dispersion(eps_a: Optional[float], eps_b: Optional[float],
                f"{label_a}={eps_a} vs {label_b}={eps_b} within {tol * 100:.0f}%")]
 
 
+# Components a complete deep run is expected to carry ("kpi" matches any
+# kpi:<name> component). Used by run_manifest for context-decay-proof resumes.
+_EXPECTED_COMPONENTS = ("guidance", "peer_readthrough", "kpi", "positioning",
+                        "reaction", "implied_move", "synthesis")
+
+
+def run_manifest(layers: List[Dict[str, Any]],
+                 now: Optional[datetime] = None,
+                 max_age_hours: float = 24.0) -> Dict[str, Any]:
+    """Resume-state for a run: which components exist, which are missing, which
+    are stale. Lets a FRESH context pick up a half-finished run from the DB
+    instead of conversation memory (the persist-as-you-go environment)."""
+    comps = {l.get("component", "") for l in layers if l.get("component")}
+
+    def _has(expected: str) -> bool:
+        if expected == "kpi":
+            return any(c.startswith("kpi") for c in comps)
+        return expected in comps
+
+    missing = [e for e in _EXPECTED_COMPONENTS if not _has(e)]
+    stale = sorted({
+        c["detail"].split(":")[0]
+        for c in check_freshness(layers, now=now, max_age_hours=max_age_hours)
+        if c["status"] in ("warn", "fail")
+    })
+    return {
+        "present": sorted(c for c in comps if c != "review"),
+        "missing": missing,
+        "stale": stale,
+        "resumable": bool(comps),
+        "complete": not missing,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Aggregator
 # ---------------------------------------------------------------------------
