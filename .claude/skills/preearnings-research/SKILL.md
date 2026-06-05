@@ -1,0 +1,274 @@
+# /preearnings-research
+
+Run 2-10 days before earnings. An **expectations-centric, layered** research pass:
+it scores DIRECTION (will they clear the bar?) and ASYMMETRY (how the stock
+reacts given a result) separately, going deep via parallel sub-agents, and
+synthesizes a verdict. Optionally places a gated paper bid.
+
+Deterministic math lives in `tools/preearnings/` (unit-tested); this skill is the
+orchestration. **Nothing is hardcoded** — peers, KPIs, guidance style, and the
+quarter window are all derived at runtime.
+
+## Working memory — the environment (context-decay discipline)
+
+Conversation context decays; the DB does not. Three hard habits:
+
+1. **Persist as you go.** Every step's DISTILLED result (direction, magnitude,
+   the 3-5 decisive numbers, citations) is `record_layer`-ed IMMEDIATELY when
+   produced — never held in conversation memory until the end. Raw tool dumps
+   are never persisted; assessments are.
+2. **Synthesize from the DB, not from memory.** Layer 3 loads `get_layers(...)`
+   and builds the verdict from the persisted components. A resumed or fresh
+   context calls `run_manifest(get_layers(...))` first — it returns
+   present/missing/stale and the run continues from exactly there.
+3. **Bulk reading never enters the main context.** Anything over ~10 documents
+   (news batches, multi-quarter transcripts, shareholder letters) goes to a
+   DIGEST sub-agent that reads everything and returns only the assessment.
+   News-digest template:
+   ```
+   News digest for {TICKER} ahead of {EARNINGS_DATE}.
+   Read mcp__nemo_finnhub__get_company_news({TICKER}, last 30d) IN FULL, then
+   run mcp__nemo_altdata__get_finbert_sentiment on the headline+summary texts.
+   Return STRICT JSON only — no article text: {"component":"news_digest",
+   "finbert_net_score":X,"direction":"...","overhangs":["<one line each>"],
+   "catalysts":["..."],"calendar_conflicts":"<any date contradicting the
+   earnings calendar, quoted>","key_finding":"<one sentence>",
+   "sources":[{claim,tool}]}
+   ```
+   Persist as component `news_digest`. (The calendar_conflicts field exists
+   because news has now caught two stale vendor dates — GME, RH.)
+
+## Inputs
+
+- `ticker` (required)
+- `mode`: `research_only` (default) | `auto_trade`
+- `earnings_date_override`: YYYY-MM-DD (optional)
+
+## Layer 0 — Always (cheap structured signals)
+
+1. **Earnings date.** `get_earnings_calendar(from_date=today, to_date=today+45, symbol=ticker)` —
+   always pass `symbol` so the single ticker's event is confirmed directly (never
+   lost to the summary cap). No entry -> output `no_upcoming_earnings` and stop.
+   Record `days_to_earnings` and the `hour` (amc/bmo). If `< 2`, add
+   `WARNING: < 48h — IV crush risk`. Never fabricate a date.
+   **Bar policy:** the calendar `eps_estimate` (Finnhub) is the SCORING bar —
+   `/earnings-eval` grades surprise_pct against Finnhub estimates, so the
+   prediction is a call on THAT number. Validate the bar with
+   `select_scoring_bar(finnhub_est, yfinance_est, same_quarter_last_year_actual)`
+   (`tools/preearnings/expectations_logic.py` — the year-ago actual is the
+   4-quarters-back entry from get_earnings_surprises, basis-consistent by
+   construction). Vendors mix GAAP and adjusted EPS (live CHWY: 67% apart);
+   the returned `basis_flag` must be stated in the output, and
+   `divergent_scoring_basis_suspect` means prediction quality is at risk.
+2. **Revision velocity.** `get_analyst_revisions_history` + `get_forward_estimates`
+   -> rising/flat/falling -> signal `revision_velocity`.
+3. **Supplier / MOPS (if applicable).** `get_supply_chain`; if it contains TSMC
+   (2330) / Foxconn (2317) / MediaTek (2454) / ASE (3711) call
+   `get_taiwan_monthly_revenue`. Else mark signal `supplier_mops = na`.
+4. **Thin alt-data (confirmation only).** `get_google_trends`,
+   `get_capex_announcements`, `get_government_contracts`, `get_policy_signals`,
+   the **news-digest agent** (replaces in-context news reading; carries the
+   FinBERT score), and `get_insider_transactions` (net open-market insider
+   buying in the last 90d = bullish lean; clustered selling = bearish; option
+   exercises ignored). Combine into one `thin_altdata` signal (majority lean).
+   Also pull one `get_macro_snapshot` line: note if the print lands on/adjacent
+   to a CPI/FOMC date — reaction is conditioned on the tape that day.
+5. **Asymmetry inputs.**
+   - `get_short_interest` (SI % float, days-to-cover), `get_options_metrics`
+     (IV skew AND put/call volume ratio), `get_options_implied_move(ticker,
+     spot_price)`, `get_price_history` (3M momentum + ~500 daily bars), and
+     reuse the Layer-0 `get_analyst_revisions_history` pct_bullish.
+     **IV sentinel rule:** if `get_options_metrics` reports
+     `data_quality.iv_status` as suspect (yfinance sentinel IVs), pass
+     `put_call_iv_skew=None` to `classify_positioning` — the volume ratio
+     stays usable; sentinel IVs do not.
+     **Event-move extraction:** the raw front straddle prices the event PLUS
+     days of ordinary diffusion. Compute the pure event move with
+     `event_implied_move(front_iv_7d, back_iv_30d, dte_front)` from the
+     options-metrics term structure (skip when IVs are sentinel-suspect).
+     Use the EVENT move for `implied_vs_realized` (1-day realized moves are
+     the apples-to-apples comparator); the RAW straddle keeps governing the
+     >20% binary-event hard rule (conservative).
+   - **Reaction history:** never pair against raw 8-K dates — non-earnings
+     8-Ks routinely land CLOSER to the vendor's period label than the real
+     print (live: ORCL -4d/-8d impostors, CHWY 2026-01-20 by ONE day, RH
+     2025-07-02 at 2d). Two filters, fast one first:
+     (a) DEFAULT: `get_company_filings_history(ticker, form_type="8-K", n=8)`
+     (instant metadata) -> `filter_earnings_cadence(dates, anchor)` where the
+     anchor is the verified most-recent print (news/nearest-to-label) —
+     earnings 8-Ks recur on a ~91d cadence, impostors don't chain.
+     (b) THOROUGH (slow, ~minutes — run SOLO, never parallel): Item 2.02
+     verification via `extract_8k_events` when the cadence chain is ambiguous
+     or the anchor is uncertain.
+     Then `get_earnings_surprises` -> pairs via
+     `pair_surprises_with_reactions(surprises, earnings_dates, bars)` -> feed
+     `reaction_profile`. For `implied_vs_realized`, use the EVENT move (above)
+     vs the pairs' `next_day_return` / 100 — both FRACTIONS (mixed units
+     return verdict "unknown").
+   - **Persist every asymmetry component as a layer** (`implied_move` with the
+     full options result incl. quotes_stale, `positioning`, `reaction`) — flags
+     buried in unpersisted tool results are invisible to /preearnings-review.
+
+## Gate — should we go deep?
+
+Compute `should_deep_research(days_to_earnings, liquid, has_peers, has_options)`
+(`tools/preearnings/gating.py`). If `deep == false`, skip Layer 1/2 and synthesize
+from Layer 0 only (mark the deep signals `data_gap`). This keeps the Sentry loop
+cheap; deep fan-out runs only near earnings on liquid names.
+
+Reuse: for each Layer 1 component, if `is_fresh(ticker, earnings_date, component,
+max_age_hours=24)` skip recompute and load via `latest_component`.
+
+## Layer 1 — Deep fan-out (parallel sub-agents)
+
+6. **Peer readthrough.** Invoke `/peer-readthrough-fanout(ticker, earnings_date)`.
+   It derives peers dynamically, fans out one `/cross-company-readthrough` per
+   reported peer, aggregates, and persists. -> signal `peer_readthrough`.
+7. **Guidance archaeology.** Spawn a sub-agent: read `get_earnings_transcripts`
+   (last 4Q) + `extract_forward_signals`, extract `{guided_low, guided_high,
+   actual}` per quarter, then apply `classify_guide_style` + `bar_position` +
+   `guidance_direction` (vs current `get_forward_estimates`). The agent also
+   calls `extract_call_sentiment(ticker, quarters=4)` — a deteriorating CFO
+   tonal trajectory caps guidance_direction at neutral even for a sandbagger
+   (tone leads the guide). Additionally DELEGATE `/expectations-hurdle-check`:
+   its easy/balanced/difficult setup feeds bar_position (a "difficult" whisper
+   setup overrides a "normal" consensus bar to "hard"). -> signal `guidance`.
+8. **KPI drill-down.** Build candidates from `get_segment_financials` (materiality)
+   + transcript Q&A mention counts; `rank_kpis` -> top 3. Spawn one sub-agent per
+   KPI to get its trajectory vs consensus (`kpi_vs_consensus`). Aggregate the KPI
+   directions -> signal `kpi_vs_consensus`.
+
+Every sub-agent returns each number tagged `{claim, tool}`. The referee (this
+skill) drops any uncited claim. Persist each component with `record_layer(...)`.
+
+### Sub-agent prompt rules (canonical — do not improvise)
+
+Build every sub-agent prompt from the templates below. `{PLACEHOLDERS}` may be
+filled ONLY with runtime tool outputs (tickers, dates, surprise lines,
+relationship types as returned by tools). **Never inject company facts from
+memory** — no executive names, product names, fiscal calendars, guidance
+practices, or relationship characterizations beyond the tool-provided type.
+Every template ends with the same contract: STRICT JSON, every number cited
+`{claim, tool}` or omitted, agent failure -> that component is data_gap.
+
+**Guidance archaeology template:**
+```
+Guidance archaeology for {TICKER} ahead of {EARNINGS_DATE}.
+Do NOT assume the company's guidance practice, fiscal calendar, executives, or
+metric names from memory — discover everything via tools.
+1. get_earnings_transcripts({TICKER}): search the last 4 quarters for explicit
+   forward guidance (EPS / revenue / segment growth ranges) given by management.
+   For each prior quarter with a guide, pair it with the actual
+   (get_earnings_surprises) -> {guided_low, guided_high, actual}.
+2. get_forward_estimates({TICKER}) for current consensus.
+Classify guide_style ONLY from pairs you actually found (0 pairs -> "unknown");
+bar_position = consensus vs the upcoming quarter's guide if you found one.
+Return STRICT JSON: {"component":"guidance","guide_style":...,"bar_position":...,
+"direction":...,"pairs_found":N,"key_finding":...,"sources":[{claim,tool}]}.
+```
+
+**KPI drill-down template:**
+```
+Dynamic KPI drill-down for {TICKER} ahead of {EARNINGS_DATE}.
+Derive the 2-3 KPIs the market trades for THIS company. Candidates come ONLY
+from (a) get_segment_financials materiality and (b) metrics analysts repeatedly
+raise in get_earnings_transcripts Q&A. Do not anchor on any example KPIs and do
+not assume KPIs from memory.
+For each top KPI: trajectory from tool data vs any consensus/guide anchor you
+can cite (get_forward_estimates / transcript guidance). No citable anchor ->
+that KPI is neutral with note "no anchor".
+Return STRICT JSON: {"component":"kpi","kpis":[{name,direction,evidence}],
+"direction":...,"magnitude":...,"key_finding":...,"sources":[{claim,tool}]}.
+```
+
+(The peer-readthrough template lives in /peer-readthrough-fanout. Bull/bear
+agents receive the Layer 0/1 evidence verbatim and may use ONLY that evidence
+plus their own tool calls — never memory facts.)
+
+## Layer 2 — Adversarial (parallel)
+
+9. Spawn two sub-agents:
+   - **Bull case:** strongest argument the target beats the bar, citing Layer 0/1.
+   - **Bear case:** strongest argument it misses, citing Layer 0/1.
+   Neither may introduce uncited numbers. Use their tension to sanity-check the
+   direction lean and surface the decisive swing factor.
+   *Budget-constrained mode:* the referee may run this adversarial pass itself
+   (no extra agents) provided the bull and bear cases are still written out
+   separately with citations and the swing factor is named.
+
+## Layer 3 — Synthesize (referee)
+
+10. Assemble the DIRECTION signals as
+    `[{name, direction, magnitude}]` for: `guidance`, `peer_readthrough`,
+    `kpi_vs_consensus`, `revision_velocity`, `supplier_mops`, `thin_altdata`
+    (use `na` where not applicable, `data_gap` where unobserved).
+
+    Compute asymmetry: `classify_positioning(short_interest, days_to_cover, skew,
+    put_call_volume_ratio, momentum_3m_pct, analyst_pct_bullish)` — crowded_long
+    needs >=2 independent pieces of evidence; `reaction_profile(pairs from
+    pair_surprises_with_reactions)`; `implied_vs_realized(implied, realized
+    next-day |moves|)`.
+
+    Call `final_verdict(signals, positioning=..., squeeze_risk=..., reaction_pattern=...,
+    implied_verdict=..., implied_move_pct=...)` (`tools/preearnings/synthesis.py`).
+    It returns `prediction`, `direction_score`, `coverage`, `agreement`,
+    `confidence`, `sizing`, `low_confidence`, and `asymmetry_notes`.
+
+11. **Persist:** `record_layer(layer=3, component="synthesis",
+    payload={**verdict, "signals": signals})` — include the signals list so
+    `/preearnings-review` can audit contradictions — and
+    `record_eval(ticker, earnings_date, prediction, confidence, implied_move_pct)`.
+    **Save:** `testing/fixtures/preearnings_{TICKER}_{DATE}.md`.
+
+12. **Review gate:** run `/preearnings-review(ticker, earnings_date)`. A verdict
+    of `not_actionable` blocks auto_trade and must be reported with its fix list.
+
+## Output
+
+```yaml
+---
+skill: preearnings-research
+ticker: {TICKER}
+earnings_date: {DATE}
+days_to_earnings: {N}
+prediction: likely_beat | in_line | likely_miss
+confidence: 0.XX
+direction_score: {X.XX}
+coverage: {X.XX}
+implied_move_pct: {X.XX}
+sizing: normal | cautious | no_position
+low_confidence: true | false
+---
+```
+
+Then: (1) DIRECTION signal table (name, direction, magnitude, weight), (2) the
+decisive bull vs bear swing factor, (3) ASYMMETRY read (positioning, reaction
+pattern, implied vs realized) and what it does to sizing, (4) data gaps,
+(5) top cited evidence with the tool that produced each number.
+
+## Trading decision (mode=auto_trade only)
+
+0. **Review gate:** a `/preearnings-review` verdict of `sound` or
+   `sound_with_warnings` from within 24h is REQUIRED. `not_actionable` (or no
+   review) -> no trade, report the fix list instead.
+1. `sentry_can_act(action_type=new_position)`; stop if not permitted.
+2. Side from `prediction` + `sizing` (`likely_beat`+size!=no_position -> buy;
+   `likely_miss`+size!=no_position -> sell; else no trade).
+3. `get_paper_account()`; max 1% equity for an earnings trade.
+4. `risk_check_proposed_trade(...)` -> only on `approve` -> `place_paper_order(...)`
+   with any `adjusted_quantity`. Record sentry actions. If rejected, report and stop.
+
+## Hard rules
+
+- Never fabricate an earnings date — only `get_earnings_calendar` output.
+- Every number cites the tool that produced it; uncited sub-agent claims dropped.
+- Derive peers/KPIs/guidance from tools — no hardcoded company/peer/KPI lists.
+- `coverage < 0.5` or `confidence < 0.5` -> `low_confidence`, no trade.
+- Never trade if `implied_move_pct > 0.20`, `confidence < 0.55`, or `days_to_earnings < 2`.
+- Always `risk_check_proposed_trade` before `place_paper_order`. Max 1% per earnings trade.
+- One failed sub-agent never fails the run — mark that component `data_gap` and continue.
+
+## When to invoke
+
+- "pre-earnings research on X" / "earnings research X"
+- Sentry candidate with `triggered_by=pre_earnings`; run 7/3/1 days out on watchlist names.

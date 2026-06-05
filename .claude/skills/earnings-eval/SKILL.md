@@ -1,0 +1,167 @@
+# /earnings-eval
+
+Score a prior `/preearnings-research` prediction against the actual earnings
+outcome. Builds a track record for improving the signal pipeline over time.
+
+## Inputs
+
+- Ticker (required)
+- Earnings date (required — YYYY-MM-DD of the quarter that just reported)
+
+## Workflow
+
+### Step 1 — Load prior prediction
+
+Query `state/preearnings.py:get_eval(ticker, earnings_date)`.
+
+If no prediction row exists, output:
+```
+no_prediction_found: no preearnings-research was run for {TICKER} on {DATE}
+```
+and stop.
+
+Also load all signals for this cycle:
+`signals_for_ticker(ticker, earnings_date)` — used to identify which signals
+were bullish/bearish.
+
+### Step 2 — Actual EPS surprise
+
+Call `get_earnings_surprises(ticker)`.
+
+Find the quarter whose `period` is NEAREST to `earnings_date` within
+**[earnings_date − 75 days, earnings_date + 45 days]** — never a tight ±7-day
+match. Finnhub labels fiscal quarters with calendar-quarter ENDS: fiscal-offset
+companies (Nov/May FYEs like ORCL/ADBE) report ~3 weeks BEFORE their label, and
+Jan-FYE names (CRM/WDAY) report up to ~60 days AFTER it. (This mirrors the
+[-45d, +75d] event window in `pair_surprises_with_reactions`, inverted.) If two
+periods qualify, take the nearest; newest on a tie.
+
+The quarter row carries `actual_eps`, `estimate_eps`, and a precomputed
+`surprise_pct` — use them as-is.
+
+Classify outcome:
+- `surprise_pct > +3%` → outcome=`beat`
+- `surprise_pct < -3%` → outcome=`miss`
+- Otherwise → outcome=`in_line`
+
+If no surprise data available (company not in Finnhub coverage), try
+`get_financial_statements(ticker)` to get the reported EPS manually.
+Mark `actual_eps_surprise = None` if unavailable.
+
+### Step 3 — Revenue surprise
+
+The Finnhub surprises endpoint is EPS-only — revenue surprise comes ONLY from
+`get_financial_statements(ticker)` vs the prior consensus (the persisted
+research layers carry the pre-print revenue consensus):
+- `actual_rev_surprise` = (actual_revenue - estimated_revenue) / estimated_revenue
+Mark None if not derivable.
+
+### Step 4 — 1-day price move
+
+Call `get_price_history(ticker, period="1mo", include_recent_bars=20)` (the
+tool takes period/bars, not date ranges). The convention depends on the
+report HOUR — confirm it via `get_earnings_calendar(symbol=ticker)`:
+- **amc** (after close): move = close[t] -> close[t+1], where t is the last
+  trading day <= earnings_date — the reaction lands in the NEXT session.
+- **bmo** (before open): move = close[t-1] -> close[t] — the reaction IS the
+  report-day bar (live CHWY: +13.3% on the day; the AMC convention would have
+  read +1.7% from the wrong session).
+This matches `pair_surprises_with_reactions(..., bmo=...)`.
+
+`actual_price_move_1d` = (close[t+1] - close[t]) / close[t] × 100
+**(a PERCENT, e.g. -6.4 — `score_reaction` requires the move in percent while
+`implied_move_pct` stays a fraction; it raises on a percent-shaped implied).**
+
+### Step 5 — Score the prediction
+
+Compare `prediction` (from prior run) to `outcome` (from Step 2):
+- If `prediction=likely_beat` and `outcome=beat` → `prediction_correct=1`
+- If `prediction=likely_miss` and `outcome=miss` → `prediction_correct=1`
+- If `prediction=in_line` and `outcome=in_line` → `prediction_correct=1`
+- Otherwise → `prediction_correct=0`
+
+### Step 6 — Signal attribution
+
+For each signal in `signals_for_ticker` (and each direction-bearing research
+layer in `get_layers`):
+- Was it directionally correct? (signal.direction agrees with actual outcome)
+- Record which signals were correct and which were noise.
+
+### Step 6b — Score the ASYMMETRY call separately
+
+The direction model predicts the fundamental outcome; the asymmetry model
+predicts the REACTION. Grade them independently:
+
+Load the persisted positioning layer: `layer = latest_component(ticker,
+earnings_date, "positioning")` and pass `layer["payload"]["positioning"]` (the
+string — the layer dict itself is not the argument). Call
+`score_reaction(positioning, outcome, price_move_1d_pct, implied_move_pct,
+prediction)` (`tools/preearnings/asymmetry_logic.py`):
+- `price_direction_match`: did the 1-day move agree with the prediction?
+  (a correct EPS call with an opposite price move = right on fundamentals,
+  wrong on the trade)
+- `asymmetry_correct`: did the crowding thesis hold? (crowded_long + beat ->
+  muted reward; crowded_long + miss -> hard punishment; crowded_short
+  mirrored). Neutral positioning -> not scored (None) — no call was made.
+
+### Step 7 — Record and output
+
+Call `record_eval(ticker, earnings_date, prediction=..., confidence=...,
+actual_eps_surprise=..., actual_rev_surprise=..., actual_price_move_1d=...,
+outcome=..., prediction_correct=..., asymmetry_correct=...,
+price_direction_match=..., notes=...)`.
+
+Pass the STORED prediction/confidence from Step 1 verbatim. (The upsert is also
+structurally guarded: a call carrying an outcome cannot rewrite the prediction —
+scoring can only append actuals.)
+
+## Output
+
+```yaml
+---
+skill: earnings-eval
+ticker: {TICKER}
+earnings_date: {DATE}
+prior_prediction: likely_beat | in_line | likely_miss
+prior_confidence: 0.XX
+actual_outcome: beat | in_line | miss
+prediction_correct: true | false
+eps_surprise_pct: {X.X}%
+price_move_1d: {X.X}%
+---
+```
+
+Then:
+
+**Signal attribution table:**
+| Signal | Prior direction | Actual outcome aligns? |
+|---|---|---|
+| google_trends | bullish | yes |
+| finbert_sentiment | neutral | — |
+| ... | ... | ... |
+
+**Post-mortem note** (1-2 sentences on the most informative signal and
+the biggest miss).
+
+**Aggregate stats** (if ≥ 3 evals exist):
+Call `eval_accuracy_summary()` from `state/preearnings.py` and print:
+```
+Overall accuracy: X/N (XX%)
+Avg confidence when correct: 0.XX
+Avg confidence when wrong:   0.XX
+```
+
+## Hard rules
+
+- Do not fabricate EPS or revenue numbers. If Finnhub returns no surprise
+  data, mark `actual_eps_surprise = None` and note the gap.
+- Classify outcome using EPS surprise only (primary). Price move is
+  supplementary context, not the outcome classifier.
+- A prediction of `in_line` that was followed by a 10% stock move is NOT
+  wrong if EPS was in-line — note the guidance/multiple expansion component.
+
+## When to invoke
+
+- User says "eval NVDA earnings" or "score my AAPL prediction"
+- 1 day after any watchlist company reports earnings
+- When the user wants aggregate signal accuracy stats

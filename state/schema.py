@@ -243,6 +243,87 @@ CREATE_SCHEMA = [
         excluded_reason       TEXT
     )""",
     "CREATE INDEX IF NOT EXISTS idx_sentry_universe_active ON sentry_universe(excluded, refreshed_at)",
+
+    # --- Pre-earnings: signals collected ahead of an earnings date ---
+    # One row per signal per ticker per earnings date. Direction and magnitude
+    # let the synthesis step weight and aggregate across signal categories.
+    """CREATE TABLE IF NOT EXISTS preearnings_signals(
+        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticker               TEXT NOT NULL,
+        earnings_date        TEXT NOT NULL,
+        signal_category      TEXT NOT NULL,
+        signal_name          TEXT NOT NULL,
+        direction            TEXT NOT NULL,
+        magnitude            REAL,
+        raw_value            TEXT,
+        source_url           TEXT,
+        collected_at         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        days_before_earnings INTEGER
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_preearnings_ticker_date ON preearnings_signals(ticker, earnings_date)",
+
+    # --- Pre-earnings: supplier readthroughs recorded per earnings cycle ---
+    """CREATE TABLE IF NOT EXISTS supplier_readthroughs(
+        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        supplier_ticker      TEXT NOT NULL,
+        downstream_ticker    TEXT NOT NULL,
+        supplier_report_date TEXT NOT NULL,
+        direction            TEXT NOT NULL,
+        key_findings         TEXT,
+        confidence           REAL,
+        triggered_at         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_supplier_readthrough_downstream ON supplier_readthroughs(downstream_ticker, triggered_at DESC)",
+
+    # --- Pre-earnings: weekly product pricing snapshots ---
+    """CREATE TABLE IF NOT EXISTS pricing_snapshots(
+        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticker               TEXT NOT NULL,
+        product_name         TEXT NOT NULL,
+        price                REAL,
+        currency             TEXT DEFAULT 'USD',
+        source_url           TEXT NOT NULL,
+        is_discounted        INTEGER DEFAULT 0,
+        discount_pct         REAL,
+        snapped_at           TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_pricing_snapshots_ticker ON pricing_snapshots(ticker, snapped_at DESC)",
+
+    # --- Pre-earnings: eval outcomes (prediction vs actual result) ---
+    """CREATE TABLE IF NOT EXISTS preearnings_evals(
+        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticker               TEXT NOT NULL,
+        earnings_date        TEXT NOT NULL,
+        prediction           TEXT NOT NULL,
+        confidence           REAL NOT NULL,
+        implied_move_pct     REAL,
+        actual_eps_surprise  REAL,
+        actual_rev_surprise  REAL,
+        actual_price_move_1d REAL,
+        outcome              TEXT,
+        prediction_correct   INTEGER,
+        notes                TEXT,
+        evaluated_at         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_preearnings_evals_ticker_date ON preearnings_evals(ticker, earnings_date)",
+
+    # --- Pre-earnings: deep research layers (sub-agent + structured outputs) ---
+    # One row per (ticker, earnings_date, component). Upserted so the 7d/3d/1d
+    # re-runs reuse fresh research instead of re-paying for deep sub-agent dives.
+    """CREATE TABLE IF NOT EXISTS preearnings_research_layers(
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticker         TEXT NOT NULL,
+        earnings_date  TEXT NOT NULL,
+        layer          INTEGER NOT NULL,        -- 0 structured / 1 fan-out / 2 adversarial / 3 synthesis
+        component      TEXT NOT NULL,           -- peer_readthrough / guidance / kpi:<name> / positioning / reaction / ...
+        direction      TEXT,                    -- bullish / bearish / neutral / na
+        magnitude      REAL,                    -- 0..1 normalized strength
+        confidence     REAL,
+        payload_json   TEXT NOT NULL,           -- structured findings (json)
+        sources_json   TEXT NOT NULL,           -- [{claim, tool}] for the citation audit
+        created_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_pe_layers_natural ON preearnings_research_layers(ticker, earnings_date, component)",
 ]
 
 
@@ -278,6 +359,15 @@ _DISCOVERY_RUNS_MIGRATIONS = [
     ("ipo_enqueued",               "INTEGER DEFAULT 0"),
     ("screener_last_ran",          "TEXT"),
     ("screener_enqueued",          "INTEGER DEFAULT 0"),
+]
+
+
+# Reaction scoring columns added to preearnings_evals: the asymmetry call
+# (crowding thesis) and price-direction validity are graded separately from
+# the EPS-direction prediction.
+_PREEARNINGS_EVALS_MIGRATIONS = [
+    ("asymmetry_correct",     "INTEGER"),   # 1/0/NULL (NULL = no asymmetry call)
+    ("price_direction_match", "INTEGER"),   # 1/0/NULL
 ]
 
 
@@ -350,6 +440,18 @@ def init_schema(db_path: str = DB_PATH) -> None:
                 try:
                     conn.execute(
                         f"ALTER TABLE sentry_discovery_runs ADD COLUMN {col_name} {col_type}"
+                    )
+                except sqlite3.OperationalError:
+                    pass
+
+        # Same pattern for preearnings_evals reaction-scoring columns.
+        existing_cols = {row['name'] for row in
+                         conn.execute("PRAGMA table_info(preearnings_evals)").fetchall()}
+        for col_name, col_type in _PREEARNINGS_EVALS_MIGRATIONS:
+            if col_name not in existing_cols:
+                try:
+                    conn.execute(
+                        f"ALTER TABLE preearnings_evals ADD COLUMN {col_name} {col_type}"
                     )
                 except sqlite3.OperationalError:
                     pass
