@@ -54,10 +54,26 @@ April prints), the lower-information tail may be GROUPED into one combined
 sub-agent — the freshest/highest-relevance peers always get dedicated agents.
 Each grouped result still counts each peer's surprise individually in sources.
 
-Per-agent contract:
-- Primary company: the peer (the one that reported)
-- Read-through target: `ticker`
-- Context: "same-quarter peer earnings readthrough to an upcoming reporter"
+**Canonical per-agent prompt template** — `{PLACEHOLDERS}` filled ONLY with
+runtime tool outputs; never inject relationship details, products, or company
+facts from memory beyond the tool-provided relationship type:
+
+```
+Same-quarter peer earnings readthrough.
+PEER: {PEER_TICKER} (relationship type per tools: {RELATIONSHIP}).
+TARGET: {TICKER}, reporting {EARNINGS_DATE}.
+Already-verified context (cite as given): {PEER_SURPRISE_LINE}  <- from
+get_earnings_surprises run by the orchestrator.
+1. Re-verify with get_earnings_surprises({PEER_TICKER}).
+2. get_company_news({PEER_TICKER}, from {REPORT_DATE-7d} to {TODAY}) for what
+   drove the quarter and the post-print stock reaction.
+Question: the implication FOR {TICKER}'s upcoming print. Characterize the
+relationship ONLY as "{RELATIONSHIP}" — do not add specifics from memory.
+Return STRICT JSON: {"peer":...,"direction":"bullish|bearish|neutral",
+"magnitude":0.0-1.0,"key_finding":"<one sentence>",
+"sources":[{"claim":...,"tool":...}]}.
+Every number cited or omitted. direction is the implication FOR {TICKER}.
+```
 
 Each sub-agent must return, for the target:
 - `direction`: bullish / bearish / neutral

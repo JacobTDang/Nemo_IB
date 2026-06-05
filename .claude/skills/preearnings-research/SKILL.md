@@ -67,6 +67,50 @@ max_age_hours=24)` skip recompute and load via `latest_component`.
 Every sub-agent returns each number tagged `{claim, tool}`. The referee (this
 skill) drops any uncited claim. Persist each component with `record_layer(...)`.
 
+### Sub-agent prompt rules (canonical — do not improvise)
+
+Build every sub-agent prompt from the templates below. `{PLACEHOLDERS}` may be
+filled ONLY with runtime tool outputs (tickers, dates, surprise lines,
+relationship types as returned by tools). **Never inject company facts from
+memory** — no executive names, product names, fiscal calendars, guidance
+practices, or relationship characterizations beyond the tool-provided type.
+Every template ends with the same contract: STRICT JSON, every number cited
+`{claim, tool}` or omitted, agent failure -> that component is data_gap.
+
+**Guidance archaeology template:**
+```
+Guidance archaeology for {TICKER} ahead of {EARNINGS_DATE}.
+Do NOT assume the company's guidance practice, fiscal calendar, executives, or
+metric names from memory — discover everything via tools.
+1. get_earnings_transcripts({TICKER}): search the last 4 quarters for explicit
+   forward guidance (EPS / revenue / segment growth ranges) given by management.
+   For each prior quarter with a guide, pair it with the actual
+   (get_earnings_surprises) -> {guided_low, guided_high, actual}.
+2. get_forward_estimates({TICKER}) for current consensus.
+Classify guide_style ONLY from pairs you actually found (0 pairs -> "unknown");
+bar_position = consensus vs the upcoming quarter's guide if you found one.
+Return STRICT JSON: {"component":"guidance","guide_style":...,"bar_position":...,
+"direction":...,"pairs_found":N,"key_finding":...,"sources":[{claim,tool}]}.
+```
+
+**KPI drill-down template:**
+```
+Dynamic KPI drill-down for {TICKER} ahead of {EARNINGS_DATE}.
+Derive the 2-3 KPIs the market trades for THIS company. Candidates come ONLY
+from (a) get_segment_financials materiality and (b) metrics analysts repeatedly
+raise in get_earnings_transcripts Q&A. Do not anchor on any example KPIs and do
+not assume KPIs from memory.
+For each top KPI: trajectory from tool data vs any consensus/guide anchor you
+can cite (get_forward_estimates / transcript guidance). No citable anchor ->
+that KPI is neutral with note "no anchor".
+Return STRICT JSON: {"component":"kpi","kpis":[{name,direction,evidence}],
+"direction":...,"magnitude":...,"key_finding":...,"sources":[{claim,tool}]}.
+```
+
+(The peer-readthrough template lives in /peer-readthrough-fanout. Bull/bear
+agents receive the Layer 0/1 evidence verbatim and may use ONLY that evidence
+plus their own tool calls — never memory facts.)
+
 ## Layer 2 — Adversarial (parallel)
 
 9. Spawn two sub-agents:
