@@ -1689,6 +1689,9 @@ class AltDataServer:
 
             if not atm_call or not atm_put:
                 msg = "could not find ATM options"
+                if target_expiry:
+                    msg += (f" (target_expiry={target_expiry} — verify it is a "
+                            f"listed, future expiry)")
                 if yf_attempted:
                     msg += " (yfinance fallback also lacked ATM coverage)"
                 elif rows:

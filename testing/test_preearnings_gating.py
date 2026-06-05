@@ -45,3 +45,17 @@ def test_gate_passes_with_options_only():
 def test_gate_no_date():
     out = should_deep_research(days_to_earnings=None, liquid=True, has_peers=True)
     assert out["deep"] is False
+
+
+def test_gate_day_of_earnings_passes():
+    out = should_deep_research(days_to_earnings=0, liquid=True, has_peers=True)
+    assert out["deep"] is True
+
+
+def test_gate_window_boundary_inclusive():
+    out = should_deep_research(days_to_earnings=10, liquid=True, has_peers=True,
+                               deep_window_days=10)
+    assert out["deep"] is True
+    out11 = should_deep_research(days_to_earnings=11, liquid=True, has_peers=True,
+                                 deep_window_days=10)
+    assert out11["deep"] is False

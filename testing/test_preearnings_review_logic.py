@@ -101,12 +101,26 @@ def test_freshness_pass_fresh():
 
 
 def test_freshness_warn_when_old():
-    out = check_freshness([_layer("guidance", age_hours=30)], now=_NOW)
+    out = check_freshness([_layer("positioning", age_hours=30)], now=_NOW)
     assert any(c["status"] == "warn" for c in out)
 
 
 def test_freshness_fail_when_very_old():
-    out = check_freshness([_layer("guidance", age_hours=100)], now=_NOW)
+    out = check_freshness([_layer("positioning", age_hours=100)], now=_NOW)
+    assert any(c["status"] == "fail" for c in out)
+
+
+def test_freshness_slow_components_get_longer_windows():
+    """Reaction profile (years of history) and guidance archaeology (changes
+    once a quarter) must not force expensive sub-agent re-runs at T-1."""
+    out = check_freshness([_layer("reaction", age_hours=100),    # < 168h
+                           _layer("guidance", age_hours=80)],    # < 96h
+                          now=_NOW)
+    assert all(c["status"] == "pass" for c in out), out
+
+
+def test_freshness_slow_components_still_expire():
+    out = check_freshness([_layer("reaction", age_hours=600)], now=_NOW)  # > 3*168
     assert any(c["status"] == "fail" for c in out)
 
 

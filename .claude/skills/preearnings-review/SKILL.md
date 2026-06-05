@@ -41,7 +41,7 @@ executes, in order:
 |---|---|---|
 | completeness | no synthesis / no eval row | missing peer/guidance/KPI/positioning/reaction |
 | citations | direction-critical layer uncited | non-critical uncited, malformed entries |
-| freshness | component > 72h old | component > 24h old |
+| freshness | component > 3x its window | component > its window (default 24h; slow layers longer: reaction 168h, guidance 96h) |
 | contradictions | — | high-magnitude opposing signals (must be NAMED) |
 | stale_flags | — | quotes_stale / sentinel / data_gap markers in payloads |
 | hard_rules | in_line sized, conf<0.55 sized, implied>20% sized, low_confidence flag inconsistent | — |

@@ -56,16 +56,30 @@ def check_citations(layers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+# Slow-moving components decay on a longer clock than market-state ones: the
+# reaction profile is years of history and guidance archaeology only changes
+# once per quarter — forcing a full sub-agent re-run at T-1 because the T-4
+# research is "stale" would burn budget for identical answers.
+_COMPONENT_MAX_AGE_HOURS: Dict[str, float] = {
+    "reaction": 168.0,    # 7d — past surprise/return pairs barely move
+    "guidance": 96.0,     # 4d — changes only when a new guide is issued
+}
+
+
 def check_freshness(layers: List[Dict[str, Any]],
                     now: Optional[datetime] = None,
-                    max_age_hours: float = 24.0) -> List[Dict[str, Any]]:
-    """Components must be recent; very stale (3x window) is disqualifying."""
+                    max_age_hours: float = 24.0,
+                    component_max_age: Optional[Dict[str, float]] = None) -> List[Dict[str, Any]]:
+    """Components must be recent; very stale (3x their window) is disqualifying.
+    Per-component windows override the default for slow-moving layers."""
     now = now or datetime.now(timezone.utc)
+    overrides = {**_COMPONENT_MAX_AGE_HOURS, **(component_max_age or {})}
     out = []
     for layer in layers:
         comp = layer.get("component", "")
         if comp == "review":
             continue
+        limit = overrides.get(comp, max_age_hours)
         created = layer.get("created_at")
         try:
             dt = datetime.fromisoformat(str(created))
@@ -76,16 +90,16 @@ def check_freshness(layers: List[Dict[str, Any]],
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         age_h = (now - dt).total_seconds() / 3600.0
-        if age_h > 3 * max_age_hours:
+        if age_h > 3 * limit:
             out.append(_r("freshness", "fail",
-                          f"{comp}: {age_h:.0f}h old (> {3 * max_age_hours:.0f}h)",
+                          f"{comp}: {age_h:.0f}h old (> {3 * limit:.0f}h)",
                           f"re-run {comp} before acting"))
-        elif age_h > max_age_hours:
+        elif age_h > limit:
             out.append(_r("freshness", "warn",
-                          f"{comp}: {age_h:.0f}h old (> {max_age_hours:.0f}h)",
+                          f"{comp}: {age_h:.0f}h old (> {limit:.0f}h)",
                           f"refresh {comp}"))
     if not out:
-        out.append(_r("freshness", "pass", "all components within the freshness window"))
+        out.append(_r("freshness", "pass", "all components within their freshness windows"))
     return out
 
 

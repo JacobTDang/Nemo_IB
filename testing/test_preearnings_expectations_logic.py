@@ -136,6 +136,16 @@ def test_bar_position_exact_bounds_are_normal():
     assert bar_position(1.2, 1.0, 1.2) == "normal"
 
 
+def test_guide_style_tie_above_below_is_inline():
+    """Documents the tie semantics: 1 above + 1 below = erratic guiding, which
+    the classifier reports as inline (no systematic bias either way)."""
+    pairs = [
+        {"guided_low": 1.0, "guided_high": 1.1, "actual": 1.3},   # above
+        {"guided_low": 1.2, "guided_high": 1.3, "actual": 1.0},   # below
+    ]
+    assert classify_guide_style(pairs) == "inline"
+
+
 # ---------------------------------------------------------------------------
 # No-hardcoding audit
 # ---------------------------------------------------------------------------

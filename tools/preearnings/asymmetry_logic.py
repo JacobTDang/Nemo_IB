@@ -177,11 +177,12 @@ def pair_surprises_with_reactions(
     import bisect
     from datetime import timedelta
 
-    # Global min-distance assignment: build every (distance, surprise, event)
-    # candidate within the window, then assign greedily by distance. A
-    # per-quarter greedy let an earlier quarter steal a later quarter's only
-    # event (and a late filer match the PRIOR quarter's report) whenever the
-    # surprise and filing histories had different lengths.
+    # OPTIMAL assignment (maximize matched quarters, then minimize total
+    # distance). Per-quarter greedy let an earlier quarter steal a later
+    # quarter's only event; distance-greedy let a late filer take the PRIOR
+    # quarter's report (44d cross-match beating two correct 47d matches).
+    # Sizes are tiny (<=12 surprises x <=12 events), so exhaustive search with
+    # a skip option is exact and instant.
     parsed_surprises = []
     for i, s in enumerate(sorted(surprises, key=lambda x: str(x.get("period") or ""))):
         period_end = _parse_d(s.get("period"))
@@ -189,24 +190,41 @@ def pair_surprises_with_reactions(
             continue
         parsed_surprises.append((i, period_end, s))
 
-    candidates = []
+    cand_lists: List[tuple] = []   # (period_end, s, [(dist, ev), ...])
     for i, period_end, s in parsed_surprises:
         window_start = period_end - timedelta(days=max_back_days)
         window_end = period_end + timedelta(days=max_gap_days)
-        for ev in events:
-            if window_start <= ev <= window_end:
-                candidates.append((abs((ev - period_end).days), i, ev, period_end, s))
-    candidates.sort(key=lambda x: (x[0], x[1]))
+        opts = sorted(
+            (abs((ev - period_end).days), ev)
+            for ev in events if window_start <= ev <= window_end
+        )
+        if opts:
+            cand_lists.append((period_end, s, opts))
 
-    used_surprises: set = set()
-    used_events: set = set()
-    assigned: List[tuple] = []
-    for dist, i, ev, period_end, s in candidates:
-        if i in used_surprises or ev in used_events:
-            continue
-        used_surprises.add(i)
-        used_events.add(ev)
-        assigned.append((period_end, ev, s))
+    best: Dict[str, Any] = {"count": -1, "dist": float("inf"), "pairs": []}
+
+    def _search(k: int, used: set, pairs: List[tuple], total: int) -> None:
+        # upper bound prune: even matching everything left can't beat best
+        if len(pairs) + (len(cand_lists) - k) < best["count"]:
+            return
+        if k == len(cand_lists):
+            if (len(pairs) > best["count"]
+                    or (len(pairs) == best["count"] and total < best["dist"])):
+                best.update(count=len(pairs), dist=total, pairs=list(pairs))
+            return
+        period_end, s, opts = cand_lists[k]
+        for dist, ev in opts:
+            if ev in used:
+                continue
+            used.add(ev)
+            pairs.append((period_end, ev, s))
+            _search(k + 1, used, pairs, total + dist)
+            pairs.pop()
+            used.remove(ev)
+        _search(k + 1, used, pairs, total)   # leave this quarter unmatched
+
+    _search(0, set(), [], 0)
+    assigned = best["pairs"]
 
     out: List[Dict[str, Any]] = []
     for period_end, ev, s in sorted(assigned, key=lambda x: x[0]):

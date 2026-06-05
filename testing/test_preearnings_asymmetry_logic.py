@@ -242,6 +242,27 @@ def test_pairing_earlier_quarter_does_not_steal_later_quarters_only_event():
     assert out[0]["surprise_pct"] == 5.0
 
 
+def test_pairing_prefers_two_correct_pairs_over_one_cross_match():
+    """The late-filer residual (agent B2): this quarter's label 2026-06-30 with
+    its own report at +47d (08-16) and the PRIOR quarter's report at -44d
+    (05-17). Greedy-by-distance matched this quarter to the prior report (44 <
+    47) and left the prior quarter unmatched. Optimal assignment must produce
+    BOTH correct pairs (47 + 47)."""
+    surprises = [
+        {"period": "2026-03-31", "surprise_pct": 2.0},   # reported 2026-05-17
+        {"period": "2026-06-30", "surprise_pct": 5.0},   # reported 2026-08-16
+    ]
+    events = ["2026-05-17", "2026-08-16"]
+    bars = _bars([("2026-05-17", 100.0), ("2026-05-18", 103.0),
+                  ("2026-08-16", 200.0), ("2026-08-17", 190.0)])
+    out = pair_surprises_with_reactions(surprises, events, bars)
+    assert len(out) == 2, out
+    assert out[0]["period"] == "2026-03-31" and out[0]["event_date"] == "2026-05-17"
+    assert out[1]["period"] == "2026-06-30" and out[1]["event_date"] == "2026-08-16"
+    assert out[0]["next_day_return"] == 3.0
+    assert out[1]["next_day_return"] == -5.0
+
+
 def test_pairing_skips_nan_close_bars():
     surprises = [{"period": "2026-03-31", "surprise_pct": 1.0}]
     events = ["2026-04-10"]
