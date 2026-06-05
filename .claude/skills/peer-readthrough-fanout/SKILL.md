@@ -48,7 +48,13 @@ If zero peers reported this quarter, record a `peer_readthrough` layer with
 ### Step 4 — Fan out one sub-agent per reported peer (parallel)
 
 For each selected peer, spawn a sub-agent (in a single message, so they run in
-parallel) running `/cross-company-readthrough`:
+parallel) running `/cross-company-readthrough`. *Cost rule:* when more than 4
+same-relationship peers reported (e.g. several hyperscaler competitors with
+April prints), the lower-information tail may be GROUPED into one combined
+sub-agent — the freshest/highest-relevance peers always get dedicated agents.
+Each grouped result still counts each peer's surprise individually in sources.
+
+Per-agent contract:
 - Primary company: the peer (the one that reported)
 - Read-through target: `ticker`
 - Context: "same-quarter peer earnings readthrough to an upcoming reporter"

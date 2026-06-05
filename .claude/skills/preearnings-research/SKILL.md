@@ -17,9 +17,11 @@ quarter window are all derived at runtime.
 
 ## Layer 0 — Always (cheap structured signals)
 
-1. **Earnings date.** `get_earnings_calendar(from=today, to=today+45)`. No entry ->
-   output `no_upcoming_earnings` and stop. Record `days_to_earnings`. If `< 2`,
-   add `WARNING: < 48h — IV crush risk`. Never fabricate a date.
+1. **Earnings date.** `get_earnings_calendar(from=today, to=today+45, symbol=ticker)` —
+   always pass `symbol` so the single ticker's event is confirmed directly (never
+   lost to the summary cap). No entry -> output `no_upcoming_earnings` and stop.
+   Record `days_to_earnings` and the `hour` (amc/bmo). If `< 2`, add
+   `WARNING: < 48h — IV crush risk`. Never fabricate a date.
 2. **Revision velocity.** `get_analyst_revisions_history` + `get_forward_estimates`
    -> rising/flat/falling -> signal `revision_velocity`.
 3. **Supplier / MOPS (if applicable).** `get_supply_chain`; if it contains TSMC
@@ -28,9 +30,15 @@ quarter window are all derived at runtime.
 4. **Thin alt-data (confirmation only).** `get_google_trends`, `get_capex_announcements`,
    `get_government_contracts`, `get_policy_signals`, `get_finbert_sentiment` (on
    `get_company_news`). Combine into one `thin_altdata` signal (majority lean).
-5. **Asymmetry inputs.** `get_short_interest`, `get_options_metrics`,
-   `get_options_implied_move(ticker, spot)`, and `get_earnings_surprises` +
-   `get_price_history` for the reaction history.
+5. **Asymmetry inputs.**
+   - `get_short_interest` (SI % float, days-to-cover), `get_options_metrics`
+     (IV skew AND put/call volume ratio), `get_options_implied_move(ticker, spot)`,
+     `get_price_history` (3M momentum + ~500 daily bars), and reuse the Layer-0
+     `get_analyst_revisions_history` pct_bullish.
+   - **Reaction history:** `get_company_filings_history(ticker, form="8-K")` for
+     report dates + `get_earnings_surprises` -> build pairs with
+     `pair_surprises_with_reactions(surprises, event_dates, bars)` -> feed
+     `reaction_profile`. Realized next-day |moves| also feed `implied_vs_realized`.
 
 ## Gate — should we go deep?
 
@@ -66,6 +74,9 @@ skill) drops any uncited claim. Persist each component with `record_layer(...)`.
    - **Bear case:** strongest argument it misses, citing Layer 0/1.
    Neither may introduce uncited numbers. Use their tension to sanity-check the
    direction lean and surface the decisive swing factor.
+   *Budget-constrained mode:* the referee may run this adversarial pass itself
+   (no extra agents) provided the bull and bear cases are still written out
+   separately with citations and the swing factor is named.
 
 ## Layer 3 — Synthesize (referee)
 
@@ -74,9 +85,11 @@ skill) drops any uncited claim. Persist each component with `record_layer(...)`.
     `kpi_vs_consensus`, `revision_velocity`, `supplier_mops`, `thin_altdata`
     (use `na` where not applicable, `data_gap` where unobserved).
 
-    Compute asymmetry: `classify_positioning(short_interest, days_to_cover, skew)`,
-    `reaction_profile(past surprise/return pairs)`, `implied_vs_realized(implied,
-    realized history)`.
+    Compute asymmetry: `classify_positioning(short_interest, days_to_cover, skew,
+    put_call_volume_ratio, momentum_3m_pct, analyst_pct_bullish)` — crowded_long
+    needs >=2 independent pieces of evidence; `reaction_profile(pairs from
+    pair_surprises_with_reactions)`; `implied_vs_realized(implied, realized
+    next-day |moves|)`.
 
     Call `final_verdict(signals, positioning=..., squeeze_risk=..., reaction_pattern=...,
     implied_verdict=..., implied_move_pct=...)` (`tools/preearnings/synthesis.py`).

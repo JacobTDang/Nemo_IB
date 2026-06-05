@@ -10,6 +10,7 @@ from tools.preearnings.asymmetry_logic import (
     reaction_profile,
     classify_positioning,
     implied_vs_realized,
+    pair_surprises_with_reactions,
 )
 
 
@@ -72,9 +73,35 @@ def test_positioning_crowded_short_elevated():
     assert out["squeeze_risk"] == "elevated"
 
 
-def test_positioning_crowded_long():
-    out = classify_positioning(short_interest_pct_float=2, put_call_iv_skew=-0.05)
-    assert out["positioning"] == "crowded_long"
+def test_positioning_crowded_long_needs_two_pieces_of_evidence():
+    # skew alone (1 piece) is NOT enough anymore
+    one = classify_positioning(short_interest_pct_float=2, put_call_iv_skew=-0.05)
+    assert one["positioning"] == "neutral"
+    # skew + call-heavy volume (2 pieces) -> crowded_long
+    two = classify_positioning(short_interest_pct_float=2, put_call_iv_skew=-0.05,
+                               put_call_volume_ratio=0.3)
+    assert two["positioning"] == "crowded_long"
+
+
+def test_positioning_orcl_live_case_is_crowded_long():
+    """Red-green for the gap surfaced live: SI 2.12%, P/C volume 0.31, +53% 3M,
+    81.6% analyst bullish read 'neutral' under the old skew-only rule."""
+    out = classify_positioning(
+        short_interest_pct_float=2.12, days_to_cover=1.28, put_call_iv_skew=0.0,
+        put_call_volume_ratio=0.31, momentum_3m_pct=53.22, analyst_pct_bullish=81.6,
+    )
+    assert out["positioning"] == "crowded_long", out
+
+
+def test_positioning_momentum_alone_not_crowded():
+    out = classify_positioning(short_interest_pct_float=2, momentum_3m_pct=40)
+    assert out["positioning"] == "neutral"
+
+
+def test_positioning_crowded_short_overrides_long_evidence():
+    out = classify_positioning(short_interest_pct_float=22,
+                               put_call_volume_ratio=0.3, momentum_3m_pct=50)
+    assert out["positioning"] == "crowded_short"
 
 
 def test_positioning_neutral_default():
@@ -110,6 +137,68 @@ def test_implied_fair():
 def test_implied_unknown_without_history():
     out = implied_vs_realized(0.06, [])
     assert out["verdict"] == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# pair_surprises_with_reactions — the reaction data path
+# ---------------------------------------------------------------------------
+
+def _bars(seq):
+    return [{"date": d, "close": c} for d, c in seq]
+
+
+def test_pairing_matches_event_after_period_and_computes_return():
+    surprises = [{"period": "2026-03-31", "surprise_pct": 5.0}]
+    events = ["2026-04-10"]
+    bars = _bars([("2026-04-09", 100.0), ("2026-04-10", 102.0), ("2026-04-13", 110.0)])
+    out = pair_surprises_with_reactions(surprises, events, bars)
+    assert len(out) == 1
+    # report bar = 04-10 close 102; next bar 04-13 close 110 -> +7.84%
+    assert out[0]["next_day_return"] == 7.84
+    assert out[0]["event_date"] == "2026-04-10"
+
+
+def test_pairing_event_on_weekend_uses_prior_trading_day():
+    surprises = [{"period": "2026-03-31", "surprise_pct": -2.0}]
+    events = ["2026-04-11"]   # a Saturday — no bar that day
+    bars = _bars([("2026-04-09", 100.0), ("2026-04-10", 105.0), ("2026-04-13", 99.75)])
+    out = pair_surprises_with_reactions(surprises, events, bars)
+    assert len(out) == 1
+    # nearest prior bar = 04-10 (105); next = 04-13 (99.75) -> -5.0%
+    assert out[0]["next_day_return"] == -5.0
+
+
+def test_pairing_skips_surprise_with_no_event_in_window():
+    surprises = [{"period": "2026-03-31", "surprise_pct": 3.0}]
+    events = ["2026-09-01"]   # far outside max_gap_days
+    bars = _bars([("2026-04-01", 100.0), ("2026-04-02", 101.0)])
+    assert pair_surprises_with_reactions(surprises, events, bars) == []
+
+
+def test_pairing_skips_event_at_last_bar():
+    surprises = [{"period": "2026-03-31", "surprise_pct": 3.0}]
+    events = ["2026-04-02"]
+    bars = _bars([("2026-04-01", 100.0), ("2026-04-02", 101.0)])  # no t+1 bar
+    assert pair_surprises_with_reactions(surprises, events, bars) == []
+
+
+def test_pairing_two_quarters_use_distinct_events():
+    surprises = [
+        {"period": "2025-12-31", "surprise_pct": 35.0},
+        {"period": "2026-03-31", "surprise_pct": 3.0},
+    ]
+    events = ["2026-01-10", "2026-04-10"]
+    bars = _bars([
+        ("2026-01-10", 100.0), ("2026-01-12", 114.0),
+        ("2026-04-10", 200.0), ("2026-04-13", 196.0),
+    ])
+    out = pair_surprises_with_reactions(surprises, events, bars)
+    assert len(out) == 2
+    assert out[0]["next_day_return"] == 14.0    # Dec quarter -> Jan report
+    assert out[1]["next_day_return"] == -2.0    # Mar quarter -> Apr report
+    # feeds straight into reaction_profile
+    prof = reaction_profile([{k: o[k] for k in ("surprise_pct", "next_day_return")} for o in out])
+    assert prof["n"] == 2
 
 
 # ---------------------------------------------------------------------------

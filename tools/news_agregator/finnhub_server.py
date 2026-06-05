@@ -957,6 +957,12 @@ class FinnhubServer:
               "to_date": {
                 "type": "string",
                 "description": "End date in YYYY-MM-DD format"
+              },
+              "symbol": {
+                "type": "string",
+                "description": "Optional: filter to one ticker (e.g. ORCL). "
+                               "Use this to confirm a single company's earnings "
+                               "date — events are never lost to the summary cap."
               }
             },
             "required": ["from_date", "to_date"]
@@ -1128,7 +1134,8 @@ class FinnhubServer:
           return await parent.get_insider_transactions(arguments["ticker"])
         case "get_earnings_calendar":
           return await parent.get_earnings_calendar(
-            arguments["from_date"], arguments["to_date"]
+            arguments["from_date"], arguments["to_date"],
+            arguments.get("symbol", "")
           )
         case "get_ipo_calendar":
           return await parent.get_ipo_calendar(
@@ -1188,12 +1195,17 @@ class FinnhubServer:
     envelope = build_envelope(condensed, ticker, "get_insider_transactions")
     return [TextContent(type="text", text=safe_json_dumps(envelope))]
 
-  async def get_earnings_calendar(self, from_date: str, to_date: str) -> List[TextContent]:
-    result = await self.client.get("/calendar/earnings", {
-      "from": from_date, "to": to_date
-    })
+  async def get_earnings_calendar(self, from_date: str, to_date: str,
+                                  symbol: str = "") -> List[TextContent]:
+    params = {"from": from_date, "to": to_date}
+    if symbol:
+      # Finnhub supports symbol filtering server-side; a single ticker's
+      # events are never lost to the condensed 15-event cap.
+      params["symbol"] = symbol.upper()
+    result = await self.client.get("/calendar/earnings", params)
     condensed = _condense_earnings_calendar(result) if isinstance(result, dict) else result
-    envelope = build_envelope(condensed, "calendar", "get_earnings_calendar")
+    envelope = build_envelope(condensed, symbol.upper() if symbol else "calendar",
+                              "get_earnings_calendar")
     return [TextContent(type="text", text=safe_json_dumps(envelope))]
 
   async def get_ipo_calendar(self, from_date: str, to_date: str) -> List[TextContent]:
