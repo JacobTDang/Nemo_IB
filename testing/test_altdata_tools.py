@@ -437,6 +437,44 @@ def test_trends_runner_cache_hit_sets_cached_flag(tmp_path, monkeypatch):
 # Fix C — Job postings: Workday probe + ATS fingerprinting (Layer 2)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Phase 5 — job postings: discovery/fetch split + no thread leak
+# ---------------------------------------------------------------------------
+
+def test_workday_discovery_split_functions_exist():
+    """Discovery (probes only) is separated from the full fetch."""
+    from tools.altdata_server.server import (
+        _discover_workday_tenant, _try_workday_discovery, _workday_fetch_full,
+    )
+    assert callable(_discover_workday_tenant)
+    assert callable(_try_workday_discovery)
+    assert callable(_workday_fetch_full)
+
+
+def test_discover_workday_tenant_garbage_returns_none():
+    """Discovery returns None (metadata absent) for an unknown tenant — no fetch."""
+    from tools.altdata_server.server import _discover_workday_tenant
+    assert _discover_workday_tenant("absolutelyfakecompany999xyz") is None
+
+
+@network
+def test_job_postings_no_thread_leak():
+    """After a job-postings call returns, worker threads must drain back to
+    ~baseline (the old design left the Workday fetch running past teardown)."""
+    import threading
+    import time
+    from tools.altdata_server.server import _fetch_job_postings
+    baseline = threading.active_count()
+    result = _fetch_job_postings("stripe", "greenhouse", None)
+    assert isinstance(result, dict)
+    # Allow brief drain for any bounded probe threads to exit.
+    deadline = time.time() + 12
+    while threading.active_count() > baseline + 2 and time.time() < deadline:
+        time.sleep(0.5)
+    leaked = threading.active_count() - baseline
+    assert leaked <= 2, f"thread leak: {leaked} threads above baseline"
+
+
 def test_workday_probe_returns_none_on_404():
     """A nonsense tenant must return None, not raise."""
     from tools.altdata_server.server import _workday_probe

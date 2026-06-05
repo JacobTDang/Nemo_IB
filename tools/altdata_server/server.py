@@ -531,10 +531,12 @@ def _workday_fetch_full(tenant: str, wd_n: int, path: str,
         return None
 
 
-def _try_workday_discovery(slug: str, dept_filter: Optional[str]) -> Optional[Dict]:
-    """
-    Generic parallel Workday discovery. Derives tenant name variants from slug
-    and probes all wd_num × path combinations simultaneously.
+def _discover_workday_tenant(slug: str) -> Optional[Dict]:
+    """Generic parallel Workday tenant discovery — probes only (limit=1), no full
+    fetch. Returns discovery metadata {tenant, wd_n, path, url, _total} or None.
+
+    Kept separate from the full fetch so the heavy fetch never runs inside a
+    racing outer pool (which could orphan it past cancel_futures).
     No hardcoded company list — works for any Workday customer.
     """
     clean = slug.replace("-", "").replace("_", "")
@@ -562,10 +564,18 @@ def _try_workday_discovery(slug: str, dept_filter: Optional[str]) -> Optional[Di
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
 
-    if found_meta is None:
+    return found_meta
+
+
+def _try_workday_discovery(slug: str, dept_filter: Optional[str]) -> Optional[Dict]:
+    """Discover the Workday tenant, then fetch the full job breakdown. Returns the
+    normalized result or None. Run this in its OWN scope (not inside a racing
+    pool), so the heavy fetch cannot be orphaned."""
+    meta = _discover_workday_tenant(slug)
+    if meta is None:
         return None
-    return _workday_fetch_full(found_meta["tenant"], found_meta["wd_n"],
-                                found_meta["path"], dept_filter)
+    return _workday_fetch_full(meta["tenant"], meta["wd_n"],
+                                meta["path"], dept_filter)
 
 
 def _detect_ats_from_website(slug: str) -> Optional[Tuple[str, str]]:
@@ -609,9 +619,11 @@ def _fetch_job_postings(slug: str, ats: str,
                          dept_filter: Optional[str]) -> Dict[str, Any]:
     """
     Multi-ATS job listing fetch with fully generic discovery.
-    Stage 1: Greenhouse + Lever + Workday auto-discovery in parallel.
-    Stage 2: ATS fingerprint via company careers URL redirect.
-    Stage 3: Structured error with detected ATS info.
+    Stage 1: Greenhouse + Lever in parallel (cheap single GETs).
+    Stage 2: Workday auto-discovery (own scope — the heavy nested-pool op never
+             races inside the Stage-1 pool, so it can't be orphaned/leak threads).
+    Stage 3: ATS fingerprint via company careers URL redirect.
+    Stage 4: Structured error with detected ATS info.
     """
     # Direct workday bypass (explicit request)
     if ats == "workday":
@@ -624,37 +636,36 @@ def _fetch_job_postings(slug: str, ats: str,
             "ats_detected": "workday_not_found", "slug": slug,
         }
 
-    # Stage 1: parallel discovery
-    pool = ThreadPoolExecutor(max_workers=3)
-    gh_f = pool.submit(_try_greenhouse_norm, slug, dept_filter)
-    lv_f = pool.submit(_try_lever_norm, slug, dept_filter)
-    wd_f = pool.submit(_try_workday_discovery, slug, dept_filter)
-
-    first_success: Optional[Dict] = None
-    preferred_success: Optional[Dict] = None
-
+    # Stage 1: greenhouse + lever in parallel (both are single fast GETs).
+    pool = ThreadPoolExecutor(max_workers=2)
     try:
-        for future in as_completed([gh_f, lv_f, wd_f], timeout=12):
-            try:
-                result = future.result()
-                if result and "error" not in result:
-                    src = result.get("ats", "")
-                    if first_success is None:
-                        first_success = result
-                    if src == ats and preferred_success is None:
-                        preferred_success = result
-            except Exception:
-                pass
-    except Exception:
-        pass
+        gh_f = pool.submit(_try_greenhouse_norm, slug, dept_filter)
+        lv_f = pool.submit(_try_lever_norm, slug, dept_filter)
+        results: Dict[str, Dict] = {}
+        try:
+            for future in as_completed([gh_f, lv_f], timeout=12):
+                try:
+                    result = future.result()
+                    if result and "error" not in result:
+                        results[result.get("ats", "")] = result
+                except Exception:
+                    pass
+        except Exception:
+            pass
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
 
-    chosen = preferred_success or first_success
+    # Prefer the explicitly requested ATS, otherwise any hit.
+    chosen = results.get(ats) or (next(iter(results.values())) if results else None)
     if chosen:
         return chosen
 
-    # Stage 2: ATS fingerprinting via website
+    # Stage 2: Workday auto-discovery in its own scope (no nested racing pool).
+    wd = _try_workday_discovery(slug, dept_filter)
+    if wd and "error" not in wd:
+        return wd
+
+    # Stage 3: ATS fingerprinting via website
     detected = _detect_ats_from_website(slug)
     if detected:
         detected_ats, detected_slug = detected
@@ -679,7 +690,7 @@ def _fetch_job_postings(slug: str, ats: str,
         return {"error": msg, "ats_detected": detected_ats,
                 "detected_slug": detected_slug, "slug": slug}
 
-    # Stage 3: clean failure
+    # Stage 4: clean failure
     return {
         "error": (
             f"No public job data found for '{slug}'. "
