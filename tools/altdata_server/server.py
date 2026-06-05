@@ -45,6 +45,10 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
+from tools.altdata_server.text_utils import (
+    text_contains, count_matches, extract_dollar_amounts, parse_news_date,
+)
+
 # ---------------------------------------------------------------------------
 # Subprocess runner paths + Python executable
 # ---------------------------------------------------------------------------
@@ -221,42 +225,114 @@ def _fetch_options_yfinance(ticker: str, spot: float,
 # Capex announcement helpers
 # ---------------------------------------------------------------------------
 
-_AMOUNT_PATTERN = re.compile(
-    r'\$\s*(\d+(?:\.\d+)?)\s*(billion|trillion|million|B|M|T)\b',
-    re.IGNORECASE,
-)
+# Sector-agnostic direction verbs. Classification keys on these universal
+# expansion/contraction verbs (and a few facility phrases), NOT on sector nouns
+# (factory / refinery / store / mine / data center), so the signal generalizes
+# across every sector. Conjugations are listed explicitly because word-boundary
+# matching is exact (avoids "invest" matching "investigation", "cut" matching
+# "circuit") and English stemming via regex is error-prone.
 _CAPEX_BULLISH = frozenset([
-    "invest", "new factory", "new plant", "expand", "expansion", "construction",
-    "groundbreaking", "build", "opening", "data center", "new facility",
-    "ramp up", "increase capex", "megafactory", "gigafactory", "announce",
+    "invest", "invests", "investing", "investment", "investments",
+    "build", "builds", "building",
+    "construct", "constructs", "constructing", "construction",
+    "expand", "expands", "expanding", "expansion",
+    "new factory", "new plant", "new facility", "new site", "new mill",
+    "new refinery", "new mine", "new store", "new warehouse", "data center",
+    "add capacity", "additional capacity", "new capacity", "increase capacity",
+    "expand capacity", "boost production", "increase production",
+    "ramp up", "ramping", "scale up", "scaling up",
+    "upgrade", "upgrades", "upgrading",
+    "modernize", "modernizing", "modernization",
+    "groundbreaking", "break ground", "broke ground", "breaks ground",
+    "gigafactory", "megafactory",
+    "commission", "commissions", "commissioning",
 ])
 _CAPEX_BEARISH = frozenset([
-    "cancel", "delay", "cut", "reduce", "shutdown", "close", "idle",
-    "lay off", "restructure", "write off", "impairment", "pause",
+    "cancel", "cancels", "canceled", "cancelled", "cancelling", "cancellation",
+    "delay", "delays", "delayed", "delaying",
+    "halt", "halts", "halted", "halting",
+    "suspend", "suspends", "suspended", "suspension",
+    "pause", "pauses", "paused", "pausing",
+    "scrap", "scraps", "scrapped",
+    "shelve", "shelved", "shelving",
+    "mothball", "mothballed", "mothballing",
+    "idle", "idled", "idling",
+    "shutdown", "shut down", "shutting down",
+    "close", "closes", "closing", "closure",
+    "wind down", "winding down",
+    "cut capex", "cut spending", "capex cut", "spending cut", "cutting",
+    "scale back", "scaling back", "scaled back",
+    "write off", "write-off", "writeoff", "write down", "writedown", "write-down",
+    "impairment", "impairments",
+    "divest", "divests", "divesting", "divestiture", "divestment",
+    "layoff", "layoffs", "lay off", "laying off",
+    "restructure", "restructures", "restructuring",
+    "reduce capacity", "reducing capacity", "reduced capacity",
 ])
 
-
-def _extract_dollar_amounts(text: str) -> List[float]:
-    amounts = []
-    for m in _AMOUNT_PATTERN.finditer(text):
-        val = float(m.group(1))
-        unit = m.group(2).lower()
-        if unit in ("billion", "b"):
-            amounts.append(val * 1_000_000_000)
-        elif unit in ("million", "m"):
-            amounts.append(val * 1_000_000)
-        elif unit in ("trillion", "t"):
-            amounts.append(val * 1_000_000_000_000)
-    return amounts
+# Backward-compatible alias — dollar extraction now lives in text_utils.
+_extract_dollar_amounts = extract_dollar_amounts
 
 
 def _classify_capex_text(text: str) -> str:
-    t = text.lower()
-    bull = sum(1 for w in _CAPEX_BULLISH if w in t)
-    bear = sum(1 for w in _CAPEX_BEARISH if w in t)
+    """Direction of a capex headline via word-boundary verb matching."""
+    bull = count_matches(text, _CAPEX_BULLISH)
+    bear = count_matches(text, _CAPEX_BEARISH)
     if bull > bear:
         return "bullish"
-    elif bear > bull:
+    if bear > bull:
+        return "bearish"
+    return "neutral"
+
+
+# Generic corporate-name words too common to identify an article as on-topic.
+_GENERIC_NAME_WORDS = frozenset([
+    "inc", "corp", "corporation", "company", "co", "group", "holdings", "ltd",
+    "plc", "the", "and", "international", "industries", "enterprises", "energy",
+    "motors", "systems", "technologies", "communications", "financial", "services",
+    "global", "worldwide", "partners", "trust", "incorporated", "limited",
+])
+
+
+def _company_name_tokens(company_name: str) -> List[str]:
+    """Distinctive lowercased tokens from a company name, for relevance filtering.
+    Drops generic corp words so 'NextEra Energy' -> ['nextera'], not ['energy']."""
+    tokens = []
+    for w in company_name.split():
+        w = w.strip(".,'\"()").lower()
+        if w.endswith("'s"):
+            w = w[:-2]
+        if len(w) >= 4 and w not in _GENERIC_NAME_WORDS:
+            tokens.append(w)
+    return tokens
+
+
+def _article_is_relevant(text: str, name_tokens: List[str]) -> bool:
+    """True if any distinctive company token appears in the article text.
+    If no distinctive tokens exist (all generic), keep the article (no filter)."""
+    if not name_tokens:
+        return True
+    tl = text.lower()
+    return any(tok in tl for tok in name_tokens)
+
+
+def _capex_signal(announcements: List[Dict]) -> str:
+    """Aggregate capex signal. A >=$1B item counts toward its OWN direction only
+    (a cancelled $2B plant is bearish, never bullish) — the old code force-bulled
+    on any large dollar figure regardless of direction."""
+    bullish_n = sum(1 for a in announcements if a["direction"] == "bullish")
+    bearish_n = sum(1 for a in announcements if a["direction"] == "bearish")
+    major_bull = any(a["max_amount_usd"] >= 1_000_000_000 and a["direction"] == "bullish"
+                     for a in announcements)
+    major_bear = any(a["max_amount_usd"] >= 1_000_000_000 and a["direction"] == "bearish"
+                     for a in announcements)
+    if major_bull and not major_bear:
+        return "bullish"
+    if major_bear and not major_bull:
+        return "bearish"
+    if bullish_n > bearish_n * 2:
+        return "bullish"
+    if bearish_n > bullish_n * 2:
         return "bearish"
     return "neutral"
 
@@ -1013,20 +1089,6 @@ def _fetch_policy_signals(ticker: str, sector: str,
 # Capex announcements via DuckDuckGo news
 # ---------------------------------------------------------------------------
 
-def _parse_article_date(date_str: str) -> Optional[datetime]:
-    if not date_str:
-        return None
-    try:
-        return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-    except ValueError:
-        pass
-    try:
-        from email.utils import parsedate_to_datetime
-        return parsedate_to_datetime(date_str)
-    except Exception:
-        return None
-
-
 def _fetch_capex_announcements(ticker: str, company_name: str,
                                  lookback_days: int) -> Dict[str, Any]:
     try:
@@ -1038,12 +1100,17 @@ def _fetch_capex_announcements(ticker: str, company_name: str,
     if not company_name:
         company_name = _ticker_to_company_name(ticker)
 
+    # Sector-agnostic queries: the first two capture capex events in ANY sector
+    # (retail distribution, energy refinery, pharma manufacturing, REIT
+    # development) via universal frames; the third keeps industrial/tech specificity.
     queries = [
-        f"{company_name} factory plant construction investment announce",
-        f"{company_name} data center capital expenditure billion expand",
+        f"{company_name} capital investment expansion announcement",
+        f"{company_name} new facility construction billion",
+        f"{company_name} factory plant data center capacity expand",
     ]
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    name_tokens = _company_name_tokens(company_name)
     all_articles: List[Dict] = []
     seen_titles: set = set()
 
@@ -1054,11 +1121,15 @@ def _fetch_capex_announcements(ticker: str, company_name: str,
                     results = list(ddgs.news(query, max_results=10, timelimit=None))
                     for r in results:
                         title = r.get("title", "")
-                        if title and title not in seen_titles:
-                            pub_date = _parse_article_date(r.get("date", ""))
-                            if pub_date is None or pub_date >= cutoff:
-                                seen_titles.add(title)
-                                all_articles.append(r)
+                        if not title or title in seen_titles:
+                            continue
+                        # Relevance: drop macro headlines that don't name the company.
+                        if not _article_is_relevant(title + " " + r.get("body", ""), name_tokens):
+                            continue
+                        pub_date = parse_news_date(r.get("date", ""))
+                        if pub_date is None or pub_date >= cutoff:
+                            seen_titles.add(title)
+                            all_articles.append(r)
                 except Exception:
                     continue
     except Exception as exc:
@@ -1092,16 +1163,7 @@ def _fetch_capex_announcements(ticker: str, company_name: str,
     announcements.sort(key=lambda x: -x["max_amount_usd"])
 
     total_usd = sum(a["max_amount_usd"] for a in announcements)
-    has_major = any(a["max_amount_usd"] >= 1_000_000_000 for a in announcements)
-    bullish_n = sum(1 for a in announcements if a["direction"] == "bullish")
-    bearish_n = sum(1 for a in announcements if a["direction"] == "bearish")
-
-    if has_major or bullish_n > bearish_n * 2:
-        signal = "bullish"
-    elif bearish_n > bullish_n * 2:
-        signal = "bearish"
-    else:
-        signal = "neutral"
+    signal = _capex_signal(announcements)
 
     return {
         "ticker": ticker, "company_name": company_name,

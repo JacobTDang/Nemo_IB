@@ -523,6 +523,81 @@ def test_classify_capex_text_mixed_favors_majority():
 
 
 # ---------------------------------------------------------------------------
+# Phase 2 — capex word-boundary classifier + direction-aware signal
+# ---------------------------------------------------------------------------
+
+def test_capex_classify_no_false_bearish_from_substring():
+    """'circuit' must not trigger 'cut'; 'disclosed' must not trigger 'close'."""
+    from tools.altdata_server.server import _classify_capex_text
+    assert _classify_capex_text("executive discussed integrated circuit boards") == "neutral"
+    assert _classify_capex_text("the company disclosed quarterly results") == "neutral"
+
+
+def test_capex_classify_conjugations_match():
+    from tools.altdata_server.server import _classify_capex_text
+    assert _classify_capex_text("the firm invests heavily and expands output") == "bullish"
+    assert _classify_capex_text("the firm cancelled the project and is divesting") == "bearish"
+
+
+def test_capex_signal_bearish_major_not_bullish():
+    """A cancelled $2B plant must read bearish, never bullish (the old bug)."""
+    from tools.altdata_server.server import _capex_signal
+    announcements = [
+        {"direction": "bearish", "max_amount_usd": 2_000_000_000},
+    ]
+    assert _capex_signal(announcements) == "bearish"
+
+
+def test_capex_signal_bullish_major():
+    from tools.altdata_server.server import _capex_signal
+    announcements = [
+        {"direction": "bullish", "max_amount_usd": 5_000_000_000},
+    ]
+    assert _capex_signal(announcements) == "bullish"
+
+
+def test_capex_signal_neutral_large_does_not_force_direction():
+    """A $5B item with no direction verb stays neutral, not auto-bullish."""
+    from tools.altdata_server.server import _capex_signal
+    announcements = [
+        {"direction": "neutral", "max_amount_usd": 5_000_000_000},
+    ]
+    assert _capex_signal(announcements) == "neutral"
+
+
+def test_capex_signal_count_majority():
+    from tools.altdata_server.server import _capex_signal
+    announcements = [
+        {"direction": "bullish", "max_amount_usd": 100_000_000},
+        {"direction": "bullish", "max_amount_usd": 50_000_000},
+        {"direction": "bullish", "max_amount_usd": 0},
+        {"direction": "bearish", "max_amount_usd": 0},
+    ]
+    assert _capex_signal(announcements) == "bullish"  # 3 bull > 2x1 bear
+
+
+def test_capex_name_tokens_drops_generic():
+    from tools.altdata_server.server import _company_name_tokens
+    assert _company_name_tokens("NextEra Energy") == ["nextera"]
+    assert _company_name_tokens("Exxon Mobil Corporation") == ["exxon", "mobil"]
+    assert "mcdonald" in _company_name_tokens("McDonald's Corporation")
+
+
+def test_capex_relevance_filters_macro_headline():
+    """Macro headline without the company name is dropped; on-topic kept."""
+    from tools.altdata_server.server import _article_is_relevant, _company_name_tokens
+    toks = _company_name_tokens("Exxon Mobil Corporation")
+    assert _article_is_relevant("US secures $18T of investment in factories", toks) is False
+    assert _article_is_relevant("Exxon to build $10B refinery expansion", toks) is True
+
+
+def test_capex_relevance_no_tokens_keeps_all():
+    from tools.altdata_server.server import _article_is_relevant
+    # No distinctive tokens -> do not over-filter
+    assert _article_is_relevant("any article text", []) is True
+
+
+# ---------------------------------------------------------------------------
 # New tools — live network tests
 # ---------------------------------------------------------------------------
 
