@@ -661,33 +661,83 @@ def _fetch_taiwan_revenue_finmind(company_codes: List[str], months: int) -> Dict
 # Government contracts via USASpending.gov
 # ---------------------------------------------------------------------------
 
-_USASPENDING_URL = "https://api.usaspending.gov/api/v2/search/spending_by_award/"
+_USASPENDING_BASE = "https://api.usaspending.gov/api/v2/search"
+_SOT_URL = _USASPENDING_BASE + "/spending_over_time/"
+_AGENCY_CATEGORY_URL = _USASPENDING_BASE + "/spending_by_category/awarding_agency/"
+_AWARD_COUNT_URL = _USASPENDING_BASE + "/spending_by_award_count/"
+_USA_TIMEOUT = 30
 _CONTRACT_AWARD_TYPES = ["A", "B", "C", "D"]
-_GRANT_AWARD_TYPES = ["04", "05", "06", "07", "08"]
+# Grants/cooperative agreements (NIH, NSF) — relevant for biotech with include_grants.
+_GRANT_AWARD_TYPES = ["02", "03", "04", "05"]
+_USA_HEADERS = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
 
 
-def _usaspending_query(company_name: str, start: str, end: str,
-                        award_types: List[str], limit: int = 100) -> Dict:
-    import requests
-    payload = {
-        "filters": {
-            "recipient_search_text": [company_name],
-            "time_period": [{"start_date": start, "end_date": end}],
-            "award_type_codes": award_types,
-        },
-        "fields": ["Award ID", "Recipient Name", "Award Amount",
-                   "Action Date", "Awarding Agency Name", "Description"],
-        "sort": "Award Amount",
-        "order": "desc",
-        "limit": limit,
-        "page": 1,
+def _usa_filters(company_name: str, start: str, end: str,
+                  award_types: List[str]) -> Dict[str, Any]:
+    return {
+        "recipient_search_text": [company_name],
+        "time_period": [{"start_date": start, "end_date": end}],
+        "award_type_codes": award_types,
     }
-    resp = requests.post(
-        _USASPENDING_URL, json=payload, timeout=35,
-        headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
-    )
+
+
+def _usa_obligations_total(company_name: str, start: str, end: str,
+                            award_types: List[str]) -> float:
+    """Sum real obligation FLOWS over a window via spending_over_time.
+
+    Unlike spending_by_award (which returns multi-year contract ceiling
+    values), spending_over_time returns the obligated amount per period.
+    The time_period filter bounds the window, so summing the buckets gives
+    the true period flow.
+    """
+    import requests
+    payload = {"group": "month",
+               "filters": _usa_filters(company_name, start, end, award_types)}
+    resp = requests.post(_SOT_URL, json=payload, timeout=_USA_TIMEOUT, headers=_USA_HEADERS)
     resp.raise_for_status()
-    return resp.json()
+    results = resp.json().get("results", [])
+    return float(sum((r.get("aggregated_amount") or 0) for r in results))
+
+
+def _usa_top_agencies(company_name: str, start: str, end: str,
+                       award_types: List[str]) -> List[Dict]:
+    import requests
+    payload = {"category": "awarding_agency",
+               "filters": _usa_filters(company_name, start, end, award_types),
+               "limit": 5}
+    resp = requests.post(_AGENCY_CATEGORY_URL, json=payload, timeout=_USA_TIMEOUT,
+                         headers=_USA_HEADERS)
+    resp.raise_for_status()
+    return resp.json().get("results", [])
+
+
+def _usa_award_count(company_name: str, start: str, end: str,
+                      award_types: List[str]) -> int:
+    import requests
+    payload = {"filters": _usa_filters(company_name, start, end, award_types)}
+    resp = requests.post(_AWARD_COUNT_URL, json=payload, timeout=_USA_TIMEOUT,
+                         headers=_USA_HEADERS)
+    resp.raise_for_status()
+    counts = resp.json().get("results", {}) or {}
+    return sum(int(counts.get(k, 0) or 0)
+               for k in ("contracts", "grants", "idvs", "direct_payments", "other"))
+
+
+def _gov_contracts_signal(trailing_total: float, prior_total: float,
+                           yoy_pct: Optional[float]) -> str:
+    """Pure signal logic. Driven by real period-flow YoY only — no absolute-size
+    override (a megacap always has $1B+ awards, which previously masked declines)."""
+    if trailing_total < 10_000_000:
+        return "not_applicable"  # essentially no federal business
+    if yoy_pct is not None:
+        if yoy_pct > 15:
+            return "bullish"
+        if yoy_pct < -15:
+            return "bearish"
+        return "neutral"
+    if prior_total == 0 and trailing_total >= 10_000_000:
+        return "bullish"  # newly winning federal business where there was none
+    return "neutral"
 
 
 def _fetch_government_contracts(ticker: str, company_name: str,
@@ -697,80 +747,71 @@ def _fetch_government_contracts(ticker: str, company_name: str,
 
     today = datetime.now()
     end = today.strftime("%Y-%m-%d")
-    start = (today - timedelta(days=months * 31)).strftime("%Y-%m-%d")
-    prior_start = (today - timedelta(days=months * 31 * 2)).strftime("%Y-%m-%d")
-    prior_end = start
+    trailing_start = (today - timedelta(days=months * 30)).strftime("%Y-%m-%d")
+    prior_start = (today - timedelta(days=months * 30 * 2)).strftime("%Y-%m-%d")
+    prior_end = trailing_start
 
     award_types = _CONTRACT_AWARD_TYPES + (_GRANT_AWARD_TYPES if include_grants else [])
 
+    # Run the four independent USASpending queries concurrently.
+    results: Dict[str, Any] = {}
+    errors: List[str] = []
+    pool = ThreadPoolExecutor(max_workers=4)
     try:
-        current_data = _usaspending_query(company_name, start, end, award_types)
-        prior_data = _usaspending_query(company_name, prior_start, prior_end, award_types)
+        futures = {
+            pool.submit(_usa_obligations_total, company_name, trailing_start, end, award_types): "trailing",
+            pool.submit(_usa_obligations_total, company_name, prior_start, prior_end, award_types): "prior",
+            pool.submit(_usa_top_agencies, company_name, trailing_start, end, award_types): "agencies",
+            pool.submit(_usa_award_count, company_name, trailing_start, end, award_types): "count",
+        }
+        for future in as_completed(futures, timeout=_USA_TIMEOUT + 5):
+            key = futures[future]
+            try:
+                results[key] = future.result()
+            except Exception as exc:
+                errors.append(f"{key}: {type(exc).__name__}: {str(exc)[:120]}")
     except Exception as exc:
-        return {"error": f"USASpending.gov request failed: {type(exc).__name__}: {str(exc)[:200]}"}
+        errors.append(f"timeout waiting for USASpending: {type(exc).__name__}")
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
-    current_results = current_data.get("results", [])
-    prior_results = prior_data.get("results", [])
-    current_count = current_data.get("page_metadata", {}).get("total", 0)
+    # Trailing obligations drive the core YoY signal; without it we cannot proceed.
+    if "trailing" not in results:
+        return {"error": f"USASpending.gov request failed: {'; '.join(errors) or 'no data'}",
+                "ticker": ticker}
 
-    current_total = sum((r.get("Award Amount") or 0) for r in current_results)
-    prior_total = sum((r.get("Award Amount") or 0) for r in prior_results)
+    trailing_total = results.get("trailing", 0) or 0
+    prior_total = results.get("prior", 0) or 0
+    agencies = results.get("agencies", []) or []
+    award_count = results.get("count", 0) or 0
 
     yoy_pct = None
     if prior_total > 0:
-        yoy_pct = round((current_total - prior_total) / abs(prior_total) * 100, 1)
+        yoy_pct = round((trailing_total - prior_total) / abs(prior_total) * 100, 1)
 
-    # Agency breakdown
-    agency_totals: Dict[str, float] = {}
-    for r in current_results:
-        agency = r.get("Awarding Agency Name", "Unknown")
-        agency_totals[agency] = agency_totals.get(agency, 0) + (r.get("Award Amount") or 0)
+    top_agencies = [
+        {"agency": a.get("name") or "Unknown",
+         "amount_usd": a.get("amount") or 0,
+         "pct_of_total": round((a.get("amount") or 0) / trailing_total * 100, 1) if trailing_total else 0}
+        for a in agencies[:5]
+    ]
 
-    top_agencies = sorted(
-        [{"agency": k, "amount_usd": v,
-          "pct_of_total": round(v / current_total * 100, 1) if current_total else 0}
-         for k, v in agency_totals.items()],
-        key=lambda x: -x["amount_usd"],
-    )[:5]
-
-    # Major recent awards (>$100M)
-    major = [
-        {
-            "description": (r.get("Description") or "")[:100],
-            "amount_usd": r.get("Award Amount") or 0,
-            "date": r.get("Action Date") or "",
-            "agency": r.get("Awarding Agency Name") or "",
-        }
-        for r in current_results
-        if (r.get("Award Amount") or 0) >= 100_000_000
-    ][:5]
-
-    # Signal
-    signal = "neutral"
-    if current_total < 10_000_000:
-        signal = "not_applicable"  # company has essentially no federal contracts
-    elif yoy_pct is not None:
-        if yoy_pct > 10 or any(a["amount_usd"] >= 1_000_000_000 for a in major):
-            signal = "bullish"
-        elif yoy_pct < -10:
-            signal = "bearish"
+    signal = _gov_contracts_signal(trailing_total, prior_total, yoy_pct)
 
     return {
         "company_name": company_name,
         "ticker": ticker,
         "period_months": months,
-        "trailing_awards_usd": current_total,
-        "trailing_award_count": current_count,
-        "prior_period_awards_usd": prior_total,
+        "trailing_awards_usd": round(trailing_total, 2),
+        "trailing_award_count": award_count,
+        "prior_period_awards_usd": round(prior_total, 2),
         "yoy_change_pct": yoy_pct,
         "signal": signal,
         "top_agencies": top_agencies,
-        "major_recent_awards": major,
         "source": "usaspending.gov",
-        "note": (
-            "Dollar totals are based on the top 100 awards by amount "
-            "(captures majority of contract value for most companies)."
-        ),
+        "basis": ("Contract obligations (period flow) via spending_over_time — "
+                  "not multi-year contract ceiling values."),
+        "partial_errors": errors,
     }
 
 
@@ -1232,11 +1273,12 @@ class AltDataServer:
                 Tool(
                     name="get_government_contracts",
                     description=(
-                        "Federal contract (and optional grant) awards to a company "
-                        "via USASpending.gov — free, no auth required. "
-                        "Returns trailing-period total, YoY change, top awarding agencies, "
-                        "and major awards (>$100M). "
-                        "Signal: YoY > +10% or any >$1B award = bullish; YoY < -10% = bearish; "
+                        "Federal contract (and optional grant) obligations to a company "
+                        "via USASpending.gov — free, no auth required. Uses spending_over_time "
+                        "for true period FLOW (not multi-year contract ceiling values). "
+                        "Returns trailing-period obligations, prior-period obligations, YoY change, "
+                        "top awarding agencies, and award count. "
+                        "Signal: YoY > +15% = bullish; YoY < -15% = bearish; "
                         "< $10M total = not_applicable (consumer/B2C company). "
                         "Most relevant for: defense (LMT, RTX, NOC), cloud (AMZN, MSFT), "
                         "IT services, biotech (with include_grants=true)."

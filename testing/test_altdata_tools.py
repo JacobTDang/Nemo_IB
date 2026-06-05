@@ -526,6 +526,41 @@ def test_classify_capex_text_mixed_favors_majority():
 # New tools — live network tests
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Phase 0 — gov-contracts signal logic (pure, no network)
+# ---------------------------------------------------------------------------
+
+def test_gov_signal_decline_is_not_bullish():
+    """Regression guard: a YoY decline must NOT read bullish even at huge size.
+    (The old >=$1B override force-bulled every megacap regardless of trend.)"""
+    from tools.altdata_server.server import _gov_contracts_signal
+    # $45B trailing, $49B prior, -8% YoY — exactly the LMT case that was wrong
+    assert _gov_contracts_signal(45e9, 49e9, -8.0) == "neutral"
+    assert _gov_contracts_signal(45e9, 60e9, -25.0) == "bearish"
+
+
+def test_gov_signal_flat_band_is_neutral():
+    from tools.altdata_server.server import _gov_contracts_signal
+    for yoy in (-15.0, -10.0, 0.0, 10.0, 15.0):
+        assert _gov_contracts_signal(50e9, 50e9, yoy) == "neutral", f"yoy={yoy}"
+
+
+def test_gov_signal_growth_is_bullish():
+    from tools.altdata_server.server import _gov_contracts_signal
+    assert _gov_contracts_signal(60e9, 40e9, 50.0) == "bullish"
+
+
+def test_gov_signal_tiny_is_not_applicable():
+    from tools.altdata_server.server import _gov_contracts_signal
+    assert _gov_contracts_signal(5_000_000, 0, None) == "not_applicable"
+
+
+def test_gov_signal_new_business_is_bullish():
+    from tools.altdata_server.server import _gov_contracts_signal
+    # prior 0, trailing above floor, no computable YoY → newly winning business
+    assert _gov_contracts_signal(50_000_000, 0, None) == "bullish"
+
+
 def _skip_on_usaspending_timeout(result):
     """Skip test if USASpending.gov was unreachable (flaky free API)."""
     if "error" in result:
@@ -554,7 +589,8 @@ def test_government_contracts_has_required_fields():
     _skip_on_usaspending_timeout(result)
     assert "error" not in result, result.get("error")
     required = ["company_name", "ticker", "period_months", "trailing_awards_usd",
-                "trailing_award_count", "signal", "top_agencies", "major_recent_awards", "source"]
+                "trailing_award_count", "prior_period_awards_usd", "yoy_change_pct",
+                "signal", "top_agencies", "source", "basis"]
     for field in required:
         assert field in result, f"missing field: {field}"
     assert result["signal"] in {"bullish", "bearish", "neutral", "not_applicable"}
