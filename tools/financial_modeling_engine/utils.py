@@ -1,9 +1,10 @@
 import yfinance as yf
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 import pandas as pd
 import numpy as np
 import re
 import sys
+from datetime import datetime, timedelta, timezone
 
 def get_data(ticker: str) -> Dict[str, Any]:
   data = {}
@@ -614,6 +615,108 @@ def get_short_interest(ticker: str) -> Dict[str, Any]:
     'signal':                    signal,
     'source':                    'yfinance (underlying: FINRA biweekly short interest)',
   }
+
+
+def _safe_float(v: Any, default: float = 0.0) -> float:
+  """float() that maps None, non-numeric, and NaN to a default.
+
+  yfinance returns NaN (a truthy float) for ask/impliedVolatility on illiquid
+  strikes; `float(x or 0)` leaves NaN intact, which then poisons the straddle
+  math and serializes to invalid JSON. NaN != NaN, so `f == f` catches it."""
+  try:
+    f = float(v)
+  except (TypeError, ValueError):
+    return default
+  return f if f == f else default
+
+
+def _leg_price(opt: Dict) -> Tuple[float, bool]:
+  """Price of one ATM leg for the straddle. Prefer the live ask; when ask is 0
+  (market closed) fall back to last_price then bid. Returns (price, used_fallback);
+  used_fallback=True means the quote is stale (after-hours / illiquid)."""
+  # _safe_float each key separately: a NaN ask is truthy, so `ask or ask_price`
+  # would swallow a valid OpenBB ask_price behind a NaN yfinance ask.
+  ask = _safe_float(opt.get("ask")) or _safe_float(opt.get("ask_price"))
+  if ask > 0:
+    return ask, False
+  for k in ("last_price", "bid"):
+    v = _safe_float(opt.get(k))
+    if v > 0:
+      return v, True
+  return 0.0, True
+
+
+def compute_implied_move(spot: float, atm_call_ask: float,
+            atm_put_ask: float) -> Dict[str, Any]:
+  straddle = _safe_float(atm_call_ask) + _safe_float(atm_put_ask)
+  implied_move_pct = straddle / spot if spot > 0 else 0.0
+  return {"implied_move_pct": round(implied_move_pct, 4), "straddle_cost": straddle}
+
+
+_ATM_GAP_THRESHOLD = 0.08  # nearest strike >8% from spot → treat as ATM missing
+_PARITY_TOLERANCE = 0.05   # |C-P-(S-K)|/S above this → ask quotes are junk
+
+
+def _us_market_today():
+  """Today's date in US-market terms. UTC is a day ahead of ET every evening
+  (00:00-05:00 UTC) — exactly when after-hours pre-earnings research runs —
+  which made a tomorrow-ET front expiry look like 'today' and get dropped."""
+  try:
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("America/New_York")).date()
+  except Exception:
+    # tzdata unavailable: fixed ET-standard offset (off by 1h in summer,
+    # which only matters in the 04:00-05:00 UTC sliver)
+    return datetime.now(timezone(timedelta(hours=-5))).date()
+
+
+def _find_atm_options(rows: List[Dict], spot: float,
+           target_expiry: Optional[str] = None):
+  """Find the nearest ATM call and put. Returns (None, None, None) if ATM gap > 8%."""
+  if not rows:
+    return None, None, None
+
+  expiries = sorted({r.get("expiration") or r.get("expiration_date", "") for r in rows
+           if r.get("expiration") or r.get("expiration_date")})
+  if not expiries:
+    return None, None, None
+
+  today = _us_market_today().isoformat()
+  future = [e for e in expiries if e > today]
+  chosen_expiry = future[0] if future else expiries[-1]
+  if target_expiry:
+    chosen_expiry = target_expiry
+
+  chain = [r for r in rows
+      if (r.get("expiration") or r.get("expiration_date", "")) == chosen_expiry]
+  calls = [r for r in chain if (r.get("option_type") or r.get("optionType", "")).lower() == "call"]
+  puts  = [r for r in chain if (r.get("option_type") or r.get("optionType", "")).lower() == "put"]
+
+  def _effective_price(r):
+    # Ask is the right straddle cost when the market is open; after hours
+    # ask is 0, so fall back to last_price then bid for ATM selection.
+    for k in ("ask", "ask_price", "last_price", "bid"):
+      v = _safe_float(r.get(k))
+      if v > 0:
+        return v
+    return 0.0
+
+  def nearest_atm(options):
+    if not options:
+      return None
+    # Prefer strikes with a positive price signal; a 0-price ATM strike
+    # would yield a garbage straddle.
+    quoted = [o for o in options if _effective_price(o) > 0]
+    pool = quoted or options
+    best = min(pool, key=lambda r: abs(_safe_float(r.get("strike")) - spot))
+    # Guard: reject if gap is too large (truncated chain)
+    if spot > 0 and abs(_safe_float(best.get("strike")) - spot) / spot > _ATM_GAP_THRESHOLD:
+      return None
+    return best
+
+  atm_call = nearest_atm(calls)
+  atm_put  = nearest_atm(puts)
+  return atm_call, atm_put, chosen_expiry
 
 
 def get_options_metrics(ticker: str) -> Dict[str, Any]:
