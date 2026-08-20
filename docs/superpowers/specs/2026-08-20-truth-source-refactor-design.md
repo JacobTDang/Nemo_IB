@@ -209,3 +209,43 @@ on live numbers, so it comes from differential comparison instead.
 HTTP transport, Dockerfiles, deployment, splitting `nemo_web`'s RAG tools from
 its SEC extractors, moving `state/` behind a service, and full manifest
 reconciliation. Each is its own spec.
+
+### Handed off to the primary-source swap
+
+`2026-08-20-primary-source-swap-design.md` owns the following. They were found
+during this refactor's audit but are deliberately NOT fixed here, to keep the two
+efforts from touching the same files in the same window:
+
+- `get_financial_statements` and `get_forward_estimates` both 403 on the current
+  Finnhub tier and silently fall back to yfinance. Four skills each depend on them.
+- Re-backing `get_financial_statements` with the repo's own SEC XBRL extractors.
+- The 7 unit-scale test failures on `get_revenue_base` / `get_ebitda_margin`. The
+  production code is correct — the tests assert a millions-scale range against raw-dollar
+  output. **Do not "fix" the extractor in this refactor.**
+- `get_revenue_base`, `get_ebitda_margin`, `get_margin_breakdown` being referenced by
+  zero skills.
+
+**File boundary.** This refactor touches `tools/financial_modeling_engine/`,
+`tools/altdata_server/`, `tools/openbb_server/`, `agent/cache.py`, `state/schema.py`,
+and `.claude/skills/preearnings-research/`. The primary-source swap touches
+`tools/news_agregator/finnhub_server.py` and `tools/web_search_server/sec_utils.py`.
+The only shared surface is the dependency manifests, and the swap adds no dependencies.
+
+**Ordering.** The swap lands after this refactor's D4 cache split — EDGAR extraction is
+cache-heavy and would otherwise write cache rows into the state database.
+
+### Deferred, in neither spec
+
+Found during the audit, tracked in `.superpowers/sdd/progress.md`, to be triaged at the
+final review rather than absorbed into either effort:
+
+- `close_paper_position` reports failure after successfully closing
+  (`tools/alpaca/server.py:415`, `NameError` swallowed by a broad `except`). Highest
+  severity finding; belongs on its own branch.
+- README documents Alpaca env var names the code does not read.
+- `SEC_EMAIL` silently defaults to `analyst@example.com`.
+- Test-infrastructure debt: no `pytest-asyncio` (11 tests cannot run), tests depending on
+  a missing `.mcp.json` and a missing root `CLAUDE.md` (17 tests), 5 scratch scripts
+  erroring on collection, and `test_all_500_revenue` — a sequential 500-ticker live EDGAR
+  loop marked `slow` rather than `network`, which became more hazardous once `SEC_EMAIL`
+  was set to a real identity.
