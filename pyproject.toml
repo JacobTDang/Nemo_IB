@@ -8,7 +8,6 @@ dependencies = [
   "torchvision==0.20.1",
   "torchaudio==2.5.1",
   "sympy==1.13.1",
-  "accelerate==1.12.0",
   "aiofiles==25.1.0",
   "aiohappyeyeballs==2.6.1",
   "aiohttp==3.13.2",
@@ -19,7 +18,6 @@ dependencies = [
   "attrs==25.4.0",
   "babel==2.17.0",
   "beautifulsoup4==4.14.3",
-  "bitsandbytes==0.49.0",
   "brotli==1.2.0",
   "certifi==2026.1.4",
   "cffi==2.0.0",
@@ -202,6 +200,6 @@ environments = [
 
 [tool.pytest.ini_options]
 markers = [
-    "slow: model-loading tests (FinBERT) excluded from quick runs via -m 'not slow'",
+    "slow: long-running tests excluded from quick runs via -m 'not slow'",
     "network: live-network tests skippable via SKIP_NETWORK_TESTS=1",
 ]

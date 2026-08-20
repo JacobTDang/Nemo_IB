@@ -26,7 +26,6 @@ if not os.path.isfile(_VENV_PY):
     _VENV_PY = sys.executable
 
 _TRENDS_RUNNER = os.path.join(_REPO, "tools", "altdata_server", "trends_runner.py")
-_FINBERT_RUNNER = os.path.join(_REPO, "tools", "altdata_server", "finbert_runner.py")
 _OPTIONS_RUNNER = os.path.join(_REPO, "tools", "altdata_server", "options_runner.py")
 
 SKIP_NETWORK = os.getenv("SKIP_NETWORK_TESTS", "0") == "1"
@@ -96,60 +95,6 @@ def test_trends_runner_bad_json_args():
     )
     result = json.loads(proc.stdout)
     assert result["success"] is False
-
-
-# ---------------------------------------------------------------------------
-# FinBERT runner — Layer 1
-# ---------------------------------------------------------------------------
-
-@pytest.mark.slow
-def test_finbert_runner_positive_sentiment():
-    texts = [
-        "Revenue beat expectations by 15%, raising full-year guidance",
-        "Strong demand across all product lines, margins expanded",
-        "Record quarterly earnings driven by AI chip demand",
-    ]
-    proc = _run(_FINBERT_RUNNER, "get_finbert_sentiment",
-                {"texts": texts, "ticker": "NVDA"}, timeout=180)
-    assert proc.returncode == 0, f"stderr: {proc.stderr[-300:]}"
-    result = json.loads(proc.stdout)
-    assert result["success"] is True, result.get("error")
-    data = result["data"]
-    assert data["signal"] == "bullish", f"expected bullish, got {data['signal']} (score={data['net_score']})"
-    assert data["net_score"] > 0
-    assert data["article_count"] == 3
-    assert len(data["per_article"]) == 3
-
-
-@pytest.mark.slow
-def test_finbert_runner_negative_sentiment():
-    texts = [
-        "Missed EPS estimates by a wide margin, guidance cut significantly",
-        "Revenue declined year over year, demand deteriorating",
-        "CEO resigned amid accounting irregularities investigation",
-    ]
-    proc = _run(_FINBERT_RUNNER, "get_finbert_sentiment",
-                {"texts": texts, "ticker": "TEST"}, timeout=180)
-    result = json.loads(proc.stdout)
-    assert result["success"] is True
-    data = result["data"]
-    assert data["signal"] == "bearish", f"expected bearish, got {data['signal']} (score={data['net_score']})"
-    assert data["net_score"] < 0
-
-
-def test_finbert_runner_empty_texts_fails_clean():
-    proc = _run(_FINBERT_RUNNER, "get_finbert_sentiment",
-                {"texts": [], "ticker": "AAPL"}, timeout=10)
-    result = json.loads(proc.stdout)
-    assert result["success"] is False
-    assert "Traceback" not in result.get("error", "")
-
-
-def test_finbert_runner_unknown_tool_fails_clean():
-    proc = _run(_FINBERT_RUNNER, "bad_tool", {"texts": ["x"], "ticker": "AAPL"})
-    result = json.loads(proc.stdout)
-    assert result["success"] is False
-    assert "unknown tool" in result["error"]
 
 
 # ---------------------------------------------------------------------------

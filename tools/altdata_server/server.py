@@ -1,8 +1,7 @@
 """nemo_altdata MCP server — alternative data tools for pre-earnings research.
 
-8 tools:
+7 tools:
   get_google_trends          -- pytrends wrapper; YoY demand signal
-  get_finbert_sentiment      -- FinBERT financial sentiment on news headlines
   get_taiwan_monthly_revenue -- FinMind API for TSMC/Foxconn/MediaTek/ASE revenue
   get_job_postings_count     -- Multi-ATS job listing count (Greenhouse/Lever/Workday
                                 auto-discovery — no hardcoded company list)
@@ -12,8 +11,8 @@
   get_policy_signals         -- Legislative climate via GovTrack (+ Congress.gov if key set)
   get_capex_announcements    -- Capital investment announcements via DuckDuckGo news
 
-Heavy tools (pytrends, FinBERT) run in isolated subprocesses via the same
-pattern as tools/openbb_server/server.py to avoid asyncio conflicts on Windows.
+Heavy tools (pytrends) run in isolated subprocesses via the same pattern as
+tools/openbb_server/server.py to avoid asyncio conflicts on Windows.
 Light tools (FinMind, job postings, options, gov contracts, policy, capex) run
 directly in async handlers via asyncio.to_thread.
 
@@ -62,14 +61,11 @@ if not os.path.isfile(_VENV_PYTHON):
     _VENV_PYTHON = sys.executable
 
 _TRENDS_RUNNER = os.path.join(_HERE, "trends_runner.py")
-_FINBERT_RUNNER = os.path.join(_HERE, "finbert_runner.py")
 _OPTIONS_RUNNER = os.path.join(_HERE, "options_runner.py")
 
 # Extended timeouts: trends_runner now retries on 429 (adds up to 30s)
 _TRENDS_TIMEOUT_S = 45.0
-_FINBERT_TIMEOUT_S = 120.0
 _SUBPROCESS_TIMEOUT_S = 40.0
-_FINBERT_SUB_TIMEOUT_S = 115.0
 # Options: fresh subprocess isolates yfinance cold-start; subprocess.run kills
 # the child on hang (no leaked thread, unlike asyncio.to_thread on a hung lib).
 _OPTIONS_TIMEOUT_S = 30.0
@@ -1322,27 +1318,6 @@ class AltDataServer:
                     },
                 ),
                 Tool(
-                    name="get_finbert_sentiment",
-                    description=(
-                        "Score news headlines using FinBERT (ProsusAI/finbert). "
-                        "Returns per-article labels and aggregated net_score "
-                        "(-1.0 all negative → +1.0 all positive). "
-                        "Signal: net_score > 0.15 = bullish, < -0.15 = bearish."
-                    ),
-                    inputSchema={
-                        "type": "object",
-                        "required": ["texts", "ticker"],
-                        "properties": {
-                            "texts": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "News headlines or summaries (max 50).",
-                            },
-                            "ticker": {"type": "string"},
-                        },
-                    },
-                ),
-                Tool(
                     name="get_taiwan_monthly_revenue",
                     description=(
                         "Monthly revenue for Taiwan-listed companies via FinMind "
@@ -1526,36 +1501,12 @@ class AltDataServer:
                         },
                     },
                 ),
-                Tool(
-                    name="get_web_traffic_signal",
-                    description=(
-                        "TIER 2 (paid): YoY web-traffic demand signal via SimilarWeb. "
-                        "Requires SIMILARWEB_API_KEY; returns a clean error if unset. "
-                        "Supersedes Google Trends as the demand proxy for digital / "
-                        "e-commerce / SaaS / marketplace names. Domain auto-resolved "
-                        "from the ticker (yfinance website) unless overridden. "
-                        "Signal: visits YoY > +10% bullish, < -10% bearish, else neutral."
-                    ),
-                    inputSchema={
-                        "type": "object",
-                        "required": ["ticker"],
-                        "properties": {
-                            "ticker": {"type": "string"},
-                            "domain": {
-                                "type": "string",
-                                "description": "Optional: override the web domain (e.g. 'nvidia.com').",
-                            },
-                        },
-                    },
-                ),
             ]
 
         @self.server.call_tool()
         async def call_tool(name: str, args: Dict[str, Any]):
             if name == "get_google_trends":
                 return await parent.google_trends(args)
-            if name == "get_finbert_sentiment":
-                return await parent.finbert_sentiment(args)
             if name == "get_taiwan_monthly_revenue":
                 return await parent.taiwan_monthly_revenue(args)
             if name == "get_job_postings_count":
@@ -1568,8 +1519,6 @@ class AltDataServer:
                 return await parent.policy_signals(args)
             if name == "get_capex_announcements":
                 return await parent.capex_announcements(args)
-            if name == "get_web_traffic_signal":
-                return await parent.web_traffic_signal(args)
             return _err(name, f"unknown tool: {name}")
 
     # -----------------------------------------------------------------------
@@ -1599,27 +1548,6 @@ class AltDataServer:
         if not result.get("success"):
             return _err("get_google_trends", result.get("error", "unknown error"))
         return _ok("get_google_trends", result["data"])
-
-    async def finbert_sentiment(self, args: Dict[str, Any]) -> List[TextContent]:
-        texts = args.get("texts")
-        ticker = str(args.get("ticker", "")).upper()
-        if not texts:
-            return _err("get_finbert_sentiment", "texts is required", ticker)
-        kwargs = {"texts": texts, "ticker": ticker}
-        try:
-            result = await asyncio.wait_for(
-                asyncio.to_thread(
-                    _run_subprocess, _FINBERT_RUNNER, "get_finbert_sentiment",
-                    kwargs, _FINBERT_SUB_TIMEOUT_S,
-                ),
-                timeout=_FINBERT_TIMEOUT_S,
-            )
-        except asyncio.TimeoutError:
-            return _err("get_finbert_sentiment",
-                        f"timeout after {_FINBERT_TIMEOUT_S}s", ticker)
-        if not result.get("success"):
-            return _err("get_finbert_sentiment", result.get("error", "unknown error"), ticker)
-        return _ok("get_finbert_sentiment", result["data"], ticker)
 
     async def taiwan_monthly_revenue(self, args: Dict[str, Any]) -> List[TextContent]:
         codes = args.get("company_codes", [])
@@ -1815,26 +1743,6 @@ class AltDataServer:
             return _err("get_policy_signals",
                         f"{type(exc).__name__}: {str(exc)[:200]}", ticker)
         return _ok("get_policy_signals", result, ticker)
-
-    async def web_traffic_signal(self, args: Dict[str, Any]) -> List[TextContent]:
-        ticker = str(args.get("ticker", "")).upper()
-        if not ticker:
-            return _err("get_web_traffic_signal", "ticker is required")
-        domain = args.get("domain")
-        try:
-            from tools.preearnings.web_traffic import web_traffic_signal as _wts
-            result = await asyncio.wait_for(
-                asyncio.to_thread(_wts, ticker, domain),
-                timeout=30.0,
-            )
-        except asyncio.TimeoutError:
-            return _err("get_web_traffic_signal", "SimilarWeb timed out after 30s", ticker)
-        except Exception as exc:
-            return _err("get_web_traffic_signal",
-                        f"{type(exc).__name__}: {str(exc)[:200]}", ticker)
-        if "error" in result:
-            return _err("get_web_traffic_signal", result["error"], ticker)
-        return _ok("get_web_traffic_signal", result, ticker)
 
     async def capex_announcements(self, args: Dict[str, Any]) -> List[TextContent]:
         ticker = str(args.get("ticker", "")).upper()
