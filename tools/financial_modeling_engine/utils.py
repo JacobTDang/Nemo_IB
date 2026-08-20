@@ -719,6 +719,56 @@ def _find_atm_options(rows: List[Dict], spot: float,
   return atm_call, atm_put, chosen_expiry
 
 
+def _chain_to_rows(chain, expiry: str) -> List[Dict]:
+  """Flatten one yfinance option_chain result into the row shape the ATM
+  helpers expect. yfinance uses camelCase DataFrame columns; the helpers use
+  snake_case keys, so the rename happens here and nowhere else."""
+  rows: List[Dict] = []
+  for df, otype in ((chain.calls, 'call'), (chain.puts, 'put')):
+    for _, row in df.iterrows():
+      rows.append({
+        'expiration': expiry,
+        'option_type': otype,
+        'strike': _safe_float(row.get('strike')),
+        'ask': _safe_float(row.get('ask')),
+        'bid': _safe_float(row.get('bid')),
+        'last_price': _safe_float(row.get('lastPrice')),
+        'implied_volatility': _safe_float(row.get('impliedVolatility')),
+      })
+  return rows
+
+
+def _straddle_legs(atm_call: Dict, atm_put: Dict,
+                   spot: float) -> Tuple[float, float, bool]:
+  """Price both straddle legs, with a put-call parity sanity check.
+
+  C - P should approximate S - K for same-strike legs. A nonzero ask is not
+  necessarily a SANE ask -- junk wide quotes left at the close pass a bare >0
+  check (live ORCL: call 6.75 / put 28.35 at strike 237.5 with spot 236.34, a
+  $21 violation). On gross violation both legs are rebuilt from last_price/bid
+  and the result is flagged stale.
+
+  Returns (call_price, put_price, quotes_stale)."""
+  call_px, call_stale = _leg_price(atm_call)
+  put_px, put_stale = _leg_price(atm_put)
+  stale = call_stale or put_stale
+
+  strike = _safe_float(atm_call.get('strike'))
+  if (call_px > 0 and put_px > 0 and spot > 0
+      and abs((call_px - put_px) - (spot - strike)) / spot > _PARITY_TOLERANCE):
+    def _no_ask(opt):
+      return {k: v for k, v in opt.items() if k not in ('ask', 'ask_price')}
+    c2, _ = _leg_price(_no_ask(atm_call))
+    p2, _ = _leg_price(_no_ask(atm_put))
+    # Only rebuild if a fallback actually exists -- otherwise keep the asks
+    # rather than returning a fabricated zero.
+    if c2 > 0 and p2 > 0:
+      call_px, put_px = c2, p2
+      stale = True
+
+  return call_px, put_px, stale
+
+
 def get_options_metrics(ticker: str) -> Dict[str, Any]:
   """Compute key options-market metrics from yfinance option chains.
 
@@ -731,7 +781,7 @@ def get_options_metrics(ticker: str) -> Dict[str, Any]:
   values on deep ITM/OTM strikes. ATM is defined as the strike closest to
   spot. Skew compares 0.9*spot put IV to 1.1*spot call IV.
   """
-  from datetime import datetime, date as _date
+  from datetime import datetime
 
   out: Dict[str, Any] = {'ticker': ticker.upper(), 'success': True, 'error': None}
 
@@ -748,7 +798,7 @@ def get_options_metrics(ticker: str) -> Dict[str, Any]:
       return {'ticker': ticker, 'success': False, 'error': 'no options listed'}
     out['expirations_available'] = len(exps)
 
-    today = _date.today()
+    today = _us_market_today()
     exp_dates = []
     for e in exps:
       try:
@@ -774,6 +824,8 @@ def get_options_metrics(ticker: str) -> Dict[str, Any]:
 
     # Term structure
     term_structure = {}
+    front_chain = None
+    front_expiry = None
     for label, target_days in [('7d', 7), ('30d', 30), ('60d', 60), ('90d', 90)]:
       exp, dte = _find_expiry(target_days)
       try:
@@ -781,6 +833,9 @@ def get_options_metrics(ticker: str) -> Dict[str, Any]:
       except Exception:
         term_structure[label] = {'expiry': exp, 'dte': dte, 'error': 'chain fetch failed'}
         continue
+      if label == '7d':
+        front_chain = chain
+        front_expiry = exp
       call_iv = _atm_iv(chain, 'call')
       put_iv = _atm_iv(chain, 'put')
       atm_iv = None
@@ -798,6 +853,24 @@ def get_options_metrics(ticker: str) -> Dict[str, Any]:
         'atm_iv':         round(atm_iv, 4) if atm_iv is not None else None,
       }
     out['term_structure'] = term_structure
+
+    # ATM straddle from the front expiry — reuses the 7d chain already
+    # fetched for the term structure rather than refetching.
+    if front_chain is not None:
+      rows = _chain_to_rows(front_chain, front_expiry)
+      call, put, chosen_expiry = _find_atm_options(rows, spot)
+      if call is None or put is None:
+        out['implied_move'] = {'error': 'no ATM strike within threshold'}
+      else:
+        call_px, put_px, stale = _straddle_legs(call, put, spot)
+        moved = compute_implied_move(spot, call_px, put_px)
+        out['implied_move'] = {
+          **moved,
+          'front_expiry': chosen_expiry,
+          'quotes_stale': stale,
+        }
+    else:
+      out['implied_move'] = {'error': 'front expiry chain unavailable'}
 
     # 30d skew
     exp_30, _ = _find_expiry(30)

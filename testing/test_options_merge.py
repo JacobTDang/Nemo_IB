@@ -122,3 +122,62 @@ def test_skew_classification():
     call, put, _ = _find_atm_options(rows, 100.0, "2099-08-15")
     skew_diff = float(put["implied_volatility"]) - float(call["implied_volatility"])
     assert skew_diff > 0.03  # put_heavy
+
+
+def test_chain_to_rows_normalizes_yfinance_columns():
+    import pandas as pd
+
+    from tools.financial_modeling_engine.utils import _chain_to_rows
+
+    class _Chain:
+        calls = pd.DataFrame([{"strike": 100.0, "ask": 3.0, "bid": 2.8,
+                               "lastPrice": 2.9, "impliedVolatility": 0.35}])
+        puts = pd.DataFrame([{"strike": 100.0, "ask": 2.0, "bid": 1.8,
+                              "lastPrice": 1.9, "impliedVolatility": 0.33}])
+
+    rows = _chain_to_rows(_Chain(), "2099-01-15")
+
+    assert len(rows) == 2
+    call = next(r for r in rows if r["option_type"] == "call")
+    assert call["expiration"] == "2099-01-15"
+    assert call["strike"] == 100.0
+    assert call["ask"] == 3.0
+    assert call["last_price"] == 2.9          # camelCase -> snake_case
+    assert call["implied_volatility"] == 0.35
+    assert {r["option_type"] for r in rows} == {"call", "put"}
+
+
+def test_straddle_legs_uses_ask_when_parity_holds():
+    from tools.financial_modeling_engine.utils import _straddle_legs
+
+    # C - P = 3 - 2 = 1; S - K = 100 - 99 = 1. Parity holds, asks are trusted.
+    call = {"strike": 99.0, "ask": 3.0, "last_price": 2.5}
+    put = {"strike": 99.0, "ask": 2.0, "last_price": 1.5}
+    call_px, put_px, stale = _straddle_legs(call, put, spot=100.0)
+    assert (call_px, put_px) == (3.0, 2.0)
+    assert stale is False
+
+
+def test_straddle_legs_rebuilds_on_parity_violation():
+    """Live ORCL case: call 6.75 / put 28.35 at strike 237.5, spot 236.34 -- a
+    $21 parity violation from junk wide quotes left at the close. A nonzero ask
+    is not necessarily a sane ask."""
+    from tools.financial_modeling_engine.utils import _straddle_legs
+
+    call = {"strike": 237.5, "ask": 6.75, "last_price": 5.10}
+    put = {"strike": 237.5, "ask": 28.35, "last_price": 6.40}
+    call_px, put_px, stale = _straddle_legs(call, put, spot=236.34)
+
+    assert (call_px, put_px) == (5.10, 6.40), "should rebuild both legs off last_price"
+    assert stale is True
+
+
+def test_straddle_legs_keeps_ask_when_no_fallback_available():
+    from tools.financial_modeling_engine.utils import _straddle_legs
+
+    # Parity violated but no last_price/bid to fall back to: keep the asks
+    # rather than fabricating a number.
+    call = {"strike": 237.5, "ask": 6.75}
+    put = {"strike": 237.5, "ask": 28.35}
+    call_px, put_px, stale = _straddle_legs(call, put, spot=236.34)
+    assert (call_px, put_px) == (6.75, 28.35)
