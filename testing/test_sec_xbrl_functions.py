@@ -70,6 +70,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# This suite hits live SEC EDGAR extensively — nearly every class below calls
+# get_latest_filing/get_revenue_base/etc. against real tickers with no mocking
+# (TestBatchProcessing alone loops over ~500 tickers sequentially). Skip the
+# entire module under the same offline gate the rest of this project uses
+# (see testing/test_altdata_tools.py:31) so `SKIP_NETWORK_TESTS=1` keeps CI
+# and local runs from hammering SEC EDGAR / hanging on the batch loop.
+SKIP_NETWORK = os.environ.get("SKIP_NETWORK_TESTS") == "1"
+
+pytestmark = pytest.mark.skipif(
+    SKIP_NETWORK,
+    reason="SEC EDGAR live network tests skipped (SKIP_NETWORK_TESTS=1)",
+)
+
 
 # =============================================================================
 # TEST DATA: 500 STOCK TICKERS ORGANIZED BY SECTOR
