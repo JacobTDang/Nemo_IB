@@ -1,24 +1,21 @@
 """nemo_altdata MCP server — alternative data tools for pre-earnings research.
 
-7 tools:
+6 tools:
   get_google_trends          -- pytrends wrapper; YoY demand signal
   get_taiwan_monthly_revenue -- FinMind API for TSMC/Foxconn/MediaTek/ASE revenue
   get_job_postings_count     -- Multi-ATS job listing count (Greenhouse/Lever/Workday
                                 auto-discovery — no hardcoded company list)
-  get_options_implied_move   -- ATM straddle implied move + put/call skew
-                                (yfinance auto-fetch; no obb_options_chain required)
   get_government_contracts   -- Federal contract awards via USASpending.gov (no auth)
   get_policy_signals         -- Legislative climate via GovTrack (+ Congress.gov if key set)
   get_capex_announcements    -- Capital investment announcements via DuckDuckGo news
 
 Heavy tools (pytrends) run in isolated subprocesses via the same pattern as
 tools/openbb_server/server.py to avoid asyncio conflicts on Windows.
-Light tools (FinMind, job postings, options, gov contracts, policy, capex) run
+Light tools (FinMind, job postings, gov contracts, policy, capex) run
 directly in async handlers via asyncio.to_thread.
 
 Taiwan revenue uses FinMind (api.finmindtrade.com).
 Job postings: auto-discovers Greenhouse → Lever → Workday in parallel (no curated list).
-Options: calls yfinance directly when ATM strikes are missing from supplied rows.
 
 Register:
   claude mcp add -s user nemo_altdata -e PYTHONPATH=<repo> -- \\
@@ -61,15 +58,10 @@ if not os.path.isfile(_VENV_PYTHON):
     _VENV_PYTHON = sys.executable
 
 _TRENDS_RUNNER = os.path.join(_HERE, "trends_runner.py")
-_OPTIONS_RUNNER = os.path.join(_HERE, "options_runner.py")
 
 # Extended timeouts: trends_runner now retries on 429 (adds up to 30s)
 _TRENDS_TIMEOUT_S = 45.0
 _SUBPROCESS_TIMEOUT_S = 40.0
-# Options: fresh subprocess isolates yfinance cold-start; subprocess.run kills
-# the child on hang (no leaked thread, unlike asyncio.to_thread on a hung lib).
-_OPTIONS_TIMEOUT_S = 30.0
-_OPTIONS_SUB_TIMEOUT_S = 25.0
 
 
 # ---------------------------------------------------------------------------
@@ -132,112 +124,6 @@ def _err(tool: str, msg: str, ticker: str = "") -> List[TextContent]:
     return [TextContent(type="text",
                         text=json.dumps(_envelope(None, tool, ticker, errors=[msg]),
                                         default=str))]
-
-
-# ---------------------------------------------------------------------------
-# Options implied move — pure math
-# ---------------------------------------------------------------------------
-
-def _safe_float(v: Any, default: float = 0.0) -> float:
-    """float() that maps None, non-numeric, and NaN to a default.
-
-    yfinance returns NaN (a truthy float) for ask/impliedVolatility on illiquid
-    strikes; `float(x or 0)` leaves NaN intact, which then poisons the straddle
-    math and serializes to invalid JSON. NaN != NaN, so `f == f` catches it."""
-    try:
-        f = float(v)
-    except (TypeError, ValueError):
-        return default
-    return f if f == f else default
-
-
-def _leg_price(opt: Dict) -> Tuple[float, bool]:
-    """Price of one ATM leg for the straddle. Prefer the live ask; when ask is 0
-    (market closed) fall back to last_price then bid. Returns (price, used_fallback);
-    used_fallback=True means the quote is stale (after-hours / illiquid)."""
-    # _safe_float each key separately: a NaN ask is truthy, so `ask or ask_price`
-    # would swallow a valid OpenBB ask_price behind a NaN yfinance ask.
-    ask = _safe_float(opt.get("ask")) or _safe_float(opt.get("ask_price"))
-    if ask > 0:
-        return ask, False
-    for k in ("last_price", "bid"):
-        v = _safe_float(opt.get(k))
-        if v > 0:
-            return v, True
-    return 0.0, True
-
-
-def compute_implied_move(spot: float, atm_call_ask: float,
-                         atm_put_ask: float) -> Dict[str, Any]:
-    straddle = _safe_float(atm_call_ask) + _safe_float(atm_put_ask)
-    implied_move_pct = straddle / spot if spot > 0 else 0.0
-    return {"implied_move_pct": round(implied_move_pct, 4), "straddle_cost": straddle}
-
-
-_ATM_GAP_THRESHOLD = 0.08  # nearest strike >8% from spot → treat as ATM missing
-_PARITY_TOLERANCE = 0.05   # |C-P-(S-K)|/S above this → ask quotes are junk
-
-
-def _us_market_today():
-    """Today's date in US-market terms. UTC is a day ahead of ET every evening
-    (00:00-05:00 UTC) — exactly when after-hours pre-earnings research runs —
-    which made a tomorrow-ET front expiry look like 'today' and get dropped."""
-    try:
-        from zoneinfo import ZoneInfo
-        return datetime.now(ZoneInfo("America/New_York")).date()
-    except Exception:
-        # tzdata unavailable: fixed ET-standard offset (off by 1h in summer,
-        # which only matters in the 04:00-05:00 UTC sliver)
-        return datetime.now(timezone(timedelta(hours=-5))).date()
-
-
-def _find_atm_options(rows: List[Dict], spot: float,
-                      target_expiry: Optional[str] = None):
-    """Find the nearest ATM call and put. Returns (None, None, None) if ATM gap > 8%."""
-    if not rows:
-        return None, None, None
-
-    expiries = sorted({r.get("expiration") or r.get("expiration_date", "") for r in rows
-                       if r.get("expiration") or r.get("expiration_date")})
-    if not expiries:
-        return None, None, None
-
-    today = _us_market_today().isoformat()
-    future = [e for e in expiries if e > today]
-    chosen_expiry = future[0] if future else expiries[-1]
-    if target_expiry:
-        chosen_expiry = target_expiry
-
-    chain = [r for r in rows
-             if (r.get("expiration") or r.get("expiration_date", "")) == chosen_expiry]
-    calls = [r for r in chain if (r.get("option_type") or r.get("optionType", "")).lower() == "call"]
-    puts  = [r for r in chain if (r.get("option_type") or r.get("optionType", "")).lower() == "put"]
-
-    def _effective_price(r):
-        # Ask is the right straddle cost when the market is open; after hours
-        # ask is 0, so fall back to last_price then bid for ATM selection.
-        for k in ("ask", "ask_price", "last_price", "bid"):
-            v = _safe_float(r.get(k))
-            if v > 0:
-                return v
-        return 0.0
-
-    def nearest_atm(options):
-        if not options:
-            return None
-        # Prefer strikes with a positive price signal; a 0-price ATM strike
-        # would yield a garbage straddle.
-        quoted = [o for o in options if _effective_price(o) > 0]
-        pool = quoted or options
-        best = min(pool, key=lambda r: abs(_safe_float(r.get("strike")) - spot))
-        # Guard: reject if gap is too large (truncated chain)
-        if spot > 0 and abs(_safe_float(best.get("strike")) - spot) / spot > _ATM_GAP_THRESHOLD:
-            return None
-        return best
-
-    atm_call = nearest_atm(calls)
-    atm_put  = nearest_atm(puts)
-    return atm_call, atm_put, chosen_expiry
 
 
 # ---------------------------------------------------------------------------
@@ -1375,37 +1261,6 @@ class AltDataServer:
                     },
                 ),
                 Tool(
-                    name="get_options_implied_move",
-                    description=(
-                        "Compute the options-implied earnings move from the ATM straddle. "
-                        "When options_chain_rows is omitted or lacks ATM coverage, "
-                        "fetches the full chain via yfinance automatically — no "
-                        "obb_options_chain pre-call required. "
-                        "Returns: implied_move_pct, put_call_skew, front_expiry, source. "
-                        "Rule: implied_move_pct > 0.15 = high binary risk."
-                    ),
-                    inputSchema={
-                        "type": "object",
-                        "required": ["ticker", "spot_price"],
-                        "properties": {
-                            "ticker": {"type": "string"},
-                            "spot_price": {
-                                "type": "number",
-                                "description": "Current stock price.",
-                            },
-                            "options_chain_rows": {
-                                "type": "array",
-                                "description": "Optional: pre-fetched rows from obb_options_chain. "
-                                               "When omitted or ATM is missing, yfinance is used.",
-                            },
-                            "target_expiry": {
-                                "type": "string",
-                                "description": "Optional YYYY-MM-DD: use this expiry instead of front-month.",
-                            },
-                        },
-                    },
-                ),
-                Tool(
                     name="get_government_contracts",
                     description=(
                         "Federal contract (and optional grant) obligations to a company "
@@ -1511,8 +1366,6 @@ class AltDataServer:
                 return await parent.taiwan_monthly_revenue(args)
             if name == "get_job_postings_count":
                 return await parent.job_postings_count(args)
-            if name == "get_options_implied_move":
-                return await parent.options_implied_move(args)
             if name == "get_government_contracts":
                 return await parent.government_contracts(args)
             if name == "get_policy_signals":
@@ -1583,120 +1436,6 @@ class AltDataServer:
             return _err("get_job_postings_count",
                         f"{type(exc).__name__}: {str(exc)[:200]}")
         return _ok("get_job_postings_count", result, slug.upper())
-
-    async def options_implied_move(self, args: Dict[str, Any]) -> List[TextContent]:
-        ticker = str(args.get("ticker", "")).upper()
-        spot = float(args.get("spot_price", 0))
-        rows = args.get("options_chain_rows") or []
-        target_expiry = args.get("target_expiry")
-
-        if spot <= 0:
-            return _err("get_options_implied_move", "spot_price must be > 0", ticker)
-
-        source = "supplied"
-        try:
-            atm_call, atm_put, expiry = _find_atm_options(rows, spot, target_expiry)
-
-            # Fallback to yfinance when rows are empty or ATM gap too large.
-            # Only switch source to "yfinance" if yfinance actually produced
-            # BOTH ATM legs — otherwise the error message stays accurate.
-            yf_attempted = False
-            if (not atm_call or not atm_put) and ticker:
-                yf_attempted = True
-                # Fetch via an isolated subprocess: avoids yfinance cold-start
-                # stalls in the long-running server, and subprocess.run(timeout)
-                # hard-kills a hung fetch (no leaked thread).
-                try:
-                    res = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            _run_subprocess, _OPTIONS_RUNNER, "get_options_chain",
-                            {"ticker": ticker}, _OPTIONS_SUB_TIMEOUT_S,
-                        ),
-                        timeout=_OPTIONS_TIMEOUT_S,
-                    )
-                    yf_rows = res.get("data", {}).get("rows", []) if res.get("success") else []
-                except asyncio.TimeoutError:
-                    yf_rows = []
-                if yf_rows:
-                    yf_call, yf_put, yf_expiry = _find_atm_options(yf_rows, spot, target_expiry)
-                    if yf_call and yf_put:
-                        atm_call, atm_put, expiry = yf_call, yf_put, yf_expiry
-                        source = "yfinance"
-
-            if not atm_call or not atm_put:
-                msg = "could not find ATM options"
-                if target_expiry:
-                    msg += (f" (target_expiry={target_expiry} — verify it is a "
-                            f"listed, future expiry)")
-                if yf_attempted:
-                    msg += " (yfinance fallback also lacked ATM coverage)"
-                elif rows:
-                    all_strikes = [_safe_float(r.get("strike")) for r in rows]
-                    if all_strikes and spot > 0:
-                        nearest = min(all_strikes, key=lambda s: abs(s - spot))
-                        gap_pct = abs(nearest - spot) / spot * 100
-                        msg += (f" (nearest strike {nearest:.1f} is "
-                                f"{gap_pct:.1f}% from spot {spot} — "
-                                f"supplied chain lacks ATM coverage)")
-                return _err("get_options_implied_move", msg, ticker)
-
-            call_ask, call_stale = _leg_price(atm_call)
-            put_ask,  put_stale  = _leg_price(atm_put)
-            quotes_stale = call_stale or put_stale
-
-            # Put-call parity sanity: C - P ~= S - K for same-strike legs. A
-            # nonzero ask is not necessarily a SANE ask — junk wide quotes left
-            # at the close pass the >0 check (live ORCL: call 6.75 / put 28.35
-            # at 237.5 with spot 236.34, a $21 parity violation). On gross
-            # violation rebuild both legs from last_price/bid and flag stale.
-            strike_for_parity = _safe_float(atm_call.get("strike"))
-            if (call_ask > 0 and put_ask > 0 and spot > 0
-                    and abs((call_ask - put_ask) - (spot - strike_for_parity)) / spot
-                        > _PARITY_TOLERANCE):
-                def _no_ask(opt):
-                    return {k: v for k, v in opt.items()
-                            if k not in ("ask", "ask_price")}
-                c2, _ = _leg_price(_no_ask(atm_call))
-                p2, _ = _leg_price(_no_ask(atm_put))
-                if c2 > 0 and p2 > 0:
-                    call_ask, put_ask = c2, p2
-                    quotes_stale = True
-            call_iv  = _safe_float(atm_call.get("implied_volatility") or atm_call.get("impliedVolatility"))
-            put_iv   = _safe_float(atm_put.get("implied_volatility")  or atm_put.get("impliedVolatility"))
-            strike   = _safe_float(atm_call.get("strike"))
-
-            move = compute_implied_move(spot, call_ask, put_ask)
-            skew_diff = put_iv - call_iv
-            skew_label = (
-                "put_heavy" if skew_diff > 0.03
-                else "call_heavy" if skew_diff < -0.03
-                else "balanced"
-            )
-
-            data = {
-                "ticker": ticker,
-                "spot_price": spot,
-                "front_expiry": expiry,
-                "atm_strike": strike,
-                "atm_call_ask": call_ask,
-                "atm_put_ask": put_ask,
-                "implied_move_pct": move["implied_move_pct"],
-                "straddle_cost": move["straddle_cost"],
-                "call_iv": round(call_iv, 4),
-                "put_iv": round(put_iv, 4),
-                "put_call_skew": round(skew_diff, 4),
-                "skew_label": skew_label,
-                "source": source,
-                "quotes_stale": quotes_stale,
-                "risk_flag": (
-                    "HIGH VOLATILITY WARNING: implied move >15%"
-                    if move["implied_move_pct"] > 0.15 else None
-                ),
-            }
-        except Exception as exc:
-            return _err("get_options_implied_move",
-                        f"{type(exc).__name__}: {str(exc)[:200]}", ticker)
-        return _ok("get_options_implied_move", data, ticker)
 
     # -----------------------------------------------------------------------
     # New tool handlers

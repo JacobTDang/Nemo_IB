@@ -99,6 +99,58 @@ def test_find_atm_options_empty_returns_none():
     assert _find_atm_options([], spot=100.0) == (None, None, None)
 
 
+def test_find_atm_prefers_positive_ask():
+    """An ATM strike with 0/NaN ask should yield to a positive-ask neighbor."""
+    nan = float("nan")
+    rows = [
+        {"expiration": "2026-08-15", "option_type": "call", "strike": 100, "ask": nan, "implied_volatility": 0.3},
+        {"expiration": "2026-08-15", "option_type": "call", "strike": 101, "ask": 2.5, "implied_volatility": 0.3},
+        {"expiration": "2026-08-15", "option_type": "put",  "strike": 100, "ask": 0,   "implied_volatility": 0.3},
+        {"expiration": "2026-08-15", "option_type": "put",  "strike": 101, "ask": 2.2, "implied_volatility": 0.3},
+    ]
+    call, put, _ = _find_atm_options(rows, spot=100.0, target_expiry="2026-08-15")
+    assert call is not None and float(call["strike"]) == 101.0  # skipped NaN-ask 100
+    assert put is not None and float(put["strike"]) == 101.0    # skipped 0-ask 100
+
+
+def test_atm_gap_guard_returns_none_when_strike_too_far():
+    """Nearest strike >8% from spot must return (None, None, None)."""
+    rows = [
+        # spot=234, strike=190 → gap ~18.8% — should be rejected
+        {"expiration": "2026-07-18", "option_type": "call", "strike": 190, "ask": 5.0, "implied_volatility": 0.30},
+        {"expiration": "2026-07-18", "option_type": "put",  "strike": 190, "ask": 4.5, "implied_volatility": 0.33},
+    ]
+    c, p, e = _find_atm_options(rows, spot=234.0, target_expiry="2026-07-18")
+    assert c is None
+    assert p is None
+    assert e == "2026-07-18"
+
+
+def test_atm_gap_guard_passes_when_strike_within_threshold():
+    """Strike within 8% of spot must not be rejected."""
+    rows = [
+        # spot=234, strike=220 → gap ~6% — should be accepted
+        {"expiration": "2026-07-18", "option_type": "call", "strike": 220, "ask": 8.0, "implied_volatility": 0.28},
+        {"expiration": "2026-07-18", "option_type": "put",  "strike": 220, "ask": 7.5, "implied_volatility": 0.32},
+    ]
+    c, p, e = _find_atm_options(rows, spot=234.0, target_expiry="2026-07-18")
+    assert c is not None
+    assert p is not None
+    assert float(c["strike"]) == 220.0
+
+
+def test_atm_gap_guard_boundary_just_inside():
+    """Strike exactly at 8% boundary (inclusive) should be accepted."""
+    spot = 100.0
+    strike = 92.1   # gap = 7.9% — just inside threshold
+    rows = [
+        {"expiration": "2026-08-01", "option_type": "call", "strike": strike, "ask": 2.0, "implied_volatility": 0.25},
+        {"expiration": "2026-08-01", "option_type": "put",  "strike": strike, "ask": 1.8, "implied_volatility": 0.27},
+    ]
+    c, p, _ = _find_atm_options(rows, spot=spot, target_expiry="2026-08-01")
+    assert c is not None and p is not None
+
+
 def test_find_atm_uses_last_price_after_hours():
     # ask == 0 everywhere (market closed); selection must still find the strike.
     rows = [
