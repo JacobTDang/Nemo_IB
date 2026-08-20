@@ -9,8 +9,8 @@
   get_policy_signals         -- Legislative climate via GovTrack (+ Congress.gov if key set)
   get_capex_announcements    -- Capital investment announcements via DuckDuckGo news
 
-Heavy tools (pytrends) run in isolated subprocesses via the same pattern as
-tools/openbb_server/server.py to avoid asyncio conflicts on Windows.
+Heavy tools (pytrends) run in isolated subprocesses to avoid asyncio
+conflicts on Windows.
 Light tools (FinMind, job postings, gov contracts, policy, capex) run
 directly in async handlers via asyncio.to_thread.
 
