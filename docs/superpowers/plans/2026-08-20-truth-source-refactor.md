@@ -1388,13 +1388,27 @@ Keep the IV-sentinel rule and the event-move extraction paragraph unchanged — 
 
 Also note `implied_move.quotes_stale`: when true, the straddle rebuilt from `last_price` and the event-move math inherits that staleness (`known_issues.md` #5).
 
+- [ ] **Step 3b: Fix the stale example in `earnings-eval`**
+
+`.claude/skills/earnings-eval/SKILL.md:140` lists `finbert_sentiment` as a row in the
+signal-attribution illustration table. It is an EXAMPLE, not a tool call — nothing
+breaks — but it names a signal that no longer exists. Replace that row with a signal
+the system still produces, e.g.:
+
+```
+| news_sentiment | neutral | — |
+```
+
+Do not remove the table or the `google_trends` row above it.
+
 - [ ] **Step 4: Verify no stale tool references**
 
 ```bash
-grep -rn "get_finbert_sentiment\|get_options_implied_move\|get_web_traffic_signal\|obb_" .claude/skills/
+grep -rn "get_finbert_sentiment\|get_options_implied_move\|get_web_traffic_signal\|obb_\|finbert" .claude/skills/
 ```
 
-Expected: no output.
+Expected: no output. Note this grep now also catches bare `finbert`, which is how the
+`earnings-eval` example row was missed on the first pass.
 
 - [ ] **Step 5: Full suite**
 
