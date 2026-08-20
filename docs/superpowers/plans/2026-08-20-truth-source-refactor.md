@@ -28,6 +28,20 @@
 
 Establishes the number every later regression gate is a delta against, and stops the daemons that write the database Task 6 modifies.
 
+**Run Task 0.5 first if no `.venv` exists** — on arm64 the environment cannot be built
+until the CUDA torch pin is removed, so there is nothing to measure a baseline against.
+
+**Baseline caveat:** `testing/` holds scratch scripts alongside real tests
+(`debug_client.py`, `debug_ebitda.py`, `get_8k_details.py`,
+`run_full_orchestration_AMD.py`, `run_orchestration_resume_AMD.py`, `simple_test.py`).
+pytest will not collect most of them, but do not treat "116 files" as a test count.
+Record what pytest actually collects.
+
+**Offline-gate caveat:** only `testing/test_altdata_tools.py` uses the `network`
+marker. Roughly 15 other files make live calls without one, so `SKIP_NETWORK_TESTS=1`
+does not fully isolate an offline run. Expect network-dependent failures in the
+baseline and record them as pre-existing rather than chasing them.
+
 **Files:**
 - Create: `docs/superpowers/plans/baseline.txt`
 
@@ -65,6 +79,78 @@ Expected: a summary line. Append any pre-existing failures to `baseline.txt` —
 ```bash
 git add docs/superpowers/plans/baseline.txt
 git commit -m "record test baseline before truth-source refactor"
+```
+
+---
+
+### Task 0.5: Make the environment installable
+
+**Pulled forward from Task 5.** `pyproject.toml` pins `torch==2.5.1+cu121` against a
+CUDA-only index. Those wheels do not exist for arm64, so `uv sync` cannot resolve on
+an Apple Silicon machine — the environment cannot be built at all until this changes.
+Every remaining torch consumer is CPU-bound, so the CUDA pin buys nothing.
+
+This task is independent of the FinBERT deletion and must run before any other task.
+
+**Files:**
+- Modify: `pyproject.toml:7-9, 203-211`, `requirements.txt`
+
+- [ ] **Step 1: Repin torch to CPU wheels**
+
+In `pyproject.toml`, change lines 7-9:
+
+```toml
+  "torch==2.5.1",
+  "torchvision==0.20.1",
+  "torchaudio==2.5.1",
+```
+
+Delete the `[[tool.uv.index]]` block named `pytorch-cu121` (around line 203) and the
+`[tool.uv.sources]` entries pinning torch/torchvision/torchaudio to it (around lines
+209-211). Apply the same version changes to `requirements.txt`.
+
+Leave `accelerate` and `bitsandbytes` alone — they are removed in Task 5, after the
+dead code that uses them is deleted.
+
+- [ ] **Step 2: Verify no CUDA pin remains**
+
+```bash
+grep -n "cu121\|pytorch-cu121" pyproject.toml requirements.txt
+```
+
+Expected: no output.
+
+- [ ] **Step 3: Build the environment**
+
+```bash
+uv venv --python 3.12 .venv
+uv pip install -r requirements.txt 2>&1 | tail -20
+```
+
+Expected: resolution succeeds. If it fails on a package unrelated to torch, record the
+package and stop — a second unsatisfiable pin is a finding, not something to work
+around silently.
+
+- [ ] **Step 4: Verify torch and the embedder import**
+
+```bash
+.venv/bin/python -c "import torch; print('torch', torch.__version__)"
+.venv/bin/python -c "from agent.rag.embedder import embed; print('embedder ok')"
+```
+
+Expected: a plain version with no `+cu121` suffix, then `embedder ok`. The second
+command downloads the ~80MB MiniLM model on first run.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add pyproject.toml requirements.txt
+git commit -m "repin torch to CPU wheels
+
+The +cu121 pin targets a CUDA-only index with no arm64 wheels, so uv sync
+could not resolve on Apple Silicon at all. Every torch consumer in the repo
+is CPU-bound -- finbert_runner ran device=-1 and MiniLM embedding is trivial
+on CPU -- so the CUDA build bought nothing."
 ```
 
 ---
@@ -826,23 +912,16 @@ SKIP_NETWORK_TESTS=1 pytest testing/test_sec_xbrl_functions.py -m slow --collect
 
 Expected: 14 tests collected.
 
-- [ ] **Step 7: Repin torch to CPU wheels**
+- [ ] **Step 7: Drop accelerate and bitsandbytes**
 
-torch stays — `agent/rag/embedder.py:49` needs it through sentence-transformers. Only the CUDA variant goes.
+The torch CPU repin already happened in Task 0.5. What remains is the two pins whose
+only consumer was `agent/huggingface_template.py`, deleted in Step 3 of this task.
 
-In `pyproject.toml`, change lines 7-9 from `+cu121` to plain versions:
+Remove `"accelerate==1.12.0"` and `"bitsandbytes==0.49.0"` from `pyproject.toml` and
+`requirements.txt`.
 
-```toml
-  "torch==2.5.1",
-  "torchvision==0.20.1",
-  "torchaudio==2.5.1",
-```
-
-Delete the `[[tool.uv.index]]` block named `pytorch-cu121` (around line 203) and the `[tool.uv.sources]` entries pinning torch/torchvision/torchaudio to it (around lines 209-211).
-
-Remove the now-direct-consumerless pins `"accelerate==1.12.0"` and `"bitsandbytes==0.49.0"`. Leave `"transformers==4.57.3"` — sentence-transformers requires it, so it stays as a transitive dependency; removing the direct pin is optional and out of scope here.
-
-Apply the same removals to `requirements.txt`.
+Leave `"transformers==4.57.3"` — sentence-transformers requires it, so it stays as a
+transitive dependency; dropping the direct pin is out of scope.
 
 - [ ] **Step 8: Verify the embedder still imports**
 
