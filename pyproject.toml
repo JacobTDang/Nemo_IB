@@ -149,6 +149,7 @@ dependencies = [
   "rpds-py==0.30.0",
   "safetensors==0.7.0",
   "selenium==4.39.0",
+  "sentence-transformers==5.5.1",
   "setuptools==70.2.0",
   "sgmllib3k==1.0.0",
   "six==1.17.0",
