@@ -8,7 +8,14 @@ import sqlite3
 import os
 from typing import Optional
 
-DB_PATH = os.path.join("db_cache", "session.db")
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Absolute, not CWD-relative: a relative path silently opens a different
+# database when a process starts from another directory, and the mismatch
+# surfaces as an empty result rather than an error.
+DB_PATH = os.environ.get(
+    "NEMO_DB_PATH", os.path.join(_REPO_ROOT, "db_cache", "session.db")
+)
 
 CREATE_SCHEMA = [
     # --- Phase 0: watchlist (tickers actively monitored) ---
@@ -382,6 +389,11 @@ def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+    # WAL lets readers proceed during a write; busy_timeout makes a blocked
+    # writer wait rather than raise immediately. Six daemons write this file
+    # concurrently.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     try:
         import sqlite_vec
         conn.enable_load_extension(True)
