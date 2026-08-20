@@ -137,7 +137,7 @@ Then:
 | Signal | Prior direction | Actual outcome aligns? |
 |---|---|---|
 | google_trends | bullish | yes |
-| finbert_sentiment | neutral | — |
+| news_sentiment | neutral | — |
 | ... | ... | ... |
 
 **Post-mortem note** (1-2 sentences on the most informative signal and
