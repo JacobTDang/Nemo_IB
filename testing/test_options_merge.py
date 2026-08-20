@@ -17,6 +17,7 @@ if _REPO not in sys.path:
 
 from tools.financial_modeling_engine.utils import (  # noqa: E402
     _find_atm_options,
+    _find_expiry,
     _leg_price,
     _safe_float,
     compute_implied_move,
@@ -233,3 +234,43 @@ def test_straddle_legs_keeps_ask_when_no_fallback_available():
     put = {"strike": 237.5, "ask": 28.35}
     call_px, put_px, stale = _straddle_legs(call, put, spot=236.34)
     assert (call_px, put_px) == (6.75, 28.35)
+
+
+def test_find_expiry_exact_match():
+    exp_dates = [("2099-01-08", 1), ("2099-01-15", 8), ("2099-02-01", 30)]
+    exp, dte = _find_expiry(exp_dates, 30)
+    assert (exp, dte) == ("2099-02-01", 30)
+
+
+def test_find_expiry_nearest_at_or_beyond_target():
+    # No exact 30-DTE listing; 28 is short of target, 35 is the nearest
+    # at-or-beyond match and must win over the nearer-but-short 28.
+    exp_dates = [("2099-01-08", 1), ("2099-01-20", 28), ("2099-01-27", 35), ("2099-03-01", 60)]
+    exp, dte = _find_expiry(exp_dates, 30)
+    assert (exp, dte) == ("2099-01-27", 35)
+
+
+def test_find_expiry_seven_dte_floor_skips_one_dte_weekly():
+    """Regression for the escalation: a Thursday with a 1-DTE Friday weekly
+    must NOT be selected as the front expiry when the target is 7 DTE. The
+    'at-or-beyond target' rule floors the front expiry at (approximately)
+    the target DTE rather than snapping to the nearest listed expiry, which
+    is why implied_move_pct does not understate a straddle down to a 1-DTE
+    contract."""
+    exp_dates = [("2099-01-02", 1), ("2099-01-09", 8)]
+    exp, dte = _find_expiry(exp_dates, 7)
+    assert exp == "2099-01-09"
+    assert dte == 8
+
+
+def test_find_expiry_fallback_when_all_expiries_are_nearer_than_target():
+    # Every listed expiry is short of the 90-DTE target; fall back to the
+    # nearest one overall rather than returning nothing.
+    exp_dates = [("2099-01-08", 1), ("2099-01-15", 8), ("2099-02-01", 30)]
+    exp, dte = _find_expiry(exp_dates, 90)
+    assert (exp, dte) == ("2099-02-01", 30)
+
+
+def test_find_expiry_empty_input_raises():
+    with pytest.raises(ValueError):
+        _find_expiry([], 30)

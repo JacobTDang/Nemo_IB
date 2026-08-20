@@ -769,6 +769,28 @@ def _straddle_legs(atm_call: Dict, atm_put: Dict,
   return call_px, put_px, stale
 
 
+def _find_expiry(exp_dates: List[Tuple[str, int]], target_dte: int) -> Tuple[str, int]:
+  """Pick the listed expiry closest to `target_dte`, preferring at-or-beyond.
+
+  Among expirations with DTE >= target_dte, returns the one nearest to
+  target_dte. If none are at or beyond the target, falls back to the
+  overall nearest expiry (nearer-than-target).
+
+  Consequence: this floors the selection at (approximately) target_dte
+  rather than snapping to whatever is nearest overall. For the 7d term-
+  structure bucket, that means a 1-DTE Friday weekly is skipped in favor
+  of e.g. an 8-DTE expiry -- the old select_expiries() had no such floor
+  and would have picked the 1-DTE contract. That floor is intentional:
+  get_options_metrics reuses this same 7d selection as the front expiry
+  for the ATM straddle, and implied_move_pct from a 1-DTE straddle
+  understates the move enough to let the `implied_move_pct > 0.20` risk
+  gate under-fire (see .claude/skills/preearnings-research/SKILL.md).
+  """
+  future = [(e, d) for e, d in exp_dates if d >= target_dte]
+  pool = future if future else exp_dates
+  return min(pool, key=lambda x: abs(x[1] - target_dte))
+
+
 def get_options_metrics(ticker: str) -> Dict[str, Any]:
   """Compute key options-market metrics from yfinance option chains.
 
@@ -807,11 +829,6 @@ def get_options_metrics(ticker: str) -> Dict[str, Any]:
       except ValueError:
         continue
 
-    def _find_expiry(target_dte: int) -> tuple:
-      future = [(e, d) for e, d in exp_dates if d >= target_dte]
-      pool = future if future else exp_dates
-      return min(pool, key=lambda x: abs(x[1] - target_dte))
-
     def _atm_iv(chain, side: str) -> Optional[float]:
       df = chain.calls if side == 'call' else chain.puts
       # Filter out yfinance's IV=0.00001 sentinel for inactive contracts but
@@ -827,7 +844,7 @@ def get_options_metrics(ticker: str) -> Dict[str, Any]:
     front_chain = None
     front_expiry = None
     for label, target_days in [('7d', 7), ('30d', 30), ('60d', 60), ('90d', 90)]:
-      exp, dte = _find_expiry(target_days)
+      exp, dte = _find_expiry(exp_dates, target_days)
       try:
         chain = t.option_chain(exp)
       except Exception:
@@ -873,7 +890,7 @@ def get_options_metrics(ticker: str) -> Dict[str, Any]:
       out['implied_move'] = {'error': 'front expiry chain unavailable'}
 
     # 30d skew
-    exp_30, _ = _find_expiry(30)
+    exp_30, _ = _find_expiry(exp_dates, 30)
     try:
       chain30 = t.option_chain(exp_30)
       calls = chain30.calls[chain30.calls['impliedVolatility'] > 0.01]
