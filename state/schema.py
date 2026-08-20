@@ -1,8 +1,12 @@
 """SQLite schema definitions for the autonomous system's persistent state.
 
-All tables live in the same db (db_cache/session.db) as the existing
-Session_Cache tool/news/scrape caches. Tables here are created idempotently
-via CREATE TABLE IF NOT EXISTS so repeated imports are safe.
+All tables live in db_cache/session.db. This is durable book state -- theses,
+positions, the sentry queue. The disposable tool/news/scrape caches live
+separately in db_cache/tool_cache.db (see agent/cache.py) so that clearing a
+cache can never take book state with it.
+
+Tables here are created idempotently via CREATE TABLE IF NOT EXISTS so repeated
+imports are safe.
 """
 import sqlite3
 import os
