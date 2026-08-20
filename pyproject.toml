@@ -171,7 +171,6 @@ dependencies = [
   "tokenizers==0.22.2",
   "tqdm==4.67.1",
   "trafilatura==2.0.0",
-  "transformers==4.57.3",
   "trio==0.32.0",
   "trio-websocket==0.12.2",
   "typing-inspect==0.9.0",

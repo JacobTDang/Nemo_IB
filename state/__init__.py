@@ -7,8 +7,8 @@ This package owns the SQLite tables that outlive a single agent run:
   - positions     (Phase 6, execution agent writes)
   - orders        (Phase 6, execution agent writes)
 
-The existing Session_Cache (agent/cache.py) holds short-lived tool/news/scrape
-caches in the same db_cache/session.db. Tables created here coexist with those.
+The disposable tool/news/scrape caches live separately in db_cache/tool_cache.db
+(see agent/cache.py) so that clearing a cache can never take book state with it.
 """
 from state.schema import init_schema, get_connection
 
