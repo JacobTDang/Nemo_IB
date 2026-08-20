@@ -4,9 +4,9 @@ version = "1.1.0"
 requires-python = ">=3.12,<3.13"
 
 dependencies = [
-  "torch==2.5.1+cu121",
-  "torchvision==0.20.1+cu121",
-  "torchaudio==2.5.1+cu121",
+  "torch==2.5.1",
+  "torchvision==0.20.1",
+  "torchaudio==2.5.1",
   "sympy==1.13.1",
   "accelerate==1.12.0",
   "aiofiles==25.1.0",
@@ -199,16 +199,6 @@ dependencies = [
 environments = [
   "sys_platform == 'win32'",
 ]
-
-[[tool.uv.index]]
-name = "pytorch-cu121"
-url = "https://download.pytorch.org/whl/cu121"
-explicit = true
-
-[tool.uv.sources]
-torch = [{ index = "pytorch-cu121" }]
-torchvision = [{ index = "pytorch-cu121" }]
-torchaudio = [{ index = "pytorch-cu121" }]
 
 [tool.pytest.ini_options]
 markers = [
