@@ -705,15 +705,64 @@ def test_merged_matches_altdata(ticker):
     )
 ```
 
-- [ ] **Step 2: Run it**
+- [ ] **Step 1b: Add the sentinel guard**
+
+**This guard is the point of the test.** A live probe on 2026-08-20 at 01:53 ET
+(`marketState=PREPRE`) found every MSFT contract returning `bid=ask=openInterest=0`
+and ATM IV pinned to the constant `0.0156` sentinel across all four tenors, making
+skew exactly 0.0. Both implementations read that same feed. Without a guard they
+agree perfectly on garbage and the test passes while proving nothing — the exact
+false-confidence failure this task exists to prevent.
+
+Insert at the top of `test_merged_matches_altdata`, before any comparison:
+
+```python
+    # Refuse to pass on sentinel data. yfinance serves bid=ask=0 and IV
+    # sentinels outside market hours; two implementations reading the same
+    # degraded feed agree trivially. Agreement is only evidence when the
+    # underlying quotes are real.
+    ts = new.get("term_structure", {})
+    ivs = [v.get("atm_iv") for v in ts.values()
+           if isinstance(v, dict) and v.get("atm_iv") is not None]
+    assert ivs, f"{ticker}: no ATM IV in term structure — cannot verify"
+    assert max(ivs) > 0.08, (
+        f"{ticker}: IV sentinel data (max atm_iv={max(ivs):.4f}) — run this test "
+        f"during US market hours (09:30-16:00 ET). Agreement on sentinel quotes "
+        f"is not evidence the merge is correct."
+    )
+    assert len(set(round(v, 6) for v in ivs)) > 1, (
+        f"{ticker}: identical ATM IV {ivs[0]} across all tenors — sentinel feed, "
+        f"not a real term structure."
+    )
+```
+
+- [ ] **Step 2: Run it — during US market hours only**
+
+This test is only meaningful between 09:30 and 16:00 ET on a trading day. Check first:
 
 ```bash
-pytest testing/test_options_differential.py -v
+.venv/bin/python -c "
+from datetime import datetime
+from zoneinfo import ZoneInfo
+n = datetime.now(ZoneInfo('America/New_York'))
+ok = n.weekday() < 5 and (9,30) <= (n.hour, n.minute) < (16,0)
+print(f'{n:%Y-%m-%d %H:%M %Z} — {\"OK to run\" if ok else \"WAIT: market closed\"}')
+"
+```
+
+If it says WAIT, stop and report that Task 3 is time-gated. Do not run the
+differential test outside market hours and do not weaken the sentinel guard to
+make it pass — a green run on sentinel data is worse than no run, because it
+retires the risk without testing it.
+
+```bash
+.venv/bin/python -m pytest testing/test_options_differential.py -v
 ```
 
 Expected: 3 passed (or skipped for a ticker with no ATM strike).
 
-If a ticker fails on `front_expiry`, the ET-date fix from Task 2 Step 5 is likely missing or applied to only one side. If it fails on the implied-move tolerance, the ATM selection diverged — compare `o_call["strike"]` against the merged path's chosen strike before changing the tolerance. **Do not widen the tolerance to make the test pass.** That would defeat the entire purpose of this task.
+If a ticker fails on `front_expiry`, the ET-date fix from Task 2 Step 5 is likely missing or applied to only one side. If it fails on the implied-move tolerance, the ATM selection diverged — compare `o_call["strike"]` against the merged path's chosen strike before changing the tolerance. **Do not widen the tolerance, and do not lower the 0.08 sentinel floor, to make the
+test pass.** Either would defeat the entire purpose of this task.
 
 - [ ] **Step 3: Verify no consumer of the old tool remains**
 
