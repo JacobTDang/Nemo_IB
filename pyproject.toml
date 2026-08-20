@@ -137,7 +137,7 @@ dependencies = [
   "python-dotenv==1.2.1",
   "python-multipart==0.0.21",
   "pytz==2025.2",
-  "pywin32==311",
+  "pywin32==311 ; sys_platform == 'win32'",
   "pyyaml==6.0.3",
   "rank-bm25==0.2.2",
   "rapidfuzz==3.14.3",
