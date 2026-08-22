@@ -6,6 +6,7 @@ from datetime import date, datetime
 from tools.web_search_server.searxng_client import searxng_search
 from tools.web_search_server.scraper import scrape_urls
 from agent.cache import Session_Cache
+from tools.web_search_server.peers import find_peers_by_sic, get_sic_code
 from tools.web_search_server.debt_maturity import get_debt_maturity_schedule
 from tools.web_search_server.sbc import get_sbc_series
 from tools.web_search_server.dilution import (
@@ -688,6 +689,43 @@ class WebSearchServer:
             },
             "required": ["ticker"]
           }
+        ),
+        Tool(
+          name="find_peers_by_sic",
+          description=(
+            "Listed companies sharing this filer's SIC classification, for use as "
+            "a starting comp set.\n\n"
+            "comparable_company_analysis requires you to supply peers, which makes "
+            "the comps depend on already knowing the answer. This derives them from "
+            "the filings instead.\n\n"
+            "Two caveats. SIC groups filers by declared classification rather than "
+            "competitive overlap, so treat the output as a candidate list to prune, "
+            "not a finished comp table. And coverage is partial: an SIC query "
+            "returns deregistered and private filers with no listed ticker, so "
+            "compare 'peer_count' against 'filers_matched' -- 'unresolved_count' is "
+            "the gap."
+          ),
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Ticker symbol"},
+              "limit":  {"type": "integer", "description": "Max filers to request from EDGAR", "default": 20}
+            },
+            "required": ["ticker"]
+          }
+        ),
+        Tool(
+          name="get_sic_code",
+          description=(
+            "The filer's SIC classification code and industry description from "
+            "EDGAR. Useful on its own to confirm how a company classifies itself, "
+            "which is occasionally not how the market thinks of it."
+          ),
+          inputSchema={
+            "type": "object",
+            "properties": {"ticker": {"type": "string", "description": "Ticker symbol"}},
+            "required": ["ticker"]
+          }
         )]
 
     @self.server.call_tool()
@@ -699,6 +737,10 @@ class WebSearchServer:
         elif name == 'get_urls_content':
           return await parent.get_urls_content(args['urls'])
 
+        elif name == 'find_peers_by_sic':
+          return await parent.find_peers_by_sic(args['ticker'], args.get('limit', 20))
+        elif name == 'get_sic_code':
+          return await parent.get_sic_code(args['ticker'])
         elif name == 'extract_litigation':
           return await parent.extract_litigation(
             args['ticker'], args.get('form_type', '10-K'))
@@ -845,6 +887,14 @@ class WebSearchServer:
     )]
 
   # SEC XBRL Tools
+  async def find_peers_by_sic(self, ticker: str, limit: int = 20) -> List[TextContent]:
+    result = await asyncio.to_thread(find_peers_by_sic, ticker, limit)
+    return [TextContent(type="text", text=safe_json_dumps(result))]
+
+  async def get_sic_code(self, ticker: str) -> List[TextContent]:
+    result = await asyncio.to_thread(get_sic_code, ticker)
+    return [TextContent(type="text", text=safe_json_dumps(result))]
+
   async def extract_litigation(self, ticker: str,
                                form_type: str = '10-K') -> List[TextContent]:
     result = await asyncio.to_thread(extract_litigation, ticker, form_type)
