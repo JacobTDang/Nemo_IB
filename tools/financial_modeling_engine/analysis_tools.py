@@ -1615,27 +1615,39 @@ class Financial_Analysis:
     return [TextContent(type="text", text=json.dumps(result))]
 
   async def calculate_dcf(self, args: Dict[str, Any]) -> List[TextContent]:
+    # A DCF with no revenue base produces enterprise_value 0 and
+    # price_per_share 0, which reads as a real valuation rather than a missing
+    # input and is exactly the kind of number that ends up in a thesis.
+    # calculate_wacc already refuses this way; match it.
+    if not args.get('revenue_base'):
+      return [TextContent(type='text', text=json.dumps({
+        'error': ("revenue_base is zero or absent, cannot compute a DCF. "
+                  "Resolve it with get_revenue_base first, then pass it in."),
+        'ticker': args.get('ticker', ''),
+      }))]
     result = _dcf_math(
-      revenue_base=args['revenue_base'],
-      ebitda_margin=args['ebitda_margin'],
-      capex_pct_revenue=args['capex_pct_revenue'],
-      tax_rate=args['tax_rate'],
-      depreciation=args['depreciation'],
-      revenue_growth=args['revenue_growth'],
-      wacc=args['wacc'],
-      terminal_growth=args['terminal_growth'],
-      terminal_multiple=args['terminal_multiple'],
-      cash=args['cash'],
-      debt=args['debt'],
-      shares_outstanding=args['shares_outstanding'],
+      revenue_base=args.get('revenue_base', 0),
+      ebitda_margin=args.get('ebitda_margin', 0),
+      capex_pct_revenue=args.get('capex_pct_revenue', 0),
+      tax_rate=args.get('tax_rate', 0),
+      depreciation=args.get('depreciation', 0),
+      # Declared as an array in the schema ("SET TO [0,0,0,0,0]"), so its
+      # absent default has to be a sequence rather than a scalar zero.
+      revenue_growth=args.get('revenue_growth') or [0, 0, 0, 0, 0],
+      wacc=args.get('wacc', 0),
+      terminal_growth=args.get('terminal_growth', 0),
+      terminal_multiple=args.get('terminal_multiple', 0),
+      cash=args.get('cash', 0),
+      debt=args.get('debt', 0),
+      shares_outstanding=args.get('shares_outstanding', 0),
       ticker=args.get('ticker', ''),
     )
     return [TextContent(type='text', text=json.dumps(result))]
 
   async def calculate_wacc(self, args: Dict[str, Any]) -> List[TextContent]:
     result = _wacc_math(
-      beta=args['beta'],
-      risk_free_rate=args['risk_free_rate'],
+      beta=args.get('beta', 0),
+      risk_free_rate=args.get('risk_free_rate', 0),
       equity_risk_premium=args.get('equity_risk_premium', 0.06),
       cost_of_debt=args.get('cost_of_debt', 0),
       tax_rate=args.get('tax_rate', 0),

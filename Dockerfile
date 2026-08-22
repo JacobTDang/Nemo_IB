@@ -40,6 +40,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY tools/ ./tools/
 COPY agent/ ./agent/
 COPY state/ ./state/
+COPY knowledge/ ./knowledge/
 
 # The tool cache lives here; mount a volume so it survives container replacement.
 RUN mkdir -p /app/db_cache
@@ -79,6 +80,9 @@ COPY --from=base /app/.venv /app/.venv
 COPY --from=base /app/tools /app/tools
 COPY --from=base /app/agent /app/agent
 COPY --from=base /app/state /app/state
-RUN mkdir -p /app/db_cache
+COPY --from=base /app/knowledge /app/knowledge
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN mkdir -p /app/db_cache && chmod +x /usr/local/bin/docker-entrypoint.sh
 
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["python", "-m", "tools.news_agregator.fred_server", "server"]

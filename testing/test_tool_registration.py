@@ -86,3 +86,64 @@ def test_every_registered_tool_name_has_a_dispatch_branch():
         dispatched = set(re.findall(r'name\s*==\s*["\']([a-z0-9_]+)["\']', source))
         missing = declared - dispatched
         assert not missing, f"{path}: declared but never dispatched: {sorted(missing)}"
+
+
+# --------------------------------------------------------------------------
+# Schema/implementation contract.
+#
+# A tool declaring "required": [] promises an MCP client that it can be called
+# with no arguments. Claude reads that schema and does exactly that. If the
+# implementation then indexes args[...] with a bracket, the client gets a
+# KeyError for obeying the contract the tool published.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("tool_name", ["calculate_dcf", "calculate_wacc"])
+def test_optional_argument_tools_survive_an_empty_call(tool_name):
+    """Both declare "required": [] and describe their numeric inputs as
+    'SET TO 0 -- auto-resolved'. Calling with none must not raise."""
+    import tools.financial_modeling_engine.analysis_tools as at
+
+    server = at.Financial_Analysis()
+    result = _run(getattr(server, tool_name)({}))
+    data = _payload(result)
+    assert isinstance(data, dict)
+    assert "KeyError" not in json.dumps(data)
+
+
+def test_declared_optional_arguments_are_read_with_get():
+    """Guards the whole family rather than the two known cases: a handler whose
+    schema says required=[] must not use bracket access on its args dict."""
+    import inspect
+    import re
+
+    import tools.financial_modeling_engine.analysis_tools as at
+
+    source = inspect.getsource(at)
+    offenders = []
+    for tool in ("calculate_dcf", "calculate_wacc"):
+        match = re.search(rf"async def {tool}\(self, args.*?\n(?=  async def |\nclass )",
+                          source, re.DOTALL)
+        if not match:
+            continue
+        for bracket in re.findall(r"args\['([a-z_]+)'\]", match.group(0)):
+            offenders.append(f"{tool}: args['{bracket}']")
+    assert not offenders, (
+        "bracket access on optional args -- these raise KeyError when a client "
+        "honours the published schema:\n  " + "\n  ".join(offenders))
+
+
+def test_dcf_refuses_to_value_a_company_with_no_inputs():
+    """Returning price_per_share: 0 is worse than raising.
+
+    A KeyError is obviously broken. A DCF that quietly reports a zero
+    enterprise value looks like a real valuation, and it is the kind of answer
+    that gets copied into a thesis. calculate_wacc already refuses this way --
+    "market_cap + total_debt is zero, cannot compute WACC" -- and the DCF
+    should match it.
+    """
+    import tools.financial_modeling_engine.analysis_tools as at
+
+    data = _payload(_run(at.Financial_Analysis().calculate_dcf({"ticker": "MSFT"})))
+    assert "error" in data, f"expected a refusal, got a valuation: {data}"
+    assert data.get("price_per_share") in (None, 0) or "error" in data
+    assert "revenue_base" in data["error"].lower() or "input" in data["error"].lower()
