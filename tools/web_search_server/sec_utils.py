@@ -1548,37 +1548,53 @@ def get_patent_filings(company_name: str, years_back: int = 5,
   url = 'https://patents.google.com/xhr/query'
   headers = {'User-Agent': 'Mozilla/5.0 (compatible; nemo-ib/1.0)'}
 
-  def _query(qs: str) -> Optional[Dict[str, Any]]:
+  def _query(qs: str) -> Dict[str, Any]:
+    """{'ok': True, 'payload': ...} or {'ok': False, 'reason': '<cause>'}.
+
+    Google throttles this endpoint with a 503 "Sorry..." page. Collapsing that,
+    a 404 and a DNS failure into a bare None made every failure read the same
+    and left the caller unable to tell "retry later" from "wrong assignee".
+    """
     try:
       r = _req.get(url, params={'url': qs, 'exp': ''},
                    headers=headers, timeout=20)
-      if r.status_code != 200:
-        return None
-      return r.json()
-    except Exception:
-      return None
+    except Exception as exc:
+      return {'ok': False, 'reason': f'{type(exc).__name__}: {str(exc)[:150]}'}
+    if r.status_code != 200:
+      return {'ok': False, 'reason': f'HTTP {r.status_code}'}
+    try:
+      return {'ok': True, 'payload': r.json()}
+    except ValueError as exc:
+      return {'ok': False,
+              'reason': f'HTTP 200 with a non-JSON body: {str(exc)[:150]}'}
 
   # Total count for assignee
   base_q = f'assignee={company_name}'
-  total_payload = _query(base_q + '&num=10')
-  if total_payload is None:
+  total = _query(base_q + '&num=10')
+  if not total['ok']:
     return {'company_name': company_name, 'success': False,
-            'error': 'Google Patents query failed (network or 4xx response)'}
+            'error': f"Google Patents query failed: {total['reason']}"}
+  total_payload = total['payload']
 
   total_results = total_payload.get('results', {}).get('total_num_results', 0)
 
   # Year-by-year breakdown (last N years of grant dates)
   this_year = _dt.now().year
   year_counts = []
+  failed_years = []
   for y in range(this_year - years_back, this_year + 1):
     # Patents granted within calendar year y
     yq = f'assignee={company_name}&after=publication:{y}0101&before=publication:{y}1231&num=1'
-    pl = _query(yq)
-    if pl:
+    res = _query(yq)
+    if res['ok']:
       year_counts.append({
         'year': y,
-        'count': pl.get('results', {}).get('total_num_results', 0),
+        'count': res['payload'].get('results', {}).get('total_num_results', 0),
       })
+    else:
+      # A skipped year silently truncates the R&D trend, which is the whole
+      # signal this tool exists to produce. Name the gap instead.
+      failed_years.append({'year': y, 'reason': res['reason']})
 
   # Recent sample
   recent = []
@@ -1605,6 +1621,7 @@ def get_patent_filings(company_name: str, years_back: int = 5,
     'error':          None,
     'total_patents':  total_results,
     'year_counts':    year_counts,
+    'failed_years':   failed_years,
     'recent_sample':  recent,
     'source':         'Google Patents /xhr/query (USPTO + EPO + WIPO + national)',
     'note':           'Patents publish ~18 months after filing. Year_counts reflect publication year, not filing year. Trend across years is the cleaner R&D signal than absolute most-recent year.',

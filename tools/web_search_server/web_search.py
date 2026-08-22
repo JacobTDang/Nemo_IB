@@ -335,7 +335,7 @@ class WebSearchServer:
         ),
         Tool(
           name="get_patent_filings",
-          description="Patent filing counts and recent samples from Google Patents (aggregates USPTO + EPO + WIPO + national patents). Returns total assignee patent count, year-by-year publication counts for the last N years (R&D output proxy), and a small sample of recent patents with titles and snippets. Useful for tech/biotech research to validate the R&D-intensity narrative and detect patent-cliff risk. Note: patents publish ~18 months after filing; the most recent year always undercounts.",
+          description="Patent filing counts and recent samples from Google Patents (aggregates USPTO + EPO + WIPO + national patents). Returns total assignee patent count, year-by-year publication counts for the last N years (R&D output proxy), and a small sample of recent patents with titles and snippets. Useful for tech/biotech research to validate the R&D-intensity narrative and detect patent-cliff risk. Note: patents publish ~18 months after filing; the most recent year always undercounts. Google throttles this endpoint, so check `failed_years` before reading a trend — any year listed there is missing from `year_counts`, not zero.",
           inputSchema={
             "type": "object",
             "properties": {
