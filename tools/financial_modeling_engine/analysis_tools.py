@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, Optional
 import asyncio
 from tools.financial_modeling_engine.corporate_actions import get_corporate_actions
+from tools.financial_modeling_engine.trading_metrics import get_trading_metrics
 import json
 import sys
 import traceback
@@ -37,6 +38,11 @@ Should NOT use: For intraday positioning — short interest reports lag 2 weeks.
 price_history_description = """Historical price summary: returns over 1M/3M/6M/YTD/1Y/3Y windows, realized volatility (annualized) over 30d/90d/180d/1Y, 52-week high/low with dates, max drawdown from trailing-12-month peak, and a configurable number of recent OHLCV bars. Source: yfinance auto-adjusted daily history.
 Should use: For drawdown framing ('stock down N% from peak'), volatility regime read (vol spike before earnings = expected surprise), and return decomposition over multiple windows.
 Should NOT use: For minute-level technical analysis (this returns daily bars). For intraday spot price use get_market_data."""
+
+trading_metrics_description = """Execution and position-sizing inputs from daily bars: relative volume (RVOL, the latest session's volume against its own trailing 20-session average), average dollar volume (ADV over 20 and 60 sessions, in USD and in shares), and average true range (ATR, Wilder-smoothed over 14 sessions, plus ATR as a percent of price). Source: the same yfinance daily bars as get_price_history.
+Should use: When deciding HOW to trade a name you have already researched -- how large a position the tape can absorb, how many days it takes to exit, how wide a stop has to be to survive ordinary daily noise, and whether today's volume is unusual enough to signal that something happened.
+Should NOT use: For any question about the business. These are tape mechanics and say nothing about revenue, margins, competitive position, or valuation. Do not reach for this during fundamental research -- it will not help and it is not evidence about the company.
+Notes: ADV is dollars because share counts do not tell you whether a position can be exited. ATR uses true range, so overnight gaps are included -- ATR will exceed the average high-minus-low on gappy names. Windows that the available history cannot fill are returned as null with a note, never as a shorter average. If the newest bar is the session currently in progress, latest_bar_is_partial_session is true: RVOL is then a live intraday read against full-session baselines and will understate, while ADV and ATR exclude the partial bar entirely."""
 
 industry_etfs_description = """Map a research theme (e.g. 'AI semis', 'energy', 'cloud', 'uranium', 'biotech') to relevant ETFs and return their top holdings + weights. Acts as the bridge from top-down thematic conviction to bottom-up ticker selection — e.g. an AI/memory thesis surfaces SK Hynix (HBM) as AIQ's top holding, not just NVDA. Returns ETF AUM, top 10 holdings, sector weightings. Covers ~50 themes across tech, energy, financials, healthcare, geographic, and macro categories.
 Should use: As the FIRST step in thematic research — convert 'I think AI capex will accelerate' into a list of pure-play tickers via the ETF holdings.
@@ -1241,6 +1247,20 @@ class Financial_Analysis:
           }
         ),
         Tool(
+          name="get_trading_metrics",
+          description=trading_metrics_description,
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Stock symbol"},
+              "period": {"type": "string", "description": "yfinance period spec; only has to cover the widest window requested", "default": "1y"},
+              "rvol_lookback": {"type": "integer", "description": "Sessions in the RVOL baseline, which excludes the session being measured", "default": 20},
+              "atr_period": {"type": "integer", "description": "Sessions in the Wilder ATR", "default": 14}
+            },
+            "required": ["ticker"]
+          }
+        ),
+        Tool(
           name="get_price_history",
           description=price_history_description,
           inputSchema={
@@ -1450,6 +1470,8 @@ class Financial_Analysis:
           return await parent.get_short_interest(args['ticker'])
         elif name == "get_price_history":
           return await parent.get_price_history(args['ticker'], args.get('period', '2y'), args.get('include_recent_bars', 20))
+        elif name == "get_trading_metrics":
+          return await parent.get_trading_metrics(args['ticker'], args.get('period', '1y'), args.get('rvol_lookback', 20), args.get('atr_period', 14))
         elif name == "get_industry_etfs":
           return await parent.get_industry_etfs(args['theme'], args.get('top_holdings_per_etf', 10))
         elif name == "get_historical_analogue":
@@ -1519,6 +1541,13 @@ class Financial_Analysis:
 
   async def get_price_history(self, ticker: str, period: str = '2y', include_recent_bars: int = 20) -> List[TextContent]:
     result = await asyncio.to_thread(get_price_history, ticker, period, include_recent_bars)
+    return [TextContent(type="text", text=json.dumps(_to_native(result), default=str))]
+
+  async def get_trading_metrics(self, ticker: str, period: str = '1y',
+                                rvol_lookback: int = 20,
+                                atr_period: int = 14) -> List[TextContent]:
+    result = await asyncio.to_thread(get_trading_metrics, ticker, period,
+                                     rvol_lookback, atr_period)
     return [TextContent(type="text", text=json.dumps(_to_native(result), default=str))]
 
   async def get_industry_etfs(self, theme: str, top_holdings_per_etf: int = 10) -> List[TextContent]:

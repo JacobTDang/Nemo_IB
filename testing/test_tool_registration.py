@@ -82,6 +82,23 @@ def test_modeling_corporate_actions_handler_serialises(monkeypatch):
     assert data["success"] is True
 
 
+def test_modeling_trading_metrics_handler_serialises(monkeypatch):
+    """RVOL/ADV/ATR go out over MCP as JSON.
+
+    numpy floats and pandas Timestamps do not serialise on their own, and the
+    handler is where that breaks -- never in the unit tests, which look at the
+    dict.
+    """
+    import tools.financial_modeling_engine.analysis_tools as at
+
+    monkeypatch.setattr(at, "get_trading_metrics",
+                        lambda *a, **k: {"ticker": "NVDA", "success": True,
+                                         "rvol": {}, "adv": {}, "atr": {}})
+    server = at.Financial_Analysis()
+    data = _payload(_run(server.get_trading_metrics("NVDA", "1y", 20, 14)))
+    assert data["success"] is True
+
+
 def test_every_registered_tool_name_has_a_dispatch_branch():
     """A Tool() entry with no dispatch branch returns 'Unknown tool' at runtime
     while looking perfectly registered in tools/list."""
