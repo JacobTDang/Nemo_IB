@@ -42,13 +42,13 @@ claude mcp add --transport http nemo-altdata   http://<host>:8814/mcp
 
 | Server | Port | Module | Tools |
 |---|---|---|---|
-| SEC EDGAR | 8810 | `tools.web_search_server.web_search` | 39 of 42 |
+| SEC EDGAR | 8810 | `tools.web_search_server.web_search` | 42 of 45 |
 | Market data and modelling | 8811 | `tools.financial_modeling_engine.analysis_tools` | 19 |
 | Finnhub | 8812 | `tools.news_agregator.finnhub_server` | 14 |
 | FRED macro | 8813 | `tools.news_agregator.fred_server` | 5 |
 | Alt data | 8814 | `tools.altdata_server.server` | 5 |
 
-The SEC server advertises 39 of its 42 tools: `search` and the two rag tools
+The SEC server advertises 42 of its 45 tools: `search` and the two rag tools
 are hidden because SearXNG and the RAG stack are not in this image. That is
 deliberate. `search` returns an empty result list rather than an error when
 SearXNG is missing, so advertising it would make an absent container

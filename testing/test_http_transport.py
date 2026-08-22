@@ -77,7 +77,7 @@ def test_server_completes_a_handshake_and_a_real_call(name):
 def test_sec_server_gates_capabilities_over_http_too():
     """Capability gating is applied in list_tools, so it must survive the
     transport swap. Without SearXNG and the RAG stack the SEC server advertises
-    39 of its 42 tools; advertising all 42 would mean a caller can invoke
+    42 of its 45 tools; advertising all 45 would mean a caller can invoke
     `search` and get an empty list with no error."""
     port = SERVERS["sec"][0]
     _require(port)

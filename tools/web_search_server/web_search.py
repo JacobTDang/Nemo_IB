@@ -6,6 +6,11 @@ from datetime import date, datetime
 from tools.web_search_server.searxng_client import searxng_search
 from tools.web_search_server.scraper import scrape_urls
 from agent.cache import Session_Cache
+from tools.web_search_server.forward_metrics import (
+  get_contracted_revenue,
+  get_geographic_revenue,
+  get_public_float,
+)
 from tools.web_search_server.peers import find_peers_by_sic, get_sic_code
 from tools.web_search_server.debt_maturity import get_debt_maturity_schedule
 from tools.web_search_server.sbc import get_sbc_series
@@ -711,6 +716,73 @@ def _build_all_tools() -> List[Tool]:
             "properties": {"ticker": {"type": "string", "description": "Ticker symbol"}},
             "required": ["ticker"]
           }
+        ),
+        Tool(
+          name="get_contracted_revenue",
+          description=(
+            "Revenue already under contract but not yet recognised: remaining "
+            "performance obligation (RPO) and deferred revenue.\n\n"
+            "RPO is the strongest forward number an enterprise filer publishes "
+            "-- signed business that has not hit the income statement yet. It "
+            "leads reported revenue by quarters, so RPO growth stalling while "
+            "revenue still looks healthy is an early warning that the income "
+            "statement cannot show you.\n\n"
+            "Reports the consolidated total, not a sum of the customer-type and "
+            "timing breakdowns filers publish alongside it. An empty 'rpo' with "
+            "deferred revenue present is normal and not a failure -- most "
+            "non-subscription businesses never disclose RPO."
+          ),
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Ticker symbol"},
+              "limit":  {"type": "integer", "description": "Annual filings to walk back", "default": 3}
+            },
+            "required": ["ticker"]
+          }
+        ),
+        Tool(
+          name="get_geographic_revenue",
+          description=(
+            "Revenue by geography with each region's share of the disclosed "
+            "total, and several years of history from a single filing.\n\n"
+            "Business segments tell you what a company sells; this tells you "
+            "where, which is where China exposure, tariff risk and FX "
+            "translation actually live. NVDA books roughly 20% of revenue in "
+            "Taiwan and 9% in China including Hong Kong -- neither is visible "
+            "in segment reporting.\n\n"
+            "Region names come from whatever the filer tagged, mixing standard "
+            "country codes with company-specific groupings, so check "
+            "'regions_found'. Percentages are of the disclosed geographic total, "
+            "which can differ from consolidated revenue when part is grouped "
+            "under 'other'."
+          ),
+          inputSchema={
+            "type": "object",
+            "properties": {"ticker": {"type": "string", "description": "Ticker symbol"}},
+            "required": ["ticker"]
+          }
+        ),
+        Tool(
+          name="get_public_float",
+          description=(
+            "Market value of shares held by non-affiliates, from the 10-K cover "
+            "page.\n\n"
+            "Different from shares outstanding, and the difference is the point: "
+            "float excludes insider and affiliate holdings, so it is what "
+            "actually trades. For founder-controlled companies the gap is large, "
+            "and float is what governs volatility, liquidity and squeeze risk.\n\n"
+            "Pair with get_share_count_series -- a wide gap between float and "
+            "total shares means less stock changes hands than the share count "
+            "implies. Measured at the filer's second-quarter close, so it lags; "
+            "'as_of' gives the measurement date rather than leaving you to "
+            "assume it is current."
+          ),
+          inputSchema={
+            "type": "object",
+            "properties": {"ticker": {"type": "string", "description": "Ticker symbol"}},
+            "required": ["ticker"]
+          }
         )]
 
 
@@ -785,6 +857,12 @@ class WebSearchServer:
         elif name == 'get_urls_content':
           return await parent.get_urls_content(args['urls'])
 
+        elif name == 'get_contracted_revenue':
+          return await parent.get_contracted_revenue(args['ticker'], args.get('limit', 3))
+        elif name == 'get_geographic_revenue':
+          return await parent.get_geographic_revenue(args['ticker'])
+        elif name == 'get_public_float':
+          return await parent.get_public_float(args['ticker'])
         elif name == 'find_peers_by_sic':
           return await parent.find_peers_by_sic(args['ticker'], args.get('limit', 20))
         elif name == 'get_sic_code':
@@ -935,6 +1013,18 @@ class WebSearchServer:
     )]
 
   # SEC XBRL Tools
+  async def get_contracted_revenue(self, ticker: str, limit: int = 3) -> List[TextContent]:
+    result = await asyncio.to_thread(get_contracted_revenue, ticker, limit)
+    return [TextContent(type="text", text=safe_json_dumps(result))]
+
+  async def get_geographic_revenue(self, ticker: str) -> List[TextContent]:
+    result = await asyncio.to_thread(get_geographic_revenue, ticker)
+    return [TextContent(type="text", text=safe_json_dumps(result))]
+
+  async def get_public_float(self, ticker: str) -> List[TextContent]:
+    result = await asyncio.to_thread(get_public_float, ticker)
+    return [TextContent(type="text", text=safe_json_dumps(result))]
+
   async def find_peers_by_sic(self, ticker: str, limit: int = 20) -> List[TextContent]:
     result = await asyncio.to_thread(find_peers_by_sic, ticker, limit)
     return [TextContent(type="text", text=safe_json_dumps(result))]
