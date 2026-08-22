@@ -301,7 +301,11 @@ def fetch_concept_series(ticker: str, concept: str, form: str = "10-Q",
     _require_identity()
 
     company = Company(ticker)
-    filings = company.get_filings(form=form).head(limit)
+    # Amendments are excluded. TSLA's most recent "10-K" is a 10-K/A carrying
+    # the Part III proxy information and 37 fact rows -- no financial
+    # statements. Left in, it takes a slot in the walk and every concept in the
+    # real 10-K behind it reads as untagged.
+    filings = company.get_filings(form=form, amendments=False).head(limit)
 
     points: List[FilingPoint] = []
     for filing in filings:

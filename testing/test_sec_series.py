@@ -364,7 +364,7 @@ def _fake_edgar(monkeypatch, frame, contexts=None):
     monkeypatch.setattr(ss, "_require_identity", lambda: "test")
     filings = [_FakeFiling(frame, contexts or {})]
     monkeypatch.setattr(ss, "Company", lambda ticker: type("C", (), {
-        "get_filings": lambda self, form: type("F", (), {
+        "get_filings": lambda self, form, amendments=True: type("F", (), {
             "head": lambda self, limit: filings})()})())
 
 
@@ -432,3 +432,38 @@ def test_msft_total_assets_is_not_total_current_assets():
     assert assets is not None
     assert assets.value > 500e9, (
         f"MSFT total assets {assets.value:,.0f} -- current assets leaked in")
+
+
+# --------------------------------------------------------------------------
+# Amendments displace the filing that carries the data.
+#
+# TSLA's most recent 10-K "filing" is a 10-K/A from 2026-04-30 carrying 37
+# fact rows -- the Part III proxy information, no financial statements. The
+# real FY2025 10-K sits behind it. Any single-filing lookup therefore reported
+# Tesla as tagging no operating leases, no revenue and no assets at all.
+# --------------------------------------------------------------------------
+
+def test_amendments_are_excluded_from_the_filing_walk(monkeypatch):
+    import tools.web_search_server.sec_series as ss
+
+    seen = {}
+    frame = _frame([{"concept": "us-gaap:Assets", "numeric_value": 1.0,
+                     "period_instant": "2026-06-30",
+                     "period_key": "instant_2026-06-30", "context_ref": "c-1"}])
+
+    def get_filings(self, form, amendments=True):
+        seen["form"] = form
+        seen["amendments"] = amendments
+        # An amendment carries almost no XBRL; returning it here would stand
+        # in for the real 10-K and answer "not covered" for every concept.
+        filings = [_FakeFiling(frame, {})]
+        return type("F", (), {"head": lambda self, limit: filings})()
+
+    monkeypatch.setattr(ss, "_require_identity", lambda: "test")
+    monkeypatch.setattr(ss, "Company", lambda ticker: type(
+        "C", (), {"get_filings": get_filings})())
+
+    fetch_concept_series("TSLA", "us-gaap:Assets", form="10-K", limit=1)
+    assert seen["amendments"] is False, (
+        "a 10-K/A with no financial statements must not consume a slot in the "
+        "filing walk")
