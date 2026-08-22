@@ -295,3 +295,130 @@ def test_same_context_but_different_values_are_both_kept():
         ConceptFact(200.0, "2026-07-27", {}, ""),
     ])
     assert point.total() == 300.0
+
+
+# --------------------------------------------------------------------------
+# by_concept() is a PREFIX match, not an exact one.
+#
+# Probed live against MSFT's FY2026 10-K: querying "us-gaap:Assets" returns
+# four rows, two of them us-gaap:AssetsCurrent. latest_undimensioned() then
+# returned 207.7bn -- total *current* assets -- as MSFT's total assets against
+# a real 758.4bn. Nothing about the value looks wrong, which is what makes it
+# dangerous: it is the denominator of the accrual ratio.
+#
+# The same trap sits under us-gaap:OperatingLeaseLiability (matches
+# ...LiabilityCurrent, ...LiabilityNoncurrent and the whole
+# LesseeOperatingLeaseLiabilityPaymentsDue* family) and us-gaap:NetIncomeLoss
+# (matches ...AttributableToNoncontrollingInterest).
+# --------------------------------------------------------------------------
+
+class _FakeQuery:
+    """Mimics edgartools' prefix-matching by_concept."""
+
+    def __init__(self, frame):
+        self._frame = frame
+
+    def by_concept(self, concept):
+        if "concept" not in self._frame.columns:
+            return _FakeQuery(self._frame)
+        mask = self._frame["concept"].map(lambda c: str(c).startswith(concept))
+        return _FakeQuery(self._frame[mask])
+
+    def to_dataframe(self):
+        return self._frame
+
+
+class _FakeFacts:
+    def __init__(self, frame):
+        self._frame = frame
+
+    def query(self):
+        return _FakeQuery(self._frame)
+
+
+class _FakeFiling:
+    def __init__(self, frame, contexts, filing_date="2026-07-29"):
+        self._xbrl = type("X", (), {"facts": _FakeFacts(frame),
+                                    "contexts": contexts})()
+        self.filing_date = filing_date
+        self.form = "10-K"
+        self.accession_no = "0000-00-000000"
+
+    def xbrl(self):
+        return self._xbrl
+
+
+def _fake_edgar(monkeypatch, frame, contexts=None):
+    import tools.web_search_server.sec_series as ss
+
+    monkeypatch.setattr(ss, "_require_identity", lambda: "test")
+    filings = [_FakeFiling(frame, contexts or {})]
+    monkeypatch.setattr(ss, "Company", lambda ticker: type("C", (), {
+        "get_filings": lambda self, form: type("F", (), {
+            "head": lambda self, limit: filings})()})())
+
+
+def _frame(rows):
+    import pandas as pd
+    return pd.DataFrame(rows)
+
+
+def test_prefix_matched_concepts_are_dropped(monkeypatch):
+    """The MSFT regression: AssetsCurrent must not answer for Assets."""
+    _fake_edgar(monkeypatch, _frame([
+        {"concept": "us-gaap:AssetsCurrent", "numeric_value": 207_710_000_000.0,
+         "period_instant": "2026-06-30", "period_key": "instant_2026-06-30",
+         "context_ref": "c-1"},
+        {"concept": "us-gaap:Assets", "numeric_value": 758_376_000_000.0,
+         "period_instant": "2026-06-30", "period_key": "instant_2026-06-30",
+         "context_ref": "c-1"},
+    ]))
+    points = fetch_concept_series("MSFT", "us-gaap:Assets", form="10-K", limit=1)
+    assert [f.value for f in points[0].facts] == [758_376_000_000.0]
+    assert points[0].latest_undimensioned().value == 758_376_000_000.0
+
+
+def test_only_prefix_matches_present_raises_not_covered(monkeypatch):
+    """A filer tagging OperatingLeaseLiabilityCurrent but not the total does
+    not have a total. Returning the current portion as the whole obligation
+    understates it by whatever the noncurrent piece is."""
+    _fake_edgar(monkeypatch, _frame([
+        {"concept": "us-gaap:OperatingLeaseLiabilityCurrent",
+         "numeric_value": 1_631_000_000.0, "period_instant": "2026-01-31",
+         "period_key": "instant_2026-01-31", "context_ref": "c-1"},
+    ]))
+    with pytest.raises(NotCovered):
+        fetch_concept_series("WMT", "us-gaap:OperatingLeaseLiability",
+                             form="10-K", limit=1)
+
+
+def test_facts_record_the_concept_they_came_from(monkeypatch):
+    _fake_edgar(monkeypatch, _frame([
+        {"concept": "us-gaap:Assets", "numeric_value": 1.0,
+         "period_instant": "2026-06-30", "period_key": "instant_2026-06-30",
+         "context_ref": "c-1"},
+    ]))
+    points = fetch_concept_series("MSFT", "us-gaap:Assets", form="10-K", limit=1)
+    assert points[0].facts[0].concept == "us-gaap:Assets"
+
+
+def test_a_frame_without_a_concept_column_is_not_silently_emptied(monkeypatch):
+    """Defensive: an edgartools version that stops emitting the column must
+    degrade to today's behaviour rather than reporting every filer uncovered."""
+    _fake_edgar(monkeypatch, _frame([
+        {"numeric_value": 5.0, "period_instant": "2026-06-30",
+         "period_key": "instant_2026-06-30", "context_ref": "c-1"},
+    ]))
+    points = fetch_concept_series("MSFT", "us-gaap:Assets", form="10-K", limit=1)
+    assert points[0].facts[0].value == 5.0
+
+
+@network
+def test_msft_total_assets_is_not_total_current_assets():
+    """Live pin on the regression. MSFT FY2026: 758.4bn total assets, 207.7bn
+    current. The prefix match returned the latter."""
+    points = fetch_concept_series("MSFT", "us-gaap:Assets", form="10-K", limit=1)
+    assets = points[0].latest_undimensioned()
+    assert assets is not None
+    assert assets.value > 500e9, (
+        f"MSFT total assets {assets.value:,.0f} -- current assets leaked in")

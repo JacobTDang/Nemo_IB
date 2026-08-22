@@ -150,6 +150,27 @@ def _period_rank(period: str) -> tuple:
     return (end.isoformat(), (end - start).days)
 
 
+def _concept_matches(row_concept: Any, requested: str) -> bool:
+    """Whether a fact row is the requested concept rather than a longer name.
+
+    `facts.query().by_concept(name)` matches by **prefix**, which is not what
+    any caller here wants. Querying `us-gaap:Assets` against MSFT's FY2026 10-K
+    returns `us-gaap:AssetsCurrent` alongside it, and the current-assets fact
+    shares the balance-sheet context, so it survives every dimension filter and
+    can win `latest_undimensioned()`. That returned 207.7bn as MSFT's total
+    assets against a real 758.4bn — plausible enough to go unnoticed, and it is
+    the denominator of the accrual ratio.
+
+    Prefixes are separated with either ':' or '_' depending on the source, so
+    both spellings of the same element compare equal.
+    """
+    if row_concept is None:
+        return False
+    left = str(row_concept).strip().replace("_", ":")
+    right = str(requested).strip().replace("_", ":")
+    return left == right
+
+
 def resolve_dimensions(xbrl: Any, context_ref: str) -> Dict[str, str]:
     """Map a fact's context reference to its dimension members.
 
@@ -177,6 +198,7 @@ class ConceptFact:
     period: str
     dimensions: Dict[str, str] = field(default_factory=dict)
     context_ref: str = ""
+    concept: str = ""
 
     def dimension_member(self, axis: str) -> Optional[str]:
         return self.dimensions.get(axis)
@@ -296,6 +318,16 @@ def fetch_concept_series(ticker: str, concept: str, form: str = "10-Q",
         if frame is None or len(frame) == 0:
             continue
 
+        # by_concept is a prefix match. Keep only the concept actually asked
+        # for. When the frame carries no concept column at all there is nothing
+        # to filter on, so the rows pass through as before rather than every
+        # filer being reported uncovered.
+        if "concept" in getattr(frame, "columns", []):
+            frame = frame[frame["concept"].map(
+                lambda c: _concept_matches(c, concept))]
+            if len(frame) == 0:
+                continue
+
         facts: List[ConceptFact] = []
         for _, row in frame.iterrows():
             value = _clean_number(row.get("numeric_value"))
@@ -307,6 +339,7 @@ def fetch_concept_series(ticker: str, concept: str, form: str = "10-Q",
                 period=_clean_period(row),
                 dimensions=resolve_dimensions(xbrl, context_ref),
                 context_ref=context_ref,
+                concept=str(row.get("concept") or concept),
             ))
 
         if facts:
