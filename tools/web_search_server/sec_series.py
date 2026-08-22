@@ -26,6 +26,8 @@ that looks entirely plausible.
 from __future__ import annotations
 
 import os
+import re
+from collections import Counter
 from datetime import date
 import threading
 import time
@@ -171,6 +173,44 @@ def _concept_matches(row_concept: Any, requested: str) -> bool:
     return left == right
 
 
+# Wrapper tokens filers put around the measure in a unit reference. SAP emits
+# "Unit_Standard_EUR_<opaque>", Alibaba "U_CNY", TSMC a bare "twd".
+_UNIT_WRAPPER_TOKENS = {"unit", "u", "standard", "measure", "iso4217"}
+
+
+def currency_of(unit_ref: Any) -> Optional[str]:
+    """ISO-style currency code for an XBRL unit reference, or None.
+
+    Every fact in a domestic 10-K is denominated in usd, so nothing in this
+    package needed the unit until foreign private issuers arrived. TSM reports
+    in TWD, SAP and ASML in EUR, NVO in DKK, BABA in CNY -- and a bare
+    3,809,054,300,000 reads as $3.8 trillion.
+
+    None means "not a plain amount of money", which covers share counts,
+    percentages, headcounts, per-share amounts and FX rates. Guessing a
+    currency for `usdPerShare` would put a price where a total belongs, and
+    Enbridge's 2017 40-F names its units `Unit12`, so "no currency" has to
+    stay expressible rather than being forced to a default.
+
+    The three-letter token is taken as tagged rather than validated against
+    ISO 4217: a whitelist would silently drop whichever currency it had not
+    seen, and that is the failure this package keeps relearning.
+    """
+    text = str(unit_ref or "").strip()
+    if not text:
+        return None
+    lowered = text.lower()
+    # "usdPerShare", "dkkPerUSD", "Unit_Divide_EUR_shares_..." are ratios. The
+    # numerator is a currency but the fact is not an amount of money.
+    if "per" in lowered or "divide" in lowered:
+        return None
+    for part in re.split(r"[_:]", text):
+        if not part or part.lower() in _UNIT_WRAPPER_TOKENS:
+            continue
+        return part.upper() if re.fullmatch(r"[A-Za-z]{3}", part) else None
+    return None
+
+
 def resolve_dimensions(xbrl: Any, context_ref: str) -> Dict[str, str]:
     """Map a fact's context reference to its dimension members.
 
@@ -199,9 +239,15 @@ class ConceptFact:
     dimensions: Dict[str, str] = field(default_factory=dict)
     context_ref: str = ""
     concept: str = ""
+    unit: str = ""
 
     def dimension_member(self, axis: str) -> Optional[str]:
         return self.dimensions.get(axis)
+
+    @property
+    def currency(self) -> Optional[str]:
+        """Currency this value is denominated in, or None if it is not money."""
+        return currency_of(self.unit)
 
 
 @dataclass
@@ -235,14 +281,69 @@ class FilingPoint:
             out.append(fact)
         return out
 
-    def total(self) -> Optional[float]:
+    def currencies(self) -> Dict[str, int]:
+        """How many distinct facts here are tagged in each currency.
+
+        Empty when the concept is not monetary (share counts, percentages) or
+        when the filer names its units opaquely, as Enbridge's 40-F does.
+        """
+        counts = Counter(f.currency for f in self.deduplicated() if f.currency)
+        return dict(counts)
+
+    def reporting_currency(self) -> Optional[str]:
+        """The currency the statements themselves are presented in.
+
+        SEC rules let a foreign private issuer add a US-dollar convenience
+        translation, but only of the most recent period. The reporting
+        currency is therefore the one carrying every comparative year, so the
+        commonest currency wins.
+
+        On a tie -- one period's worth of facts in two currencies, which is
+        what `limit=1` on a single-period concept produces -- USD loses. A
+        filer presenting in dollars has no second currency to be confused
+        with, so a USD fact sitting beside another currency is the
+        translation rather than the statement.
+        """
+        counts = self.currencies()
+        if not counts:
+            return None
+        return max(counts.items(), key=lambda kv: (kv[1], kv[0] != "USD"))[0]
+
+    def _in_reporting_currency(self, facts: List[ConceptFact],
+                               currency: Optional[str]) -> List[ConceptFact]:
+        """Narrow to one currency so translations cannot mix with statements.
+
+        TSM and BABA tag their USD convenience translation with the same
+        concept, the same period and the *same context* as the reporting
+        figure, and it carries no dimensions -- so it survives every filter
+        this class had. `total()` was adding TWD to USD, and
+        `latest_undimensioned()` had two maximal candidates and returned
+        whichever pandas yielded first.
+
+        Facts with no currency at all (share counts, opaque units) are never
+        dropped: for those the whole notion does not apply.
+        """
+        if currency is not None:
+            wanted = currency.upper()
+            return [f for f in facts if (f.currency or "").upper() == wanted]
+        counts = Counter(f.currency for f in facts if f.currency)
+        if len(counts) < 2:
+            return facts
+        dominant = max(counts.items(), key=lambda kv: (kv[1], kv[0] != "USD"))[0]
+        return [f for f in facts if f.currency in (None, dominant)]
+
+    def total(self, currency: Optional[str] = None) -> Optional[float]:
         """Sum across distinct facts, or None when there are none.
 
         None rather than 0.0 deliberately: for a share count, zero is a
         meaningful and alarming value, so absence must stay distinguishable
         from it.
+
+        Facts in a second currency are excluded rather than added -- see
+        `_in_reporting_currency`. Share classes, which carry no currency at
+        all, still sum as before: NVO's A and B counts are both `shares`.
         """
-        facts = self.deduplicated()
+        facts = self._in_reporting_currency(self.deduplicated(), currency)
         if not facts:
             return None
         return float(sum(f.value for f in facts))
@@ -258,7 +359,8 @@ class FilingPoint:
         """
         return [f for f in self.deduplicated() if not f.dimensions]
 
-    def latest_undimensioned(self) -> Optional[ConceptFact]:
+    def latest_undimensioned(
+            self, currency: Optional[str] = None) -> Optional[ConceptFact]:
         """The consolidated fact for the most recent, longest period here.
 
         A 10-K's XBRL carries three comparative years for a duration concept,
@@ -270,8 +372,15 @@ class FilingPoint:
 
         Ranked by period end first, then by span, so the annual fact wins over
         a quarter ending the same day.
+
+        Period ranking alone is not enough for a foreign private issuer. A USD
+        convenience translation shares the period *and* the context with the
+        reporting-currency fact, so both rank identically and the winner was
+        whichever row pandas produced first. Candidates are narrowed to one
+        currency before ranking; pass `currency` to ask for the translation
+        deliberately, and get None rather than a substitute if it is absent.
         """
-        candidates = self.undimensioned()
+        candidates = self._in_reporting_currency(self.undimensioned(), currency)
         if not candidates:
             return None
         return max(candidates, key=lambda f: _period_rank(f.period))
@@ -344,6 +453,10 @@ def fetch_concept_series(ticker: str, concept: str, form: str = "10-Q",
                 dimensions=resolve_dimensions(xbrl, context_ref),
                 context_ref=context_ref,
                 concept=str(row.get("concept") or concept),
+                # Blank rather than absent when the frame carries no unit
+                # column, so a currency-unaware edgartools degrades to the
+                # old behaviour instead of raising.
+                unit=str(row.get("unit_ref") or ""),
             ))
 
         if facts:

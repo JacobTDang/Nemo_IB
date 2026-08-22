@@ -467,3 +467,204 @@ def test_amendments_are_excluded_from_the_filing_walk(monkeypatch):
     assert seen["amendments"] is False, (
         "a 10-K/A with no financial statements must not consume a slot in the "
         "filing walk")
+
+
+# --------------------------------------------------------------------------
+# Units, and the convenience translation.
+#
+# Every fact in a US filer's 10-K is denominated in usd, so nothing here ever
+# needed a unit. A foreign private issuer's 20-F is not: TSM reports in TWD,
+# SAP and ASML in EUR, NVO in DKK, BABA in CNY. Reporting 3,809,054,300,000
+# with no unit attached reads as $3.8 trillion of revenue.
+#
+# Worse, SEC rules let a foreign filer add a US-dollar convenience translation
+# of the most recent year. TSM and BABA both do, and they tag it with the same
+# concept, the same period and the *same context* as the reporting-currency
+# fact. It is undimensioned, so it survives every dimension filter:
+# latest_undimensioned() had two maximal candidates and returned whichever
+# pandas happened to yield first, and total() summed TWD and USD together.
+# --------------------------------------------------------------------------
+
+from tools.web_search_server.sec_series import currency_of  # noqa: E402
+
+
+@pytest.mark.parametrize("unit_ref,expected", [
+    ("twd", "TWD"),                                    # TSM
+    ("usd", "USD"),                                    # AAPL
+    ("dkk", "DKK"),                                    # NVO
+    ("eur", "EUR"),                                    # ASML
+    ("cad", "CAD"),                                    # BCE, 40-F
+    ("U_CNY", "CNY"),                                  # BABA
+    ("U_USD", "USD"),
+    ("Unit_Standard_EUR_DzninQPyI02xgP6HIeCj9A", "EUR"),   # SAP
+    ("iso4217:JPY", "JPY"),
+])
+def test_currency_is_read_from_the_unit_reference(unit_ref, expected):
+    """Filers spell the same unit four different ways; all five basket members
+    were checked live."""
+    assert currency_of(unit_ref) == expected
+
+
+@pytest.mark.parametrize("unit_ref", [
+    "shares", "number", "pure", "employee", "vote", "site", "rate",
+    "Unit_Standard_pure_h56Qul0IO0iTmrP0VNUG2Q",
+    "Unit_Standard_shares_ZhX2cvyn2kmnAWTzNhwVQA",
+    "U_pure",
+    "twdPerShare", "usdPerShare", "eurPerShare", "cadPerShare",
+    "dkkPerUSD",                                       # an FX rate, not money
+    "Unit_Divide_EUR_shares_rFrgpyX0UUqjguloF55e-A",   # earnings per share
+    "Unit_Divide_CHF_EUR_oPh-6DUpEUyhcKcDVmZoKg",      # an FX rate
+    "U_UnitedStatesOfAmericaDollarsShare",
+    "Unit12",                                          # ENB tags units opaquely
+    "", None,
+])
+def test_non_monetary_units_have_no_currency(unit_ref):
+    """None means "not a plain amount of money". Guessing a currency for a
+    per-share or ratio unit would put a price where a total belongs."""
+    assert currency_of(unit_ref) is None
+
+
+def test_facts_carry_the_unit_they_were_tagged_with(monkeypatch):
+    _fake_edgar(monkeypatch, _frame([
+        {"concept": "ifrs-full:Revenue", "numeric_value": 309_064_000_000.0,
+         "period_key": "duration_2025-01-01_2025-12-31",
+         "context_ref": "c-1", "unit_ref": "dkk"},
+    ]))
+    points = fetch_concept_series("NVO", "ifrs-full:Revenue", form="20-F", limit=1)
+    fact = points[0].facts[0]
+    assert fact.unit == "dkk"
+    assert fact.currency == "DKK"
+
+
+def test_a_frame_without_a_unit_column_leaves_the_unit_blank(monkeypatch):
+    """Defensive: an edgartools version that drops unit_ref must keep working."""
+    _fake_edgar(monkeypatch, _frame([
+        {"concept": "us-gaap:Assets", "numeric_value": 5.0,
+         "period_instant": "2026-06-30", "period_key": "instant_2026-06-30",
+         "context_ref": "c-1"},
+    ]))
+    fact = fetch_concept_series("MSFT", "us-gaap:Assets", form="10-K", limit=1)[0].facts[0]
+    assert fact.unit == ""
+    assert fact.currency is None
+
+
+def _tsm_point():
+    """TSM's FY2025 revenue as actually tagged: three years in TWD plus a
+    single USD convenience translation sharing context c-1 with FY2025."""
+    return FilingPoint("2026-04-16", "20-F", "acc", facts=[
+        ConceptFact(3_809_054_300_000.0, "duration_2025-01-01_2025-12-31",
+                    {}, "c-1", "ifrs-full:RevenueFromContractsWithCustomers", "twd"),
+        ConceptFact(121_423_500_000.0, "duration_2025-01-01_2025-12-31",
+                    {}, "c-1", "ifrs-full:RevenueFromContractsWithCustomers", "usd"),
+        ConceptFact(2_894_307_700_000.0, "duration_2024-01-01_2024-12-31",
+                    {}, "c-6", "ifrs-full:RevenueFromContractsWithCustomers", "twd"),
+        ConceptFact(2_161_735_800_000.0, "duration_2023-01-01_2023-12-31",
+                    {}, "c-5", "ifrs-full:RevenueFromContractsWithCustomers", "twd"),
+    ])
+
+
+def test_the_reporting_currency_wins_over_the_convenience_translation():
+    """Both facts are undimensioned, share a context and share a period, so
+    period ranking alone cannot separate them. The reporting currency is the
+    one that covers every comparative year; a convenience translation is
+    permitted only for the latest."""
+    fact = _tsm_point().latest_undimensioned()
+    assert fact.value == 3_809_054_300_000.0
+    assert fact.currency == "TWD"
+
+
+def test_a_caller_can_ask_for_the_convenience_translation_explicitly():
+    fact = _tsm_point().latest_undimensioned(currency="USD")
+    assert fact.value == 121_423_500_000.0
+
+
+def test_asking_for_an_absent_currency_returns_none_rather_than_the_wrong_one():
+    assert _tsm_point().latest_undimensioned(currency="JPY") is None
+
+
+def test_currencies_present_reports_both():
+    assert _tsm_point().currencies() == {"TWD": 3, "USD": 1}
+
+
+def test_reporting_currency_is_the_one_covering_the_most_periods():
+    assert _tsm_point().reporting_currency() == "TWD"
+
+
+def test_total_does_not_add_a_convenience_translation_to_the_reporting_figure():
+    """TWD 3.81tn + USD 121bn = 3.93tn of nothing.
+
+    One period only, because total() deliberately adds across every distinct
+    fact -- it exists for share classes, where the parts really do sum.
+    """
+    point = FilingPoint("2026-04-16", "20-F", "acc", facts=[
+        ConceptFact(3_809_054_300_000.0, "duration_2025-01-01_2025-12-31",
+                    {}, "c-1", "ifrs-full:RevenueFromContractsWithCustomers", "twd"),
+        ConceptFact(121_423_500_000.0, "duration_2025-01-01_2025-12-31",
+                    {}, "c-1", "ifrs-full:RevenueFromContractsWithCustomers", "usd"),
+    ])
+    assert point.total() == 3_809_054_300_000.0
+
+
+def test_a_single_year_tie_still_prefers_the_non_usd_reporting_currency():
+    """With limit=1 on a concept tagged for one period only, both currencies
+    appear once. A foreign filer's convenience translation is always the USD
+    one -- if it reported in USD there would be no second currency."""
+    point = FilingPoint("2026-05-20", "20-F", "acc", facts=[
+        ConceptFact(1_023_670_000_000.0, "duration_2025-04-01_2026-03-31",
+                    {}, "C_bdc", "us-gaap:Revenues", "U_CNY"),
+        ConceptFact(148_401_000_000.0, "duration_2025-04-01_2026-03-31",
+                    {}, "C_bdc", "us-gaap:Revenues", "U_USD"),
+    ])
+    assert point.latest_undimensioned().value == 1_023_670_000_000.0
+    assert point.reporting_currency() == "CNY"
+
+
+def test_a_us_filer_is_unaffected():
+    """Every existing caller runs through this path. One currency means the
+    selection rule is a no-op."""
+    point = FilingPoint("2026-07-29", "10-K", "acc", facts=[
+        ConceptFact(281_724_000_000.0, "duration_2025-07-01_2026-06-30",
+                    {}, "c-1", "us-gaap:Revenues", "usd"),
+        ConceptFact(245_122_000_000.0, "duration_2024-07-01_2025-06-30",
+                    {}, "c-2", "us-gaap:Revenues", "usd"),
+    ])
+    assert point.latest_undimensioned().value == 281_724_000_000.0
+    assert point.total() == 526_846_000_000.0
+    assert point.reporting_currency() == "USD"
+
+
+def test_share_classes_still_sum_when_the_unit_is_not_money():
+    """NVO's cover page carries A and B share counts, both in `shares`. The
+    currency rule must not touch them -- total() is what dilution depends on."""
+    point = FilingPoint("2026-02-04", "20-F", "acc", facts=[
+        ConceptFact(1_074_872_000.0, "2026-02-04", {}, "c-1",
+                    "dei:EntityCommonStockSharesOutstanding", "shares"),
+        ConceptFact(3_390_128_000.0, "2026-02-04", {}, "c-2",
+                    "dei:EntityCommonStockSharesOutstanding", "shares"),
+    ])
+    assert point.total() == 4_465_000_000.0
+
+
+def test_facts_with_no_unit_at_all_still_select():
+    """Filings predating unit_ref in the frame, and the ENB case where units
+    are opaque tokens carrying no currency."""
+    point = FilingPoint("2017-02-17", "40-F", "acc", facts=[
+        ConceptFact(100.0, "duration_2016-01-01_2016-12-31", {}, "c-1", "x", "Unit12"),
+        ConceptFact(90.0, "duration_2015-01-01_2015-12-31", {}, "c-2", "x", "Unit12"),
+    ])
+    assert point.latest_undimensioned().value == 100.0
+    assert point.reporting_currency() is None
+
+
+@network
+def test_tsm_revenue_is_reported_in_twd_not_dollars():
+    """The live pin. TSM FY2025: NT$3,809,054,300,000, with a USD convenience
+    translation of $121,423,500,000 sharing the same context."""
+    points = fetch_concept_series(
+        "TSM", "ifrs-full:RevenueFromContractsWithCustomers",
+        form="20-F", limit=1)
+    fact = points[0].latest_undimensioned()
+    assert fact.currency == "TWD"
+    assert fact.value == pytest.approx(3.8090543e12, rel=1e-6)
+    assert points[0].reporting_currency() == "TWD"
+    assert "USD" in points[0].currencies()
