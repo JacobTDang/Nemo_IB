@@ -1657,6 +1657,14 @@ class Financial_Analysis:
     return [TextContent(type='text', text=json.dumps(result))]
 
   async def calculate_scenario_dcf(self, args: Dict[str, Any]) -> List[TextContent]:
+    # Same refusal as calculate_dcf: this runs _dcf_math three times, so a
+    # missing revenue_base produces three price targets of 0 instead of one.
+    if not args.get('revenue_base'):
+      return [TextContent(type='text', text=json.dumps({
+        'error': ("revenue_base is zero or absent, cannot compute a scenario DCF. "
+                  "Resolve it with get_revenue_base first, then pass it in."),
+        'ticker': args.get('ticker', ''),
+      }))]
     base_inputs = {
       'revenue_base': args.get('revenue_base', 0),
       'capex_pct_revenue': args.get('capex_pct_revenue', 0),

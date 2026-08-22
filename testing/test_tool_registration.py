@@ -147,3 +147,51 @@ def test_dcf_refuses_to_value_a_company_with_no_inputs():
     assert "error" in data, f"expected a refusal, got a valuation: {data}"
     assert data.get("price_per_share") in (None, 0) or "error" in data
     assert "revenue_base" in data["error"].lower() or "input" in data["error"].lower()
+
+
+def test_scenario_dcf_refuses_to_value_a_company_with_no_inputs():
+    """calculate_scenario_dcf runs the same _dcf_math three times.
+
+    calculate_dcf refuses a zero revenue_base because a zero price_per_share
+    reads as a real valuation. The scenario variant had no such guard, so a
+    call with only the three growth arrays and three margins -- every field the
+    schema marks required -- returned bear/base/bull prices of 0 and an
+    enterprise value of 0.0 with success implied. Three fake price targets are
+    worse than one.
+    """
+    import tools.financial_modeling_engine.analysis_tools as at
+
+    data = _payload(_run(at.Financial_Analysis().calculate_scenario_dcf({
+        "ticker": "MSFT",
+        "bear_growth": [0.05, 0.04, 0.03, 0.03, 0.02],
+        "base_growth": [0.12, 0.11, 0.10, 0.09, 0.08],
+        "bull_growth": [0.20, 0.18, 0.16, 0.14, 0.12],
+        "bear_margin": 0.45, "base_margin": 0.52, "bull_margin": 0.58,
+    })))
+    assert "error" in data, f"expected a refusal, got a valuation: {data}"
+    assert "revenue_base" in data["error"].lower()
+    for case in ("bear", "base", "bull"):
+        assert case not in data, (
+            f"refusal still carried a {case} price target: {data.get(case)}")
+
+
+def test_scenario_dcf_still_values_a_company_with_real_inputs():
+    """The guard must not swallow a legitimate call."""
+    import tools.financial_modeling_engine.analysis_tools as at
+
+    data = _payload(_run(at.Financial_Analysis().calculate_scenario_dcf({
+        "ticker": "MSFT",
+        "bear_growth": [0.05, 0.04, 0.03, 0.03, 0.02],
+        "base_growth": [0.12, 0.11, 0.10, 0.09, 0.08],
+        "bull_growth": [0.20, 0.18, 0.16, 0.14, 0.12],
+        "bear_margin": 0.45, "base_margin": 0.52, "bull_margin": 0.58,
+        "revenue_base": 331_839_000_000,
+        "capex_pct_revenue": 0.20, "tax_rate": 0.18, "depreciation": 0.08,
+        "wacc": 0.085, "terminal_growth": 0.025, "terminal_multiple": 20.0,
+        "cash": 94_000_000_000, "debt": 60_000_000_000,
+        "shares_outstanding": 7_430_000_000,
+    })))
+    assert "error" not in data, f"legitimate call refused: {data}"
+    assert data["bear"]["price_per_share"] > 0
+    assert data["base"]["price_per_share"] > data["bear"]["price_per_share"]
+    assert data["bull"]["price_per_share"] > data["base"]["price_per_share"]
