@@ -1,9 +1,10 @@
 import yfinance as yf
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 import pandas as pd
 import numpy as np
 import re
 import sys
+from datetime import datetime, timedelta, timezone
 
 def get_data(ticker: str) -> Dict[str, Any]:
   data = {}
@@ -616,6 +617,180 @@ def get_short_interest(ticker: str) -> Dict[str, Any]:
   }
 
 
+def _safe_float(v: Any, default: float = 0.0) -> float:
+  """float() that maps None, non-numeric, and NaN to a default.
+
+  yfinance returns NaN (a truthy float) for ask/impliedVolatility on illiquid
+  strikes; `float(x or 0)` leaves NaN intact, which then poisons the straddle
+  math and serializes to invalid JSON. NaN != NaN, so `f == f` catches it."""
+  try:
+    f = float(v)
+  except (TypeError, ValueError):
+    return default
+  return f if f == f else default
+
+
+def _leg_price(opt: Dict) -> Tuple[float, bool]:
+  """Price of one ATM leg for the straddle. Prefer the live ask; when ask is 0
+  (market closed) fall back to last_price then bid. Returns (price, used_fallback);
+  used_fallback=True means the quote is stale (after-hours / illiquid)."""
+  # _safe_float each key separately: a NaN ask is truthy, so `ask or ask_price`
+  # would swallow a valid OpenBB ask_price behind a NaN yfinance ask.
+  ask = _safe_float(opt.get("ask")) or _safe_float(opt.get("ask_price"))
+  if ask > 0:
+    return ask, False
+  for k in ("last_price", "bid"):
+    v = _safe_float(opt.get(k))
+    if v > 0:
+      return v, True
+  return 0.0, True
+
+
+def compute_implied_move(spot: float, atm_call_ask: float,
+            atm_put_ask: float) -> Dict[str, Any]:
+  straddle = _safe_float(atm_call_ask) + _safe_float(atm_put_ask)
+  implied_move_pct = straddle / spot if spot > 0 else 0.0
+  return {"implied_move_pct": round(implied_move_pct, 4), "straddle_cost": straddle}
+
+
+_ATM_GAP_THRESHOLD = 0.08  # nearest strike >8% from spot → treat as ATM missing
+_PARITY_TOLERANCE = 0.05   # |C-P-(S-K)|/S above this → ask quotes are junk
+
+
+def _us_market_today():
+  """Today's date in US-market terms. UTC is a day ahead of ET every evening
+  (00:00-05:00 UTC) — exactly when after-hours pre-earnings research runs —
+  which made a tomorrow-ET front expiry look like 'today' and get dropped."""
+  try:
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("America/New_York")).date()
+  except Exception:
+    # tzdata unavailable: fixed ET-standard offset (off by 1h in summer,
+    # which only matters in the 04:00-05:00 UTC sliver)
+    return datetime.now(timezone(timedelta(hours=-5))).date()
+
+
+def _find_atm_options(rows: List[Dict], spot: float,
+           target_expiry: Optional[str] = None):
+  """Find the nearest ATM call and put. Returns (None, None, None) if ATM gap > 8%."""
+  if not rows:
+    return None, None, None
+
+  expiries = sorted({r.get("expiration") or r.get("expiration_date", "") for r in rows
+           if r.get("expiration") or r.get("expiration_date")})
+  if not expiries:
+    return None, None, None
+
+  today = _us_market_today().isoformat()
+  future = [e for e in expiries if e > today]
+  chosen_expiry = future[0] if future else expiries[-1]
+  if target_expiry:
+    chosen_expiry = target_expiry
+
+  chain = [r for r in rows
+      if (r.get("expiration") or r.get("expiration_date", "")) == chosen_expiry]
+  calls = [r for r in chain if (r.get("option_type") or r.get("optionType", "")).lower() == "call"]
+  puts  = [r for r in chain if (r.get("option_type") or r.get("optionType", "")).lower() == "put"]
+
+  def _effective_price(r):
+    # Ask is the right straddle cost when the market is open; after hours
+    # ask is 0, so fall back to last_price then bid for ATM selection.
+    for k in ("ask", "ask_price", "last_price", "bid"):
+      v = _safe_float(r.get(k))
+      if v > 0:
+        return v
+    return 0.0
+
+  def nearest_atm(options):
+    if not options:
+      return None
+    # Prefer strikes with a positive price signal; a 0-price ATM strike
+    # would yield a garbage straddle.
+    quoted = [o for o in options if _effective_price(o) > 0]
+    pool = quoted or options
+    best = min(pool, key=lambda r: abs(_safe_float(r.get("strike")) - spot))
+    # Guard: reject if gap is too large (truncated chain)
+    if spot > 0 and abs(_safe_float(best.get("strike")) - spot) / spot > _ATM_GAP_THRESHOLD:
+      return None
+    return best
+
+  atm_call = nearest_atm(calls)
+  atm_put  = nearest_atm(puts)
+  return atm_call, atm_put, chosen_expiry
+
+
+def _chain_to_rows(chain, expiry: str) -> List[Dict]:
+  """Flatten one yfinance option_chain result into the row shape the ATM
+  helpers expect. yfinance uses camelCase DataFrame columns; the helpers use
+  snake_case keys, so the rename happens here and nowhere else."""
+  rows: List[Dict] = []
+  for df, otype in ((chain.calls, 'call'), (chain.puts, 'put')):
+    for _, row in df.iterrows():
+      rows.append({
+        'expiration': expiry,
+        'option_type': otype,
+        'strike': _safe_float(row.get('strike')),
+        'ask': _safe_float(row.get('ask')),
+        'bid': _safe_float(row.get('bid')),
+        'last_price': _safe_float(row.get('lastPrice')),
+        'implied_volatility': _safe_float(row.get('impliedVolatility')),
+      })
+  return rows
+
+
+def _straddle_legs(atm_call: Dict, atm_put: Dict,
+                   spot: float) -> Tuple[float, float, bool]:
+  """Price both straddle legs, with a put-call parity sanity check.
+
+  C - P should approximate S - K for same-strike legs. A nonzero ask is not
+  necessarily a SANE ask -- junk wide quotes left at the close pass a bare >0
+  check (live ORCL: call 6.75 / put 28.35 at strike 237.5 with spot 236.34, a
+  $21 violation). On gross violation both legs are rebuilt from last_price/bid
+  and the result is flagged stale.
+
+  Returns (call_price, put_price, quotes_stale)."""
+  call_px, call_stale = _leg_price(atm_call)
+  put_px, put_stale = _leg_price(atm_put)
+  stale = call_stale or put_stale
+
+  strike = _safe_float(atm_call.get('strike'))
+  if (call_px > 0 and put_px > 0 and spot > 0
+      and abs((call_px - put_px) - (spot - strike)) / spot > _PARITY_TOLERANCE):
+    def _no_ask(opt):
+      return {k: v for k, v in opt.items() if k not in ('ask', 'ask_price')}
+    c2, _ = _leg_price(_no_ask(atm_call))
+    p2, _ = _leg_price(_no_ask(atm_put))
+    # Only rebuild if a fallback actually exists -- otherwise keep the asks
+    # rather than returning a fabricated zero.
+    if c2 > 0 and p2 > 0:
+      call_px, put_px = c2, p2
+      stale = True
+
+  return call_px, put_px, stale
+
+
+def _find_expiry(exp_dates: List[Tuple[str, int]], target_dte: int) -> Tuple[str, int]:
+  """Pick the listed expiry closest to `target_dte`, preferring at-or-beyond.
+
+  Among expirations with DTE >= target_dte, returns the one nearest to
+  target_dte. If none are at or beyond the target, falls back to the
+  overall nearest expiry (nearer-than-target).
+
+  Consequence: this floors the selection at (approximately) target_dte
+  rather than snapping to whatever is nearest overall. For the 7d term-
+  structure bucket, that means a 1-DTE Friday weekly is skipped in favor
+  of e.g. an 8-DTE expiry -- the old select_expiries() had no such floor
+  and would have picked the 1-DTE contract. That floor is intentional:
+  get_options_metrics reuses this same 7d selection as the front expiry
+  for the ATM straddle, and implied_move_pct from a 1-DTE straddle
+  understates the move enough to let the `implied_move_pct > 0.20` risk
+  gate under-fire (see .claude/skills/preearnings-research/SKILL.md).
+  """
+  future = [(e, d) for e, d in exp_dates if d >= target_dte]
+  pool = future if future else exp_dates
+  return min(pool, key=lambda x: abs(x[1] - target_dte))
+
+
 def get_options_metrics(ticker: str) -> Dict[str, Any]:
   """Compute key options-market metrics from yfinance option chains.
 
@@ -628,7 +803,7 @@ def get_options_metrics(ticker: str) -> Dict[str, Any]:
   values on deep ITM/OTM strikes. ATM is defined as the strike closest to
   spot. Skew compares 0.9*spot put IV to 1.1*spot call IV.
   """
-  from datetime import datetime, date as _date
+  from datetime import datetime
 
   out: Dict[str, Any] = {'ticker': ticker.upper(), 'success': True, 'error': None}
 
@@ -645,7 +820,7 @@ def get_options_metrics(ticker: str) -> Dict[str, Any]:
       return {'ticker': ticker, 'success': False, 'error': 'no options listed'}
     out['expirations_available'] = len(exps)
 
-    today = _date.today()
+    today = _us_market_today()
     exp_dates = []
     for e in exps:
       try:
@@ -653,11 +828,6 @@ def get_options_metrics(ticker: str) -> Dict[str, Any]:
         exp_dates.append((e, d))
       except ValueError:
         continue
-
-    def _find_expiry(target_dte: int) -> tuple:
-      future = [(e, d) for e, d in exp_dates if d >= target_dte]
-      pool = future if future else exp_dates
-      return min(pool, key=lambda x: abs(x[1] - target_dte))
 
     def _atm_iv(chain, side: str) -> Optional[float]:
       df = chain.calls if side == 'call' else chain.puts
@@ -671,13 +841,18 @@ def get_options_metrics(ticker: str) -> Dict[str, Any]:
 
     # Term structure
     term_structure = {}
+    front_chain = None
+    front_expiry = None
     for label, target_days in [('7d', 7), ('30d', 30), ('60d', 60), ('90d', 90)]:
-      exp, dte = _find_expiry(target_days)
+      exp, dte = _find_expiry(exp_dates, target_days)
       try:
         chain = t.option_chain(exp)
       except Exception:
         term_structure[label] = {'expiry': exp, 'dte': dte, 'error': 'chain fetch failed'}
         continue
+      if label == '7d':
+        front_chain = chain
+        front_expiry = exp
       call_iv = _atm_iv(chain, 'call')
       put_iv = _atm_iv(chain, 'put')
       atm_iv = None
@@ -696,8 +871,26 @@ def get_options_metrics(ticker: str) -> Dict[str, Any]:
       }
     out['term_structure'] = term_structure
 
+    # ATM straddle from the front expiry — reuses the 7d chain already
+    # fetched for the term structure rather than refetching.
+    if front_chain is not None:
+      rows = _chain_to_rows(front_chain, front_expiry)
+      call, put, chosen_expiry = _find_atm_options(rows, spot)
+      if call is None or put is None:
+        out['implied_move'] = {'error': 'no ATM strike within threshold'}
+      else:
+        call_px, put_px, stale = _straddle_legs(call, put, spot)
+        moved = compute_implied_move(spot, call_px, put_px)
+        out['implied_move'] = {
+          **moved,
+          'front_expiry': chosen_expiry,
+          'quotes_stale': stale,
+        }
+    else:
+      out['implied_move'] = {'error': 'front expiry chain unavailable'}
+
     # 30d skew
-    exp_30, _ = _find_expiry(30)
+    exp_30, _ = _find_expiry(exp_dates, 30)
     try:
       chain30 = t.option_chain(exp_30)
       calls = chain30.calls[chain30.calls['impliedVolatility'] > 0.01]

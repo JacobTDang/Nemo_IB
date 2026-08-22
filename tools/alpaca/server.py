@@ -393,9 +393,10 @@ class AlpacaServer:
           # First check the broker for an open position; if none, return 404 quickly
           existing = await broker.get_open_position(ticker_u)
           if existing is None:
-            return None
-          return await broker.close_position(ticker_u)
-      order = await asyncio.wait_for(_close(), timeout=_BROKER_WRITE_TIMEOUT_S)
+            return None, None
+          order = await broker.close_position(ticker_u)
+          return existing, order
+      existing, order = await asyncio.wait_for(_close(), timeout=_BROKER_WRITE_TIMEOUT_S)
       if order is None:
         return [TextContent(type="text", text=_safe_dumps({
           "success": False, "error": "no_open_position",

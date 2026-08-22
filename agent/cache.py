@@ -5,10 +5,22 @@ import os
 from datetime import datetime
 from typing import Optional, Dict, Any
 
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Disposable tool/news/scrape caches. Deliberately a different file from the
+# state database -- cache rows are regenerable, book state is not, and mixing
+# them means a cache-clearing mistake can take theses and positions with it.
+CACHE_DB_PATH = os.environ.get(
+    "NEMO_CACHE_DB_PATH", os.path.join(_REPO_ROOT, "db_cache", "tool_cache.db")
+)
+
+
 class Session_Cache():
     def __init__(self):
-        os.makedirs("db_cache", exist_ok=True)
-        self.connection = sqlite3.connect("db_cache/session.db")
+        os.makedirs(os.path.dirname(CACHE_DB_PATH), exist_ok=True)
+        self.connection = sqlite3.connect(CACHE_DB_PATH, timeout=5.0)
+        self.connection.execute("PRAGMA journal_mode=WAL")
+        self.connection.execute("PRAGMA busy_timeout=5000")
         self.cursor = self.connection.cursor()
         self.create_session()
 

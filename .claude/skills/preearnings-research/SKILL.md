@@ -27,10 +27,10 @@ Conversation context decays; the DB does not. Three hard habits:
    News-digest template:
    ```
    News digest for {TICKER} ahead of {EARNINGS_DATE}.
-   Read mcp__nemo_finnhub__get_company_news({TICKER}, last 30d) IN FULL, then
-   run mcp__nemo_altdata__get_finbert_sentiment on the headline+summary texts.
+   Read mcp__nemo_finnhub__get_company_news({TICKER}, last 30d) IN FULL and
+   score sentiment yourself from the headline and summary text.
    Return STRICT JSON only — no article text: {"component":"news_digest",
-   "finbert_net_score":X,"direction":"...","overhangs":["<one line each>"],
+   "net_sentiment":X,"direction":"...","overhangs":["<one line each>"],
    "catalysts":["..."],"calendar_conflicts":"<any date contradicting the
    earnings calendar, quoted>","key_finding":"<one sentence>",
    "sources":[{claim,tool}]}
@@ -68,27 +68,41 @@ Conversation context decays; the DB does not. Three hard habits:
 4. **Thin alt-data (confirmation only).** `get_google_trends`,
    `get_capex_announcements`, `get_government_contracts`, `get_policy_signals`,
    the **news-digest agent** (replaces in-context news reading; carries the
-   FinBERT score), and `get_insider_transactions` (net open-market insider
+   sentiment score), and `get_insider_transactions` (net open-market insider
    buying in the last 90d = bullish lean; clustered selling = bearish; option
    exercises ignored). Combine into one `thin_altdata` signal (majority lean).
    Also pull one `get_macro_snapshot` line: note if the print lands on/adjacent
    to a CPI/FOMC date — reaction is conditioned on the tape that day.
 5. **Asymmetry inputs.**
    - `get_short_interest` (SI % float, days-to-cover), `get_options_metrics`
-     (IV skew AND put/call volume ratio), `get_options_implied_move(ticker,
-     spot_price)`, `get_price_history` (3M momentum + ~500 daily bars), and
+     (IV skew, put/call volume ratio, term structure, AND the ATM straddle as
+     `implied_move`), `get_price_history` (3M momentum + ~500 daily bars), and
      reuse the Layer-0 `get_analyst_revisions_history` pct_bullish.
+     `get_options_metrics(ticker)` is the only call needed — spot is fetched
+     internally, and on failure `implied_move` carries an `error` key rather
+     than being absent.
      **IV sentinel rule:** if `get_options_metrics` reports
      `data_quality.iv_status` as suspect (yfinance sentinel IVs), pass
      `put_call_iv_skew=None` to `classify_positioning` — the volume ratio
      stays usable; sentinel IVs do not.
      **Event-move extraction:** the raw front straddle prices the event PLUS
      days of ordinary diffusion. Compute the pure event move with
-     `event_implied_move(front_iv_7d, back_iv_30d, dte_front)` from the
-     options-metrics term structure (skip when IVs are sentinel-suspect).
+     `event_implied_move(front_iv_7d, back_iv_30d, dte_front)` — `front_iv_7d`
+     and `back_iv_30d` come from the same `get_options_metrics` call that
+     provides the `implied_move` straddle (skip when IVs are sentinel-suspect).
      Use the EVENT move for `implied_vs_realized` (1-day realized moves are
      the apples-to-apples comparator); the RAW straddle keeps governing the
      >20% binary-event hard rule (conservative).
+     **Front-expiry floor:** `implied_move.front_expiry` is floored at 7 DTE
+     (it reuses the term structure's 7d bucket) rather than taking the
+     nearest listed expiry with no floor. Deliberate: a Thursday's nearest
+     listed expiry can be a 1-DTE weekly, which would understate the move
+     feeding the >20% rule above. Expect `implied_move_pct` to differ from
+     pre-merge historical runs for this reason.
+     **Staleness:** `implied_move.quotes_stale=true` means the straddle was
+     rebuilt from `last_price` because ask quotes were unusable (after hours,
+     or a put/call parity violation) — the event-move math above inherits
+     that staleness (`docs/known_issues.md` #5).
    - **Reaction history:** never pair against raw 8-K dates — non-earnings
      8-Ks routinely land CLOSER to the vendor's period label than the real
      print (live: ORCL -4d/-8d impostors, CHWY 2026-01-20 by ONE day, RH

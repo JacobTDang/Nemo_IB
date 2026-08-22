@@ -38,10 +38,15 @@ Branch `preearnings-pipeline`, written at merge time. 314 tests passing.
    `last_price` and the result carries `quotes_stale=true`. Residual:
    last_price can be hours old; event-move math inherits that staleness.
 
-6. **Put-call parity guard not live until next MCP restart** — the guard
-   (commit 22e102b) rebuilds both legs from last_price when
-   |C−P−(S−K)|/S > 5%. The running altdata server process predates the
-   commit; restart Claude Code to activate it.
+6. **RESOLVED: Put-call parity guard not live until next MCP restart** —
+   the guard (commit 22e102b) rebuilds both legs from last_price when
+   |C−P−(S−K)|/S > 5%. Originally shipped as a separate MCP tool, so the
+   already-running altdata server process predated the commit and needed
+   a restart to pick it up. As of the `truth-source-refactor` merge the
+   guard ships inline inside `_straddle_legs` in
+   `tools/financial_modeling_engine/utils.py`, which is imported fresh on
+   every call rather than living in a long-running server process, so
+   there is no restart-lag window anymore.
 
 7. **Eval price-move attribution gap** — `/earnings-eval` grades the
    1-day move against the EPS-surprise outcome, but the move is often
@@ -72,9 +77,11 @@ Branch `preearnings-pipeline`, written at merge time. 314 tests passing.
    exist, refit `DEFAULT_DIRECTION_WEIGHTS` against realized accuracy
    and build an aggregate track-record view. First eval points land
    6-11/6-12 (ORCL, CHWY, ADBE, RH).
-2. **BUDGET-GATED: Tier 2 data** — SimilarWeb scaffold is shipped and
-   key-gated (`tools/preearnings/web_traffic.py`); next are Panjiva
-   (shipments), AlphaSense (transcripts), Ortex (live SI), card panels.
+2. **BUDGET-GATED: Tier 2 data** — SimilarWeb scaffold was shipped and
+   key-gated as `get_web_traffic_signal` (`tools/preearnings/web_traffic.py`);
+   removed in `truth-source-refactor` alongside the broken FinBERT sentiment
+   tool. Re-scaffolding this is still backlog; next are Panjiva (shipments),
+   AlphaSense (transcripts), Ortex (live SI), card panels.
 3. **Predict-the-guide** — model the guidance number separately from
    the quarter print; most post-print moves are guide-driven (see bug 7).
 4. **KPI-level consensus scoring** — score KPI beats/misses against
@@ -234,6 +241,22 @@ install URL if neither is found.
 **Priority:** low (handled).
 
 ## MCP stdio hangs on long-lived nemo_openbb / nemo_sentry processes (overnight 2026-05-22; deeper investigation 2026-05-31)
+
+**`nemo_openbb` REMOVED in `truth-source-refactor`.** The server
+(`tools/openbb_server/`) is deleted, along with `testing/test_openbb_server.py`
+and all `openbb-*` manifest pins. Reasons: (1) all four of its tools were
+fully redundant with tools already living closer to source in servers we
+keep — `obb_insider_trading` → finnhub `get_insider_transactions` +
+`get_insider_sentiment`; `obb_analyst_consensus` → finnhub
+`get_analyst_recommendations` + `get_forward_estimates` +
+`get_analyst_revisions_history`; `obb_news_company` → finnhub
+`get_company_news`; `obb_options_chain` → the merged `get_options_metrics`;
+(2) zero `.claude/skills/` references called any `nemo_openbb` tool; and
+(3) it is the server documented below as the indefinite-hang MCP process
+that direct-Python-invocation workarounds were needed for. The nemo_openbb
+paragraphs below are kept as historical record of that investigation — they
+no longer describe a live tool. The nemo_sentry material in this section is
+still current; that server was not touched by this refactor.
 
 **Surfaced by:** Several MCP tool invocations hung indefinitely from the
 Claude Code client side: `mcp__nemo_openbb__obb_insider_trading`,
