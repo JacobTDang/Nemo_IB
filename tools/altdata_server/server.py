@@ -469,7 +469,7 @@ def _try_greenhouse_norm(slug: str, dept_filter: Optional[str]) -> Optional[Dict
     # departments; the plain listing omits the key entirely. The plain listing
     # is the fallback so a slow/oversized content response still yields a count
     # (with department_coverage saying the breakdown is missing).
-    for url, timeout in ((f"{base}?content=true", 20), (base, 10)):
+    for url, timeout in ((f"{base}?content=true", 10), (base, 8)):
         try:
             resp = requests.get(url, timeout=timeout,
                                 headers={"User-Agent": "Mozilla/5.0"})
@@ -698,7 +698,11 @@ def _fetch_job_postings(slug: str, ats: str,
         lv_f = pool.submit(_try_lever_norm, slug, dept_filter)
         results: Dict[str, Dict] = {}
         try:
-            for future in as_completed([gh_f, lv_f], timeout=12):
+            # Bounds both providers, including Greenhouse's content=true
+            # attempt and its plain-listing fallback (10s + 8s worst case).
+            # A tighter bound here would report "no provider answered" for a
+            # board that was merely slow.
+            for future in as_completed([gh_f, lv_f], timeout=20):
                 try:
                     result = future.result()
                     if result:
