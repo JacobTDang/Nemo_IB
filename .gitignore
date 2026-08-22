@@ -30,3 +30,6 @@ searxng/cache/
 
 # Slack channel plugin: bun-installed deps
 tools/slack_channel/node_modules/
+
+# Scratch spreadsheets from ad-hoc excel-tool runs
+*.xlsx
