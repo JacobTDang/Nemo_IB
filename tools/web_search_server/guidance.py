@@ -45,10 +45,28 @@ numbers -- "74.9% and 75.0%" -- so the absence of one is the tell. Also
 quotations, safe-harbour boilerplate, backward references to guidance already
 given, and reported results that happen to sit near a guidance cue.
 
-Refusing tables costs recall: Coca-Cola, Walmart, Adobe and Micron all guide
-and all come back empty. `guidance_may_be_table_only` is set when the refused
-regions mention guidance, which is the difference between "does not guide"
-and "guides where this tool will not look".
+`guidance_may_be_table_only` is set when the refused regions mention
+guidance, which is the difference between "does not guide" and "guides where
+this tool will not look".
+
+MEASURED, at the tool's own defaults (four releases per company, each
+truncated to 50k characters by get_earnings_releases)
+------------------------------------------------------------------------
+24 large caps. 3 had no usable source: Caterpillar filed no 8-K Item 2.02 in
+the window, Delta's and Procter & Gamble's exhibit text would not extract at
+all. Of the 21 readable, 17 yielded prose guidance -- 145 statements -- and 4
+came back empty: Apple, Costco and Microsoft genuinely do not guide in the
+release, and Walmart does but only in tables, where it is flagged.
+
+Auditing all 145 by hand: 1 is not guidance (a General Motors results
+headline whose amounts belong to a dividend and a buyback) and 2 carry a
+wrong period label. The rest are real, correctly attributed guidance.
+
+How many quarters you scan changes what you find, and not gently. Coca-Cola's
+most recent release is truncated before its outlook section, so quarters=1
+returns nothing for a company that guides every quarter; quarters=4 returns
+25 statements. Read a small `quarters` as a weaker search, never as evidence
+of silence.
 """
 from __future__ import annotations
 
@@ -60,18 +78,32 @@ from tools.web_search_server.sec_utils import get_earnings_releases
 # edgartools renders table rules with box-drawing characters and abbreviates
 # overflowing cells with a horizontal ellipsis. Either one means the text
 # around it came out of a grid.
-TABLE_CHARS = re.compile('[─-╿…]')
+# Box rules and truncated-cell ellipses come from edgartools' table renderer.
+# U+200B is Deere's: its industry outlook grid separates cells with zero-width
+# spaces and carries no visible table signature at all.
+TABLE_CHARS = re.compile('[\u2500-\u257f\u2026\u200b]')
 
 AMOUNT_RE = (r'(?:\$\s?\d[\d,]*(?:\.\d+)?(?:\s*(?:billion|million|trillion|B|M))?'
              r'|\d+(?:\.\d+)?\s*%)')
 AMOUNT = re.compile(AMOUNT_RE)
 # Two amounts separated by nothing but whitespace: a row, not a range.
 ADJACENT_AMOUNTS = re.compile(AMOUNT_RE + r'\s+' + AMOUNT_RE)
+# "Non- GAAP" with a stray space appears 29 times in the measured corpus, so
+# the hyphen may be followed by whitespace. Numbers themselves are never
+# broken -- no split decimals, separators or units in 1.4M characters -- so
+# only the hyphenated word needs the allowance.
 COLUMN_HEADERS = re.compile(
-    r'(?i)\bGAAP\s+Non-?GAAP\b|\bNon-?GAAP\s+GAAP\b|\bCurrent\s+Prior\b'
+    r'(?i)\bGAAP\s+Non-?\s*GAAP\b|\bNon-?\s*GAAP\s+GAAP\b'
+    r'|\bCurrent\s+Prior\b'
     r'|\bPrior\s+Current\b|\bLow\s+High\b|\bHigh\s+Low\b'
     r'|\bQ[1-4]\s*\d{4}\s+GAAP\b|\bGuidance\s+Current\b')
-AS_FOLLOWS = re.compile(r'(?i)as follows\s*:')
+# A table lead-in: "as follows:", "based on the following FY26 figures:".
+AS_FOLLOWS = re.compile(
+    r'(?i)(?:as follows|based on the following|the following[^.:]{0,40})\s*:')
+# ".39" with no leading zero is a table cell. Prose does not write decimals
+# that way, and Lilly's EPS reconciliation is nothing but them.
+BARE_DECIMAL = re.compile(r'(?<![\d.])\.\d{1,2}\b')
+_MAX_BARE_DECIMALS = 1
 # Captions that only ever head a financial table. Target's non-GAAP EPS
 # reconciliation reached the caller through every other guard.
 TABLE_CAPTION = re.compile(
@@ -91,14 +123,16 @@ BACKWARD_REFERENCE = re.compile(
     r'(?i)(?:prior|previous|original|initial)\s+guidance'
     r'|guidance\s+(?:provided|issued|given)\s+(?:on|in)'
     r'|(?:compared|relative)\s+to\s+.{0,20}guidance'
-    r'|versus\s+.{0,15}guidance')
+    r'|versus\s+.{0,15}guidance'
+    r'|\b(?:exceed(?:s|ed|ing)?|beat|beats|surpass\w*|ahead\s+of'
+    r'|above|below)\s+(?:\w+\s+){0,2}guidance\b')
 QUOTATION = re.compile(r'[“”]|"\s*,?\s*said|said\s+[A-Z][a-z]+\s+[A-Z]')
 
 # Unambiguously forward-looking on its own.
 STRONG_CUE = re.compile(
     r'(?i)\b(?:expects?|expecting|is expected to|are expected to|anticipates?'
     r'|anticipating|projects?|projecting|forecasts?|forecasting|outlook'
-    r'|guidance|guiding|sees|plans? to|targets?)\b')
+    r'|guidance|guiding|sees|plans? to|targets|targeting|targeted)\b')
 # Forward-looking only next to a guidance noun. "lower revenue" is a report of
 # what happened; "lowers its guidance" is a statement about what will.
 DIRECTIONAL_CUE = re.compile(
@@ -148,6 +182,9 @@ _PAGE_FURNITURE = re.compile(
 _GUIDANCE_WORD = re.compile(r'(?i)\bguidance\b|\boutlook\b|\btargets?\b')
 
 _MAX_STATEMENT_CHARS = 420
+# A section heading is short. "Second Quarter 2026 Considerations" is one at
+# 34 characters; a sentence that merely opens with a period phrase is not.
+_MAX_HEADING_CHARS = 60
 _MAX_NUMERIC_DENSITY = 0.28
 # How far after a forward cue an amount can sit and still belong to it.
 _CUE_TO_AMOUNT_CHARS = 200
@@ -166,19 +203,31 @@ LIMITATIONS = (
 def _split_statements(text: str) -> List[str]:
   """Break a release into candidate statements.
 
-  Sentence punctuation alone is not enough. A release opens with its headline,
-  its dateline and its first result sentence in one unbroken run, so
-  "Reaffirms Fiscal 2026 Guidance" ends up joined to "reported sales of $47.9
-  billion" and the actual becomes the guide.
+  The blank line comes first and matters most. Coca-Cola guides in prose
+  paragraphs closed by a status annotation -- "the company expects to deliver
+  organic revenue (non-GAAP) growth of 4% to 5%. -- No Update" -- and there is
+  no sentence punctuation between one paragraph and the next. Collapsing the
+  document to a single line welds that guide onto the currency paragraph
+  after it and reports two claims as one.
+
+  A single newline is the opposite case: these releases hard-wrap mid
+  sentence, so splitting on one would cut "4% to" away from "5%".
+
+  Sentence punctuation alone is not enough either. A release opens with its
+  headline, its dateline and its first result sentence in one unbroken run,
+  so "Reaffirms Fiscal 2026 Guidance" ends up joined to "reported sales of
+  $47.9 billion" and the actual becomes the guide.
   """
-  text = re.sub(r'\s+', ' ', text or '')
-  text = _BULLETS.sub(_BREAK, text)
-  text = _DATELINE.sub(_BREAK, text)
-  text = _OPENER.sub(_BREAK, text)
-  text = _PAGE_FURNITURE.sub(_BREAK, text)
+  paragraphs = re.split(r'\n[ \t]*\n', text or '')
   parts: List[str] = []
-  for block in text.split(_BREAK):
-    parts.extend(re.split(r'(?<=[.!?])\s+(?=[A-Z(“"])', block))
+  for paragraph in paragraphs:
+    paragraph = re.sub(r'\s+', ' ', paragraph)
+    paragraph = _BULLETS.sub(_BREAK, paragraph)
+    paragraph = _DATELINE.sub(_BREAK, paragraph)
+    paragraph = _OPENER.sub(_BREAK, paragraph)
+    paragraph = _PAGE_FURNITURE.sub(_BREAK, paragraph)
+    for block in paragraph.split(_BREAK):
+      parts.extend(re.split(r'(?<=[.!?])\s+(?=[A-Z(“"])', block))
   return [part.strip() for part in parts if part.strip()]
 
 
@@ -198,6 +247,7 @@ def _looks_tabular(statement: str) -> bool:
       or DANGLING_RANGE.search(statement)
       or len(PERIOD.findall(statement)) > _MAX_PERIOD_PHRASES
       or _numeric_density(statement) > _MAX_NUMERIC_DENSITY
+      or len(BARE_DECIMAL.findall(statement)) > _MAX_BARE_DECIMALS
       or (AS_FOLLOWS.search(statement) and len(AMOUNT.findall(statement)) >= 2))
 
 
@@ -274,6 +324,20 @@ def _period_for(statement: str,
   return None, None, caveats
 
 
+def _is_period_heading(candidate: str) -> bool:
+  """A short line that is only a period phrase, e.g. "Full Year 2026".
+
+  Once paragraphs are split properly these headings stop being glued to the
+  sentences beneath them, and without this every Coca-Cola guidance line
+  reports no period at all.
+  """
+  if len(candidate) > _MAX_HEADING_CHARS:
+    return False
+  if AMOUNT.search(candidate):
+    return False
+  return PERIOD.search(candidate) is not None
+
+
 def _scan_guidance(text: str) -> Dict[str, Any]:
   """Pure text scan. No I/O, so it can be tested against filing strings."""
   statements: List[Dict[str, Any]] = []
@@ -284,8 +348,10 @@ def _scan_guidance(text: str) -> Dict[str, Any]:
   for candidate in _split_statements(text):
     verdict = _classify(candidate)
 
-    if SECTION_LEAD_IN.search(candidate) and (
-        STRONG_CUE.search(candidate) or DIRECTIONAL_CUE.search(candidate)):
+    sets_context = _is_period_heading(candidate) or (
+        SECTION_LEAD_IN.search(candidate) is not None
+        and (STRONG_CUE.search(candidate) or DIRECTIONAL_CUE.search(candidate)))
+    if sets_context:
       lead_in = _longest_period(candidate)
       if lead_in is not None:
         inherited = lead_in.group(0).strip()

@@ -45,6 +45,58 @@ def _texts(result):
   return [s["text"] for s in result["statements"]]
 
 
+# ---------------------------------------------- paragraphs are the unit
+
+def test_paragraphs_are_not_welded_together():
+  """Coca-Cola, 8-K of 2026-04-28, verbatim including the line wrapping.
+
+  Coca-Cola guides in prose paragraphs, each closed by its own status
+  annotation ("— No Update" / "— Updated") saying whether that line moved
+  since last quarter. Nothing between two paragraphs is sentence punctuation
+  followed by a capital, so collapsing the whole document to one line welds
+  the organic-revenue guide onto the currency paragraph that follows it and
+  reports them as one claim.
+  """
+  text = ("  Full Year 2026\n\n"
+          "The com pany expects to deliver organic revenue (non-GAAP) growth "
+          "of 4% to 5%. \u2014\nNo Update\n\n"
+          "For comparable net revenues (non-GAAP), the company expects a 1% to "
+          "2% currency\ntailwind based on the current rates and including the "
+          "impact of hedged\npositions. \u2014 Updated\n")
+  found = g._scan_guidance(text)
+
+  organic = [s for s in found["statements"] if "organic revenue" in s["text"]]
+  assert organic, f"lost the organic revenue guide: {_texts(found)}"
+  assert "comparable net revenues" not in organic[0]["text"], (
+      f"two paragraphs welded into one statement: {organic[0]['text']!r}")
+
+
+def test_a_wrapped_line_inside_one_paragraph_is_not_split():
+  """The same filing wraps mid-sentence. A single newline is layout, not a
+  boundary; splitting on it would cut "4% to" away from "5%"."""
+  text = ("The company expects to deliver comparable currency neutral EPS\n"
+          "(non-GAAP) growth of 6% to 7% versus $3.00 in 2025.\n")
+  found = g._scan_guidance(text)
+  assert len(found["statements"]) == 1
+  assert "6% to 7%" in found["statements"][0]["text"]
+
+
+def test_a_standalone_period_heading_sets_the_period_for_what_follows():
+  """"Full Year 2026" on its own line is Coca-Cola's section heading.
+
+  Once paragraphs are split properly the guidance sentences no longer carry
+  the heading, so without this they would all report no period at all.
+  """
+  text = ("  Full Year 2026\n\n"
+          "The company expects to generate free cash flow (non-GAAP) of "
+          "approximately $12.2 billion.\n")
+  found = g._scan_guidance(text)
+  assert len(found["statements"]) == 1
+  statement = found["statements"][0]
+  assert statement["period_label"] == "Full Year 2026"
+  assert statement["period_source"] == "section_lead_in"
+
+
 # ------------------------------------------------------------ prose is kept
 
 def test_a_plain_guidance_sentence_is_kept_with_its_own_period():
@@ -124,6 +176,23 @@ def test_two_amounts_with_only_whitespace_between_them_are_a_table_row():
   assert found["rejected"].get("table_layout")
 
 
+def test_a_column_header_pair_survives_the_stray_space_artifact():
+  """The extractor emits "Non- GAAP" 29 times across the measured corpus.
+
+  Nothing splits a *number* -- no broken decimals, thousands separators or
+  units anywhere in 1.4M characters -- but this one hyphenated word does
+  split, and it is the word a refusal signature keys on. Left alone, a
+  GAAP/non-GAAP column pair reads as prose.
+  """
+  assert g.COLUMN_HEADERS.search("Outlook GAAP Non- GAAP Revenue"), (
+      "the stray space defeats the GAAP/non-GAAP column-header signature")
+  found = g._scan_guidance(
+      "The outlook for fiscal 2027 is GAAP Non- GAAP Revenue to be "
+      "$15.8 billion")
+  assert found["statements"] == []
+  assert found["rejected"].get("table_layout")
+
+
 def test_a_current_versus_prior_column_pair_is_a_table_row():
   """Coca-Cola, 8-K of 2026-07-28, verbatim.
 
@@ -169,6 +238,88 @@ def test_a_truncated_cell_ellipsis_marks_a_rendered_table():
   found = g._scan_guidance(
       "Q1 Fiscal 2027 Summary G… ($ in m… expects R… $8… $6… 20 % 85 %")
   assert found["statements"] == []
+
+
+# ------------------------------------- false positives found by full audit
+
+def test_zero_width_spaces_mark_a_rendered_table():
+  """Deere, 8-K of 2026-08-20, verbatim.
+
+  Deere's industry outlook is a grid whose cells are separated by U+200B
+  rather than by box rules, so it carried no visible table signature at all
+  and five of these reached the caller in the first audit.
+  """
+  found = g._scan_guidance(
+      "\u200b \u200b Industry Outlook for Fiscal 2026 \u200b Agriculture & Turf "
+      "\u200b U.S. & Canada: \u200b Large Ag Down 15 to 20% Small Ag & Turf "
+      "Flat to up 5% Europe Flat South America Down 15 to 20% Asia Flat")
+  assert found["statements"] == []
+  assert found["rejected"].get("table_layout")
+
+
+def test_bare_decimals_mark_a_reconciliation_table():
+  """Eli Lilly, 8-K of 2025-10-30, verbatim.
+
+  ".39" and ".43" are table cells: prose does not write a decimal without its
+  leading zero. The row labels between them are long enough to keep numeric
+  density low, so nothing else caught this.
+  """
+  found = g._scan_guidance(
+      "2025 Guidance Earnings per share (reported) $21.80 to $22.50 U.S. tax "
+      "legislation .39 Amortization of intangible assets .43 Asset "
+      "impairment, restructuring, and other special .39 charges Earnings per "
+      "share (non-GAAP) $23.00 to $23.70")
+  assert found["statements"] == []
+  assert found["rejected"].get("table_layout")
+
+
+def test_a_base_year_footnote_is_not_a_guide():
+  """Walmart, 8-K of 2026-08-20, verbatim.
+
+  Every number in it is a fiscal 2026 ACTUAL, quoted as the base the fiscal
+  2027 growth guidance is computed from. Labelled "Fiscal year 2027" and
+  carrying $706.4 billion, it reads as a revenue guide roughly a year early.
+  """
+  found = g._scan_guidance(
+      "Fiscal year 2027 The Company's fiscal year guidance is based on the "
+      "following FY26 figures: Net sales: $706.4 billion, adjusted operating "
+      "income1: $31.0 billion, and adjusted EPS1: $2.64.")
+  assert found["statements"] == []
+
+
+def test_the_company_named_target_is_not_a_guidance_cue():
+  """Target, 8-K of 2026-08-19, verbatim -- a corporate-giving blurb.
+
+  "target" was a forward-looking cue, so the filer's own name matched it and
+  a line about 1946 came back as guidance. Plural and verb forms are
+  guidance language; the bare singular is usually a proper noun.
+  """
+  found = g._scan_guidance(
+      "Since 1946, Target has given 5% of its profit to communities, which "
+      "today equals millions of dollars a week.")
+  assert found["statements"] == []
+
+
+def test_targets_as_a_verb_is_still_a_cue():
+  """The guard against over-correcting the previous test.
+
+  Adobe states its assumptions as "Targets assume ...", which is the only
+  prose guidance Adobe files -- the headline targets are in a table.
+  """
+  found = g._scan_guidance(
+      "1 Targets assume non-GAAP operating margin of ~44.0%, GAAP tax rate of "
+      "~23.0% and diluted share count of ~395 million for third quarter "
+      "FY2026.")
+  assert len(found["statements"]) == 1
+
+
+def test_beating_guidance_is_a_report_not_a_guide():
+  """Salesforce, 8-K of 2025-09-03, verbatim: a results headline."""
+  found = g._scan_guidance(
+      "Exceeds Guidance Across All Metrics; Subscription & Support Revenue "
+      "up 11% Y/Y, 9% in CC")
+  assert found["statements"] == []
+  assert found["rejected"].get("backward_reference")
 
 
 # --------------------------------------------------- not-guidance is not kept
@@ -459,6 +610,38 @@ def test_salesforce_guides_the_full_year_in_prose():
   labels = [(s["period_label"] or "").lower() for s in result["statements"]]
   assert any("full year" in label or "full-year" in label for label in labels), (
       f"no full-year guide: {labels}")
+
+
+@network
+def test_coca_cola_guidance_is_found_at_the_tools_own_defaults():
+  """The claim that was wrong the first time, now pinned live.
+
+  Coca-Cola guides in prose paragraphs every quarter -- organic revenue,
+  comparable EPS, free cash flow -- each closed by its own "No Update" /
+  "Updated" annotation. It was reported as an empty, table-only company
+  because the audit behind that claim scanned one release per company while
+  the tool scans four, and Coca-Cola's most recent exhibit is truncated
+  before its outlook section.
+  """
+  result = g.extract_guidance("KO")
+
+  assert result["success"] is True, result["error"]
+  assert result["guidance_found"] is True, (
+      f"KO reported as not guiding: {result['no_guidance_reason']}")
+  assert result["guidance_may_be_table_only"] is False
+  labels = [(s["period_label"] or "").lower() for s in result["statements"]]
+  assert any("full year" in label for label in labels), labels
+
+
+@network
+def test_scanning_one_quarter_finds_less_than_scanning_four():
+  """Recall is a function of `quarters`, which is why an empty result is
+  never evidence that a company does not guide."""
+  narrow = g.extract_guidance("KO", quarters=1)
+  wide = g.extract_guidance("KO", quarters=4)
+
+  assert wide["statement_count"] > narrow["statement_count"], (
+      f"narrow={narrow['statement_count']} wide={wide['statement_count']}")
 
 
 @network
