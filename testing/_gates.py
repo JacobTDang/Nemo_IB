@@ -39,7 +39,29 @@ def _offline() -> bool:
     return os.environ.get("SKIP_NETWORK_TESTS", "0") == "1"
 
 
+# Credentials live in .env, and every LLM template calls load_dotenv() in its
+# own constructor. Reading os.environ alone therefore made the gates blinder
+# than the code they gate: pytest loads no .env, so OpenRouter tests were
+# skipped while the code under them would have run fine. A gate more
+# conservative than reality is not safe -- it is the invisible-failure case
+# these gates exist to prevent, arriving by another door.
+_ENV_LOADED = False
+
+
+def _load_env_once() -> None:
+    global _ENV_LOADED
+    if _ENV_LOADED:
+        return
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except Exception:  # noqa: BLE001 - absent .env is normal in CI
+        pass
+    _ENV_LOADED = True
+
+
 def _env_key(name: str) -> bool:
+    _load_env_once()
     # An empty value is a missing credential, not a configured one.
     return bool(os.environ.get(name, "").strip())
 
@@ -56,6 +78,7 @@ _OFFLINE_REASON = (
 
 
 def service_missing(name: str) -> str | None:
+    _load_env_once()
     """Return a human-readable reason the service is unavailable, or None."""
     if name == "groq":
         if _offline():

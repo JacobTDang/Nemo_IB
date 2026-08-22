@@ -193,6 +193,7 @@ dependencies = [
 
 
 [tool.pytest.ini_options]
+asyncio_mode = "auto"
 markers = [
     "slow: long-running tests excluded from quick runs via -m 'not slow'",
     "network: live-network tests skippable via SKIP_NETWORK_TESTS=1",
@@ -207,6 +208,12 @@ explicit = true
 torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
 
 [dependency-groups]
+# Without it, 10 async scraper tests cannot run at all -- they were
+# hidden behind the SearXNG gate and failed on the plugin, not the service.
+dev = [
+  "pytest-asyncio==1.3.0",
+]
+
 # Exactly what the five data-source MCP servers import, derived by importing
 # each server and recording what loads -- not guessed. The full project
 # dependency set installs 189 distributions, of which 88 are never referenced

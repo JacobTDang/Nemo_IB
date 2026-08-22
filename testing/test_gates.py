@@ -134,3 +134,58 @@ def test_strict_mode_reports_a_failure_not_an_error():
     result = _run_probe({"NEMO_REQUIRE_SERVICES": "1"})
     assert "1 failed" in result.stdout, result.stdout
     assert "error" not in result.stdout.lower(), result.stdout
+
+
+# --------------------------------------------------------------------------
+# The gates must resolve credentials the same way the code they gate does.
+#
+# _gates read os.environ directly. The credentials live in .env, and every LLM
+# template calls load_dotenv() in its own constructor -- so the code could see
+# a key the gate could not, and pytest (which loads no .env) skipped tests that
+# would have passed. A gate more conservative than reality is not "safe": it is
+# the invisible-failure case these gates exist to prevent, arriving by a
+# different door.
+# --------------------------------------------------------------------------
+
+def test_gates_resolve_dotenv_like_the_code_they_gate(tmp_path, monkeypatch):
+    """A key present only in .env must count as available."""
+    import importlib
+    import os
+
+    env = tmp_path / ".env"
+    env.write_text("GATEPROBE_KEY=a-real-looking-value\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("GATEPROBE_KEY", raising=False)
+
+    from dotenv import load_dotenv
+    load_dotenv(env)
+    assert os.environ.get("GATEPROBE_KEY") == "a-real-looking-value", (
+        "dotenv did not populate the environment; the premise of this test is wrong")
+
+    import testing._gates as gates
+    importlib.reload(gates)
+    assert hasattr(gates, "_load_env_once"), (
+        "_gates does not load .env, so it cannot see credentials the code it "
+        "gates resolves through load_dotenv()")
+
+
+def test_openrouter_gate_sees_a_dotenv_key(monkeypatch):
+    """The concrete case: OPENROUTER_API_KEY is set in this repo's .env, and
+    the offline suite was skipping OpenRouter tests that would have run."""
+    import importlib
+    import pathlib
+
+    repo_env = pathlib.Path(__file__).resolve().parent.parent / ".env"
+    if not repo_env.exists():
+        pytest.skip("no .env in this checkout")
+    if "OPENROUTER_API_KEY" not in repo_env.read_text():
+        pytest.skip("OPENROUTER_API_KEY not configured in .env")
+
+    # SKIP_NETWORK_TESTS deliberately counts as "service unavailable" for
+    # network gates, so it has to be cleared to test credential resolution.
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("SKIP_NETWORK_TESTS", raising=False)
+    import testing._gates as gates
+    importlib.reload(gates)
+    assert gates.service_missing("openrouter") is None, (
+        "gate reports OpenRouter unavailable while .env configures it")
