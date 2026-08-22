@@ -313,6 +313,13 @@ def main() -> None:
           file=sys.stderr, flush=True)
     sys.exit(1)
 
+  # Eager check at boot, but only when a feed actually needs classification --
+  # tick() builds the classifier under the same condition. The client is built
+  # lazily now, so without this a missing GROQ_API_KEY would first surface
+  # inside a tick rather than at startup.
+  if any(f.get('materiality', 'classify') == 'classify' for f in feeds):
+    Materiality_Classifier().validate_credentials()
+
   print(f"[rss_aggregator] starting | feeds={len(feeds)} | interval={args.interval}s",
         file=sys.stderr, flush=True)
 

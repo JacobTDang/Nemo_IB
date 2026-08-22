@@ -34,16 +34,36 @@ class GroqModel:
 
   def __init__(self, model_name: str = 'llama-3.3-70b-versatile', api_key_env: str = "GROQ_API_KEY"):
     load_dotenv()
-    api_key = os.getenv(api_key_env)
-    if not api_key:
-      raise ValueError(f"{api_key_env} not found in environment. Add it to your .env file.")
-    self.client = OpenAI(
-      api_key=api_key,
-      base_url="https://api.groq.com/openai/v1",
-      timeout=self.CLIENT_TIMEOUT
-    )
+    self._api_key_env = api_key_env
+    self._client = None
     self.model_name = model_name
     self.conversatoin_history = []  # Typo kept for codebase consistency
+
+  def _resolve_api_key(self) -> str:
+    api_key = os.getenv(self._api_key_env)
+    if not api_key:
+      raise ValueError(f"{self._api_key_env} not found in environment. Add it to your .env file.")
+    return api_key
+
+  def validate_credentials(self) -> None:
+    """Fail fast at process start. Daemon entrypoints call this on boot so a
+    missing key surfaces immediately rather than partway through a run.
+
+    Construction deliberately does not call this: subclasses carry
+    deterministic methods -- prompt builders, guards, scoring maths -- that
+    never touch the API, and validating in __init__ held those hostage to a
+    credential they never use."""
+    self._resolve_api_key()
+
+  @property
+  def client(self) -> OpenAI:
+    if self._client is None:
+      self._client = OpenAI(
+        api_key=self._resolve_api_key(),
+        base_url="https://api.groq.com/openai/v1",
+        timeout=self.CLIENT_TIMEOUT
+      )
+    return self._client
 
   @staticmethod
   def _strip_thinking(text: str) -> str:
