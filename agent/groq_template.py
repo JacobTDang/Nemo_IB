@@ -10,6 +10,16 @@ if hasattr(sys.stdout, 'reconfigure'):
   sys.stderr.reconfigure(errors='replace')
 
 
+
+class CredentialsMissing(ValueError):
+  """No usable API key is configured.
+
+  Distinct from every other failure because it will not fix itself: a caller
+  looping over work items gets the identical failure on every one. Subclasses
+  ValueError so existing `except ValueError` handlers keep working.
+  """
+
+
 class GroqModel:
   """
   Groq API base class using the OpenAI-compatible SDK.
@@ -42,7 +52,8 @@ class GroqModel:
   def _resolve_api_key(self) -> str:
     api_key = os.getenv(self._api_key_env)
     if not api_key:
-      raise ValueError(f"{self._api_key_env} not found in environment. Add it to your .env file.")
+      raise CredentialsMissing(
+        f"{self._api_key_env} not found in environment. Add it to your .env file.")
     return api_key
 
   def validate_credentials(self) -> None:
