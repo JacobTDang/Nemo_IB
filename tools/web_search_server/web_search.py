@@ -76,22 +76,7 @@ def _warm_embedder_session() -> None:
     pass
 
 
-class WebSearchServer:
-  def __init__(self):
-    self.server = Server("web_client")
-    self.cache = Session_Cache()
-    self._setup_handlers()
-    # Warm the embedding model in the background so first rag_search
-    # arrives to a hot model. Same pattern as the yfinance warmup in
-    # finnhub_server.py and alpaca/server.py.
-    import threading
-    threading.Thread(target=_warm_embedder_session, daemon=True).start()
-
-  def _setup_handlers(self):
-    parent = self
-
-    @self.server.list_tools()
-    async def list_tools() -> List[Tool]:
+def _build_all_tools() -> List[Tool]:
       return [
         Tool(
           name="search",
@@ -727,6 +712,69 @@ class WebSearchServer:
             "required": ["ticker"]
           }
         )]
+
+
+_ALL_TOOLS = _build_all_tools()
+
+
+# Capability gating: never advertise a tool this deployment cannot perform.
+# `search` needs SearXNG and the rag_* pair needs the RAG stack. rag_search at
+# least raises when it is missing; `search` returns an empty result list with
+# no error, so an absent SearXNG is indistinguishable from "nothing matched".
+
+def _searxng_reachable() -> bool:
+  import socket
+  from urllib.parse import urlparse
+  url = os.environ.get("SEARXNG_URL", "http://localhost:8888")
+  parsed = urlparse(url)
+  host = parsed.hostname or "localhost"
+  port = parsed.port or (443 if parsed.scheme == "https" else 80)
+  try:
+    with socket.create_connection((host, port), timeout=1.5):
+      return True
+  except OSError:
+    return False
+
+
+def _rag_available() -> bool:
+  import importlib.util
+  return importlib.util.find_spec("agent.rag") is not None
+
+
+_GATED_TOOLS = {
+  "search": lambda: _searxng_reachable(),
+  "rag_search": lambda: _rag_available(),
+  "rag_ingest": lambda: _rag_available(),
+}
+
+
+def _tool_is_available(name: str) -> bool:
+  check = _GATED_TOOLS.get(name)
+  return True if check is None else check()
+
+
+def available_tool_names():
+  """Names this deployment can actually serve. Used by list_tools and tests."""
+  return [t.name for t in _ALL_TOOLS if _tool_is_available(t.name)]
+
+
+class WebSearchServer:
+  def __init__(self):
+    self.server = Server("web_client")
+    self.cache = Session_Cache()
+    self._setup_handlers()
+    # Warm the embedding model in the background so first rag_search
+    # arrives to a hot model. Same pattern as the yfinance warmup in
+    # finnhub_server.py and alpaca/server.py.
+    import threading
+    threading.Thread(target=_warm_embedder_session, daemon=True).start()
+
+  def _setup_handlers(self):
+    parent = self
+
+    @self.server.list_tools()
+    async def list_tools() -> List[Tool]:
+      return [t for t in _ALL_TOOLS if _tool_is_available(t.name)]
 
     @self.server.call_tool()
     async def call_tool(name: str, args: Dict[str, Any]) -> List[TextContent]:
