@@ -485,3 +485,149 @@ def test_capex_live_unknown_ticker_fails():
 
     assert out["success"] is False
     assert out["reason"] == "unknown_ticker"
+
+
+# ---------------------------------------------------------------------------
+# get_policy_signals
+# ---------------------------------------------------------------------------
+
+def _bill(title="Semiconductor Investment Act", status="introduced"):
+    return {"title": title, "current_status": status,
+            "introduced_date": "", "current_status_date": "",
+            "link": f"https://govtrack.us/{title}"}
+
+
+def _no_congress_key(monkeypatch):
+    monkeypatch.delenv("CONGRESS_API_KEY", raising=False)
+
+
+def test_policy_unknown_ticker_is_a_failure(monkeypatch):
+    _no_congress_key(monkeypatch)
+    _fake_yfinance(monkeypatch)
+    get = _RoutedGet({"govtrack.us": (200, {"objects": [_bill()]})})
+    monkeypatch.setattr(requests, "get", get)
+
+    out = alt._fetch_policy_signals("ZZZZ", "", 180)
+
+    assert out["success"] is False
+    assert out["reason"] == "unknown_ticker"
+    assert get.urls == [], "queried legislation for a symbol that does not exist"
+
+
+def test_policy_unmapped_sector_does_not_silently_answer_about_tech(monkeypatch):
+    """The default keyword set was ['technology','semiconductor','defense'], so
+    an unmapped sector got a confident semiconductor answer."""
+    _no_congress_key(monkeypatch)
+    get = _RoutedGet({"govtrack.us": (200, {"objects": [_bill()]})})
+    monkeypatch.setattr(requests, "get", get)
+
+    out = alt._fetch_policy_signals("XYZ", "Widget Manufacturing", 180)
+
+    assert out["success"] is False
+    assert out["reason"] == "sector_not_covered"
+    assert "Widget Manufacturing" in out["error"]
+    assert "Technology" in out["sectors_supported"]
+    assert get.urls == []
+
+
+def test_policy_ticker_without_a_sector_is_a_failure(monkeypatch):
+    """yfinance has no sector for an ETF or an index; that is unjudged, not
+    'Technology'."""
+    _no_congress_key(monkeypatch)
+    _fake_yfinance(monkeypatch, info={"longName": "SPDR S&P 500 ETF Trust"})
+    monkeypatch.setattr(requests, "get", _RoutedGet({}))
+
+    out = alt._fetch_policy_signals("SPY", "", 180)
+
+    assert out["success"] is False
+    assert out["reason"] == "sector_unresolved"
+    assert "SPY" in out["error"]
+
+
+def test_policy_provider_outage_is_not_an_absence_of_bills(monkeypatch):
+    _no_congress_key(monkeypatch)
+
+    def boom(*a, **k):
+        raise requests.exceptions.ConnectionError("govtrack unreachable")
+
+    monkeypatch.setattr(requests, "get", boom)
+
+    out = alt._fetch_policy_signals("NVDA", "Technology", 180)
+
+    assert out["success"] is False
+    assert out["reason"] == "provider_unavailable"
+    assert "govtrack" in out["error"].lower()
+    assert out["bill_count"] is None
+
+
+def test_policy_zero_matching_bills_is_a_genuine_empty(monkeypatch):
+    _no_congress_key(monkeypatch)
+    monkeypatch.setattr(requests, "get",
+                        _RoutedGet({"govtrack.us": (200, {"objects": []})}))
+
+    out = alt._fetch_policy_signals("NVDA", "Technology", 180)
+
+    assert out["success"] is True
+    assert out["bill_count"] == 0
+    assert out["signal"] == "neutral"
+    assert out["keywords_searched"]
+
+
+def test_policy_missing_congress_key_is_named_as_a_degradation(monkeypatch):
+    _no_congress_key(monkeypatch)
+    monkeypatch.setattr(requests, "get",
+                        _RoutedGet({"govtrack.us": (200, {"objects": [_bill()]})}))
+
+    out = alt._fetch_policy_signals("NVDA", "Technology", 180)
+
+    assert out["success"] is True
+    assert out["coverage"] == "partial"
+    assert any("CONGRESS_API_KEY" in d for d in out["degraded"]), out["degraded"]
+
+
+def test_policy_partial_keyword_failure_is_reported(monkeypatch):
+    _no_congress_key(monkeypatch)
+    calls = {"n": 0}
+
+    def flaky(url, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise requests.exceptions.Timeout("read timeout")
+        return _Response({"objects": [_bill()]}, 200)
+
+    monkeypatch.setattr(requests, "get", flaky)
+
+    out = alt._fetch_policy_signals("NVDA", "Technology", 180)
+
+    assert out["success"] is True
+    assert out["coverage"] == "partial"
+    assert any("Timeout" in e for e in out["partial_errors"]), out["partial_errors"]
+
+
+def test_policy_handler_envelope_reports_the_failure(monkeypatch):
+    _no_congress_key(monkeypatch)
+    _fake_yfinance(monkeypatch)
+
+    payload = _envelope(_run(alt.AltDataServer().policy_signals({"ticker": "ZZZZ"})))
+
+    assert payload["success"] is False
+    assert payload["metadata"]["errors"]
+
+
+@network
+def test_policy_live_unknown_ticker_fails():
+    out = alt._fetch_policy_signals("ZZZZ", "", 180)
+
+    assert out["success"] is False
+    assert out["reason"] == "unknown_ticker"
+
+
+@network
+def test_policy_live_known_sector_still_returns_bills(monkeypatch):
+    _no_congress_key(monkeypatch)
+
+    out = alt._fetch_policy_signals("NVDA", "Technology", 180)
+
+    assert out["success"] is True, out.get("error")
+    assert out["bill_count"] > 0
+    assert out["coverage"] == "partial"  # GovTrack only without the API key

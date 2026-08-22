@@ -1103,9 +1103,15 @@ def _score_bill_title(title: str, status: str) -> float:
 
 
 def _govtrack_fetch_bills(keywords: List[str], congress: int,
-                           limit: int = 8) -> List[Dict]:
+                           limit: int = 8) -> Tuple[List[Dict], List[str]]:
+    """(bills, errors). A keyword whose query failed is named in `errors`.
+
+    Swallowing the exception made "GovTrack is down" and "no bill mentions
+    semiconductors" the same answer.
+    """
     import requests
     bills = []
+    errors: List[str] = []
     seen_ids: set = set()
 
     for kw in keywords[:3]:
@@ -1138,15 +1144,20 @@ def _govtrack_fetch_bills(keywords: List[str], congress: int,
                         "congress": congress,
                         "source": "govtrack",
                     })
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - recorded, not hidden
+            errors.append(f"govtrack {kw!r} (congress {congress}): "
+                          f"{type(exc).__name__}: {str(exc)[:120]}")
             continue
-    return bills
+    return bills, errors
 
 
 def _congress_api_fetch_bills(keywords: List[str], congress: int,
-                               api_key: str, limit: int = 10) -> List[Dict]:
+                               api_key: str,
+                               limit: int = 10) -> Tuple[List[Dict], List[str]]:
+    """(bills, errors) — same contract as _govtrack_fetch_bills."""
     import requests
     bills = []
+    errors: List[str] = []
     seen_titles: set = set()
 
     for kw in keywords[:3]:
@@ -1185,15 +1196,54 @@ def _congress_api_fetch_bills(keywords: List[str], congress: int,
                     "congress": congress,
                     "source": "congress.gov",
                 })
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - recorded, not hidden
+            errors.append(f"congress.gov {kw!r} (congress {congress}): "
+                          f"{type(exc).__name__}: {str(exc)[:120]}")
             continue
-    return bills
+    return bills, errors
 
 
 def _fetch_policy_signals(ticker: str, sector: str,
                            lookback_days: int) -> Dict[str, Any]:
+    """Legislative climate for a sector.
+
+    Every failure mode here used to look like "no relevant bills found": an
+    unknown ticker, a sector with no keyword mapping (which silently answered
+    with the technology/semiconductor/defense default), and GovTrack being
+    unreachable. Each is now named.
+    """
+    base = {"ticker": ticker, "sector": sector or None,
+            "lookback_days": lookback_days, "bill_count": None,
+            "bills": [], "signal": None}
+
     if not sector:
-        sector = _ticker_to_sector(ticker)
+        try:
+            sector = _resolve_ticker(ticker)["sector"]
+        except LookupFailure as exc:
+            return _lookup_failed(exc, **base)
+        if not sector:
+            return {
+                **base, "success": False, "coverage": "not_covered",
+                "reason": "sector_unresolved",
+                "error": (f"no sector for '{ticker}' in the quote response "
+                          f"(ETFs and indices carry none). Pass an explicit "
+                          f"`sector` to search legislation."),
+                "sectors_supported": sorted(SECTOR_BILL_KEYWORDS),
+            }
+        base["sector"] = sector
+
+    keywords = SECTOR_BILL_KEYWORDS.get(sector)
+    if not keywords:
+        # The old default keyword set answered about semiconductors and
+        # defense for any sector it did not recognise.
+        return {
+            **base, "success": False, "coverage": "not_covered",
+            "reason": "sector_not_covered",
+            "error": (f"no bill keywords are mapped for sector "
+                      f"{sector!r}; refusing to answer from another sector's "
+                      f"keywords."),
+            "sectors_supported": sorted(SECTOR_BILL_KEYWORDS),
+        }
 
     # Determine current and prior congress
     year = datetime.now().year
@@ -1201,17 +1251,40 @@ def _fetch_policy_signals(ticker: str, sector: str,
     current_congress = (start_year - 1789) // 2 + 1
     prior_congress = current_congress - 1
 
-    keywords = SECTOR_BILL_KEYWORDS.get(sector, ["technology", "semiconductor", "defense"])
-
     api_key = os.environ.get("CONGRESS_API_KEY", "")
+    source = "congress.gov" if api_key else "govtrack.us"
+    degraded: List[str] = []
+    if not api_key:
+        degraded.append(
+            "CONGRESS_API_KEY unset — Congress.gov was not queried; this "
+            "answer is from GovTrack alone.")
+
+    fetch_errors: List[str] = []
     if api_key:
-        bills = _congress_api_fetch_bills(keywords, current_congress, api_key)
+        bills, errs = _congress_api_fetch_bills(keywords, current_congress, api_key)
+        fetch_errors += errs
         if not bills:
-            bills = _congress_api_fetch_bills(keywords, prior_congress, api_key)
+            bills, errs = _congress_api_fetch_bills(keywords, prior_congress, api_key)
+            fetch_errors += errs
     else:
-        bills = _govtrack_fetch_bills(keywords, current_congress)
+        bills, errs = _govtrack_fetch_bills(keywords, current_congress)
+        fetch_errors += errs
         if len(bills) < 3:
-            bills += _govtrack_fetch_bills(keywords, prior_congress)
+            more, errs = _govtrack_fetch_bills(keywords, prior_congress)
+            bills += more
+            fetch_errors += errs
+
+    if not bills and fetch_errors:
+        # Every query the provider was asked errored. An empty bill list here
+        # means the provider is unreachable, not that Congress is idle.
+        return {
+            **base, "sector": sector, "success": False,
+            "coverage": "not_covered", "reason": "provider_unavailable",
+            "error": (f"{source} returned no usable response for any of "
+                      f"{keywords[:3]}: " + "; ".join(fetch_errors)),
+            "keywords_searched": keywords, "source": source,
+            "degraded": degraded,
+        }
 
     # Apply lookback_days: keep bills with recent legislative activity. Bills with
     # an unparseable/missing date are kept (don't over-filter on bad metadata).
@@ -1221,15 +1294,24 @@ def _fetch_policy_signals(ticker: str, sector: str,
         return d is None or d >= cutoff
     bills = [b for b in bills if _recent(b)]
 
+    coverage = "partial" if (degraded or fetch_errors) else "full"
+
     if not bills:
+        # The provider answered; nothing it returned matched. A genuine empty.
         return {
+            "success": True,
+            "coverage": coverage,
             "ticker": ticker, "sector": sector,
             "keywords_searched": keywords,
             "bill_count": 0,
             "bills": [],
             "signal": "neutral",
-            "signal_basis": "no relevant bills found",
-            "note": "Set CONGRESS_API_KEY env var for more comprehensive legislative data.",
+            "signal_basis": (f"{source} returned no bill matching "
+                             f"{keywords[:3]} with activity in the last "
+                             f"{lookback_days} days"),
+            "source": source,
+            "degraded": degraded,
+            "partial_errors": fetch_errors,
         }
 
     # Score each bill
@@ -1252,6 +1334,8 @@ def _fetch_policy_signals(ticker: str, sector: str,
     bills_out = sorted(bills, key=lambda b: -abs(b["score"]))[:10]
 
     return {
+        "success": True,
+        "coverage": coverage,
         "ticker": ticker, "sector": sector,
         "keywords_searched": keywords,
         "bill_count": len(bills),
@@ -1259,9 +1343,9 @@ def _fetch_policy_signals(ticker: str, sector: str,
         "signal": signal,
         "signal_basis": basis,
         "bills": bills_out,
-        "source": "congress.gov" if api_key else "govtrack.us",
-        "note": (None if api_key
-                 else "Set CONGRESS_API_KEY env var for Congress.gov access."),
+        "source": source,
+        "degraded": degraded,
+        "partial_errors": fetch_errors,
     }
 
 
@@ -1525,7 +1609,12 @@ class AltDataServer:
                         "Finds recent bills matching sector-specific keywords, scores "
                         "them by title sentiment and status probability, returns "
                         "bullish / bearish / neutral legislative signal. "
-                        "Sector is auto-detected from yfinance if not provided. "
+                        "Sector is auto-detected from yfinance if not provided; an "
+                        "unresolvable ticker, a ticker with no sector, or a sector with "
+                        "no keyword mapping returns success=false rather than answering "
+                        "from another sector's keywords. Without CONGRESS_API_KEY the "
+                        "answer is GovTrack-only: coverage='partial' and the missing key "
+                        "is named in 'degraded'. "
                         "Most relevant for: semiconductors (CHIPS Act), defense (NDAA), "
                         "pharma (drug pricing), energy (IRA credits), fintech (crypto regs)."
                     ),
@@ -1681,7 +1770,7 @@ class AltDataServer:
         except Exception as exc:
             return _err("get_policy_signals",
                         f"{type(exc).__name__}: {str(exc)[:200]}", ticker)
-        return _ok("get_policy_signals", result, ticker)
+        return _dispatch("get_policy_signals", result, ticker)
 
     async def capex_announcements(self, args: Dict[str, Any]) -> List[TextContent]:
         ticker = str(args.get("ticker", "")).upper()
