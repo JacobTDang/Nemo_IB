@@ -1,4 +1,4 @@
-"""Article scraper. Trafilatura primary (HTTP+HTML); Crawl4AI fallback (Playwright).
+"""Article scraper. Trafilatura over HTTP+HTML.
 
 Response shape matches what agent/workflows/execution_engine.py _process_scrape expects:
     {success, url, title, content, error?, word_count, char_count, extraction_method, timestamp}
@@ -11,11 +11,11 @@ from datetime import datetime
 import httpx
 import trafilatura
 
-try:
-  from crawl4ai import AsyncWebCrawler
-  _CRAWL4AI_AVAILABLE = True
-except ImportError:
-  _CRAWL4AI_AVAILABLE = False
+# Crawl4AI was the JS-rendering fallback here. It requires lxml>=5.3,<6 and
+# this project pins lxml==6.0.2, so it has never been installable alongside the
+# rest of the dependency set -- the guarded import always took the False branch
+# and every scrape went through trafilatura. Removed rather than left as a
+# branch that cannot execute.
 
 _DEFAULT_TIMEOUT = 20.0
 
@@ -75,38 +75,9 @@ async def _fetch_with_trafilatura(url: str) -> Optional[Dict[str, Any]]:
   }
 
 
-async def _fetch_with_crawl4ai(url: str) -> Optional[Dict[str, Any]]:
-  """Fallback: Crawl4AI with Playwright for JS-rendered content."""
-  if not _CRAWL4AI_AVAILABLE:
-    return None
-  try:
-    async with AsyncWebCrawler(verbose=False) as crawler:
-      result = await crawler.arun(url=url, timeout=30000)
-      if not (result and result.success and result.markdown):
-        return None
-      md = result.markdown
-      if isinstance(md, str) and len(md) < 100:
-        return None
-      title = url
-      if result.metadata and isinstance(result.metadata, dict):
-        title = result.metadata.get('title', url) or url
-      return {
-        'success': True,
-        'url': url,
-        'title': title,
-        'content': md,
-        'word_count': len(md.split()) if isinstance(md, str) else 0,
-        'char_count': len(md) if isinstance(md, str) else 0,
-        'extraction_method': 'crawl4ai',
-        'timestamp': datetime.now().isoformat(),
-      }
-  except Exception as e:
-    print(f"  [Crawl4AI] Fallback failed for {url}: {e}", file=sys.stderr, flush=True)
-    return None
-
 
 async def scrape_url(url: str, cache=None) -> Dict[str, Any]:
-  """Scrape one URL. Tries cache, then Trafilatura, then Crawl4AI."""
+  """Scrape one URL. Tries the cache, then Trafilatura."""
   # Cache hit
   if cache is not None:
     cached = cache.get_scrape(url)
@@ -128,21 +99,11 @@ async def scrape_url(url: str, cache=None) -> Dict[str, Any]:
       cache.put_scrape(url, result)
     return result
 
-  # Fallback: Crawl4AI
-  print(f"  [Trafilatura empty] Falling back to Crawl4AI for {url[:60]}",
-        file=sys.stderr, flush=True)
-  result = await _fetch_with_crawl4ai(url)
-  if result:
-    print(f"  [Crawl4AI OK] {url[:60]} ({result['word_count']} words)",
-          file=sys.stderr, flush=True)
-    if cache is not None:
-      cache.put_scrape(url, result)
-    return result
 
   return {
     'success': False,
     'url': url,
-    'error': 'Both Trafilatura and Crawl4AI returned empty/insufficient content',
+    'error': 'Trafilatura returned empty or insufficient content',
   }
 
 

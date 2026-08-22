@@ -229,3 +229,14 @@ server = [
   "trafilatura==2.0.0",
   "yfinance==1.0",
 ]
+
+# Optional extra. state/schema.py guards its sqlite-vec import and the RAG
+# tools are capability-gated out when it is absent, so this is genuinely
+# optional rather than missing.
+#
+# Declared so that optional status is deliberate. Previously it was simply
+# undeclared, which is indistinguishable from an oversight -- and was in fact
+# how pytrends stayed broken everywhere for months.
+rag = [
+  "sqlite-vec==0.1.6",
+]
