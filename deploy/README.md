@@ -96,6 +96,62 @@ unset, verified.
 - `analyze_exposures` and `get_thesis_evolution` read book state. The entrypoint
   creates the schema so they return an empty result rather than failing, but a
   data-source host holds no positions, so empty is the truthful answer.
-- **Authentication is not implemented.** Anything that can reach these ports
-  can call every tool using the host's Finnhub and FRED keys. Bind to a LAN
-  address and do not forward the ports at the router until this is addressed.
+- Employee count is not available from XBRL: no filer examined tags it, so it
+  would need cover-page text extraction.
+
+## Authentication
+
+Two layers. The network one does most of the work.
+
+### Private network
+
+Put the host on a Tailscale or WireGuard overlay and bind the published ports
+to its tailnet address rather than every interface:
+
+```yaml
+ports: ["100.x.y.z:8810:8080"]
+```
+
+Nothing is then reachable from the internet or from the untrusted LAN — only
+from devices you have enrolled. Tailscale is per machine, not per project: one
+install gives the box a tailnet IP and every service on it becomes reachable by
+port. If other projects live on the same host they need no separate setup, and
+`--advertise-routes` turns one node into a subnet router for the whole LAN.
+
+### Bearer token
+
+Defence in depth, and the only mechanism every MCP client can use — a header
+needs no client-side implementation, where OAuth needs both an interactive flow
+and code in the client.
+
+```bash
+export NEMO_MCP_TOKEN=$(openssl rand -hex 32)
+docker compose -f deploy/docker-compose.yml up -d
+
+claude mcp add --transport http nemo-sec http://<host>:8810/mcp \
+  --header "Authorization: Bearer $NEMO_MCP_TOKEN"
+```
+
+**A server with no token refuses to start.** Defaulting to open means one
+forgotten variable silently publishes every tool while the running server looks
+perfectly healthy. If a deployment is genuinely reachable only through a tunnel
+you control, set `MCP_ALLOW_UNAUTHENTICATED=1` and it will start with a warning
+— the point is that running open has to be stated rather than defaulted into.
+
+Tokens shorter than 24 characters are refused: a guessable token is worse than
+none because it looks like security.
+
+`/health` is exempt so the container healthcheck works without credentials. It
+reports liveness only and never returns data.
+
+### Why not OAuth
+
+The MCP specification defines an OAuth 2.1 flow, and it is right for a
+multi-user service. For one person it means running an auth server and debugging
+redirect URIs to authenticate exactly one identity.
+
+Blast radius argues the same way. These five servers are read-only — Alpaca is
+deliberately excluded — so a leaked token exposes market-data queries against
+free-tier keys, not money and not trades. The one genuine harm is SEC identity
+misuse getting `SEC_EMAIL` rate-limited. A rotatable token behind a private
+network is proportionate to that; an OAuth server is not.
