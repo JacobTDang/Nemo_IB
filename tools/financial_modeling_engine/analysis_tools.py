@@ -1478,7 +1478,7 @@ class Financial_Analysis:
   async def get_corporate_actions(self, ticker: str,
                                   years: int = 10) -> List[TextContent]:
     result = await asyncio.to_thread(get_corporate_actions, ticker, years)
-    return [TextContent(type="text", text=safe_json_dumps(result))]
+    return [TextContent(type="text", text=json.dumps(_to_native(result), default=str))]
 
   async def get_market_data(self, ticker: str) -> List[TextContent]:
     data = await asyncio.to_thread(get_data, ticker)
