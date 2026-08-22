@@ -6,6 +6,7 @@ from datetime import date, datetime
 from tools.web_search_server.searxng_client import searxng_search
 from tools.web_search_server.scraper import scrape_urls
 from agent.cache import Session_Cache
+from tools.web_search_server.debt_maturity import get_debt_maturity_schedule
 from tools.web_search_server.sbc import get_sbc_series
 from tools.web_search_server.dilution import (
   get_share_count_series,
@@ -613,6 +614,31 @@ class WebSearchServer:
             },
             "required": ["ticker"]
           }
+        ),
+        Tool(
+          name="get_debt_maturity_schedule",
+          description=(
+            "Principal coming due by year from the long-term debt footnote, plus "
+            "the share due within twelve months.\n\n"
+            "Leverage alone does not tell you much. 3x turns maturing next year is "
+            "a refinancing problem; the same 3x maturing in 2031 is not. Use this "
+            "alongside calculate_credit_profile before drawing any conclusion about "
+            "balance-sheet risk.\n\n"
+            "IMPORTANT: coverage is genuinely partial across filers. Check the "
+            "'coverage' field -- 'full' means all six buckets were tagged, "
+            "'partial' means some, and 'not_covered' means this filer does not tag "
+            "the split in XBRL. not_covered does NOT mean no debt matures: Ford "
+            "carries enormous debt and tags none of these concepts. Never read an "
+            "absent schedule as an absent obligation."
+          ),
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Ticker symbol"},
+              "form":   {"type": "string", "description": "Filing type", "default": "10-K"}
+            },
+            "required": ["ticker"]
+          }
         )]
 
     @self.server.call_tool()
@@ -624,6 +650,9 @@ class WebSearchServer:
         elif name == 'get_urls_content':
           return await parent.get_urls_content(args['urls'])
 
+        elif name == 'get_debt_maturity_schedule':
+          return await parent.get_debt_maturity_schedule(
+            args['ticker'], args.get('form', '10-K'))
         elif name == 'get_sbc_series':
           return await parent.get_sbc_series(
             args['ticker'], args.get('limit', 5), args.get('form', '10-K'))
@@ -761,6 +790,11 @@ class WebSearchServer:
     )]
 
   # SEC XBRL Tools
+  async def get_debt_maturity_schedule(self, ticker: str,
+                                       form: str = '10-K') -> List[TextContent]:
+    result = await asyncio.to_thread(get_debt_maturity_schedule, ticker, form)
+    return [TextContent(type="text", text=safe_json_dumps(result))]
+
   async def get_sbc_series(self, ticker: str, limit: int = 5,
                           form: str = '10-K') -> List[TextContent]:
     result = await asyncio.to_thread(get_sbc_series, ticker, limit, form)
