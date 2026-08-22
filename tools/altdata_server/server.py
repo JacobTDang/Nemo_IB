@@ -1824,6 +1824,8 @@ class AltDataServer:
 
     async def policy_signals(self, args: Dict[str, Any]) -> List[TextContent]:
         ticker = str(args.get("ticker", "")).upper()
+        if not ticker:
+            return _err("get_policy_signals", "ticker is required")
         sector = str(args.get("sector", ""))
         lookback_days = int(args.get("lookback_days", 180))
         try:

@@ -854,3 +854,12 @@ def test_taiwan_live_unknown_code_is_an_explicit_failure():
 
     assert out["success"] is False
     assert out["coverage"] == "not_covered"
+
+
+def test_policy_empty_ticker_is_rejected_like_every_other_tool():
+    """The other four handlers reject a missing ticker; this one sent it to the
+    resolver and reported a yfinance ValueError."""
+    payload = _envelope(_run(alt.AltDataServer().policy_signals({})))
+
+    assert payload["success"] is False
+    assert "ticker is required" in payload["metadata"]["errors"][0]
