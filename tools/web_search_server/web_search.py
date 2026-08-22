@@ -13,6 +13,8 @@ from tools.web_search_server.dilution import (
   get_shelf_activity,
 )
 from tools.web_search_server.sec_utils import (
+  extract_litigation,
+  extract_customer_concentration,
     get_revenue_base, get_ebitda_margin, get_capex_pct_revenue,
     get_tax_rate, get_depreciation, get_disclosures_names,
     extract_disclosure_data, get_latest_filing,
@@ -639,6 +641,53 @@ class WebSearchServer:
             },
             "required": ["ticker"]
           }
+        ),
+        Tool(
+          name="extract_litigation",
+          description=(
+            "Item 3, Legal Proceedings, from the latest annual or quarterly filing.\n\n"
+            "Material legal exposure had no coverage at all. Use when sizing a "
+            "position in a company facing regulatory action, patent disputes, or "
+            "class actions.\n\n"
+            "NOTE: most large filers cross-reference a contingencies note rather "
+            "than restating detail in Item 3, so a short result is normal. The "
+            "'cross_referenced_only' flag is true in that case, and the substance "
+            "lives in the notes to the financial statements -- follow up there "
+            "rather than concluding there is no litigation."
+          ),
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker":    {"type": "string", "description": "Ticker symbol"},
+              "form_type": {"type": "string", "description": "10-K or 10-Q", "default": "10-K"}
+            },
+            "required": ["ticker"]
+          }
+        ),
+        Tool(
+          name="extract_customer_concentration",
+          description=(
+            "Major-customer disclosure: who accounts for a material share of "
+            "revenue, and how much.\n\n"
+            "Often the entire thesis. A supplier deriving 22% of revenue from one "
+            "buyer has a different risk profile from a diversified one, and it "
+            "does not appear anywhere in the financial statements.\n\n"
+            "Read the two flags together. 'has_concentration' true with entries in "
+            "'named_customers' means real concentration was disclosed. "
+            "'explicitly_none' true means the filer stated that no customer crosses "
+            "the threshold, which is a genuine finding of LOW concentration -- not "
+            "missing data. Both false means nothing was found either way. Most "
+            "filers describe the customer without naming it, so a null name with a "
+            "percentage is the common case."
+          ),
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker":    {"type": "string", "description": "Ticker symbol"},
+              "form_type": {"type": "string", "description": "10-K or 10-Q", "default": "10-K"}
+            },
+            "required": ["ticker"]
+          }
         )]
 
     @self.server.call_tool()
@@ -650,6 +699,12 @@ class WebSearchServer:
         elif name == 'get_urls_content':
           return await parent.get_urls_content(args['urls'])
 
+        elif name == 'extract_litigation':
+          return await parent.extract_litigation(
+            args['ticker'], args.get('form_type', '10-K'))
+        elif name == 'extract_customer_concentration':
+          return await parent.extract_customer_concentration(
+            args['ticker'], args.get('form_type', '10-K'))
         elif name == 'get_debt_maturity_schedule':
           return await parent.get_debt_maturity_schedule(
             args['ticker'], args.get('form', '10-K'))
@@ -790,6 +845,16 @@ class WebSearchServer:
     )]
 
   # SEC XBRL Tools
+  async def extract_litigation(self, ticker: str,
+                               form_type: str = '10-K') -> List[TextContent]:
+    result = await asyncio.to_thread(extract_litigation, ticker, form_type)
+    return [TextContent(type="text", text=safe_json_dumps(result))]
+
+  async def extract_customer_concentration(self, ticker: str,
+                                           form_type: str = '10-K') -> List[TextContent]:
+    result = await asyncio.to_thread(extract_customer_concentration, ticker, form_type)
+    return [TextContent(type="text", text=safe_json_dumps(result))]
+
   async def get_debt_maturity_schedule(self, ticker: str,
                                        form: str = '10-K') -> List[TextContent]:
     result = await asyncio.to_thread(get_debt_maturity_schedule, ticker, form)

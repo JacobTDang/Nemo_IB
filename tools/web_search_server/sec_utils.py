@@ -2910,3 +2910,200 @@ if __name__ == "__main__":
     except Exception as e:
       print(f"{ticker}: EXCEPTION - {str(e)}")
     print("-" * 50)
+
+
+# ---------------------------------------------------------------------------
+# Item-section extraction and customer concentration.
+#
+# Item 3 (Legal Proceedings) and major-customer disclosure both had zero
+# coverage. Litigation is a numbered item and reuses the heading-boundary
+# approach already used for MD&A and risk factors. Customer concentration is
+# not an item at all -- filers put it in Item 1, Item 1A, or the
+# concentration-of-credit-risk footnote -- so it is found by disclosure
+# language instead.
+# ---------------------------------------------------------------------------
+
+def _locate_item_section(text: str, header_pattern: str,
+                         next_item_pattern: str) -> Optional[str]:
+  """Return the body of a numbered item, or None if it is not present.
+
+  A filing names each item twice: once in the table of contents and once in the
+  body. Taking the first match returns a page number rather than the
+  disclosure, so when several matches exist and the first is early in the
+  document, the last one is used.
+  """
+  matches = list(re.finditer(header_pattern, text, re.IGNORECASE))
+  if not matches:
+    return None
+
+  match = matches[0]
+  if len(matches) > 1 and match.start() < 30000:
+    match = matches[-1]
+
+  start = match.start()
+  search_from = match.end()
+  end_match = re.search(next_item_pattern, text[search_from:], re.IGNORECASE)
+  end = (search_from + end_match.start()) if end_match else min(start + 250000,
+                                                                len(text))
+  return text[start:end]
+
+
+# "No single customer accounted for more than 10%" is a disclosure of LOW
+# concentration. Without excluding these spans first, the 10% inside the denial
+# gets scraped as though it were a real customer share.
+# Filers phrase the denial many ways: "No single customer accounted for...",
+# "No customer represented more than...", and Microsoft's "No sales to an
+# individual customer or country other than the United States accounted for
+# more than 10%". Allowing a few words between "no" and "customer" catches all
+# three. Getting this wrong inverts the meaning of the disclosure.
+_NO_CONCENTRATION_RE = re.compile(
+  r'no\s+(?:\w+\s+){0,5}?(?:customers?|clients?)\b[^.]{0,140}?\d{1,2}(?:\.\d+)?\s*%',
+  re.IGNORECASE)
+
+# Either order: "customer ... 19%" or "19% ... from one customer".
+_CUSTOMER_PCT_RE = re.compile(
+  r'(?:customer|client)[^.]{0,100}?(\d{1,2}(?:\.\d+)?)\s*%',
+  re.IGNORECASE)
+
+_CUSTOMER_NAME_RE = re.compile(
+  r'(?:customer|client),?\s+([A-Z][A-Za-z.&\- ]{2,40}?),?\s+'
+  r'(?:accounted|represented|comprised)',
+  re.IGNORECASE)
+
+
+def _clean_customer_name(candidate: str) -> Optional[str]:
+  """Accept a proper-noun name, reject a sentence fragment.
+
+  The name pattern happily matched "or country other than the United States"
+  out of Microsoft's denial sentence. A genuine company name capitalises every
+  word; a fragment carries lowercase connectives, so any all-lowercase word
+  disqualifies the match.
+  """
+  name = (candidate or "").strip().strip(",")
+  if not name:
+    return None
+  words = name.split()
+  if not words:
+    return None
+  for word in words:
+    stripped = word.strip(".,&-")
+    if stripped and stripped[0].islower():
+      return None
+  return name
+
+
+def _scan_customer_concentration(text: str) -> Dict[str, Any]:
+  """Find major-customer disclosure in filing text.
+
+  Returns `explicitly_none` when the filer states no customer crosses the
+  threshold. That is a real and useful disclosure, distinct from finding
+  nothing at all, and the two must not be conflated.
+  """
+  denial_spans = [m.span() for m in _NO_CONCENTRATION_RE.finditer(text)]
+
+  def _inside_denial(position: int) -> bool:
+    return any(start <= position < end for start, end in denial_spans)
+
+  customers: List[Dict[str, Any]] = []
+  for match in _CUSTOMER_PCT_RE.finditer(text):
+    if _inside_denial(match.start()):
+      continue
+    try:
+      pct = float(match.group(1))
+    except (TypeError, ValueError):
+      continue
+    # A "customer" sentence quoting 90%+ is nearly always describing something
+    # other than one buyer's share of revenue.
+    if not 0 < pct <= 100:
+      continue
+    window = text[max(0, match.start() - 120):match.end() + 40]
+    name_match = _CUSTOMER_NAME_RE.search(window)
+    customers.append({
+      "name": _clean_customer_name(name_match.group(1)) if name_match else None,
+      "pct_of_revenue": pct,
+      "excerpt": window.strip(),
+    })
+
+  return {
+    "named_customers": customers,
+    "has_concentration": bool(customers),
+    "explicitly_none": bool(denial_spans) and not customers,
+  }
+
+
+def extract_litigation(ticker: str, form_type: str = '10-K',
+                       max_chars: int = 40000) -> Dict[str, Any]:
+  """Extract Item 3, Legal Proceedings.
+
+  Many filers cross-reference a note rather than restating the detail here, so
+  a short section is normal and is not an extraction failure.
+  """
+  try:
+    filing_data = get_latest_filing(ticker, form_type)
+    if not filing_data:
+      return {'ticker': ticker, 'success': False,
+              'error': f'No {form_type} filing found for {ticker}'}
+
+    filing_obj = filing_data.get('filing_object')
+    if filing_obj is None:
+      return {'ticker': ticker, 'success': False,
+              'error': 'No filing object in cache'}
+
+    text = filing_obj.text()
+    if not text:
+      return {'ticker': ticker, 'success': False, 'error': 'Empty filing text'}
+
+    section = _locate_item_section(
+      text, r'ITEM\s+3\.?\s*[-–—]?\s*LEGAL\s+PROCEEDINGS', r'ITEM\s+4\b')
+    if section is None:
+      return {'ticker': ticker, 'success': False,
+              'error': 'Could not locate Item 3 (Legal Proceedings) header'}
+
+    section = section[:max_chars]
+    return {
+      'ticker': ticker,
+      'success': True,
+      'form_type': form_type,
+      'filing_date': filing_data.get('filing_date'),
+      'text': section,
+      'char_count': len(section),
+      'cross_referenced_only': len(section) < 1500,
+    }
+  except Exception as e:
+    return {'ticker': ticker, 'success': False,
+            'error': f'{type(e).__name__}: {e}'}
+
+
+def extract_customer_concentration(ticker: str,
+                                   form_type: str = '10-K') -> Dict[str, Any]:
+  """Find major-customer disclosure anywhere in the filing.
+
+  Not a numbered item: filers place this in Item 1, Item 1A, or the
+  concentration-of-credit-risk footnote, so the whole document is scanned.
+  """
+  try:
+    filing_data = get_latest_filing(ticker, form_type)
+    if not filing_data:
+      return {'ticker': ticker, 'success': False,
+              'error': f'No {form_type} filing found for {ticker}'}
+
+    filing_obj = filing_data.get('filing_object')
+    if filing_obj is None:
+      return {'ticker': ticker, 'success': False,
+              'error': 'No filing object in cache'}
+
+    text = filing_obj.text()
+    if not text:
+      return {'ticker': ticker, 'success': False, 'error': 'Empty filing text'}
+
+    found = _scan_customer_concentration(text)
+    return {
+      'ticker': ticker,
+      'success': True,
+      'form_type': form_type,
+      'filing_date': filing_data.get('filing_date'),
+      **found,
+    }
+  except Exception as e:
+    return {'ticker': ticker, 'success': False,
+            'error': f'{type(e).__name__}: {e}'}
