@@ -1466,9 +1466,17 @@ class AltDataServer:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2 or sys.argv[1] != "server":
-        print("Usage: python -m tools.altdata_server.server server", file=sys.stderr)
+    if len(sys.argv) < 2 or sys.argv[1] not in ("server", "http"):
+        print("Usage: python -m tools.altdata_server.server [server|http]", file=sys.stderr)
         sys.exit(1)
-    print("[altdata] starting", file=sys.stderr, flush=True)
-    srv = AltDataServer()
-    asyncio.run(srv.run_server())
+
+    if sys.argv[1] == "http":
+        # Streamable HTTP, for a host a client connects to rather than one
+        # that spawns it. stdio stays the default for local use.
+        from tools.mcp_http import run_http
+        print("[altdata] starting over streamable HTTP", file=sys.stderr, flush=True)
+        run_http(AltDataServer().server)
+    else:
+        print("[altdata] starting", file=sys.stderr, flush=True)
+        srv = AltDataServer()
+        asyncio.run(srv.run_server())

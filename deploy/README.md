@@ -23,43 +23,59 @@ normally for the life of a session — it just does not outlive it.
 
 ## Registering with Claude Code
 
-Each server is a separate MCP entry. Claude Code spawns the container per
-session, so `--rm` plus tmpfs means cleanup is automatic rather than a chore.
+The servers speak streamable HTTP, so Claude Code connects to them rather than
+spawning them. Bring the stack up first:
 
-```json
-{
-  "mcpServers": {
-    "nemo-sec": {
-      "command": "docker",
-      "args": [
-        "run", "-i", "--rm",
-        "--env-file", "/path/to/.env",
-        "--tmpfs", "/root/.edgar:rw,size=512m",
-        "--tmpfs", "/app/db_cache:rw,size=128m",
-        "nemo-data:local",
-        "python", "-m", "tools.web_search_server.web_search", "server"
-      ]
-    }
-  }
-}
+```bash
+docker compose -f deploy/docker-compose.yml up -d
 ```
 
-The five data-source servers and their modules:
+Then register each one:
 
-| Server | Module |
-|---|---|
-| SEC EDGAR | `tools.web_search_server.web_search` |
-| Market data and modelling | `tools.financial_modeling_engine.analysis_tools` |
-| Finnhub | `tools.news_agregator.finnhub_server` |
-| FRED macro | `tools.news_agregator.fred_server` |
-| Alt data | `tools.altdata_server.server` |
+```bash
+claude mcp add --transport http nemo-sec       http://<host>:8810/mcp
+claude mcp add --transport http nemo-financial http://<host>:8811/mcp
+claude mcp add --transport http nemo-finnhub   http://<host>:8812/mcp
+claude mcp add --transport http nemo-fred      http://<host>:8813/mcp
+claude mcp add --transport http nemo-altdata   http://<host>:8814/mcp
+```
 
+| Server | Port | Module | Tools |
+|---|---|---|---|
+| SEC EDGAR | 8810 | `tools.web_search_server.web_search` | 39 of 42 |
+| Market data and modelling | 8811 | `tools.financial_modeling_engine.analysis_tools` | 19 |
+| Finnhub | 8812 | `tools.news_agregator.finnhub_server` | 14 |
+| FRED macro | 8813 | `tools.news_agregator.fred_server` | 5 |
+| Alt data | 8814 | `tools.altdata_server.server` | 5 |
+
+The SEC server advertises 39 of its 42 tools: `search` and the two rag tools
+are hidden because SearXNG and the RAG stack are not in this image. That is
+deliberate. `search` returns an empty result list rather than an error when
+SearXNG is missing, so advertising it would make an absent container
+indistinguishable from a query that matched nothing.
+
+stdio still works for local use -- swap `http` for `server` in the command.
+
+### Health checks are not a deploy gate
+
+`/health` reports that uvicorn bound the port and the app started. A server
+whose MCP layer failed still answers it. Compose uses it for restart decisions;
+the actual gate is `testing/test_http_transport.py`, which completes a real
+handshake and one live tool call against each server.
+
+## Building
 ## Building
 
 ```bash
-docker build -t nemo-data:local .                        # native, for local testing
-docker buildx build --platform linux/amd64 -t nemo-data:amd64 .   # for Proxmox
+docker build -t nemo-data:local .                                  # native, local testing
+docker buildx build --platform linux/amd64 -t nemo-data:amd64 .    # for Proxmox
 ```
+
+The image copies only the servers it serves, which means **a new top-level
+module under `tools/` must be added to the `COPY` line explicitly** or it is
+silently absent at runtime. `tools/mcp_http.py` was missed exactly this way on
+its first run. The build-time import check now covers it, so the build fails
+rather than the container.
 
 Proxmox VE is x86-64 only, so a homelab image must be built for `linux/amd64`.
 Building on Apple Silicon without `--platform` produces an arm64 image that will
@@ -80,6 +96,6 @@ unset, verified.
 - `analyze_exposures` and `get_thesis_evolution` read book state. The entrypoint
   creates the schema so they return an empty result rather than failing, but a
   data-source host holds no positions, so empty is the truthful answer.
-- Transport is stdio. Claude Code spawns the process, so these servers are not
-  reachable over a network yet. Serving them from the homelab needs the HTTP
-  transport work.
+- **Authentication is not implemented.** Anything that can reach these ports
+  can call every tool using the host's Finnhub and FRED keys. Bind to a LAN
+  address and do not forward the ports at the router until this is addressed.

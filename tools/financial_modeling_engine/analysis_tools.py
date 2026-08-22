@@ -1773,10 +1773,17 @@ class Financial_Analysis:
 
 if __name__ == "__main__":
   if len(sys.argv) < 2:
-    print("Usage: python -m tools.financial_modeling_engine.analysis_tools server", file=sys.stderr)
+    print("Usage: python -m tools.financial_modeling_engine.analysis_tools [server|http]", file=sys.stderr)
     sys.exit(1)
 
-  if sys.argv[1] == "server":
+  if sys.argv[1] == "http":
+    # Streamable HTTP, for a host a client connects to rather than one
+    # that spawns it. stdio stays the default for local use.
+    from tools.mcp_http import run_http
+    print("Starting financial engine over streamable HTTP", file=sys.stderr, flush=True)
+    run_http(Financial_Analysis().server)
+
+  elif sys.argv[1] == "server":
     print("Starting Financial Analysis Server", file=sys.stderr, flush=True)
     try:
       server = Financial_Analysis()

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import pathlib
 from typing import Any
 
 import uvicorn
@@ -72,3 +73,28 @@ def run_http(mcp_server: Any, *, host: str | None = None,
     port = port or int(os.environ.get("MCP_HTTP_PORT", DEFAULT_PORT))
     uvicorn.run(build_app(mcp_server, stateless=stateless),
                 host=host, port=port, log_level="info")
+
+
+@contextlib.contextmanager
+def request_scratch(prefix: str = "mcp-req-"):
+    """A temp directory for one request, removed on the way out.
+
+    No tool in this image writes a file today -- none of the five servers even
+    accepts a file path. This exists because the safety net that used to cover
+    that case is gone: with stdio and --rm, anything a tool left behind died
+    with the container. A long-lived HTTP server keeps it.
+
+    Removal is in a `finally`, so it survives an exception. That is the case
+    that matters -- a tool failing halfway through writing output is exactly
+    how a server that never restarts fills up its disk.
+    """
+    import shutil
+    import tempfile
+
+    path = pathlib.Path(tempfile.mkdtemp(prefix=prefix))
+    try:
+        yield path
+    finally:
+        # ignore_errors so a tool that already cleaned up after itself does not
+        # turn tidiness into a crash.
+        shutil.rmtree(path, ignore_errors=True)

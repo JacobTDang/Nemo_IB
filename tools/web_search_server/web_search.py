@@ -1181,12 +1181,19 @@ class WebSearchServer:
 
 if __name__ == "__main__":
   if len(sys.argv) < 2:
-    print("Usage: python -m tools.web_search_server.web_search server", file=sys.stderr)
+    print("Usage: python -m tools.web_search_server.web_search [server|http]", file=sys.stderr)
     sys.exit(1)
 
   system_args = sys.argv[1]
 
-  if system_args == "server":
+  if system_args == "http":
+    # Streamable HTTP, for a host a client connects to rather than one
+    # that spawns it. stdio stays the default for local use.
+    from tools.mcp_http import run_http
+    print("Starting web_client over streamable HTTP", file=sys.stderr, flush=True)
+    run_http(WebSearchServer().server)
+
+  elif system_args == "server":
     print("Starting web_client process", file=sys.stderr, flush=True)
     try:
       server = WebSearchServer()

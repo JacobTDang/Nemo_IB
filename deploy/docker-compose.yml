@@ -1,0 +1,64 @@
+# Data-source MCP servers over streamable HTTP.
+#
+# One service per server. The alternative -- merging five tool registries
+# behind a single endpoint -- collapses five independent restart domains into
+# one and buys only a shorter client config.
+#
+# Every service shares one image and differs only in its command and port.
+#
+# Build for the target architecture before deploying. Proxmox VE is x86-64
+# only, so an image built on Apple Silicon without --platform will not run:
+#   docker buildx build --platform linux/amd64 -t nemo-data:amd64 -f ../Dockerfile ..
+
+x-server: &server
+  image: nemo-data:local
+  env_file: ../.env
+  restart: unless-stopped
+  # Both writable paths are RAM-backed and capped. edgartools caches every
+  # filing it fetches -- 2MB after a single one, unbounded across tickers --
+  # and a long-lived container no longer gets --rm to clean up after it.
+  tmpfs:
+    - /root/.edgar:rw,size=512m
+    - /app/db_cache:rw,size=128m
+  healthcheck:
+    # No curl in the runtime stage; python is what the image has.
+    # /health only proves the port is bound and the app started. A server whose
+    # MCP layer failed still answers it, which is why the deploy gate is the
+    # handshake test rather than this.
+    test: ["CMD", "python", "-c",
+           "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health',timeout=3).status==200 else 1)"]
+    interval: 30s
+    timeout: 5s
+    retries: 3
+    start_period: 10s
+
+services:
+  sec:
+    <<: *server
+    container_name: nemo-sec
+    command: python -m tools.web_search_server.web_search http
+    ports: ["8810:8080"]
+
+  financial:
+    <<: *server
+    container_name: nemo-financial
+    command: python -m tools.financial_modeling_engine.analysis_tools http
+    ports: ["8811:8080"]
+
+  finnhub:
+    <<: *server
+    container_name: nemo-finnhub
+    command: python -m tools.news_agregator.finnhub_server http
+    ports: ["8812:8080"]
+
+  fred:
+    <<: *server
+    container_name: nemo-fred
+    command: python -m tools.news_agregator.fred_server http
+    ports: ["8813:8080"]
+
+  altdata:
+    <<: *server
+    container_name: nemo-altdata
+    command: python -m tools.altdata_server.server http
+    ports: ["8814:8080"]
