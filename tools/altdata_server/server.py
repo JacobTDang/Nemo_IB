@@ -785,6 +785,12 @@ def _fetch_taiwan_revenue_finmind(company_codes: List[str], months: int) -> Dict
     lookback_days = (months + 14) * 31
     start_date = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     token = os.environ.get("FINMIND_TOKEN", "")
+    token_hint = ("" if token else
+                  " FINMIND_TOKEN is unset, so this ran on FinMind's anonymous "
+                  "tier (shared per-IP daily quota).")
+    degraded: List[str] = [] if token else [
+        "FINMIND_TOKEN unset — requests use FinMind's anonymous tier, which "
+        "shares a daily quota per IP."]
     results: Dict[str, Any] = {}
 
     for code in company_codes:
@@ -804,13 +810,17 @@ def _fetch_taiwan_revenue_finmind(company_codes: List[str], months: int) -> Dict
             resp.raise_for_status()
             payload = resp.json()
         except Exception as exc:
-            results[code] = {"error": f"{type(exc).__name__}: {str(exc)[:150]}"}
+            results[code] = {
+                "error": (f"FinMind request for code {code} failed: "
+                          f"{type(exc).__name__}: {str(exc)[:150]}")
+            }
             continue
 
         if payload.get("status") != 200:
             results[code] = {
                 "error": (f"FinMind status {payload.get('status')}: "
-                          f"{payload.get('msg', 'no message')}")
+                          f"{payload.get('msg', 'no message')}"
+                          f" (code {code}).{token_hint}")
             }
             continue
 
@@ -846,7 +856,32 @@ def _fetch_taiwan_revenue_finmind(company_codes: List[str], months: int) -> Dict
         results[code] = {"company_code": code, "months_returned": len(parsed),
                          "months": parsed, "source": "finmind"}
 
-    return {"companies": results, "codes_requested": company_codes}
+    failed = [c for c in company_codes if "error" in results.get(c, {})]
+
+    if failed and len(failed) == len(company_codes):
+        # Every code failed. The per-code errors were there all along, nested
+        # inside a payload the envelope still called a success.
+        return {
+            "success": False,
+            "coverage": "not_covered",
+            "reason": "no_data",
+            "error": ("FinMind returned no monthly revenue for any requested "
+                      f"code ({', '.join(company_codes)}): "
+                      + "; ".join(results[c]["error"] for c in failed)),
+            "companies": results,
+            "codes_requested": company_codes,
+            "codes_failed": failed,
+            "degraded": degraded,
+        }
+
+    return {
+        "success": True,
+        "coverage": "partial" if failed else "full",
+        "companies": results,
+        "codes_requested": company_codes,
+        "codes_failed": failed,
+        "degraded": degraded,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1531,7 +1566,11 @@ class AltDataServer:
                         "Monthly revenue for Taiwan-listed companies via FinMind "
                         "(TWSE feed). Key codes: TSMC=2330, Foxconn=2317, "
                         "MediaTek=2454, ASE Group=3711. "
-                        "Returns NTD millions per month + YoY%."
+                        "Returns NTD millions per month + YoY%. Every requested code "
+                        "failing returns success=false, coverage='not_covered'; some "
+                        "failing returns coverage='partial' with codes_failed listed. "
+                        "An unset FINMIND_TOKEN is named in 'degraded' (anonymous tier, "
+                        "shared per-IP daily quota)."
                     ),
                     inputSchema={
                         "type": "object",
@@ -1733,7 +1772,7 @@ class AltDataServer:
         except Exception as exc:
             return _err("get_taiwan_monthly_revenue",
                         f"{type(exc).__name__}: {str(exc)[:200]}")
-        return _ok("get_taiwan_monthly_revenue", result)
+        return _dispatch("get_taiwan_monthly_revenue", result)
 
     async def job_postings_count(self, args: Dict[str, Any]) -> List[TextContent]:
         slug = str(args.get("company_slug", "")).strip().lower()

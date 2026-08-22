@@ -744,3 +744,113 @@ def test_policy_live_known_sector_still_returns_bills(monkeypatch):
     assert out["success"] is True, out.get("error")
     assert out["bill_count"] > 0
     assert out["coverage"] == "partial"  # GovTrack only without the API key
+
+
+# ---------------------------------------------------------------------------
+# get_taiwan_monthly_revenue
+# ---------------------------------------------------------------------------
+
+def _finmind(monkeypatch, per_code):
+    """Patch FinMind. `per_code` maps a code to (status, msg, rows)."""
+    def get(url, params=None, **k):
+        code = (params or {}).get("data_id")
+        status, msg, rows = per_code.get(code, (200, "success", []))
+        return _Response({"status": status, "msg": msg, "data": rows}, 200)
+
+    monkeypatch.setattr(requests, "get", get)
+
+
+def _rows(code_year=2026):
+    return [
+        {"date": "2025-08-01", "revenue_year": 2025, "revenue_month": 7,
+         "revenue": 200_000_000_000},
+        {"date": f"{code_year}-08-01", "revenue_year": code_year,
+         "revenue_month": 7, "revenue": 300_000_000_000},
+    ]
+
+
+def test_taiwan_every_code_failing_is_a_failed_lookup(monkeypatch):
+    monkeypatch.delenv("FINMIND_TOKEN", raising=False)
+    _finmind(monkeypatch, {"9999999": (200, "success", [])})
+
+    out = alt._fetch_taiwan_revenue_finmind(["9999999"], months=3)
+
+    assert out["success"] is False
+    assert out["coverage"] == "not_covered"
+    assert "9999999" in out["error"]
+    assert out["codes_failed"] == ["9999999"]
+
+
+def test_taiwan_partial_failure_keeps_the_good_code_and_says_so(monkeypatch):
+    monkeypatch.delenv("FINMIND_TOKEN", raising=False)
+    _finmind(monkeypatch, {"2330": (200, "success", _rows()),
+                           "9999999": (200, "success", [])})
+
+    out = alt._fetch_taiwan_revenue_finmind(["2330", "9999999"], months=3)
+
+    assert out["success"] is True
+    assert out["coverage"] == "partial"
+    assert out["codes_failed"] == ["9999999"]
+    assert out["companies"]["2330"]["months_returned"] == 2
+
+
+def test_taiwan_all_codes_ok_is_full_coverage(monkeypatch):
+    monkeypatch.setenv("FINMIND_TOKEN", "t")
+    _finmind(monkeypatch, {"2330": (200, "success", _rows())})
+
+    out = alt._fetch_taiwan_revenue_finmind(["2330"], months=3)
+
+    assert out["success"] is True
+    assert out["coverage"] == "full"
+    assert out["degraded"] == []
+
+
+def test_taiwan_missing_token_is_named_as_a_degradation(monkeypatch):
+    monkeypatch.delenv("FINMIND_TOKEN", raising=False)
+    _finmind(monkeypatch, {"2330": (200, "success", _rows())})
+
+    out = alt._fetch_taiwan_revenue_finmind(["2330"], months=3)
+
+    assert out["success"] is True
+    assert any("FINMIND_TOKEN" in d for d in out["degraded"]), out["degraded"]
+
+
+def test_taiwan_rate_limit_without_a_token_names_the_token(monkeypatch):
+    """FinMind's anonymous tier is what runs out of requests; the error said
+    only 'status 402'."""
+    monkeypatch.delenv("FINMIND_TOKEN", raising=False)
+    _finmind(monkeypatch, {"2330": (402, "Requests reach the upper limit.", [])})
+
+    out = alt._fetch_taiwan_revenue_finmind(["2330"], months=3)
+
+    assert out["success"] is False
+    assert "FINMIND_TOKEN" in out["companies"]["2330"]["error"]
+
+
+def test_taiwan_handler_envelope_reports_the_failure(monkeypatch):
+    monkeypatch.delenv("FINMIND_TOKEN", raising=False)
+    _finmind(monkeypatch, {"9999999": (200, "success", [])})
+
+    payload = _envelope(_run(alt.AltDataServer().taiwan_monthly_revenue(
+        {"company_codes": ["9999999"], "months": 3})))
+
+    assert payload["success"] is False
+    assert payload["metadata"]["errors"]
+    assert payload["data"]["companies"]["9999999"]["error"]
+
+
+@network
+def test_taiwan_live_tsmc_is_covered():
+    out = alt._fetch_taiwan_revenue_finmind(["2330"], months=3)
+
+    assert out["success"] is True, out.get("error")
+    assert out["coverage"] == "full"
+    assert out["companies"]["2330"]["months_returned"] > 0
+
+
+@network
+def test_taiwan_live_unknown_code_is_an_explicit_failure():
+    out = alt._fetch_taiwan_revenue_finmind(["9999999"], months=3)
+
+    assert out["success"] is False
+    assert out["coverage"] == "not_covered"
