@@ -56,6 +56,9 @@ def test_web_search_research_handlers_serialise(monkeypatch):
         "get_accruals_quality": (
             "get_accruals_quality", lambda *a, **k: {"ticker": "X", "success": True},
             lambda: server.get_accruals_quality("X", 2, "10-K")),
+        "get_working_capital_trends": (
+            "get_working_capital_trends", lambda *a, **k: {"ticker": "X", "success": True},
+            lambda: server.get_working_capital_trends("X", 2, "10-K")),
     }
     for label, (attr, stub, call) in cases.items():
         monkeypatch.setattr(ws, attr, stub)

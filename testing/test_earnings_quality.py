@@ -1,9 +1,13 @@
-"""Earnings quality: net income against operating cash flow.
+"""Earnings quality: accruals and working-capital dynamics.
 
-The gap that lets a company look healthy right up to the point it does not:
+Two gaps that let a company look healthy right up to the point it does not:
 
 - **Accruals.** Net income rising while operating cash flow does not is the
   classic pre-blowup signature. Nothing here compared the two.
+- **Working capital.** get_working_capital pulls receivables and inventory and
+  stops at net working capital. Receivables growing faster than revenue is
+  channel stuffing or a collection problem; inventory building is demand
+  deterioration. Neither was computable.
 
 The live figures below were read off the filings before the code was written,
 so a passing test means the arithmetic matches EDGAR rather than matching my
@@ -257,6 +261,157 @@ def test_the_newest_filing_wins_for_a_restated_period(monkeypatch):
     assert eq.get_accruals_quality("X")["latest"]["net_income"] == 88.0
 
 
+# =========================================================== working capital
+
+AR = "us-gaap:AccountsReceivableNetCurrent"
+AR_ALT = "us-gaap:ReceivablesNetCurrent"
+INV = "us-gaap:InventoryNet"
+AP = "us-gaap:AccountsPayableCurrent"
+REV = "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax"
+COGS = "us-gaap:CostOfRevenue"
+COGS_ALT = "us-gaap:CostOfGoodsAndServicesSold"
+INV_AEROSPACE = "us-gaap:InventoryNetOfAllowancesCustomerAdvancesAndProgressBillings"
+
+
+def _costco_year(end="2025-08-31", start="2024-09-02"):
+    """COST FY2025, straight off the 10-K."""
+    return {
+        REV: [_point([_year(275_235_000_000.0, end=end, start=start)])],
+        COGS_ALT: [_point([_year(239_886_000_000.0, end=end, start=start)])],
+        AR_ALT: [_point([_instant(3_203_000_000.0, end=end)])],
+        INV: [_point([_instant(18_116_000_000.0, end=end)])],
+        AP: [_point([_instant(19_783_000_000.0, end=end)])],
+    }
+
+
+def test_dso_dio_dpo_and_the_cash_conversion_cycle(monkeypatch):
+    monkeypatch.setattr(eq, "fetch_concept_series", _chain(_costco_year()))
+    latest = eq.get_working_capital_trends("COST")["latest"]
+    # 3,203 / 275,235 * 364 days
+    assert latest["dso"] == pytest.approx(4.24, abs=0.05)
+    assert latest["dio"] == pytest.approx(27.5, abs=0.15)
+    assert latest["dpo"] == pytest.approx(30.0, abs=0.15)
+    assert latest["cash_conversion_cycle"] == pytest.approx(
+        latest["dso"] + latest["dio"] - latest["dpo"])
+
+
+def test_cost_of_revenue_falls_through_the_concept_chain(monkeypatch):
+    """WMT tags CostOfRevenue, MSFT and COST tag CostOfGoodsAndServicesSold.
+    Either one alone reports half the market as having no cost of sales."""
+    monkeypatch.setattr(eq, "fetch_concept_series", _chain(_costco_year()))
+    result = eq.get_working_capital_trends("COST")
+    assert result["concepts_used"]["cost_of_revenue"] == COGS_ALT
+
+
+def test_receivables_fall_through_the_concept_chain(monkeypatch):
+    """WMT and COST tag ReceivablesNetCurrent, not AccountsReceivableNetCurrent."""
+    monkeypatch.setattr(eq, "fetch_concept_series", _chain(_costco_year()))
+    result = eq.get_working_capital_trends("COST")
+    assert result["concepts_used"]["receivables"] == AR_ALT
+    assert result["latest"]["accounts_receivable"] == 3_203_000_000.0
+
+
+def test_a_filer_with_no_inventory_reports_null_not_zero(monkeypatch):
+    """CRM tags no InventoryNet at all. DIO of zero would read as 'sells
+    through instantly', which is a different claim from 'holds no inventory'."""
+    monkeypatch.setattr(eq, "fetch_concept_series", _chain({
+        REV: [_point([_year(41_525_000_000.0, end="2026-01-31", start="2025-02-01")])],
+        COGS_ALT: [_point([_year(9_270_000_000.0, end="2026-01-31", start="2025-02-01")])],
+        AR: [_point([_instant(14_339_000_000.0, end="2026-01-31")])],
+    }))
+    result = eq.get_working_capital_trends("CRM")
+    assert result["success"] is True
+    assert result["coverage"] == "partial"
+    assert result["latest"]["inventory"] is None
+    assert result["latest"]["dio"] is None
+    assert result["latest"]["cash_conversion_cycle"] is None
+    assert result["latest"]["dso"] == pytest.approx(126.0, abs=0.5)
+    assert INV in " ".join(result["concepts_tried"])
+
+
+def test_aerospace_inventory_is_found_under_its_own_concept(monkeypatch):
+    """Boeing nets customer advances off inventory and tags it as
+    InventoryNetOfAllowancesCustomerAdvancesAndProgressBillings. A chain of
+    InventoryNet alone reported the largest inventory position in the
+    industrials index as no inventory at all."""
+    monkeypatch.setattr(eq, "fetch_concept_series", _chain({
+        REV: [_point([_year(1000.0)])],
+        COGS: [_point([_year(500.0)])],
+        INV_AEROSPACE: [_point([_instant(250.0)])],
+    }))
+    result = eq.get_working_capital_trends("BA")
+    assert result["latest"]["inventory"] == 250.0
+    assert result["concepts_used"]["inventory"] == INV_AEROSPACE
+
+
+def test_receivables_outgrowing_revenue_is_surfaced(monkeypatch):
+    """Revenue +10%, receivables +50%. The gap is the tool's reason to exist."""
+    monkeypatch.setattr(eq, "fetch_concept_series", _chain({
+        REV: [_point([
+            _year(110.0, end="2026-06-30", start="2025-07-01"),
+            _year(100.0, end="2025-06-30", start="2024-07-01", ref="c-2")])],
+        COGS: [_point([
+            _year(55.0, end="2026-06-30", start="2025-07-01"),
+            _year(50.0, end="2025-06-30", start="2024-07-01", ref="c-2")])],
+        AR: [_point([
+            _instant(15.0, end="2026-06-30"),
+            _instant(10.0, end="2025-06-30", ref="c-2")])],
+    }))
+    latest = eq.get_working_capital_trends("X")["latest"]
+    assert latest["revenue_growth_pct"] == pytest.approx(10.0)
+    assert latest["receivables_growth_pct"] == pytest.approx(50.0)
+    assert latest["receivables_vs_revenue_gap_pct"] == pytest.approx(40.0)
+
+
+def test_days_come_from_the_period_span_not_a_hardcoded_year(monkeypatch):
+    """A 10-Q's revenue covers a quarter. Dividing a quarter's revenue by 365
+    days quadruples DSO and turns a healthy filer into a fraud."""
+    monkeypatch.setattr(eq, "fetch_concept_series", _chain({
+        REV: [_point([_year(100.0, end="2026-06-30", start="2026-04-01")])],
+        COGS: [_point([_year(50.0, end="2026-06-30", start="2026-04-01")])],
+        AR: [_point([_instant(50.0, end="2026-06-30")])],
+    }))
+    latest = eq.get_working_capital_trends("X", form="10-Q")["latest"]
+    assert latest["period_days"] == 90
+    assert latest["dso"] == pytest.approx(45.0)
+
+
+def test_segment_receivables_do_not_displace_the_consolidated_balance(monkeypatch):
+    monkeypatch.setattr(eq, "fetch_concept_series", _chain({
+        REV: [_point([_year(1000.0)])],
+        COGS: [_point([_year(500.0)])],
+        AR: [_point([
+            _instant(100.0),
+            _instant(400.0, dims={SEGMENT_AXIS: "x:BigSegmentMember"}, ref="c-9")])],
+    }))
+    assert eq.get_working_capital_trends("X")["latest"]["accounts_receivable"] == 100.0
+
+
+def test_no_revenue_is_an_explicit_failure(monkeypatch):
+    """Every ratio here divides by revenue or cost of revenue. Without one
+    there is nothing to report, and reporting nothing must not look like zero
+    days outstanding."""
+    monkeypatch.setattr(eq, "fetch_concept_series", _chain({
+        AR: [_point([_instant(100.0)])],
+    }))
+    result = eq.get_working_capital_trends("NOTAGS")
+    assert result["success"] is False
+    assert result["periods"] == []
+    assert result["latest"] is None
+    assert "revenue" in result["error"].lower()
+
+
+def test_a_tagged_zero_receivable_is_kept(monkeypatch):
+    monkeypatch.setattr(eq, "fetch_concept_series", _chain({
+        REV: [_point([_year(1000.0)])],
+        COGS: [_point([_year(500.0)])],
+        AR: [_point([_instant(0.0)])],
+    }))
+    latest = eq.get_working_capital_trends("X")["latest"]
+    assert latest["accounts_receivable"] == 0.0
+    assert latest["dso"] == 0.0
+
+
 # ============================================================ live golden set
 
 @pytest.fixture(scope="module", autouse=True)
@@ -328,6 +483,45 @@ def test_msft_total_assets_are_not_current_assets():
 
 
 @network
+def test_cost_working_capital_matches_the_fy2025_10k():
+    """COST FY2025: revenue 275.235bn, cost of goods 239.886bn, inventory
+    18.116bn, receivables 3.203bn, payables 19.783bn. A warehouse retailer
+    turns inventory in under a month and is paid before it pays."""
+    result = eq.get_working_capital_trends("COST")
+    assert result["success"] is True
+    row = _period(result, "2025-08-31")
+    assert row["inventory"] == 18_116_000_000.0
+    assert row["dio"] == pytest.approx(27.5, abs=0.6)
+    assert row["dso"] == pytest.approx(4.2, abs=0.6)
+    assert row["cash_conversion_cycle"] < 10, "COST is paid before it pays"
+
+
+@network
+def test_wmt_working_capital_matches_the_fy2026_10k():
+    """WMT FY2026 (ends 2026-01-31): inventory 58.851bn against 535.395bn cost
+    of revenue -- about forty days of stock. WMT tags ReceivablesNetCurrent
+    rather than AccountsReceivableNetCurrent, so the chain is load-bearing."""
+    result = eq.get_working_capital_trends("WMT")
+    assert result["success"] is True
+    row = _period(result, "2026-01-31")
+    assert row["inventory"] == 58_851_000_000.0
+    assert row["dio"] == pytest.approx(40.0, abs=1.0)
+    assert row["accounts_receivable"] == 11_172_000_000.0
+
+
+@network
+def test_crm_has_no_inventory_and_that_is_the_right_answer():
+    """CRM tags no InventoryNet and no AccountsPayableCurrent. DIO must be
+    null rather than zero, and the call still succeeds on DSO."""
+    result = eq.get_working_capital_trends("CRM")
+    assert result["success"] is True
+    row = _period(result, "2026-01-31")
+    assert row["inventory"] is None
+    assert row["dio"] is None
+    assert row["dso"] == pytest.approx(126.0, abs=1.0)
+
+
+@network
 def test_ford_reports_the_year_it_actually_just_filed():
     """Live pin on the stale-concept regression. Ford's FY2025 10-K tags
     us-gaap:ProfitLoss and drops us-gaap:NetIncomeLoss, so a chain that stops
@@ -340,6 +534,19 @@ def test_ford_reports_the_year_it_actually_just_filed():
     assert result["latest"]["operating_cash_flow"] == 21_282_000_000.0
     assert result["latest"]["total_assets"] == 289_160_000_000.0
     assert result["concepts_used"]["net_income"] == "us-gaap:ProfitLoss"
+
+
+@network
+def test_googl_working_capital_uses_the_concept_its_latest_10k_tags():
+    """Alphabet's FY2025 10-K tags us-gaap:Revenues at 402.836bn. The ASC 606
+    element covers 2024 and earlier only, and taking it computed DSO against a
+    year-old revenue."""
+    result = eq.get_working_capital_trends("GOOGL")
+    assert result["success"] is True
+    assert result["latest"]["period_end"] == "2025-12-31"
+    assert result["latest"]["revenue"] == 402_836_000_000.0
+    assert result["concepts_used"]["revenue"] == "us-gaap:Revenues"
+    assert result["latest"]["dio"] is None, "Alphabet tags no inventory"
 
 
 @network

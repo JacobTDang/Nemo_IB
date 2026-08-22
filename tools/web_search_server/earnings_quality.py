@@ -1,10 +1,16 @@
-"""Are these earnings real? Net income against operating cash flow.
+"""Are these earnings real? Accruals and working-capital dynamics.
 
-A question the SEC layer could not answer:
+Two questions the SEC layer could not answer:
 
 **Accruals.** Net income rising while operating cash flow does not is the
 classic pre-blowup signature -- earnings arriving as promises rather than cash.
 Both numbers were extractable one at a time and nothing compared them.
+
+**Working capital.** `sec_utils.get_working_capital` pulls receivables,
+inventory and payables and stops at net working capital. It never divides them
+by revenue, so receivables growing faster than sales (channel stuffing, or
+customers who have stopped paying) and inventory building ahead of demand were
+both invisible.
 
 Everything is period-joined on the fiscal period end date, so a balance-sheet
 instant is matched to the income-statement duration that ends the same day.
@@ -30,6 +36,46 @@ OCF_CONCEPTS = (
 )
 
 ASSETS_CONCEPTS = ("us-gaap:Assets",)
+
+# WMT and COST tag ReceivablesNetCurrent; MSFT, AAPL and CRM tag
+# AccountsReceivableNetCurrent. Neither alone covers the market.
+RECEIVABLES_CONCEPTS = (
+    "us-gaap:AccountsReceivableNetCurrent",
+    "us-gaap:ReceivablesNetCurrent",
+    "us-gaap:AccountsAndOtherReceivablesNetCurrent",
+    "us-gaap:AccountsNotesAndLoansReceivableNetCurrent",
+)
+
+# InventoryNet covers most filers, but two large sectors do not use it at all:
+# aerospace and defence net customer advances off the balance
+# (BA carries 84.7bn there), and the majors tag energy inventory separately.
+INVENTORY_CONCEPTS = (
+    "us-gaap:InventoryNet",
+    "us-gaap:InventoryNetOfAllowancesCustomerAdvancesAndProgressBillings",
+    "us-gaap:EnergyRelatedInventory",
+    "us-gaap:RetailRelatedInventory",
+    "us-gaap:InventoryFinishedGoodsNetOfReserves",
+)
+
+PAYABLES_CONCEPTS = (
+    "us-gaap:AccountsPayableCurrent",
+    "us-gaap:AccountsPayableTradeCurrent",
+    "us-gaap:AccountsPayableAndAccruedLiabilitiesCurrent",
+)
+
+REVENUE_CONCEPTS = (
+    "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",
+    "us-gaap:Revenues",
+    "us-gaap:SalesRevenueNet",
+)
+
+# WMT tags CostOfRevenue, MSFT/AAPL/COST tag CostOfGoodsAndServicesSold.
+COST_OF_REVENUE_CONCEPTS = (
+    "us-gaap:CostOfRevenue",
+    "us-gaap:CostOfGoodsAndServicesSold",
+    "us-gaap:CostOfGoodsSold",
+    "us-gaap:CostOfServices",
+)
 
 # Accrual ratio bands, applied to the latest period. Sloan's original work
 # sorted the market into deciles; these are the round numbers that separate
@@ -263,4 +309,129 @@ def get_accruals_quality(ticker: str, limit: int = 2,
                  "balance, not an average, so a large acquisition mid-year "
                  "flatters the ratio. A null accrual_ratio_pct means the filer "
                  "did not tag total assets, not that accruals were zero."),
+    }
+
+
+# ============================================================ working capital
+
+def get_working_capital_trends(ticker: str, limit: int = 2,
+                               form: str = "10-K") -> Dict[str, Any]:
+    """Days sales outstanding, days inventory, days payable, and the cycle.
+
+    DSO is receivables divided by revenue per day; DIO and DPO divide
+    inventory and payables by cost of revenue per day. Days come from each
+    period's actual span, so quarterly filings and 52/53-week years stay
+    comparable rather than being scaled against a nominal 365.
+    """
+    tried = _flat((REVENUE_CONCEPTS, COST_OF_REVENUE_CONCEPTS,
+                   RECEIVABLES_CONCEPTS, INVENTORY_CONCEPTS, PAYABLES_CONCEPTS))
+    try:
+        rev_rows, rev_concept = _series(ticker, REVENUE_CONCEPTS, form, limit)
+        cogs_rows, cogs_concept = _series(
+            ticker, COST_OF_REVENUE_CONCEPTS, form, limit)
+        ar_rows, ar_concept = _series(ticker, RECEIVABLES_CONCEPTS, form, limit)
+        inv_rows, inv_concept = _series(ticker, INVENTORY_CONCEPTS, form, limit)
+        ap_rows, ap_concept = _series(ticker, PAYABLES_CONCEPTS, form, limit)
+    except Exception as exc:  # noqa: BLE001
+        return {"ticker": ticker, "success": False,
+                "error": f"fetching working-capital concepts failed: {exc}",
+                "periods": [], "latest": None, "concepts_tried": tried}
+
+    if not rev_rows:
+        return {
+            "ticker": ticker, "success": False, "coverage": "not_covered",
+            "error": (f"{ticker} does not tag revenue in the last {limit} "
+                      f"{form} filings. Every ratio here is per revenue-day, "
+                      f"so none can be computed."),
+            "periods": [], "latest": None, "concepts_tried": tried,
+        }
+    if not (ar_rows or inv_rows or ap_rows):
+        return {
+            "ticker": ticker, "success": False, "coverage": "not_covered",
+            "error": (f"{ticker} tags none of receivables, inventory or "
+                      f"payables in its {form}, so there is no working-capital "
+                      f"cycle to report"),
+            "periods": [], "latest": None, "concepts_tried": tried,
+        }
+
+    periods: List[Dict[str, Any]] = []
+    for end in sorted(rev_rows, reverse=True):
+        days = rev_rows[end]["period_days"]
+        if days <= 0:
+            continue  # a revenue fact with no usable span cannot carry a rate
+        revenue = rev_rows[end]["value"]
+        cost = cogs_rows[end]["value"] if end in cogs_rows else None
+        receivables = ar_rows[end]["value"] if end in ar_rows else None
+        inventory = inv_rows[end]["value"] if end in inv_rows else None
+        payables = ap_rows[end]["value"] if end in ap_rows else None
+        dso = _ratio(receivables, revenue, days)
+        dio = _ratio(inventory, cost, days)
+        dpo = _ratio(payables, cost, days)
+        periods.append({
+            "period_end": end,
+            "period_days": days,
+            "filing_date": rev_rows[end]["filing_date"],
+            "revenue": revenue,
+            "cost_of_revenue": cost,
+            "accounts_receivable": receivables,
+            "inventory": inventory,
+            "accounts_payable": payables,
+            "dso": dso,
+            "dio": dio,
+            "dpo": dpo,
+            "cash_conversion_cycle": (dso + dio - dpo
+                                      if None not in (dso, dio, dpo) else None),
+        })
+
+    if not periods:
+        return {
+            "ticker": ticker, "success": False, "coverage": "not_covered",
+            "error": (f"{ticker} tags revenue but no period carries a usable "
+                      f"duration, so no per-day ratio can be computed"),
+            "periods": [], "latest": None, "concepts_tried": tried,
+        }
+
+    # Growth is measured against the next-older period in the series, which is
+    # the comparison that matters: receivables outrunning revenue.
+    for index, row in enumerate(periods):
+        older = periods[index + 1] if index + 1 < len(periods) else None
+        rev_growth = _pct_change(row["revenue"],
+                                 older["revenue"] if older else None)
+        ar_growth = _pct_change(row["accounts_receivable"],
+                                older["accounts_receivable"] if older else None)
+        inv_growth = _pct_change(row["inventory"],
+                                 older["inventory"] if older else None)
+        row["revenue_growth_pct"] = rev_growth
+        row["receivables_growth_pct"] = ar_growth
+        row["inventory_growth_pct"] = inv_growth
+        row["receivables_vs_revenue_gap_pct"] = (
+            ar_growth - rev_growth
+            if ar_growth is not None and rev_growth is not None else None)
+        row["inventory_vs_revenue_gap_pct"] = (
+            inv_growth - rev_growth
+            if inv_growth is not None and rev_growth is not None else None)
+
+    covered = all((cogs_rows, ar_rows, inv_rows, ap_rows))
+    return {
+        "ticker": ticker, "success": True,
+        "coverage": "full" if covered else "partial",
+        "periods": periods,
+        "latest": periods[0],
+        "concepts_used": {"revenue": rev_concept,
+                          "cost_of_revenue": cogs_concept,
+                          "receivables": ar_concept,
+                          "inventory": inv_concept,
+                          "payables": ap_concept},
+        "concepts_tried": tried,
+        "note": ("DSO is receivables per revenue-day; DIO and DPO are "
+                 "inventory and payables per cost-of-revenue-day. The cash "
+                 "conversion cycle is DSO + DIO - DPO, and a negative cycle "
+                 "means suppliers finance the business. A null DIO means the "
+                 "filer tags no inventory at all, which is the correct answer "
+                 "for software and most services businesses -- it is not zero "
+                 "days of stock. Balances are period-end, not averages, so a "
+                 "seasonal year-end distorts the level; the growth gaps are "
+                 "the more reliable signal. receivables_vs_revenue_gap_pct "
+                 "above roughly 10 points means receivables are outrunning "
+                 "sales, which is channel stuffing or a collection problem."),
     }

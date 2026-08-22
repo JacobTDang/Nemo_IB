@@ -13,6 +13,7 @@ from tools.web_search_server.forward_metrics import (
 )
 from tools.web_search_server.earnings_quality import (
   get_accruals_quality,
+  get_working_capital_trends,
 )
 from tools.web_search_server.peers import find_peers_by_sic, get_sic_code
 from tools.web_search_server.debt_maturity import get_debt_maturity_schedule
@@ -823,6 +824,42 @@ def _build_all_tools() -> List[Tool]:
             },
             "required": ["ticker"]
           }
+        ),
+        Tool(
+          name="get_working_capital_trends",
+          description=(
+            "Days sales outstanding, days inventory, days payable and the cash "
+            "conversion cycle, per period, with growth gaps against "
+            "revenue.\n\n"
+            "Where an earnings-quality problem shows up on the balance sheet. "
+            "Receivables growing faster than revenue means the company is "
+            "stuffing the channel or not getting paid: "
+            "'receivables_vs_revenue_gap_pct' above roughly 10 points is the "
+            "flag. Inventory building faster than sales is demand "
+            "deteriorating ahead of the reported numbers, which is the "
+            "earliest read available on a consumer or hardware name.\n\n"
+            "DSO is receivables per revenue-day; DIO and DPO are inventory and "
+            "payables per cost-of-revenue-day, computed on each period's "
+            "actual span so 10-Q figures and 52/53-week years stay comparable. "
+            "A negative cash conversion cycle means suppliers finance the "
+            "business -- COST and WMT both run near zero.\n\n"
+            "A null DIO means the filer tags no inventory at all, which is the "
+            "correct answer for software and services and is not the same as "
+            "zero days of stock. Balances are period-end, so a seasonal "
+            "year-end distorts the level and the growth gaps are the more "
+            "reliable signal."
+          ),
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Ticker symbol"},
+              "limit":  {"type": "integer",
+                         "description": "Filings to walk; each carries 2-3 comparative years",
+                         "default": 2},
+              "form":   {"type": "string", "description": "10-K or 10-Q", "default": "10-K"}
+            },
+            "required": ["ticker"]
+          }
         )]
 
 
@@ -905,6 +942,9 @@ class WebSearchServer:
           return await parent.get_public_float(args['ticker'])
         elif name == 'get_accruals_quality':
           return await parent.get_accruals_quality(
+            args['ticker'], args.get('limit', 2), args.get('form', '10-K'))
+        elif name == 'get_working_capital_trends':
+          return await parent.get_working_capital_trends(
             args['ticker'], args.get('limit', 2), args.get('form', '10-K'))
         elif name == 'find_peers_by_sic':
           return await parent.find_peers_by_sic(args['ticker'], args.get('limit', 20))
@@ -1071,6 +1111,12 @@ class WebSearchServer:
   async def get_accruals_quality(self, ticker: str, limit: int = 2,
                                  form: str = '10-K') -> List[TextContent]:
     result = await asyncio.to_thread(get_accruals_quality, ticker, limit, form)
+    return [TextContent(type="text", text=safe_json_dumps(result))]
+
+  async def get_working_capital_trends(self, ticker: str, limit: int = 2,
+                                       form: str = '10-K') -> List[TextContent]:
+    result = await asyncio.to_thread(
+      get_working_capital_trends, ticker, limit, form)
     return [TextContent(type="text", text=safe_json_dumps(result))]
 
   async def find_peers_by_sic(self, ticker: str, limit: int = 20) -> List[TextContent]:
