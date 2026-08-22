@@ -36,6 +36,7 @@ from tools.web_search_server.sec_utils import (
     get_schedule_13d_filings, track_segment_growth, extract_call_sentiment,
     extract_forward_signals,
 )
+from tools.web_search_server.guidance import extract_guidance
 from tools.web_search_server.hf_letters import (
     compare_fund_holdings, list_known_funds, get_fund_holdings,
 )
@@ -893,6 +894,53 @@ def _build_all_tools() -> List[Tool]:
             },
             "required": ["ticker"]
           }
+        ),        Tool(
+          name="extract_guidance",
+          description=(
+            "Company-issued forward guidance, verbatim, from 8-K Item 2.02 "
+            "earnings-release exhibits, with the filing each statement came "
+            "from.\n\n"
+            "This is what management SAID it would do -- the raw material for "
+            "judging management credibility, which nothing else here "
+            "captured. extract_forward_signals matches forward-looking "
+            "language but truncates at the first period, so '$1.5 billion' "
+            "becomes '$1'.\n\n"
+            "IT DOES NOT SAY WHETHER GUIDANCE WAS MET, and will not be made "
+            "to. Grading a guide needs the actual on the same basis for the "
+            "same fiscal period; GAAP and non-GAAP EPS can differ several-"
+            "fold, and the available actuals are labelled by calendar "
+            "quarter-end. Read the statements and judge them yourself.\n\n"
+            "Guidance rendered only in tables is REFUSED rather than parsed. "
+            "Flattening a filing's HTML interleaves columns: Salesforce's EPS "
+            "table renders as '$1.74 - $7.93', which is the quarterly low "
+            "bolted to the full-year high, and Intel's 'Gross margin 41.0% "
+            "42.0%' is the GAAP and non-GAAP columns rather than a range.\n\n"
+            "'no_guidance_reason' separates the three ways of finding "
+            "nothing, which are not the same finding: "
+            "'no_earnings_releases_found' (could not look), "
+            "'release_text_unavailable' (the exhibit would not extract), and "
+            "'no_guidance_language_found' (looked, found none). When the last "
+            "is paired with 'guidance_may_be_table_only': true, the company "
+            "does guide -- in a table this tool declined to read.\n\n"
+            "Measured on 24 large caps: 21 had readable text, 14 of those "
+            "yielded prose guidance, and 5 of the 7 empties were correctly "
+            "flagged table-only. Coca-Cola, Walmart, Adobe and Micron all "
+            "guide and all come back empty. Never read an empty result as "
+            "'management gave no guidance'.\n\n"
+            "Each statement carries 'caveats': 'period_inherited_from_section"
+            "_lead_in' (the period came from an outlook heading, not the "
+            "sentence), 'period_may_not_be_the_guided_period', "
+            "'no_period_identified', 'contains_past_tense_reporting'. The "
+            "verbatim 'text' is always there to check them against."
+          ),
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker":   {"type": "string", "description": "Ticker symbol"},
+              "quarters": {"type": "integer", "description": "How many recent earnings releases to scan", "default": 4}
+            },
+            "required": ["ticker"]
+          }
         )]
 
 
@@ -992,6 +1040,9 @@ class WebSearchServer:
         elif name == 'extract_customer_concentration':
           return await parent.extract_customer_concentration(
             args['ticker'], args.get('form_type', '10-K'))
+        elif name == 'extract_guidance':
+          return await parent.extract_guidance(
+            args['ticker'], args.get('quarters', 4))
         elif name == 'get_debt_maturity_schedule':
           return await parent.get_debt_maturity_schedule(
             args['ticker'], args.get('form', '10-K'))
@@ -1244,6 +1295,10 @@ class WebSearchServer:
 
   async def extract_mda(self, ticker: str, form_type: str = '10-K', max_chars: int = 80000) -> List[TextContent]:
     result = await asyncio.to_thread(extract_mda, ticker, form_type, max_chars)
+    return [TextContent(type="text", text=safe_json_dumps(result))]
+
+  async def extract_guidance(self, ticker: str, quarters: int = 4) -> List[TextContent]:
+    result = await asyncio.to_thread(extract_guidance, ticker, quarters)
     return [TextContent(type="text", text=safe_json_dumps(result))]
 
   async def extract_forward_signals(self, ticker: str, lookback_quarters: int = 4) -> List[TextContent]:

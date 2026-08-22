@@ -59,6 +59,9 @@ def test_web_search_research_handlers_serialise(monkeypatch):
         "get_working_capital_trends": (
             "get_working_capital_trends", lambda *a, **k: {"ticker": "X", "success": True},
             lambda: server.get_working_capital_trends("X", 2, "10-K")),
+        "extract_guidance": (
+            "extract_guidance", lambda *a, **k: {"ticker": "X", "success": True},
+            lambda: server.extract_guidance("X", 4)),
         "get_operating_leases": (
             "get_operating_leases", lambda *a, **k: {"ticker": "X", "success": True},
             lambda: server.get_operating_leases("X", "10-K")),
