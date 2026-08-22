@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
-from state.schema import get_connection, DB_PATH
+from state.schema import get_connection, current_db_path
 
 
 # Lazy schema guard: the preearnings path is driven by skills (inline Python),
@@ -23,7 +23,7 @@ _initialized_paths: set = set()
 
 def _db_conn(db: Optional[str]):
     from state.schema import init_schema
-    path = db or DB_PATH
+    path = db or current_db_path()
     if path not in _initialized_paths:
         init_schema(path)
         _initialized_paths.add(path)
