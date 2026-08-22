@@ -77,7 +77,6 @@ unset, verified.
 
 ## Known gaps in this image
 
-- `get_google_trends` needs `pytrends`, which is declared in neither manifest.
 - `analyze_exposures` and `get_thesis_evolution` read book state. The entrypoint
   creates the schema so they return an empty result rather than failing, but a
   data-source host holds no positions, so empty is the truthful answer.

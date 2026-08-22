@@ -205,3 +205,27 @@ explicit = true
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[dependency-groups]
+# Exactly what the five data-source MCP servers import, derived by importing
+# each server and recording what loads -- not guessed. The full project
+# dependency set installs 189 distributions, of which 88 are never referenced
+# anywhere in the servers' source: LangGraph and LangChain (used only by
+# agent/workflows), the FinBERT leftovers (transformers, tokenizers,
+# safetensors), scipy, scikit-learn, selenium, sympy, alpaca-py and pytest.
+#
+# The homelab image installs only this group, so none of that reaches the host.
+server = [
+  "aiohttp==3.13.2",
+  "beautifulsoup4==4.14.3",
+  "ddgs==9.10.0",
+  "python-dotenv==1.2.1",
+  "edgartools==5.8.0",
+  "httpx==0.28.1",
+  "mcp==1.25.0",
+  "numpy==2.3.5",
+  "pandas==2.3.3",
+  "requests==2.32.5",
+  "trafilatura==2.0.0",
+  "yfinance==1.0",
+]

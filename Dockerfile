@@ -33,12 +33,26 @@ WORKDIR /app
 # a gigabyte, which is larger than the venv it builds.
 COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-install-project \
-      --no-install-package torch \
-      --no-install-package sentence-transformers
+    uv sync --frozen --no-install-project --only-group server
 
-COPY tools/ ./tools/
-COPY agent/ ./agent/
+# Copy only the servers this image serves. `COPY tools/` would ship alpaca,
+# sentry, excel and slack as well -- excluded from running but present on disk,
+# which on a LAN-reachable host is the difference between "no trading tools"
+# and "trading tools nobody happens to start".
+COPY tools/__init__.py ./tools/
+COPY tools/news_agregator/ ./tools/news_agregator/
+COPY tools/web_search_server/ ./tools/web_search_server/
+COPY tools/financial_modeling_engine/ ./tools/financial_modeling_engine/
+COPY tools/altdata_server/ ./tools/altdata_server/
+COPY tools/preearnings/ ./tools/preearnings/
+# Only the three agent modules the servers reach. Copying agent/ wholesale
+# brings workflows/ and twelve *_Agent.py files, and with them LangGraph,
+# LangChain and the OpenAI client -- none of which this image ever runs.
+# Verified by importing all five servers and recording what loads.
+COPY agent/__init__.py ./agent/
+COPY agent/cache.py ./agent/
+COPY agent/exposure_analyzer.py ./agent/
+COPY agent/backtest_engine.py ./agent/
 COPY state/ ./state/
 COPY knowledge/ ./knowledge/
 
