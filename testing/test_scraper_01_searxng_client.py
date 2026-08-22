@@ -4,6 +4,10 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tools.web_search_server.searxng_client import searxng_search
 
+from testing._gates import requires_searxng
+
+pytestmark = requires_searxng
+
 
 async def test_basic_query():
   results = await searxng_search("apple earnings 2025", max_results=5)

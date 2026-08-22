@@ -15,6 +15,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agent.Materiality_Classifier import Materiality_Classifier, MaterialityResult
 
+from testing._gates import requires_groq
+
+pytestmark = requires_groq
+
 
 def _is_result(r):
   assert r is not None, "classifier returned None — parse failed or API down"

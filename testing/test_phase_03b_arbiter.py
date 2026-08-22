@@ -8,6 +8,10 @@ from agent.Bull_Agent import BullCase
 from agent.Bear_Agent import BearCase
 from agent.Arbiter_Agent import Arbiter_Agent, ArbiterVerdict
 
+from testing._gates import requires_groq
+
+pytestmark = requires_groq
+
 
 VARIABLES = {
   "ticker": "AAPL", "services_growth_yoy": 0.14, "iphone_growth_yoy": -0.02,

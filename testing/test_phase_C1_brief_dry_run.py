@@ -11,6 +11,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from testing._gates import requires_playbook
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLAUDE_MD = os.path.join(ROOT, 'CLAUDE.md')
 
@@ -49,12 +51,14 @@ def _extract_section(md, header):
   return rest[:end]
 
 
+@requires_playbook
 def test_brief_section_present():
   md = _read_md()
   assert REQUIRED_TOP_HEADER in md, f"missing top header: {REQUIRED_TOP_HEADER!r}"
   print("PASS: brief section header present")
 
 
+@requires_playbook
 def test_subsections_present():
   md = _read_md()
   body = _extract_section(md, REQUIRED_TOP_HEADER) or ""
@@ -63,6 +67,7 @@ def test_subsections_present():
   print(f"PASS: all {len(REQUIRED_SUBSECTIONS)} sub-sections present")
 
 
+@requires_playbook
 def test_api_references_present():
   md = _read_md()
   body = _extract_section(md, REQUIRED_TOP_HEADER) or ""
@@ -71,6 +76,7 @@ def test_api_references_present():
   print(f"PASS: all {len(REQUIRED_API_REFERENCES)} api references present")
 
 
+@requires_playbook
 def test_no_trade_placement_in_brief():
   md = _read_md()
   body = _extract_section(md, REQUIRED_TOP_HEADER) or ""

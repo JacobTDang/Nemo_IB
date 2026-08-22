@@ -23,6 +23,8 @@ from state.events_store import store_event
 from fastapi.testclient import TestClient
 from dashboard.app import app
 
+from testing._gates import requires_groq
+
 
 client = TestClient(app)
 
@@ -41,6 +43,7 @@ def _clean():
 
 # ---- Pre-mortem -----------------------------------------------------------
 
+@requires_groq
 def test_pre_mortem_produces_structured_output():
   pma = Pre_Mortem_Agent()
   report = pma.envision(
@@ -63,6 +66,7 @@ def test_pre_mortem_produces_structured_output():
         f"with worst case {report.worst_case_loss_pct}%")
 
 
+@requires_groq
 def test_pre_mortem_failure_modes_are_specific():
   pma = Pre_Mortem_Agent()
   report = pma.envision(

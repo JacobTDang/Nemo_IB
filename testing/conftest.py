@@ -46,3 +46,32 @@ def isolated_databases(tmp_path_factory, request):
             os.environ.pop(variable, None)
         else:
             os.environ[variable] = value
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "fail_missing_service(name, reason): gated test that must fail, not "
+        "skip, when NEMO_REQUIRE_SERVICES=1 and the service is unavailable",
+    )
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_pyfunc_call(pyfuncitem):
+    """Under NEMO_REQUIRE_SERVICES=1, a gated test fails instead of skipping.
+
+    This fires in the call phase deliberately. The obvious alternative --
+    pytest.fail() inside pytest_runtest_setup -- reports the test as an ERROR
+    rather than a FAILURE, which muddies the "0 failed, 0 errors" target.
+    Verified: setup gives `1 error`, this gives `1 failed`.
+
+    tryfirst so it runs ahead of any other pytest_pyfunc_call implementation
+    (pytest-asyncio ships one) and therefore gates async tests too.
+    """
+    marker = pyfuncitem.get_closest_marker("fail_missing_service")
+    if marker is not None:
+        pytest.fail(
+            f"NEMO_REQUIRE_SERVICES=1 but {marker.kwargs['name']} is "
+            f"unavailable: {marker.kwargs['reason']}",
+            pytrace=False,
+        )

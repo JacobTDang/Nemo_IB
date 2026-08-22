@@ -1,0 +1,136 @@
+"""A gate that cannot fail is not a gate.
+
+Skipping a test when its dependency is absent is only honest if the skip can
+be turned back into a failure on demand. Otherwise "skipped" silently decays
+into "deleted" and nobody notices that dozens of tests stopped running.
+"""
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
+import textwrap
+
+import pytest
+
+
+def _online(monkeypatch):
+    """These tests exercise credential resolution, so the offline gate -- which
+    is checked first and would mask it -- has to be off."""
+    monkeypatch.delenv("SKIP_NETWORK_TESTS", raising=False)
+
+
+def test_missing_groq_key_is_reported(monkeypatch):
+    from testing import _gates
+    _online(monkeypatch)
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    assert _gates.service_missing("groq") is not None
+
+
+def test_present_groq_key_is_not_reported(monkeypatch):
+    from testing import _gates
+    _online(monkeypatch)
+    monkeypatch.setenv("GROQ_API_KEY", "test-key-not-real")
+    assert _gates.service_missing("groq") is None
+
+
+def test_empty_key_counts_as_missing(monkeypatch):
+    """GROQ_API_KEY is present in .env with an empty value. An empty string is
+    a missing credential, not a configured one."""
+    from testing import _gates
+    _online(monkeypatch)
+    monkeypatch.setenv("GROQ_API_KEY", "")
+    assert _gates.service_missing("groq") is not None
+
+
+def test_offline_run_counts_as_missing(monkeypatch):
+    """A live completion is a network call whether or not a key is configured.
+    Nothing marked these tests before, so SKIP_NETWORK_TESTS=1 did not gate
+    them and an offline run still spent real time on live LLM calls."""
+    from testing import _gates
+    monkeypatch.setenv("SKIP_NETWORK_TESTS", "1")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key-not-real")
+    reason = _gates.service_missing("openrouter")
+    assert reason is not None and "SKIP_NETWORK_TESTS" in reason
+
+
+def test_playbook_gate_ignores_the_offline_flag(monkeypatch, tmp_path):
+    """CLAUDE.md is a local file, not a service. An offline run must still
+    run the playbook lint when the playbook is there."""
+    from testing import _gates
+    monkeypatch.setenv("SKIP_NETWORK_TESTS", "1")
+    monkeypatch.setattr(_gates, "_playbook_present", lambda: True)
+    assert _gates.service_missing("playbook") is None
+
+
+def test_reason_names_the_missing_dependency(monkeypatch):
+    """A skip with no reason is how a broken test hides."""
+    from testing import _gates
+    _online(monkeypatch)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    assert "OPENROUTER_API_KEY" in _gates.service_missing("openrouter")
+
+
+def test_unknown_service_raises(monkeypatch):
+    """A typo in a gate name must not silently mean 'available'."""
+    from testing import _gates
+    with pytest.raises(ValueError, match="unknown service gate"):
+        _gates.service_missing("no_such_service")
+
+
+def _run_probe(env_extra):
+    """Run a one-test probe in a subprocess with a controlled environment.
+
+    A subprocess is required because _gates.STRICT is read at import time, so
+    NEMO_REQUIRE_SERVICES cannot be toggled within a running session.
+
+    The probe file is written into testing/ rather than a tempdir on purpose:
+    testing/conftest.py owns the strict-mode hook, and a file outside that
+    directory would not pick the conftest up. The gate would then silently
+    never fire and this test would pass for the wrong reason.
+    """
+    probe = textwrap.dedent("""
+        import pytest
+        from testing._gates import requires_groq
+
+        pytestmark = requires_groq
+
+        def test_needs_groq():
+            assert True
+    """)
+    testing_dir = pathlib.Path(__file__).resolve().parent
+    handle, name = tempfile.mkstemp(
+        prefix="test_probe_gate_", suffix=".py", dir=testing_dir)
+    os.close(handle)
+    path = pathlib.Path(name)
+    path.write_text(probe)
+    try:
+        env = {**os.environ, **env_extra}
+        env.pop("GROQ_API_KEY", None)
+        env["PYTHONPATH"] = str(testing_dir.parent)
+        env["SKIP_NETWORK_TESTS"] = "1"
+        return subprocess.run(
+            [sys.executable, "-m", "pytest", str(path),
+             "-q", "--no-header", "-p", "no:randomly"],
+            capture_output=True, text=True, env=env,
+        )
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_gate_skips_when_service_absent():
+    result = _run_probe({})
+    assert "1 skipped" in result.stdout, result.stdout
+
+
+def test_gate_fails_when_strict_mode_is_on():
+    result = _run_probe({"NEMO_REQUIRE_SERVICES": "1"})
+    assert "1 failed" in result.stdout, result.stdout
+
+
+def test_strict_mode_reports_a_failure_not_an_error():
+    """pytest.fail() inside pytest_runtest_setup reports an ERROR, which muddies
+    the '0 failed, 0 errors' target. The hook must fire in the call phase."""
+    result = _run_probe({"NEMO_REQUIRE_SERVICES": "1"})
+    assert "1 failed" in result.stdout, result.stdout
+    assert "error" not in result.stdout.lower(), result.stdout
