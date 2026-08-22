@@ -6,6 +6,10 @@ from datetime import date, datetime
 from tools.web_search_server.searxng_client import searxng_search
 from tools.web_search_server.scraper import scrape_urls
 from agent.cache import Session_Cache
+from tools.web_search_server.dilution import (
+  get_share_count_series,
+  get_shelf_activity,
+)
 from tools.web_search_server.sec_utils import (
     get_revenue_base, get_ebitda_margin, get_capex_pct_revenue,
     get_tax_rate, get_depreciation, get_disclosures_names,
@@ -537,6 +541,53 @@ class WebSearchServer:
             },
             "required": ["text"]
           }
+        ),
+        Tool(
+          name="get_share_count_series",
+          description=(
+            "Shares outstanding across recent filings, with per-class breakdown and "
+            "the percentage change over the window. Sourced from the cover-page tag "
+            "dei:EntityCommonStockSharesOutstanding in each 10-Q or 10-K.\n\n"
+            "Use this before trusting any per-share metric. A company can grow EPS "
+            "purely by shrinking the denominator, or erode it by growing the "
+            "denominator, and neither shows up in the income statement.\n\n"
+            "Multi-class companies (GOOGL, BRK, META) report each class separately; "
+            "'total' sums them and 'by_class' shows the split. Check 'classes_found' "
+            "-- if a company you know has multiple classes reports only one, the "
+            "total is understated. 'direction' is dilution / buyback / flat / "
+            "insufficient_history."
+          ),
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Ticker symbol"},
+              "limit":  {"type": "integer", "description": "How many filings to walk back", "default": 8},
+              "form":   {"type": "string", "description": "10-Q for quarterly granularity, 10-K for annual", "default": "10-Q"}
+            },
+            "required": ["ticker"]
+          }
+        ),
+        Tool(
+          name="get_shelf_activity",
+          description=(
+            "Shelf registrations (S-3) and takedowns (424B5) filed in the lookback "
+            "window.\n\n"
+            "This is the mechanism behind dilution, where get_share_count_series is "
+            "the effect. An effective S-3 means the company is authorised to sell "
+            "shares; each 424B5 is an actual sale off that shelf. A rising share "
+            "count plus repeated 424B5 filings means dilution is ongoing rather "
+            "than finished -- the distinction matters for whether you size into it.\n\n"
+            "Cash-generative megacaps typically show nothing here. Serial issuers "
+            "show many takedowns."
+          ),
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker":        {"type": "string", "description": "Ticker symbol"},
+              "lookback_days": {"type": "integer", "description": "Window in days", "default": 730}
+            },
+            "required": ["ticker"]
+          }
         )]
 
     @self.server.call_tool()
@@ -547,6 +598,14 @@ class WebSearchServer:
           return result
         elif name == 'get_urls_content':
           return await parent.get_urls_content(args['urls'])
+
+        # Dilution / share count
+        elif name == 'get_share_count_series':
+          return await parent.get_share_count_series(
+            args['ticker'], args.get('limit', 8), args.get('form', '10-Q'))
+        elif name == 'get_shelf_activity':
+          return await parent.get_shelf_activity(
+            args['ticker'], args.get('lookback_days', 730))
 
         # SEC XBRL Tools
         elif name == 'get_revenue_base':
@@ -673,6 +732,16 @@ class WebSearchServer:
     )]
 
   # SEC XBRL Tools
+  async def get_share_count_series(self, ticker: str, limit: int = 8,
+                                   form: str = '10-Q') -> List[TextContent]:
+    result = await asyncio.to_thread(get_share_count_series, ticker, limit, form)
+    return [TextContent(type="text", text=safe_json_dumps(result))]
+
+  async def get_shelf_activity(self, ticker: str,
+                               lookback_days: int = 730) -> List[TextContent]:
+    result = await asyncio.to_thread(get_shelf_activity, ticker, lookback_days)
+    return [TextContent(type="text", text=safe_json_dumps(result))]
+
   async def get_revenue_base(self, ticker: str, form_type: str = '10-K') -> List[TextContent]:
     result = await asyncio.to_thread(get_revenue_base, ticker, form_type)
     return [TextContent(type="text", text=safe_json_dumps(result))]
