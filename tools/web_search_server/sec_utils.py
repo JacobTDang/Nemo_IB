@@ -269,6 +269,7 @@ def extract_disclosure_data(ticker: str, disclosure_name: str, form_type: str = 
 
         # Find the specific disclosure by name
         target_disclosure = None
+        available_names = []
         for disclosure in disclosures:
           if hasattr(disclosure, 'role_or_type'):
             role = disclosure.role_or_type
@@ -278,6 +279,7 @@ def extract_disclosure_data(ticker: str, disclosure_name: str, form_type: str = 
             else:
               current_name = role
 
+            available_names.append(current_name)
             if current_name == disclosure_name:
               target_disclosure = disclosure
               break
@@ -344,28 +346,39 @@ def extract_disclosure_data(ticker: str, disclosure_name: str, form_type: str = 
 
           return disclosure_summary
 
-        else:
-          print(f'debug: Unable to find disclosure: {disclosure_name}', file=sys.stderr, flush=True)
-          print(f'Available disclosures: {[d.role_or_type.split("/")[-1] if hasattr(d, "role_or_type") and "/" in d.role_or_type else str(d) for d in disclosures[:5]]}...', file=sys.stderr, flush=True)
-
+        # Disclosure names are per-filing taxonomy roles, so a guessed or
+        # borrowed name misses routinely. Returning {} here made a miss look
+        # like a company that discloses nothing; name the miss and hand back
+        # the roles this filing actually carries.
+        return {
+          'ticker': ticker,
+          'success': False,
+          'error': (f"No disclosure named '{disclosure_name}' in {ticker}'s "
+                    f"latest {form_type}. Pick one from "
+                    "available_disclosure_names, or call get_disclosures_names."),
+          'available_disclosure_names': available_names,
+        }
 
       except Exception as e:
         return {
-          'error': f'Unable to get statement'
+          'ticker': ticker,
+          'success': False,
+          'error': (f"Unable to read the XBRL statements index for {ticker}: "
+                    f"{type(e).__name__}: {e}"),
         }
     else:
       # failed to get the filing data
       return {
+        'ticker': ticker,
+        'success': False,
         'error': f"Unable to get latest filing for {ticker}"
       }
   except Exception as e:
     return {
+      'ticker': ticker,
       'error': f"Unable to get {disclosure_name} for {ticker}: {str(e)}",
       'success': False
     }
-
-
-  return {}
 
 def get_revenue_base(ticker: str, form_type: str= "10-K") -> Dict[str, Any]:
   # this is the company's recurring revenue from its primary business operations. It will be the starting point for nearly all financial analysis
@@ -1548,37 +1561,53 @@ def get_patent_filings(company_name: str, years_back: int = 5,
   url = 'https://patents.google.com/xhr/query'
   headers = {'User-Agent': 'Mozilla/5.0 (compatible; nemo-ib/1.0)'}
 
-  def _query(qs: str) -> Optional[Dict[str, Any]]:
+  def _query(qs: str) -> Dict[str, Any]:
+    """{'ok': True, 'payload': ...} or {'ok': False, 'reason': '<cause>'}.
+
+    Google throttles this endpoint with a 503 "Sorry..." page. Collapsing that,
+    a 404 and a DNS failure into a bare None made every failure read the same
+    and left the caller unable to tell "retry later" from "wrong assignee".
+    """
     try:
       r = _req.get(url, params={'url': qs, 'exp': ''},
                    headers=headers, timeout=20)
-      if r.status_code != 200:
-        return None
-      return r.json()
-    except Exception:
-      return None
+    except Exception as exc:
+      return {'ok': False, 'reason': f'{type(exc).__name__}: {str(exc)[:150]}'}
+    if r.status_code != 200:
+      return {'ok': False, 'reason': f'HTTP {r.status_code}'}
+    try:
+      return {'ok': True, 'payload': r.json()}
+    except ValueError as exc:
+      return {'ok': False,
+              'reason': f'HTTP 200 with a non-JSON body: {str(exc)[:150]}'}
 
   # Total count for assignee
   base_q = f'assignee={company_name}'
-  total_payload = _query(base_q + '&num=10')
-  if total_payload is None:
+  total = _query(base_q + '&num=10')
+  if not total['ok']:
     return {'company_name': company_name, 'success': False,
-            'error': 'Google Patents query failed (network or 4xx response)'}
+            'error': f"Google Patents query failed: {total['reason']}"}
+  total_payload = total['payload']
 
   total_results = total_payload.get('results', {}).get('total_num_results', 0)
 
   # Year-by-year breakdown (last N years of grant dates)
   this_year = _dt.now().year
   year_counts = []
+  failed_years = []
   for y in range(this_year - years_back, this_year + 1):
     # Patents granted within calendar year y
     yq = f'assignee={company_name}&after=publication:{y}0101&before=publication:{y}1231&num=1'
-    pl = _query(yq)
-    if pl:
+    res = _query(yq)
+    if res['ok']:
       year_counts.append({
         'year': y,
-        'count': pl.get('results', {}).get('total_num_results', 0),
+        'count': res['payload'].get('results', {}).get('total_num_results', 0),
       })
+    else:
+      # A skipped year silently truncates the R&D trend, which is the whole
+      # signal this tool exists to produce. Name the gap instead.
+      failed_years.append({'year': y, 'reason': res['reason']})
 
   # Recent sample
   recent = []
@@ -1605,6 +1634,7 @@ def get_patent_filings(company_name: str, years_back: int = 5,
     'error':          None,
     'total_patents':  total_results,
     'year_counts':    year_counts,
+    'failed_years':   failed_years,
     'recent_sample':  recent,
     'source':         'Google Patents /xhr/query (USPTO + EPO + WIPO + national)',
     'note':           'Patents publish ~18 months after filing. Year_counts reflect publication year, not filing year. Trend across years is the cleaner R&D signal than absolute most-recent year.',

@@ -10,7 +10,6 @@ from data.catalysts import upcoming_catalysts, summarize_for_analyst
 from data.risk_factor_diff import (
   diff_risk_factors, _paragraph_split, _ngrams, _jaccard, _matches_any
 )
-from data.alt_sources import google_trends_for, TICKER_QUERIES
 
 
 # ---- Catalyst calendar -----------------------------------------------------
@@ -265,78 +264,7 @@ def test_diff_paragraph_count_delta():
 
 # ---- Google Trends ---------------------------------------------------------
 
-def test_trends_returns_error_for_unmapped_ticker():
-  result = google_trends_for('ZZZ_UNKNOWN', query_terms=None)
-  assert 'error' in result
-  assert result['error'] == 'no_queries_mapped'
-  print("PASS: unmapped ticker returns clear error")
 
 
-def test_trends_uses_mapped_queries():
-  """When user doesn't supply query_terms, we should fall back to TICKER_QUERIES."""
-  assert 'AAPL' in TICKER_QUERIES
-  assert 'iPhone' in TICKER_QUERIES['AAPL']
-  # We can't make a real call but we can verify the lookup
-  print(f"PASS: TICKER_QUERIES has {len(TICKER_QUERIES)} tickers mapped including AAPL/NVDA/TSLA")
 
 
-def test_trends_handles_pytrends_failure():
-  with patch.dict('sys.modules', {'pytrends.request': MagicMock(
-    TrendReq=MagicMock(side_effect=Exception("simulated rate limit"))
-  )}):
-    result = google_trends_for('AAPL')
-  assert 'error' in result, f"failed pytrends should return error, got {result}"
-  print("PASS: pytrends failure returned as error, not crash")
-
-
-def test_trends_processes_dataframe():
-  """Mock the dataframe return and verify post-processing."""
-  import pandas as pd
-  import numpy as np
-  fake_df = pd.DataFrame({
-    'iPhone':   np.linspace(40, 80, 52),  # rising trend
-    'AirPods':  [50] * 52,                # flat trend
-    'Apple Vision Pro': np.linspace(80, 30, 52),  # falling
-    'isPartial': [False] * 52,
-  }, index=pd.date_range('2025-05-10', periods=52, freq='W'))
-
-  fake_pytrends_cls = MagicMock()
-  fake_pytrends = MagicMock()
-  fake_pytrends.interest_over_time.return_value = fake_df
-  fake_pytrends_cls.return_value = fake_pytrends
-
-  with patch.dict('sys.modules', {'pytrends.request': MagicMock(TrendReq=fake_pytrends_cls)}):
-    result = google_trends_for('AAPL')
-
-  assert 'error' not in result, f"unexpected error: {result}"
-  assert 'iPhone' in result['series']
-  assert result['momentum_3m_vs_12m_pct']['iPhone'] > 0, \
-    f"rising series should have positive momentum, got {result['momentum_3m_vs_12m_pct']['iPhone']}"
-  assert result['momentum_3m_vs_12m_pct']['Apple Vision Pro'] < 0, \
-    f"falling series should have negative momentum"
-  print(f"PASS: trends processed correctly "
-        f"(iPhone momentum={result['momentum_3m_vs_12m_pct']['iPhone']}%, "
-        f"Vision Pro momentum={result['momentum_3m_vs_12m_pct']['Apple Vision Pro']}%)")
-
-
-if __name__ == "__main__":
-  test_catalysts_includes_fomc_when_in_window()
-  test_catalysts_includes_earnings_when_available()
-  test_catalysts_sorted_chronologically()
-  test_catalysts_no_api_key_still_returns_macro()
-  test_nfp_lands_on_first_friday()
-  test_summarize_for_analyst_renders_compactly()
-  test_summarize_for_analyst_empty()
-  test_paragraph_split_filters_short()
-  test_paragraph_split_handles_varied_separators()
-  test_ngrams_jaccard_self_match()
-  test_diff_detects_new_risk_paragraph()
-  test_diff_detects_modified_supply_chain_paragraph()
-  test_diff_detects_no_removals_when_all_kept()
-  test_diff_handles_empty_input()
-  test_diff_paragraph_count_delta()
-  test_trends_returns_error_for_unmapped_ticker()
-  test_trends_uses_mapped_queries()
-  test_trends_handles_pytrends_failure()
-  test_trends_processes_dataframe()
-  print("\nAll Phase 5 tests passed.")

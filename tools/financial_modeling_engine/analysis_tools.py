@@ -340,6 +340,19 @@ def _lbo_math(entry_ev: float, revenue_base: float, ebitda_margin: float,
 
   entry_ebitda = revenue_base * ebitda_margin
   debt_amount = entry_ebitda * leverage_turns
+  if debt_amount >= entry_ev:
+    # Debt is sized off EBITDA and equity off EV, so an entry multiple below
+    # the leverage turns puts more debt in the deal than the whole purchase
+    # price. The 10% floor below would invent an equity cheque and the model
+    # would report a fictitious MOIC and IRR with achieves_20pct_irr True.
+    raise ValueError(
+      f"acquisition debt {debt_amount:,.0f} ({leverage_turns}x entry EBITDA "
+      f"{entry_ebitda:,.0f}) meets or exceeds the entry_ev {entry_ev:,.0f}. "
+      f"That is an entry multiple of "
+      f"{(entry_ev / entry_ebitda if entry_ebitda else 0):.2f}x against "
+      f"{leverage_turns}x of leverage -- the structure cannot be funded. "
+      "Lower leverage_turns or raise entry_ev."
+    )
   equity_invested = max(entry_ev - debt_amount, entry_ev * 0.10)  # floor: 10% equity
 
   current_revenue = revenue_base
@@ -1478,7 +1491,7 @@ class Financial_Analysis:
   async def get_corporate_actions(self, ticker: str,
                                   years: int = 10) -> List[TextContent]:
     result = await asyncio.to_thread(get_corporate_actions, ticker, years)
-    return [TextContent(type="text", text=safe_json_dumps(result))]
+    return [TextContent(type="text", text=json.dumps(_to_native(result), default=str))]
 
   async def get_market_data(self, ticker: str) -> List[TextContent]:
     data = await asyncio.to_thread(get_data, ticker)
@@ -1615,27 +1628,39 @@ class Financial_Analysis:
     return [TextContent(type="text", text=json.dumps(result))]
 
   async def calculate_dcf(self, args: Dict[str, Any]) -> List[TextContent]:
+    # A DCF with no revenue base produces enterprise_value 0 and
+    # price_per_share 0, which reads as a real valuation rather than a missing
+    # input and is exactly the kind of number that ends up in a thesis.
+    # calculate_wacc already refuses this way; match it.
+    if not args.get('revenue_base'):
+      return [TextContent(type='text', text=json.dumps({
+        'error': ("revenue_base is zero or absent, cannot compute a DCF. "
+                  "Resolve it with get_revenue_base first, then pass it in."),
+        'ticker': args.get('ticker', ''),
+      }))]
     result = _dcf_math(
-      revenue_base=args['revenue_base'],
-      ebitda_margin=args['ebitda_margin'],
-      capex_pct_revenue=args['capex_pct_revenue'],
-      tax_rate=args['tax_rate'],
-      depreciation=args['depreciation'],
-      revenue_growth=args['revenue_growth'],
-      wacc=args['wacc'],
-      terminal_growth=args['terminal_growth'],
-      terminal_multiple=args['terminal_multiple'],
-      cash=args['cash'],
-      debt=args['debt'],
-      shares_outstanding=args['shares_outstanding'],
+      revenue_base=args.get('revenue_base', 0),
+      ebitda_margin=args.get('ebitda_margin', 0),
+      capex_pct_revenue=args.get('capex_pct_revenue', 0),
+      tax_rate=args.get('tax_rate', 0),
+      depreciation=args.get('depreciation', 0),
+      # Declared as an array in the schema ("SET TO [0,0,0,0,0]"), so its
+      # absent default has to be a sequence rather than a scalar zero.
+      revenue_growth=args.get('revenue_growth') or [0, 0, 0, 0, 0],
+      wacc=args.get('wacc', 0),
+      terminal_growth=args.get('terminal_growth', 0),
+      terminal_multiple=args.get('terminal_multiple', 0),
+      cash=args.get('cash', 0),
+      debt=args.get('debt', 0),
+      shares_outstanding=args.get('shares_outstanding', 0),
       ticker=args.get('ticker', ''),
     )
     return [TextContent(type='text', text=json.dumps(result))]
 
   async def calculate_wacc(self, args: Dict[str, Any]) -> List[TextContent]:
     result = _wacc_math(
-      beta=args['beta'],
-      risk_free_rate=args['risk_free_rate'],
+      beta=args.get('beta', 0),
+      risk_free_rate=args.get('risk_free_rate', 0),
       equity_risk_premium=args.get('equity_risk_premium', 0.06),
       cost_of_debt=args.get('cost_of_debt', 0),
       tax_rate=args.get('tax_rate', 0),
@@ -1645,6 +1670,14 @@ class Financial_Analysis:
     return [TextContent(type='text', text=json.dumps(result))]
 
   async def calculate_scenario_dcf(self, args: Dict[str, Any]) -> List[TextContent]:
+    # Same refusal as calculate_dcf: this runs _dcf_math three times, so a
+    # missing revenue_base produces three price targets of 0 instead of one.
+    if not args.get('revenue_base'):
+      return [TextContent(type='text', text=json.dumps({
+        'error': ("revenue_base is zero or absent, cannot compute a scenario DCF. "
+                  "Resolve it with get_revenue_base first, then pass it in."),
+        'ticker': args.get('ticker', ''),
+      }))]
     base_inputs = {
       'revenue_base': args.get('revenue_base', 0),
       'capex_pct_revenue': args.get('capex_pct_revenue', 0),
@@ -1674,19 +1707,25 @@ class Financial_Analysis:
     return [TextContent(type='text', text=json.dumps(result))]
 
   async def calculate_lbo(self, args: Dict[str, Any]) -> List[TextContent]:
-    result = _lbo_math(
-      entry_ev=args['entry_ev'],
-      revenue_base=args['revenue_base'],
-      ebitda_margin=args['ebitda_margin'],
-      capex_pct_revenue=args['capex_pct_revenue'],
-      depreciation=args['depreciation'],
-      tax_rate=args['tax_rate'],
-      revenue_growth=args['revenue_growth'],
-      debt_interest_rate=args['debt_interest_rate'],
-      leverage_turns=args['leverage_turns'],
-      exit_multiple=args['exit_multiple'],
-      hold_years=args.get('hold_years', 5),
-    )
+    try:
+      result = _lbo_math(
+        entry_ev=args['entry_ev'],
+        revenue_base=args['revenue_base'],
+        ebitda_margin=args['ebitda_margin'],
+        capex_pct_revenue=args['capex_pct_revenue'],
+        depreciation=args['depreciation'],
+        tax_rate=args['tax_rate'],
+        revenue_growth=args['revenue_growth'],
+        debt_interest_rate=args['debt_interest_rate'],
+        leverage_turns=args['leverage_turns'],
+        exit_multiple=args['exit_multiple'],
+        hold_years=args.get('hold_years', 5),
+      )
+    except ValueError as e:
+      # Unfundable capital structure -- surface the refusal rather than a model.
+      return [TextContent(type='text', text=json.dumps({
+        'error': str(e), 'ticker': args.get('ticker', ''),
+      }))]
     result['ticker'] = args.get('ticker', '')
     return [TextContent(type='text', text=json.dumps(result))]
 

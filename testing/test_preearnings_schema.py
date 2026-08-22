@@ -344,7 +344,7 @@ def test_record_signal_roundtrip():
         ticker="ZZTST",
         earnings_date="2026-08-20",
         signal_category="demand",
-        signal_name="google_trends",
+        signal_name="job_postings",
         direction="bullish",
         magnitude=0.72,
         raw_value='{"yoy_ratio": 1.14}',
@@ -355,7 +355,7 @@ def test_record_signal_roundtrip():
     assert row_id > 0
     rows = signals_for_ticker("ZZTST", "2026-08-20", _db=_TMP_DB)
     assert len(rows) >= 1
-    row = next(r for r in rows if r["signal_name"] == "google_trends")
+    row = next(r for r in rows if r["signal_name"] == "job_postings")
     assert row["direction"] == "bullish"
     assert abs(row["magnitude"] - 0.72) < 0.001
     assert row["days_before_earnings"] == -14
@@ -363,17 +363,17 @@ def test_record_signal_roundtrip():
 
 
 def test_signals_ordered_by_collected_at():
-    for name in ["google_trends", "finbert_sentiment", "job_postings"]:
+    for name in ["job_postings", "capex_announcements", "policy_signals"]:
         record_signal("ZZORD", "2026-09-01", "demand", name, "neutral", _db=_TMP_DB)
     rows = signals_for_ticker("ZZORD", "2026-09-01", _db=_TMP_DB)
     names = [r["signal_name"] for r in rows]
-    assert names == ["google_trends", "finbert_sentiment", "job_postings"]
+    assert names == ["job_postings", "capex_announcements", "policy_signals"]
     _clean()
 
 
 def test_signals_different_earnings_dates_isolated():
-    record_signal("ZZISO", "2026-06-01", "demand", "google_trends", "bullish", _db=_TMP_DB)
-    record_signal("ZZISO", "2026-09-01", "demand", "google_trends", "bearish", _db=_TMP_DB)
+    record_signal("ZZISO", "2026-06-01", "demand", "job_postings", "bullish", _db=_TMP_DB)
+    record_signal("ZZISO", "2026-09-01", "demand", "job_postings", "bearish", _db=_TMP_DB)
     q1 = signals_for_ticker("ZZISO", "2026-06-01", _db=_TMP_DB)
     q3 = signals_for_ticker("ZZISO", "2026-09-01", _db=_TMP_DB)
     assert all(r["direction"] == "bullish" for r in q1)

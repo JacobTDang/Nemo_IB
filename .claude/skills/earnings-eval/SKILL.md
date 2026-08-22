@@ -136,7 +136,7 @@ Then:
 **Signal attribution table:**
 | Signal | Prior direction | Actual outcome aligns? |
 |---|---|---|
-| google_trends | bullish | yes |
+| job_postings | bullish | yes |
 | news_sentiment | neutral | — |
 | ... | ... | ... |
 

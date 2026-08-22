@@ -65,8 +65,7 @@ Conversation context decays; the DB does not. Three hard habits:
 3. **Supplier / MOPS (if applicable).** `get_supply_chain`; if it contains TSMC
    (2330) / Foxconn (2317) / MediaTek (2454) / ASE (3711) call
    `get_taiwan_monthly_revenue`. Else mark signal `supplier_mops = na`.
-4. **Thin alt-data (confirmation only).** `get_google_trends`,
-   `get_capex_announcements`, `get_government_contracts`, `get_policy_signals`,
+4. **Thin alt-data (confirmation only).** `get_capex_announcements`, `get_government_contracts`, `get_policy_signals`,
    the **news-digest agent** (replaces in-context news reading; carries the
    sentiment score), and `get_insider_transactions` (net open-market insider
    buying in the last 90d = bullish lean; clustered selling = bearish; option

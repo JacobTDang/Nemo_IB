@@ -481,11 +481,30 @@ def init_schema(db_path: str = DB_PATH) -> None:
                 "CREATE VIRTUAL TABLE IF NOT EXISTS rag_chunk_embeddings "
                 "USING vec0(embedding float[384])"
             )
-        except (ImportError, sqlite3.OperationalError) as exc:
-            # If sqlite-vec is missing the RAG feature is unusable but the
-            # rest of the schema is still valid. Print a single warning
-            # rather than failing the whole init.
-            print(f"[Schema] WARNING: rag_chunk_embeddings not created: {exc}")
+        except ImportError as exc:
+            # The RAG extras (sqlite-vec, sentence-transformers, torch) are not
+            # installed. Every other table is still valid and the rest of the
+            # system runs normally, so this is a capability notice rather than a
+            # failure -- minimal images such as the homelab container ship this
+            # way on purpose. Say exactly what is unavailable so it is not
+            # mistaken for a broken install, and keep the cause attached.
+            print(
+                "[Schema] Vector search disabled: sqlite-vec is not installed, so "
+                "the rag_chunk_embeddings table was skipped. Semantic RAG "
+                "retrieval will be unavailable; everything else works normally. "
+                "This is expected when the RAG extras are not installed. "
+                f"Cause: {exc}"
+            )
+        except sqlite3.OperationalError as exc:
+            # sqlite-vec imported but the vec0 table could not be created -- the
+            # extension failed to load on this connection or this platform. RAG
+            # is meant to work here, so this one is a real problem.
+            print(
+                "[Schema] Vector search BROKEN: sqlite-vec is installed but the "
+                "rag_chunk_embeddings vec0 table could not be created, so "
+                "extension loading is failing on this platform. Semantic RAG "
+                f"retrieval will not work. Cause: {type(exc).__name__}: {exc}"
+            )
         conn.commit()
     finally:
         conn.close()

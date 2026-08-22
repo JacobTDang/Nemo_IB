@@ -5,8 +5,6 @@ requires-python = ">=3.12,<3.13"
 
 dependencies = [
   "torch==2.5.1",
-  "torchvision==0.20.1",
-  "torchaudio==2.5.1",
   "sympy==1.13.1",
   "aiofiles==25.1.0",
   "aiohappyeyeballs==2.6.1",
@@ -193,13 +191,52 @@ dependencies = [
   "zstandard==0.25.0",
 ]
 
-[tool.uv]
-environments = [
-  "sys_platform == 'win32'",
-]
 
 [tool.pytest.ini_options]
 markers = [
     "slow: long-running tests excluded from quick runs via -m 'not slow'",
     "network: live-network tests skippable via SKIP_NETWORK_TESTS=1",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[dependency-groups]
+# Exactly what the five data-source MCP servers import, derived by importing
+# each server and recording what loads -- not guessed. The full project
+# dependency set installs 189 distributions, of which 88 are never referenced
+# anywhere in the servers' source: LangGraph and LangChain (used only by
+# agent/workflows), the FinBERT leftovers (transformers, tokenizers,
+# safetensors), scipy, scikit-learn, selenium, sympy, alpaca-py and pytest.
+#
+# The homelab image installs only this group, so none of that reaches the host.
+server = [
+  "aiohttp==3.13.2",
+  "beautifulsoup4==4.14.3",
+  "ddgs==9.10.0",
+  "python-dotenv==1.2.1",
+  "edgartools==5.8.0",
+  "httpx==0.28.1",
+  "mcp==1.25.0",
+  "numpy==2.3.5",
+  "pandas==2.3.3",
+  "requests==2.32.5",
+  "trafilatura==2.0.0",
+  "yfinance==1.0",
+]
+
+# Optional extra. state/schema.py guards its sqlite-vec import and the RAG
+# tools are capability-gated out when it is absent, so this is genuinely
+# optional rather than missing.
+#
+# Declared so that optional status is deliberate. Previously it was simply
+# undeclared, which is indistinguishable from an oversight -- and was in fact
+# how pytrends stayed broken everywhere for months.
+rag = [
+  "sqlite-vec==0.1.6",
 ]

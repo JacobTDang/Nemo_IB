@@ -25,7 +25,6 @@ if not os.path.isfile(_VENV_PY):
 if not os.path.isfile(_VENV_PY):
     _VENV_PY = sys.executable
 
-_TRENDS_RUNNER = os.path.join(_REPO, "tools", "altdata_server", "trends_runner.py")
 
 SKIP_NETWORK = os.getenv("SKIP_NETWORK_TESTS", "0") == "1"
 network = pytest.mark.skipif(SKIP_NETWORK, reason="network tests skipped")
@@ -46,54 +45,9 @@ def _run(runner, tool_name, kwargs, timeout=60):
 # Google Trends runner — Layer 1
 # ---------------------------------------------------------------------------
 
-@network
-def test_trends_runner_returns_records():
-    proc = _run(_TRENDS_RUNNER, "get_google_trends",
-                {"keywords": ["NVDA"], "timeframe": "today 3-m", "geo": "US"})
-    assert proc.returncode == 0, f"stderr: {proc.stderr[-200:]}"
-    result = json.loads(proc.stdout)
-    assert result["success"] is True, result.get("error")
-    data = result["data"]
-    assert len(data["records"]) > 0
-    assert "date" in data["records"][0]
-    assert "NVDA" in data["records"][0]
 
 
-@network
-def test_trends_runner_yoy_ratio_present():
-    proc = _run(_TRENDS_RUNNER, "get_google_trends",
-                {"keywords": ["iPhone"], "timeframe": "today 12-m", "geo": "US"})
-    result = json.loads(proc.stdout)
-    assert result["success"] is True
-    # YoY ratio requires >= 26 weeks of data (12-m timeframe)
-    assert result["data"]["yoy_ratio"] is not None
-    assert isinstance(result["data"]["yoy_ratio"], float)
-    assert result["data"]["yoy_signal"] in {"bullish", "bearish", "neutral"}
 
-
-def test_trends_runner_empty_keywords_fails_clean():
-    proc = _run(_TRENDS_RUNNER, "get_google_trends", {"keywords": []})
-    result = json.loads(proc.stdout)
-    assert result["success"] is False
-    assert "error" in result
-    # Must not be a raw Python traceback
-    assert "Traceback" not in result["error"]
-
-
-def test_trends_runner_unknown_tool_fails_clean():
-    proc = _run(_TRENDS_RUNNER, "nonexistent_tool", {"keywords": ["AAPL"]})
-    result = json.loads(proc.stdout)
-    assert result["success"] is False
-    assert "unknown tool" in result["error"]
-
-
-def test_trends_runner_bad_json_args():
-    proc = subprocess.run(
-        [_VENV_PY, _TRENDS_RUNNER, "get_google_trends", "NOT_JSON"],
-        capture_output=True, stdin=subprocess.DEVNULL, text=True, timeout=10,
-    )
-    result = json.loads(proc.stdout)
-    assert result["success"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -150,81 +104,7 @@ def test_taiwan_revenue_finmind_yoy_computed():
 # Fix B — Google Trends SQLite cache (Layer 2, no network)
 # ---------------------------------------------------------------------------
 
-def test_trends_cache_key_order_invariant():
-    """Same keywords in different order must produce the same cache key."""
-    import tools.altdata_server.trends_runner as tr
-    k1 = tr._cache_key(["Oracle", "OCI", "Oracle Cloud"], "today 12-m", "US")
-    k2 = tr._cache_key(["Oracle Cloud", "Oracle", "OCI"], "today 12-m", "US")
-    assert k1 == k2, "cache key must sort keywords before hashing"
 
-
-def test_trends_cache_key_different_geo():
-    """Different geo must produce different keys."""
-    import tools.altdata_server.trends_runner as tr
-    k_us = tr._cache_key(["NVDA"], "today 12-m", "US")
-    k_gb = tr._cache_key(["NVDA"], "today 12-m", "GB")
-    assert k_us != k_gb
-
-
-def test_trends_cache_roundtrip(tmp_path, monkeypatch):
-    """Write to cache then read back returns identical payload."""
-    import tools.altdata_server.trends_runner as tr
-    monkeypatch.setattr(tr, "_CACHE_DB", str(tmp_path / "trends_cache.db"))
-    payload = {"keywords": ["TEST"], "yoy_ratio": 1.25, "records": [{"date": "2026-01-01", "TEST": 80}]}
-    key = tr._cache_key(["TEST"], "today 12-m", "US")
-    tr._cache_put(key, payload)
-    result = tr._cache_get(key)
-    assert result is not None, "cache miss after immediate write"
-    assert result["yoy_ratio"] == 1.25
-    assert result["records"][0]["TEST"] == 80
-
-
-def test_trends_cache_miss_returns_none(tmp_path, monkeypatch):
-    """Fresh DB returns None on any key."""
-    import tools.altdata_server.trends_runner as tr
-    monkeypatch.setattr(tr, "_CACHE_DB", str(tmp_path / "trends_cache.db"))
-    result = tr._cache_get("nonexistent_key_abc123")
-    assert result is None
-
-
-def test_trends_cache_ttl_expired_returns_none(tmp_path, monkeypatch):
-    """Entry written with an old timestamp is treated as expired."""
-    import time
-    import sqlite3
-    import tools.altdata_server.trends_runner as tr
-
-    db_path = str(tmp_path / "trends_cache.db")
-    monkeypatch.setattr(tr, "_CACHE_DB", db_path)
-
-    # Write a fresh entry first (sets up the table)
-    key = "stale_key"
-    tr._cache_put(key, {"yoy_ratio": 0.5})
-
-    # Back-date the entry to 13 hours ago (past 12h TTL)
-    stale_ts = time.time() - (13 * 3600)
-    conn = sqlite3.connect(db_path)
-    conn.execute("UPDATE trends_cache SET cached_at = ? WHERE cache_key = ?", (stale_ts, key))
-    conn.commit()
-    conn.close()
-
-    result = tr._cache_get(key)
-    assert result is None, "expired entry should not be returned"
-
-
-def test_trends_runner_cache_hit_sets_cached_flag(tmp_path, monkeypatch):
-    """When runner finds a cache hit, payload contains cached=True."""
-    import tools.altdata_server.trends_runner as tr
-    monkeypatch.setattr(tr, "_CACHE_DB", str(tmp_path / "trends_cache.db"))
-    payload = {"keywords": ["AAPL"], "yoy_ratio": 1.1, "yoy_signal": "bullish",
-               "records": [], "record_count": 0, "timeframe": "today 12-m", "geo": "US"}
-    key = tr._cache_key(["AAPL"], "today 12-m", "US")
-    tr._cache_put(key, payload)
-
-    hit = tr._cache_get(key)
-    assert hit is not None
-    # Simulate what main() does: add cached=True flag
-    hit["cached"] = True
-    assert hit["cached"] is True
 
 
 # ---------------------------------------------------------------------------

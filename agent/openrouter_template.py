@@ -21,13 +21,42 @@ if hasattr(sys.stdout, 'reconfigure'):
   sys.stderr.reconfigure(errors='replace')
 
 
+_MODEL_ID_RE = re.compile(r'^[^\s/:#]+/[^\s/:#]+(?::[^\s/:#]+)?$')
+
+
+def _is_valid_model_id(model_id) -> bool:
+  """True if `model_id` looks like an OpenRouter id: `vendor/model` or
+  `vendor/model:tag`.
+
+  Rejects None, empty/whitespace-only strings, anything starting with '#', and
+  anything without a vendor separator. This exists because a malformed override
+  (e.g. a trailing `# comment` that dotenv read as the VALUE of
+  PRIMARY_REASONING_MODEL) must never be pinged, let alone admitted to the pool.
+  """
+  if not isinstance(model_id, str):
+    return False
+  candidate = model_id.strip()
+  if not candidate or candidate.startswith('#'):
+    return False
+  return _MODEL_ID_RE.match(candidate) is not None
+
+
 def _verify_model_alive(model_id: str, api_key: str, timeout: float = 10.0) -> bool:
   """Send a 1-token completion to check the model endpoint exists.
 
-  Returns True if alive (or if the error is non-404 — auth, rate limit, timeout
-  all indicate the model name itself is at least known). Returns False only on
-  explicit 404 NotFoundError.
+  Returns False immediately — without any network call — for an id that is not
+  shaped like an OpenRouter model id; a malformed id is definitively unusable
+  and pinging it would only produce an error we would have to interpret.
+
+  Otherwise returns True if alive, or if the error is non-404 (auth, rate limit,
+  timeout all indicate the model name itself is at least known and none of them
+  prove the model is dead). Returns False on explicit 404 NotFoundError.
   """
+  if not _is_valid_model_id(model_id):
+    print(f"[OpenRouter] Rejecting malformed model id {model_id!r} "
+          f"(expected 'vendor/model[:tag]'); not adding it to the pool.",
+          file=sys.stderr, flush=True)
+    return False
   try:
     client = OpenAI(api_key=api_key, base_url="https://openrouter.ai/api/v1", timeout=timeout)
     client.chat.completions.create(
@@ -37,9 +66,16 @@ def _verify_model_alive(model_id: str, api_key: str, timeout: float = 10.0) -> b
     )
     return True
   except NotFoundError:
+    print(f"[OpenRouter] {model_id} returned 404; treating it as dead.",
+          file=sys.stderr, flush=True)
     return False
-  except Exception:
-    return True  # rate limit, auth, etc. don't prove the model is dead
+  except Exception as exc:
+    # Rate limit, auth, timeout etc. don't prove the model is dead, so it stays
+    # in the pool -- but report what happened rather than swallowing it.
+    print(f"[OpenRouter] {model_id} probe hit {type(exc).__name__}: {exc}. "
+          f"Not a 404, so keeping it in the pool.",
+          file=sys.stderr, flush=True)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -66,8 +102,20 @@ def _build_reasoning_pool() -> list:
   if not api_key:
     return [ultimate_fallback]
 
+  # An explicit override stays at the top of the pool, but only if it is
+  # actually shaped like a model id. A malformed value here (most commonly a
+  # trailing `# comment` that dotenv read as the value) is reported and dropped
+  # rather than silently becoming the default model for every agent.
+  override = os.getenv("PRIMARY_REASONING_MODEL")
+  if override is not None and not _is_valid_model_id(override):
+    print(f"[OpenRouter] Ignoring malformed PRIMARY_REASONING_MODEL={override!r}. "
+          f"Expected 'vendor/model[:tag]'. Check for a comment on the same line "
+          f"as the assignment in your .env.",
+          file=sys.stderr, flush=True)
+    override = None
+
   candidates = [
-    os.getenv("PRIMARY_REASONING_MODEL"),    # explicit override stays at top
+    override,
     'deepseek/deepseek-chat-v3.1:free',
     'deepseek/deepseek-r1-distill-llama-70b:free',
     'qwen/qwq-32b-preview:free',

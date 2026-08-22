@@ -1,7 +1,6 @@
 """nemo_altdata MCP server — alternative data tools for pre-earnings research.
 
 6 tools:
-  get_google_trends          -- pytrends wrapper; YoY demand signal
   get_taiwan_monthly_revenue -- FinMind API for TSMC/Foxconn/MediaTek/ASE revenue
   get_job_postings_count     -- Multi-ATS job listing count (Greenhouse/Lever/Workday
                                 auto-discovery — no hardcoded company list)
@@ -9,7 +8,7 @@
   get_policy_signals         -- Legislative climate via GovTrack (+ Congress.gov if key set)
   get_capex_announcements    -- Capital investment announcements via DuckDuckGo news
 
-Heavy tools (pytrends) run in isolated subprocesses to avoid asyncio
+Heavy tools run in isolated subprocesses to avoid asyncio
 conflicts on Windows.
 Light tools (FinMind, job postings, gov contracts, policy, capex) run
 directly in async handlers via asyncio.to_thread.
@@ -57,10 +56,7 @@ if not os.path.isfile(_VENV_PYTHON):
 if not os.path.isfile(_VENV_PYTHON):
     _VENV_PYTHON = sys.executable
 
-_TRENDS_RUNNER = os.path.join(_HERE, "trends_runner.py")
 
-# Extended timeouts: trends_runner now retries on 429 (adds up to 30s)
-_TRENDS_TIMEOUT_S = 45.0
 _SUBPROCESS_TIMEOUT_S = 40.0
 
 
@@ -88,7 +84,7 @@ def _run_subprocess(runner_path: str, tool_name: str, kwargs: dict,
         return {"success": False,
                 "error": f"no output (exit {proc.returncode}): {stderr_snippet}"}
     # Runners emit exactly one JSON line LAST — parse the last non-empty line so
-    # a stray library print to stdout (yfinance/pytrends deprecation notice)
+    # a stray library print to stdout (yfinance deprecation notice)
     # can't break the protocol.
     last_line = stdout.splitlines()[-1].strip()
     try:
@@ -619,10 +615,22 @@ def _fetch_taiwan_revenue_finmind(company_codes: List[str], months: int) -> Dict
             results[code] = {"error": f"{type(exc).__name__}: {str(exc)[:150]}"}
             continue
 
-        if payload.get("status") != 200 or not payload.get("data"):
+        if payload.get("status") != 200:
             results[code] = {
                 "error": (f"FinMind status {payload.get('status')}: "
-                          f"{payload.get('msg', 'no data returned')}")
+                          f"{payload.get('msg', 'no message')}")
+            }
+            continue
+
+        if not payload.get("data"):
+            # FinMind answers an unknown code with status 200 / msg 'success'
+            # and an empty list, which folded into the branch above as the
+            # self-contradicting error "FinMind status 200: success".
+            results[code] = {
+                "error": (f"FinMind returned no TaiwanStockMonthRevenue rows for "
+                          f"code {code} since {start_date}. Check the code is a "
+                          "Taiwan-listed ticker (TSMC=2330, Foxconn=2317, "
+                          "MediaTek=2454, ASE Group=3711).")
             }
             continue
 
@@ -1171,39 +1179,6 @@ class AltDataServer:
         async def list_tools() -> List[Tool]:
             return [
                 Tool(
-                    name="get_google_trends",
-                    description=(
-                        "Google Trends interest-over-time for up to 5 search keywords. "
-                        "Returns weekly index values (0-100) and a YoY ratio comparing "
-                        "the last 13 weeks vs the same period 1 year prior. "
-                        "Use to gauge consumer demand before a company's earnings: "
-                        "ratio > 1.10 = bullish, < 0.90 = bearish. "
-                        "Best for consumer-facing companies (tech, automotive, retail). "
-                        "Results are cached for 12 hours to avoid rate limiting."
-                    ),
-                    inputSchema={
-                        "type": "object",
-                        "required": ["keywords"],
-                        "properties": {
-                            "keywords": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "Search terms, max 5",
-                            },
-                            "timeframe": {
-                                "type": "string",
-                                "default": "today 12-m",
-                                "description": "pytrends timeframe string. Use 12-m for YoY ratio.",
-                            },
-                            "geo": {
-                                "type": "string",
-                                "default": "US",
-                                "description": "Country code or '' for worldwide.",
-                            },
-                        },
-                    },
-                ),
-                Tool(
                     name="get_taiwan_monthly_revenue",
                     description=(
                         "Monthly revenue for Taiwan-listed companies via FinMind "
@@ -1360,8 +1335,6 @@ class AltDataServer:
 
         @self.server.call_tool()
         async def call_tool(name: str, args: Dict[str, Any]):
-            if name == "get_google_trends":
-                return await parent.google_trends(args)
             if name == "get_taiwan_monthly_revenue":
                 return await parent.taiwan_monthly_revenue(args)
             if name == "get_job_postings_count":
@@ -1378,29 +1351,6 @@ class AltDataServer:
     # Existing tool handlers
     # -----------------------------------------------------------------------
 
-    async def google_trends(self, args: Dict[str, Any]) -> List[TextContent]:
-        keywords = args.get("keywords")
-        if not keywords:
-            return _err("get_google_trends", "keywords is required")
-        kwargs = {
-            "keywords": keywords,
-            "timeframe": args.get("timeframe", "today 12-m"),
-            "geo": args.get("geo", "US"),
-        }
-        try:
-            result = await asyncio.wait_for(
-                asyncio.to_thread(
-                    _run_subprocess, _TRENDS_RUNNER, "get_google_trends",
-                    kwargs, _SUBPROCESS_TIMEOUT_S,
-                ),
-                timeout=_TRENDS_TIMEOUT_S,
-            )
-        except asyncio.TimeoutError:
-            return _err("get_google_trends",
-                        f"timeout after {_TRENDS_TIMEOUT_S}s")
-        if not result.get("success"):
-            return _err("get_google_trends", result.get("error", "unknown error"))
-        return _ok("get_google_trends", result["data"])
 
     async def taiwan_monthly_revenue(self, args: Dict[str, Any]) -> List[TextContent]:
         codes = args.get("company_codes", [])
