@@ -19,7 +19,23 @@ x-server: &server
   image: nemo-data:local
   env_file: ../.env
   restart: unless-stopped
+  # Docker writes container logs to the HOST disk, outside the tmpfs that
+  # bounds everything else, and the default json-file driver has no limit at
+  # all -- it grows until the disk is full.
+  #
+  # Rotating on size rather than on a timer is deliberate: a daily reset does
+  # not bound the worst case, because a runaway loop fills the disk long before
+  # midnight. This caps each service at 30MB total, whatever happens.
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
   environment:
+    # Set MCP_LOG_RESPONSES=1 to echo response payloads into `docker logs`.
+    # Off by default: bodies are large and the logs land on the host disk.
+    MCP_LOG_RESPONSES: ${MCP_LOG_RESPONSES:-0}
+    MCP_LOG_RESPONSE_CHARS: ${MCP_LOG_RESPONSE_CHARS:-4000}
     # Per-server token, supplied by the shell rather than written here so it
     # never lands in a file. A server with no token refuses to start, so a
     # forgotten variable fails loudly instead of publishing every tool.

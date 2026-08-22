@@ -33,11 +33,11 @@ docker compose -f deploy/docker-compose.yml up -d
 Then register each one:
 
 ```bash
-claude mcp add --transport http nemo-sec       http://<host>:8810/mcp
-claude mcp add --transport http nemo-financial http://<host>:8811/mcp
-claude mcp add --transport http nemo-finnhub   http://<host>:8812/mcp
-claude mcp add --transport http nemo-fred      http://<host>:8813/mcp
-claude mcp add --transport http nemo-altdata   http://<host>:8814/mcp
+claude mcp add --transport http nemo-sec       http://<host>:8810/mcp/
+claude mcp add --transport http nemo-financial http://<host>:8811/mcp/
+claude mcp add --transport http nemo-finnhub   http://<host>:8812/mcp/
+claude mcp add --transport http nemo-fred      http://<host>:8813/mcp/
+claude mcp add --transport http nemo-altdata   http://<host>:8814/mcp/
 ```
 
 | Server | Port | Module | Tools |
@@ -47,6 +47,9 @@ claude mcp add --transport http nemo-altdata   http://<host>:8814/mcp
 | Finnhub | 8812 | `tools.news_agregator.finnhub_server` | 14 |
 | FRED macro | 8813 | `tools.news_agregator.fred_server` | 5 |
 | Alt data | 8814 | `tools.altdata_server.server` | 5 |
+
+**Register the URL with its trailing slash.** `Mount` only matches `/mcp/`, so
+posting to `/mcp` answers `307` and every single call pays an extra round trip.
 
 The SEC server advertises 42 of its 45 tools: `search` and the two rag tools
 are hidden because SearXNG and the RAG stack are not in this image. That is
@@ -128,7 +131,7 @@ and code in the client.
 export NEMO_MCP_TOKEN=$(openssl rand -hex 32)
 docker compose -f deploy/docker-compose.yml up -d
 
-claude mcp add --transport http nemo-sec http://<host>:8810/mcp \
+claude mcp add --transport http nemo-sec http://<host>:8810/mcp/ \
   --header "Authorization: Bearer $NEMO_MCP_TOKEN"
 ```
 
@@ -155,3 +158,32 @@ deliberately excluded — so a leaked token exposes market-data queries against
 free-tier keys, not money and not trades. The one genuine harm is SEC identity
 misuse getting `SEC_EMAIL` rate-limited. A rotatable token behind a private
 network is proportionate to that; an OAuth server is not.
+
+## Logs
+
+Container logs are capped at 30MB per service — `max-size: 10m`, `max-file: 3`
+— and rotated by Docker itself. Size-based rather than time-based on purpose: a
+daily reset does not bound the worst case, because a runaway loop fills the disk
+long before midnight.
+
+This matters more than it looks. Docker writes container logs to the **host**
+disk under `/var/lib/docker/containers/`, outside the tmpfs mounts that bound
+everything else, and the default json-file driver has no limit at all.
+
+By default a request logs as `POST /mcp/ 200 OK` and nothing about the payload.
+To see what a tool actually returned:
+
+```bash
+MCP_LOG_RESPONSES=1 docker compose -f deploy/docker-compose.yml up -d
+docker logs nemo-fred
+```
+
+```
+[mcp_http] 200 /mcp/ -> event: message
+data: {"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"curve\": {\"10Y\": 4.69 ...
+```
+
+Bodies are truncated at `MCP_LOG_RESPONSE_CHARS` (default 4000) because an MD&A
+extract runs to 80KB. Off by default for the same reason the cap exists.
+`/health` is never logged — it fires every thirty seconds forever and its body
+carries nothing.

@@ -30,6 +30,9 @@ from starlette.routing import Mount, Route
 
 DEFAULT_PORT = 8080
 MCP_PATH = "/mcp"
+# What clients should register. Without the trailing slash every request
+# costs a 307 first.
+MCP_PATH_CANONICAL = "/mcp/"
 
 
 _UNSET = object()
@@ -69,9 +72,19 @@ def build_app(mcp_server: Any, *, stateless: bool = True,
         lifespan=lifespan,
     )
 
+    # Mount only matches "/mcp/" exactly, so a client posting to "/mcp" gets a
+    # 307 and pays an extra round trip on every call. Disabling redirects turns
+    # that into a 404 instead, so the fix is on the client side: register the
+    # URL with its trailing slash. MCP_PATH_CANONICAL is what the docs and the
+    # compose healthcheck use.
+
     token = resolve_auth_token() if auth_token is _UNSET else auth_token
     if token:
         app.add_middleware(BearerAuthMiddleware, token=token)
+
+    log_responses, log_chars = resolve_response_logging()
+    if log_responses:
+        app.add_middleware(ResponseLoggingMiddleware, max_chars=log_chars)
     return app
 
 
@@ -206,3 +219,83 @@ class BearerAuthMiddleware:
             return
 
         await self.app(scope, receive, send)
+
+
+# ---------------------------------------------------------------------------
+# Response logging.
+#
+# By default a request appears as `POST /mcp/ 200 OK` and nothing about the
+# payload, which is useless when you have shelled into the box because a tool
+# is returning something surprising.
+#
+# Off unless asked for. Docker's json-file driver writes container logs to the
+# HOST disk, outside the tmpfs that bounds everything else, so logging every
+# payload unconditionally reintroduces exactly the unbounded growth those
+# mounts exist to prevent. Pair this with max-size/max-file in compose.
+# ---------------------------------------------------------------------------
+
+DEFAULT_LOG_RESPONSE_CHARS = 4000
+
+
+def resolve_response_logging() -> tuple:
+    """(enabled, max_chars) from the environment.
+
+    A malformed limit falls back to the default rather than refusing to start:
+    a typo in an observability setting should not take the server down.
+    """
+    enabled = os.environ.get("MCP_LOG_RESPONSES") == "1"
+    raw = os.environ.get("MCP_LOG_RESPONSE_CHARS", "")
+    try:
+        limit = int(raw) if raw.strip() else DEFAULT_LOG_RESPONSE_CHARS
+        if limit <= 0:
+            limit = DEFAULT_LOG_RESPONSE_CHARS
+    except ValueError:
+        limit = DEFAULT_LOG_RESPONSE_CHARS
+    return enabled, limit
+
+
+class ResponseLoggingMiddleware:
+    """Echo response bodies to stderr so `docker logs` shows the payload.
+
+    Bodies are truncated: an MD&A extract runs to 80KB and a filing-history
+    response is larger still, so logging them whole floods the log and the host
+    disk behind it. /health is exempt because the healthcheck fires every
+    thirty seconds forever and its body carries nothing.
+    """
+
+    def __init__(self, app, max_chars: int = DEFAULT_LOG_RESPONSE_CHARS,
+                 exempt_paths: tuple = ("/health",)):
+        self.app = app
+        self._max_chars = max_chars
+        self._exempt = tuple(exempt_paths)
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http" or scope.get("path", "") in self._exempt:
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+        status = {"code": 0}
+        chunks: list = []
+        captured = {"bytes": 0}
+
+        async def capturing_send(message):
+            if message["type"] == "http.response.start":
+                status["code"] = message["status"]
+            elif message["type"] == "http.response.body":
+                body = message.get("body", b"")
+                # Stop accumulating past the limit rather than buffering an
+                # entire streamed response in memory to throw most of it away.
+                if captured["bytes"] < self._max_chars * 2:
+                    chunks.append(body)
+                    captured["bytes"] += len(body)
+            await send(message)
+
+        await self.app(scope, receive, capturing_send)
+
+        text = b"".join(chunks).decode("utf-8", errors="replace").strip()
+        if len(text) > self._max_chars:
+            text = (f"{text[:self._max_chars]}... "
+                    f"[truncated, {captured['bytes']} bytes captured]")
+        print(f"[mcp_http] {status['code']} {path} -> {text}",
+              file=sys.stderr, flush=True)
