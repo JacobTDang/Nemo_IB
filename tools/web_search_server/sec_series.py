@@ -191,16 +191,39 @@ class FilingPoint:
     accession: str
     facts: List[ConceptFact] = field(default_factory=list)
 
+    def deduplicated(self) -> List[ConceptFact]:
+        """Facts with exact duplicates removed.
+
+        Some filers emit the same fact twice. Biogen reports its share count
+        with identical value, period, and context_ref on two rows; since an
+        XBRL context plus a concept defines exactly one fact, those are the
+        same fact rather than two share classes. Summing them doubled Biogen's
+        share count.
+
+        Keyed on the full triple rather than context alone, so two genuinely
+        different values are never collapsed.
+        """
+        seen = set()
+        out: List[ConceptFact] = []
+        for fact in self.facts:
+            key = (fact.context_ref, fact.period, fact.value)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(fact)
+        return out
+
     def total(self) -> Optional[float]:
-        """Sum across facts, or None when there are none.
+        """Sum across distinct facts, or None when there are none.
 
         None rather than 0.0 deliberately: for a share count, zero is a
         meaningful and alarming value, so absence must stay distinguishable
         from it.
         """
-        if not self.facts:
+        facts = self.deduplicated()
+        if not facts:
             return None
-        return float(sum(f.value for f in self.facts))
+        return float(sum(f.value for f in facts))
 
     def undimensioned(self) -> List[ConceptFact]:
         """Facts carrying no dimensions -- the consolidated figures.
@@ -211,7 +234,7 @@ class FilingPoint:
         Share count is the exception where dimensions are additive, which is
         why `total()` exists separately.
         """
-        return [f for f in self.facts if not f.dimensions]
+        return [f for f in self.deduplicated() if not f.dimensions]
 
     def latest_undimensioned(self) -> Optional[ConceptFact]:
         """The consolidated fact for the most recent, longest period here.
@@ -238,7 +261,7 @@ class FilingPoint:
         single-class filers representable without a separate code path.
         """
         out: Dict[str, float] = {}
-        for fact in self.facts:
+        for fact in self.deduplicated():
             out[fact.dimension_member(axis) or ""] = fact.value
         return out
 

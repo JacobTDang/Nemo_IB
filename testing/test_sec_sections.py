@@ -174,3 +174,16 @@ def test_nvda_style_disclosure_still_captured_after_the_fix():
     pcts = sorted(r["pct_of_revenue"] for r in found["named_customers"])
     assert pcts == [14.0, 22.0]
     assert found["has_concentration"] is True
+
+
+def test_customer_concentration_failure_keeps_the_same_shape(monkeypatch):
+    """ARM's filing could not be fetched and the error path returned a dict
+    without has_concentration, so a caller reading the documented field got a
+    KeyError instead of an answer. Failure must not change the contract."""
+    monkeypatch.setattr(sec_utils, "get_latest_filing", lambda *a, **k: None)
+    result = sec_utils.extract_customer_concentration("ARM", "10-K")
+    assert result["success"] is False
+    for key in ("has_concentration", "explicitly_none", "named_customers"):
+        assert key in result, f"failure path dropped {key!r}"
+    assert result["has_concentration"] is False
+    assert result["named_customers"] == []

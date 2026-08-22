@@ -3074,6 +3074,23 @@ def extract_litigation(ticker: str, form_type: str = '10-K',
             'error': f'{type(e).__name__}: {e}'}
 
 
+def _concentration_failure(ticker: str, message: str) -> Dict[str, Any]:
+  """Failure carrying the same keys as success.
+
+  A caller reading `has_concentration` should get False, not a KeyError,
+  when the filing could not be read. Changing the shape on failure pushes
+  error handling onto every consumer.
+  """
+  return {
+    'ticker': ticker,
+    'success': False,
+    'error': message,
+    'named_customers': [],
+    'has_concentration': False,
+    'explicitly_none': False,
+  }
+
+
 def extract_customer_concentration(ticker: str,
                                    form_type: str = '10-K') -> Dict[str, Any]:
   """Find major-customer disclosure anywhere in the filing.
@@ -3084,17 +3101,16 @@ def extract_customer_concentration(ticker: str,
   try:
     filing_data = get_latest_filing(ticker, form_type)
     if not filing_data:
-      return {'ticker': ticker, 'success': False,
-              'error': f'No {form_type} filing found for {ticker}'}
+      return _concentration_failure(
+        ticker, f'No {form_type} filing found for {ticker}')
 
     filing_obj = filing_data.get('filing_object')
     if filing_obj is None:
-      return {'ticker': ticker, 'success': False,
-              'error': 'No filing object in cache'}
+      return _concentration_failure(ticker, 'No filing object in cache')
 
     text = filing_obj.text()
     if not text:
-      return {'ticker': ticker, 'success': False, 'error': 'Empty filing text'}
+      return _concentration_failure(ticker, 'Empty filing text')
 
     found = _scan_customer_concentration(text)
     return {
@@ -3105,5 +3121,4 @@ def extract_customer_concentration(ticker: str,
       **found,
     }
   except Exception as e:
-    return {'ticker': ticker, 'success': False,
-            'error': f'{type(e).__name__}: {e}'}
+    return _concentration_failure(ticker, f'{type(e).__name__}: {e}')

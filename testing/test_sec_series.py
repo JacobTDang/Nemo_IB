@@ -258,3 +258,40 @@ def test_instant_facts_still_select_by_latest_date():
         ConceptFact(200.0, "2026-07-15", {}, "new"),
     ])
     assert point.latest_undimensioned().value == 200.0
+
+
+def test_duplicate_facts_sharing_a_context_are_collapsed():
+    """BIIB emits the same share-count fact twice -- identical value, period,
+    and context_ref. In XBRL a context plus a concept defines exactly one fact,
+    so two rows sharing a context are duplicates rather than share classes.
+
+    Summing them doubled Biogen's share count to 295.5M against a real 147.75M,
+    which the market-cap reconciliation caught at 100% off.
+    """
+    point = FilingPoint("2026-07-29", "10-Q", "acc", facts=[
+        ConceptFact(147753998.0, "2026-07-27", {}, "c-2"),
+        ConceptFact(147753998.0, "2026-07-27", {}, "c-2"),
+    ])
+    assert point.total() == 147753998.0
+    assert len(point.deduplicated()) == 1
+
+
+def test_distinct_share_classes_are_not_collapsed():
+    """The dedup must not undo the multi-class handling: GOOGL's three classes
+    have distinct contexts and must all survive."""
+    point = FilingPoint("2026-07-23", "10-Q", "acc", facts=[
+        ConceptFact(5868000000.0, "2026-07-15", {"a": "A"}, "c-28"),
+        ConceptFact(835000000.0, "2026-07-15", {"a": "B"}, "c-29"),
+        ConceptFact(5527000000.0, "2026-07-15", {"a": "C"}, "c-30"),
+    ])
+    assert point.total() == 12230000000.0
+    assert len(point.deduplicated()) == 3
+
+
+def test_same_context_but_different_values_are_both_kept():
+    """Defensive: only an exact duplicate is dropped, never a differing value."""
+    point = FilingPoint("2026-07-29", "10-Q", "acc", facts=[
+        ConceptFact(100.0, "2026-07-27", {}, ""),
+        ConceptFact(200.0, "2026-07-27", {}, ""),
+    ])
+    assert point.total() == 300.0
