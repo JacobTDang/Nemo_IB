@@ -269,6 +269,7 @@ def extract_disclosure_data(ticker: str, disclosure_name: str, form_type: str = 
 
         # Find the specific disclosure by name
         target_disclosure = None
+        available_names = []
         for disclosure in disclosures:
           if hasattr(disclosure, 'role_or_type'):
             role = disclosure.role_or_type
@@ -278,6 +279,7 @@ def extract_disclosure_data(ticker: str, disclosure_name: str, form_type: str = 
             else:
               current_name = role
 
+            available_names.append(current_name)
             if current_name == disclosure_name:
               target_disclosure = disclosure
               break
@@ -344,28 +346,39 @@ def extract_disclosure_data(ticker: str, disclosure_name: str, form_type: str = 
 
           return disclosure_summary
 
-        else:
-          print(f'debug: Unable to find disclosure: {disclosure_name}', file=sys.stderr, flush=True)
-          print(f'Available disclosures: {[d.role_or_type.split("/")[-1] if hasattr(d, "role_or_type") and "/" in d.role_or_type else str(d) for d in disclosures[:5]]}...', file=sys.stderr, flush=True)
-
+        # Disclosure names are per-filing taxonomy roles, so a guessed or
+        # borrowed name misses routinely. Returning {} here made a miss look
+        # like a company that discloses nothing; name the miss and hand back
+        # the roles this filing actually carries.
+        return {
+          'ticker': ticker,
+          'success': False,
+          'error': (f"No disclosure named '{disclosure_name}' in {ticker}'s "
+                    f"latest {form_type}. Pick one from "
+                    "available_disclosure_names, or call get_disclosures_names."),
+          'available_disclosure_names': available_names,
+        }
 
       except Exception as e:
         return {
-          'error': f'Unable to get statement'
+          'ticker': ticker,
+          'success': False,
+          'error': (f"Unable to read the XBRL statements index for {ticker}: "
+                    f"{type(e).__name__}: {e}"),
         }
     else:
       # failed to get the filing data
       return {
+        'ticker': ticker,
+        'success': False,
         'error': f"Unable to get latest filing for {ticker}"
       }
   except Exception as e:
     return {
+      'ticker': ticker,
       'error': f"Unable to get {disclosure_name} for {ticker}: {str(e)}",
       'success': False
     }
-
-
-  return {}
 
 def get_revenue_base(ticker: str, form_type: str= "10-K") -> Dict[str, Any]:
   # this is the company's recurring revenue from its primary business operations. It will be the starting point for nearly all financial analysis
