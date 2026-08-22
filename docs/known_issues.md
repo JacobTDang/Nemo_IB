@@ -240,6 +240,49 @@ install URL if neither is found.
 
 **Priority:** low (handled).
 
+## Research coverage tools: measured coverage rates (2026-08-22)
+
+Seven new primary-source tools closed the blind spots listed in
+`docs/superpowers/specs/2026-08-22-research-coverage-gaps-design.md`. Coverage was
+measured across a 35-ticker basket spanning megacaps, multi-class filers, banks,
+REITs, biotech, serial issuers, industrials, energy, consumer staples, and recent
+IPOs (`testing/test_research_coverage_sweep.py`).
+
+| Tool | Coverage | Notes |
+|---|---|---|
+| `get_corporate_actions` | 35/35 (100%) | yfinance, not filing-dependent |
+| `get_share_count_series` | 32/35 (91.4%) | cover-page tag; every filer should report it |
+| `extract_customer_concentration` | 32/35 (91.4%) | text scan, not a numbered item |
+| `get_sbc_series` | 31/35 (88.6%) | concept chain across three tags |
+| `get_debt_maturity_schedule` | 20/35 (57.1%) | **full 14, partial 6, not covered 15** |
+
+**`get_debt_maturity_schedule` is the one to treat carefully.** Maturity tagging is
+inconsistent: MSFT, AAPL and T tag all six buckets while Ford and PLUG tag none,
+and Ford is among the largest debt issuers in the market. The tool returns
+`coverage: "not_covered"` in that case. **Never read that as "no debt matures."**
+
+### Two bugs the sweep caught that unit tests could not
+
+1. **Biogen double-counted.** BIIB emits its share-count fact twice with identical
+   value, period and `context_ref`. Summing reported 295.5M shares against a real
+   147.75M. Shape assertions passed; the market-cap reconciliation
+   (`shares x price` against reported market cap) caught it at 100% off. Facts are
+   now de-duplicated on the value/period/context triple.
+
+2. **Failure changed the response shape.** `extract_customer_concentration` omitted
+   `has_concentration` on its error path, so a caller reading the documented field
+   got a `KeyError` rather than `False`.
+
+Both are why the sweep asserts reconciliation rather than structure alone.
+
+### Known limitation: litigation is usually a cross-reference
+
+`extract_litigation` returns Item 3 verbatim, and most large filers use Item 3 only
+to point at a contingencies note — MSFT's is 204 characters, NVDA's 199. The
+`cross_referenced_only` flag marks this. The substance is in the notes to the
+financial statements, so a short result means "look in the notes", not "no
+litigation".
+
 ## MCP stdio hangs on long-lived nemo_openbb / nemo_sentry processes (overnight 2026-05-22; deeper investigation 2026-05-31)
 
 **`nemo_openbb` REMOVED in `truth-source-refactor`.** The server

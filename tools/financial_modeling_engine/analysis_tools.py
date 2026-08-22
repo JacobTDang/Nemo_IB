@@ -1,5 +1,6 @@
 from typing import Any, Dict, List, Optional
 import asyncio
+from tools.financial_modeling_engine.corporate_actions import get_corporate_actions
 import json
 import sys
 import traceback
@@ -1398,12 +1399,35 @@ class Financial_Analysis:
             "required": ["ticker", "market_cap", "ebitda", "capex_abs", "tax_rate", "depreciation_abs"]
           }
         ),
+        Tool(
+          name="get_corporate_actions",
+          description=(
+            "Dividend and split history, with the trailing-twelve-month dividend "
+            "and the most recent split ratio.\n\n"
+            "Check this before ANY historical per-share comparison. NVDA split "
+            "10:1 in June 2024; comparing its FY2023 EPS to FY2025 without "
+            "adjusting produces an answer wrong by an order of magnitude, and "
+            "nothing in the raw data signals the error.\n\n"
+            "'latest_split_ratio' is null when no split falls in the window -- "
+            "never 1.0, which would imply a split occurred that changed nothing."
+          ),
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Ticker symbol"},
+              "years":  {"type": "integer", "description": "Lookback window in years", "default": 10}
+            },
+            "required": ["ticker"]
+          }
+        ),
       ]
 
     @self.server.call_tool()
     async def call_tool(name: str, args: Dict[str, Any]) -> List[TextContent]:
       try:
-        if name == "get_market_data":
+        if name == "get_corporate_actions":
+          return await parent.get_corporate_actions(args['ticker'], args.get('years', 10))
+        elif name == "get_market_data":
           return await parent.get_market_data(args['ticker'])
         elif name == "extract_13f_holdings":
           return await parent.extract_13f_holdings(args['ticker'], args.get('top_n', 10))
@@ -1450,6 +1474,11 @@ class Financial_Analysis:
       )]
 
   # ---- Tool implementations ----
+
+  async def get_corporate_actions(self, ticker: str,
+                                  years: int = 10) -> List[TextContent]:
+    result = await asyncio.to_thread(get_corporate_actions, ticker, years)
+    return [TextContent(type="text", text=safe_json_dumps(result))]
 
   async def get_market_data(self, ticker: str) -> List[TextContent]:
     data = await asyncio.to_thread(get_data, ticker)

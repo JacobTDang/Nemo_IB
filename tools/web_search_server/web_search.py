@@ -6,7 +6,16 @@ from datetime import date, datetime
 from tools.web_search_server.searxng_client import searxng_search
 from tools.web_search_server.scraper import scrape_urls
 from agent.cache import Session_Cache
+from tools.web_search_server.peers import find_peers_by_sic, get_sic_code
+from tools.web_search_server.debt_maturity import get_debt_maturity_schedule
+from tools.web_search_server.sbc import get_sbc_series
+from tools.web_search_server.dilution import (
+  get_share_count_series,
+  get_shelf_activity,
+)
 from tools.web_search_server.sec_utils import (
+  extract_litigation,
+  extract_customer_concentration,
     get_revenue_base, get_ebitda_margin, get_capex_pct_revenue,
     get_tax_rate, get_depreciation, get_disclosures_names,
     extract_disclosure_data, get_latest_filing,
@@ -537,6 +546,186 @@ class WebSearchServer:
             },
             "required": ["text"]
           }
+        ),
+        Tool(
+          name="get_share_count_series",
+          description=(
+            "Shares outstanding across recent filings, with per-class breakdown and "
+            "the percentage change over the window. Sourced from the cover-page tag "
+            "dei:EntityCommonStockSharesOutstanding in each 10-Q or 10-K.\n\n"
+            "Use this before trusting any per-share metric. A company can grow EPS "
+            "purely by shrinking the denominator, or erode it by growing the "
+            "denominator, and neither shows up in the income statement.\n\n"
+            "Multi-class companies (GOOGL, BRK, META) report each class separately; "
+            "'total' sums them and 'by_class' shows the split. Check 'classes_found' "
+            "-- if a company you know has multiple classes reports only one, the "
+            "total is understated. 'direction' is dilution / buyback / flat / "
+            "insufficient_history."
+          ),
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Ticker symbol"},
+              "limit":  {"type": "integer", "description": "How many filings to walk back", "default": 8},
+              "form":   {"type": "string", "description": "10-Q for quarterly granularity, 10-K for annual", "default": "10-Q"}
+            },
+            "required": ["ticker"]
+          }
+        ),
+        Tool(
+          name="get_shelf_activity",
+          description=(
+            "Shelf registrations (S-3) and takedowns (424B5) filed in the lookback "
+            "window.\n\n"
+            "This is the mechanism behind dilution, where get_share_count_series is "
+            "the effect. An effective S-3 means the company is authorised to sell "
+            "shares; each 424B5 is an actual sale off that shelf. A rising share "
+            "count plus repeated 424B5 filings means dilution is ongoing rather "
+            "than finished -- the distinction matters for whether you size into it.\n\n"
+            "Cash-generative megacaps typically show nothing here. Serial issuers "
+            "show many takedowns."
+          ),
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker":        {"type": "string", "description": "Ticker symbol"},
+              "lookback_days": {"type": "integer", "description": "Window in days", "default": 730}
+            },
+            "required": ["ticker"]
+          }
+        ),
+        Tool(
+          name="get_sbc_series",
+          description=(
+            "Stock-based compensation over recent annual filings, with its share "
+            "of revenue and of operating cash flow.\n\n"
+            "SBC is the largest single line between GAAP earnings and the adjusted "
+            "figures companies prefer to be judged on, and it is the other engine "
+            "of dilution alongside shelf issuance. A company whose SBC is a large "
+            "and rising share of revenue is paying employees with your ownership.\n\n"
+            "Returns the consolidated figure per filing, not a sum of award-type "
+            "breakdowns -- filers tag dozens of component facts and adding them "
+            "would report several times the real expense. 'concept_used' names "
+            "which XBRL tag the figure came from."
+          ),
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Ticker symbol"},
+              "limit":  {"type": "integer", "description": "How many filings to walk back", "default": 5},
+              "form":   {"type": "string", "description": "10-K for annual, 10-Q for quarterly", "default": "10-K"}
+            },
+            "required": ["ticker"]
+          }
+        ),
+        Tool(
+          name="get_debt_maturity_schedule",
+          description=(
+            "Principal coming due by year from the long-term debt footnote, plus "
+            "the share due within twelve months.\n\n"
+            "Leverage alone does not tell you much. 3x turns maturing next year is "
+            "a refinancing problem; the same 3x maturing in 2031 is not. Use this "
+            "alongside calculate_credit_profile before drawing any conclusion about "
+            "balance-sheet risk.\n\n"
+            "IMPORTANT: coverage is genuinely partial across filers. Check the "
+            "'coverage' field -- 'full' means all six buckets were tagged, "
+            "'partial' means some, and 'not_covered' means this filer does not tag "
+            "the split in XBRL. not_covered does NOT mean no debt matures: Ford "
+            "carries enormous debt and tags none of these concepts. Never read an "
+            "absent schedule as an absent obligation."
+          ),
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Ticker symbol"},
+              "form":   {"type": "string", "description": "Filing type", "default": "10-K"}
+            },
+            "required": ["ticker"]
+          }
+        ),
+        Tool(
+          name="extract_litigation",
+          description=(
+            "Item 3, Legal Proceedings, from the latest annual or quarterly filing.\n\n"
+            "Material legal exposure had no coverage at all. Use when sizing a "
+            "position in a company facing regulatory action, patent disputes, or "
+            "class actions.\n\n"
+            "NOTE: most large filers cross-reference a contingencies note rather "
+            "than restating detail in Item 3, so a short result is normal. The "
+            "'cross_referenced_only' flag is true in that case, and the substance "
+            "lives in the notes to the financial statements -- follow up there "
+            "rather than concluding there is no litigation."
+          ),
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker":    {"type": "string", "description": "Ticker symbol"},
+              "form_type": {"type": "string", "description": "10-K or 10-Q", "default": "10-K"}
+            },
+            "required": ["ticker"]
+          }
+        ),
+        Tool(
+          name="extract_customer_concentration",
+          description=(
+            "Major-customer disclosure: who accounts for a material share of "
+            "revenue, and how much.\n\n"
+            "Often the entire thesis. A supplier deriving 22% of revenue from one "
+            "buyer has a different risk profile from a diversified one, and it "
+            "does not appear anywhere in the financial statements.\n\n"
+            "Read the two flags together. 'has_concentration' true with entries in "
+            "'named_customers' means real concentration was disclosed. "
+            "'explicitly_none' true means the filer stated that no customer crosses "
+            "the threshold, which is a genuine finding of LOW concentration -- not "
+            "missing data. Both false means nothing was found either way. Most "
+            "filers describe the customer without naming it, so a null name with a "
+            "percentage is the common case."
+          ),
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker":    {"type": "string", "description": "Ticker symbol"},
+              "form_type": {"type": "string", "description": "10-K or 10-Q", "default": "10-K"}
+            },
+            "required": ["ticker"]
+          }
+        ),
+        Tool(
+          name="find_peers_by_sic",
+          description=(
+            "Listed companies sharing this filer's SIC classification, for use as "
+            "a starting comp set.\n\n"
+            "comparable_company_analysis requires you to supply peers, which makes "
+            "the comps depend on already knowing the answer. This derives them from "
+            "the filings instead.\n\n"
+            "Two caveats. SIC groups filers by declared classification rather than "
+            "competitive overlap, so treat the output as a candidate list to prune, "
+            "not a finished comp table. And coverage is partial: an SIC query "
+            "returns deregistered and private filers with no listed ticker, so "
+            "compare 'peer_count' against 'filers_matched' -- 'unresolved_count' is "
+            "the gap."
+          ),
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Ticker symbol"},
+              "limit":  {"type": "integer", "description": "Max filers to request from EDGAR", "default": 20}
+            },
+            "required": ["ticker"]
+          }
+        ),
+        Tool(
+          name="get_sic_code",
+          description=(
+            "The filer's SIC classification code and industry description from "
+            "EDGAR. Useful on its own to confirm how a company classifies itself, "
+            "which is occasionally not how the market thinks of it."
+          ),
+          inputSchema={
+            "type": "object",
+            "properties": {"ticker": {"type": "string", "description": "Ticker symbol"}},
+            "required": ["ticker"]
+          }
         )]
 
     @self.server.call_tool()
@@ -547,6 +736,31 @@ class WebSearchServer:
           return result
         elif name == 'get_urls_content':
           return await parent.get_urls_content(args['urls'])
+
+        elif name == 'find_peers_by_sic':
+          return await parent.find_peers_by_sic(args['ticker'], args.get('limit', 20))
+        elif name == 'get_sic_code':
+          return await parent.get_sic_code(args['ticker'])
+        elif name == 'extract_litigation':
+          return await parent.extract_litigation(
+            args['ticker'], args.get('form_type', '10-K'))
+        elif name == 'extract_customer_concentration':
+          return await parent.extract_customer_concentration(
+            args['ticker'], args.get('form_type', '10-K'))
+        elif name == 'get_debt_maturity_schedule':
+          return await parent.get_debt_maturity_schedule(
+            args['ticker'], args.get('form', '10-K'))
+        elif name == 'get_sbc_series':
+          return await parent.get_sbc_series(
+            args['ticker'], args.get('limit', 5), args.get('form', '10-K'))
+
+        # Dilution / share count
+        elif name == 'get_share_count_series':
+          return await parent.get_share_count_series(
+            args['ticker'], args.get('limit', 8), args.get('form', '10-Q'))
+        elif name == 'get_shelf_activity':
+          return await parent.get_shelf_activity(
+            args['ticker'], args.get('lookback_days', 730))
 
         # SEC XBRL Tools
         elif name == 'get_revenue_base':
@@ -673,6 +887,44 @@ class WebSearchServer:
     )]
 
   # SEC XBRL Tools
+  async def find_peers_by_sic(self, ticker: str, limit: int = 20) -> List[TextContent]:
+    result = await asyncio.to_thread(find_peers_by_sic, ticker, limit)
+    return [TextContent(type="text", text=safe_json_dumps(result))]
+
+  async def get_sic_code(self, ticker: str) -> List[TextContent]:
+    result = await asyncio.to_thread(get_sic_code, ticker)
+    return [TextContent(type="text", text=safe_json_dumps(result))]
+
+  async def extract_litigation(self, ticker: str,
+                               form_type: str = '10-K') -> List[TextContent]:
+    result = await asyncio.to_thread(extract_litigation, ticker, form_type)
+    return [TextContent(type="text", text=safe_json_dumps(result))]
+
+  async def extract_customer_concentration(self, ticker: str,
+                                           form_type: str = '10-K') -> List[TextContent]:
+    result = await asyncio.to_thread(extract_customer_concentration, ticker, form_type)
+    return [TextContent(type="text", text=safe_json_dumps(result))]
+
+  async def get_debt_maturity_schedule(self, ticker: str,
+                                       form: str = '10-K') -> List[TextContent]:
+    result = await asyncio.to_thread(get_debt_maturity_schedule, ticker, form)
+    return [TextContent(type="text", text=safe_json_dumps(result))]
+
+  async def get_sbc_series(self, ticker: str, limit: int = 5,
+                          form: str = '10-K') -> List[TextContent]:
+    result = await asyncio.to_thread(get_sbc_series, ticker, limit, form)
+    return [TextContent(type="text", text=safe_json_dumps(result))]
+
+  async def get_share_count_series(self, ticker: str, limit: int = 8,
+                                   form: str = '10-Q') -> List[TextContent]:
+    result = await asyncio.to_thread(get_share_count_series, ticker, limit, form)
+    return [TextContent(type="text", text=safe_json_dumps(result))]
+
+  async def get_shelf_activity(self, ticker: str,
+                               lookback_days: int = 730) -> List[TextContent]:
+    result = await asyncio.to_thread(get_shelf_activity, ticker, lookback_days)
+    return [TextContent(type="text", text=safe_json_dumps(result))]
+
   async def get_revenue_base(self, ticker: str, form_type: str = '10-K') -> List[TextContent]:
     result = await asyncio.to_thread(get_revenue_base, ticker, form_type)
     return [TextContent(type="text", text=safe_json_dumps(result))]
