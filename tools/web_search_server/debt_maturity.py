@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from .foreign_issuer import form_mismatch_note
+from .foreign_issuer import form_mismatch_note, not_covered_reason
 from .sec_series import NotCovered, fetch_concept_series
 
 _BASE = "us-gaap:LongTermDebtMaturitiesRepaymentsOfPrincipal"
@@ -85,10 +85,11 @@ def get_debt_maturity_schedule(ticker: str,
             "success": False,
             "wrong_form": bool(mismatch),
             "coverage": "not_covered",
-            "error": mismatch or (
-                      f"{ticker} does not tag long-term debt maturities in "
-                      f"its {form}. This means the split was not disclosed in "
-                      f"XBRL, not that no debt matures."),
+            "error": not_covered_reason(
+                ticker, form,
+                f"{ticker} does not tag long-term debt maturities in its "
+                f"{form}. This means the split was not disclosed in XBRL, "
+                f"not that no debt matures."),
             "by_year": by_year,
             "total": None,
             "buckets_found": 0,

@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from .foreign_issuer import form_mismatch_note
+from .foreign_issuer import form_mismatch_note, not_covered_reason
 from .sec_series import NotCovered, _period_rank, fetch_concept_series
 
 NET_INCOME_CONCEPTS = (
@@ -257,10 +257,11 @@ def get_accruals_quality(ticker: str, limit: int = 2,
         return {
             "ticker": ticker, "success": False, "coverage": "not_covered",
             "wrong_form": bool(mismatch),
-            "error": mismatch or (
-                      f"{ticker} does not tag {' and '.join(missing)} in the "
-                      f"last {limit} {form} filings, so accruals cannot be "
-                      f"computed. This is a tagging gap, not zero accruals."),
+            "error": not_covered_reason(
+                ticker, form,
+                f"{ticker} does not tag {' and '.join(missing)} in the last "
+                f"{limit} {form} filings, so accruals cannot be computed. "
+                f"This is a tagging gap, not zero accruals."),
             "periods": [], "latest": None, "trend": None, "flag": None,
             "concepts_tried": tried,
         }
@@ -374,10 +375,11 @@ def get_working_capital_trends(ticker: str, limit: int = 2,
     if not rev_rows:
         return {
             "ticker": ticker, "success": False, "coverage": "not_covered",
-            "error": form_mismatch_note(ticker, form) or (
-                      f"{ticker} does not tag revenue in the last {limit} "
-                      f"{form} filings. Every ratio here is per revenue-day, "
-                      f"so none can be computed."),
+            "error": not_covered_reason(
+                ticker, form,
+                f"{ticker} does not tag revenue in the last {limit} {form} "
+                f"filings. Every ratio here is per revenue-day, so none can "
+                f"be computed."),
             "periods": [], "latest": None, "concepts_tried": tried,
         }
     if not (ar_rows or inv_rows or ap_rows):
@@ -524,11 +526,11 @@ def get_operating_leases(ticker: str, limit: int = 1,
     if liability is None and rou_asset is None and buckets_found == 0:
         return {
             "ticker": ticker, "success": False, "coverage": "not_covered",
-            "error": form_mismatch_note(ticker, form) or (
-                      f"{ticker} tags no operating-lease concepts in its "
-                      f"{form}. Either the filer has no material operating "
-                      f"leases or it did not tag them; this is not a zero "
-                      f"obligation."),
+            "error": not_covered_reason(
+                ticker, form,
+                f"{ticker} tags no operating-lease concepts in its {form}. "
+                f"Either the filer has no material operating leases or it "
+                f"did not tag them; this is not a zero obligation."),
             "lease_liability": None, "lease_liability_current": None,
             "lease_liability_noncurrent": None, "right_of_use_asset": None,
             "maturity_schedule": schedule, "buckets_found": 0,

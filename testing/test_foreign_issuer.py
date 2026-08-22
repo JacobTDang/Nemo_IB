@@ -671,3 +671,58 @@ def test_a_domestic_filer_is_byte_for_byte_unaffected():
     assert result["currency"] == "USD"
     assert result["revenue_base"] > 3.0e11
     assert result["note"] is None
+
+
+# --------------------------------------------------------------------------
+# The taxonomy caveat: an IFRS filer asked on its OWN form.
+#
+# Every concept chain in this package outside foreign_issuer is us-gaap. Ask
+# get_debt_maturity_schedule("SAP", form="20-F") and there is no form mismatch
+# to report, yet "SAP does not tag long-term debt maturities in its 20-F"
+# still reads as a company that did not disclose one. SAP's 20-F tags
+# ifrs-full:MaturityAnalysisForNonderivativeFinancialLiabilities,
+# ifrs-full:BondsIssuedUndiscountedCashFlows and 24 other debt elements --
+# verified live. The absence is this tool's, not SAP's.
+# --------------------------------------------------------------------------
+
+def test_an_ifrs_filer_on_its_own_form_is_told_the_chain_is_us_gaap(monkeypatch):
+    from tools.web_search_server import debt_maturity as dm
+    _foreign(monkeypatch, "SAP", "20-F", "2026-02-26")
+    monkeypatch.setattr(dm, "fetch_concept_series",
+                        lambda t, c, **k: (_ for _ in ()).throw(NotCovered(c)))
+    result = dm.get_debt_maturity_schedule("SAP", form="20-F")
+    assert result["wrong_form"] is False  # the form asked for was correct
+    assert "us-gaap concepts" in result["error"]
+    assert "get_foreign_filer_profile" in result["error"]
+    # The tool's own message survives; the caveat is added to it.
+    assert "does not tag long-term debt maturities" in result["error"]
+
+
+def test_a_domestic_filer_gets_no_taxonomy_caveat(monkeypatch):
+    from tools.web_search_server import debt_maturity as dm
+    monkeypatch.setattr(fi, "_annual_filing_index",
+                        lambda t: {"10-K": "2026-02-05"})
+    monkeypatch.setattr(dm, "fetch_concept_series",
+                        lambda t, c, **k: (_ for _ in ()).throw(NotCovered(c)))
+    error = dm.get_debt_maturity_schedule("F")["error"]
+    assert "us-gaap concepts" not in error
+    assert "foreign private issuer" not in error
+
+
+def test_the_form_mismatch_still_wins_over_the_caveat(monkeypatch):
+    """Both apply to TSM asked on 10-K. The mismatch is the actionable one and
+    should not be buried behind a message about a filing that does not exist."""
+    from tools.web_search_server import debt_maturity as dm
+    _foreign(monkeypatch)
+    monkeypatch.setattr(dm, "fetch_concept_series",
+                        lambda t, c, **k: (_ for _ in ()).throw(NotCovered(c)))
+    error = dm.get_debt_maturity_schedule("TSM")["error"]
+    assert "does not tag long-term debt maturities" not in error
+    assert "Re-run with form='20-F'" in error
+
+
+def test_the_caveat_never_raises(monkeypatch):
+    def boom(ticker):
+        raise RuntimeError("EDGAR timeout")
+    monkeypatch.setattr(fi, "_annual_filing_index", boom)
+    assert fi.not_covered_reason("TSM", "20-F", "original") == "original"

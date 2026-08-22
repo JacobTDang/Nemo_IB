@@ -25,7 +25,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional
 
-from .foreign_issuer import form_mismatch_note
+from .foreign_issuer import form_mismatch_note, not_covered_reason
 from .sec_series import NotCovered, fetch_concept_series
 
 RPO_CONCEPTS = (
@@ -128,10 +128,11 @@ def get_contracted_revenue(ticker: str, limit: int = 3,
         return {
             "ticker": ticker, "success": False,
             "wrong_form": bool(mismatch),
-            "error": mismatch or (
-                      f"contracted revenue not covered: neither "
-                      f"{RPO_CONCEPTS[0]} nor any deferred-revenue concept "
-                      f"appears in the last {limit} {form} filings"),
+            "error": not_covered_reason(
+                ticker, form,
+                f"contracted revenue not covered: neither {RPO_CONCEPTS[0]} "
+                f"nor any deferred-revenue concept appears in the last "
+                f"{limit} {form} filings."),
             "rpo": [], "deferred_revenue": [],
             "rpo_concept_used": None, "deferred_concept_used": None,
         }
@@ -234,8 +235,10 @@ def get_geographic_revenue(ticker: str, limit: int = 1,
     return {
         "ticker": ticker, "success": False,
         "wrong_form": bool(mismatch),
-        "error": mismatch or (
-            f"{ticker} does not disaggregate revenue by geography in its {form}"),
+        "error": not_covered_reason(
+            ticker, form,
+            f"{ticker} does not disaggregate revenue by geography in its "
+            f"{form}."),
         "by_region": [], "regions_found": [],
     }
 
@@ -254,9 +257,12 @@ def get_public_float(ticker: str, form: str = "10-K") -> Dict[str, Any]:
         return {
             "ticker": ticker, "success": False,
             "wrong_form": bool(mismatch),
-            "error": mismatch or (
-                      f"{ticker} does not tag {FLOAT_CONCEPT} in its {form}. "
-                      f"Smaller reporting companies sometimes omit it."),
+            "error": not_covered_reason(
+                ticker, form,
+                f"{ticker} does not tag {FLOAT_CONCEPT} in its {form}. "
+                f"Smaller reporting companies sometimes omit it, and foreign "
+                f"private issuers generally do not report float on a 20-F "
+                f"cover page at all."),
             "public_float": None, "filing_date": None,
         }
     latest = rows[0]

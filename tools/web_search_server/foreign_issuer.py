@@ -395,6 +395,39 @@ def form_mismatch_note(ticker: str, form_type: str) -> Optional[str]:
         f"currency its filings use.")
 
 
+def not_covered_reason(ticker: str, form_type: str, fallback: str) -> str:
+    """The honest reason a tool found nothing, given who this filer is.
+
+    Three cases, in order. A form mismatch is the loudest and gets the whole
+    message. Otherwise, a foreign private issuer asked on its own form still
+    warrants a caveat, because every concept chain in this package outside
+    this module is us-gaap: an IFRS filer does not tag those elements at all,
+    which is a gap in the tool and reads exactly like a company that chose
+    not to disclose. Otherwise the caller's own message stands -- Ford tagging
+    no debt maturities is a real finding about Ford.
+
+    Never raises; a failure to explain must not become a second failure.
+    """
+    try:
+        mismatch = form_mismatch_note(ticker, form_type)
+        if mismatch:
+            return mismatch
+        form, _ = _latest_annual_form(ticker)
+        if form not in FOREIGN_ANNUAL_FORMS:
+            return fallback
+        return (
+            f"{fallback} NOTE: {ticker} is a foreign private issuer filing "
+            f"{form}, and this tool reads us-gaap concepts. Roughly half of "
+            f"20-F filers report under IFRS instead (TSM, SAP and NVO do; "
+            f"ASML and BABA do not), and an IFRS filer does not tag us-gaap "
+            f"elements at all -- so an empty result here may be this tool's "
+            f"limit rather than the company's silence. Call "
+            f"get_foreign_filer_profile('{ticker}') for the taxonomy before "
+            f"concluding anything.")
+    except Exception:  # noqa: BLE001 - see docstring
+        return fallback
+
+
 def _revenue_chains(taxonomy: Optional[str]) -> Tuple[Tuple[str, ...], ...]:
     """Both concept chains, best guess first.
 
@@ -438,11 +471,13 @@ def get_annual_revenue(ticker: str, limit: int = 3,
             "series": [], "concept_used": None, "concepts_tried": [],
         }
 
-    if taxonomy_hint is None:
+    if taxonomy_hint is None and form != "10-K":
+        # Only worth an XBRL parse for a form that could be either. A domestic
+        # registrant must report under US GAAP, so a 10-K needs no probe and
+        # the common path stays one filing fetch rather than two.
         try:
-            profile = get_foreign_filer_profile(ticker)
-            taxonomy_hint = profile.get("taxonomy")
-        except Exception:  # noqa: BLE001 - ordering is an optimisation
+            taxonomy_hint = get_foreign_filer_profile(ticker).get("taxonomy")
+        except Exception:  # noqa: BLE001 - chain ordering is an optimisation
             taxonomy_hint = None
 
     tried: List[str] = []

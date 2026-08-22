@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional
 
 from edgar import Company
 
-from .foreign_issuer import form_mismatch_note
+from .foreign_issuer import form_mismatch_note, not_covered_reason
 from .sec_series import NotCovered, _require_identity, fetch_concept_series
 
 SHARES_CONCEPT = "dei:EntityCommonStockSharesOutstanding"
@@ -73,7 +73,7 @@ def _failure(ticker: str, message: str,
         "ticker": ticker,
         "success": False,
         "wrong_form": bool(mismatch),
-        "error": mismatch or message,
+        "error": not_covered_reason(ticker, form, message) if form else message,
         "latest_total": None,
         "by_class": {},
         "classes_found": [],
