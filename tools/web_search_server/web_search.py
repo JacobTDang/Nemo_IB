@@ -6,6 +6,7 @@ from datetime import date, datetime
 from tools.web_search_server.searxng_client import searxng_search
 from tools.web_search_server.scraper import scrape_urls
 from agent.cache import Session_Cache
+from tools.web_search_server.sbc import get_sbc_series
 from tools.web_search_server.dilution import (
   get_share_count_series,
   get_shelf_activity,
@@ -588,6 +589,30 @@ class WebSearchServer:
             },
             "required": ["ticker"]
           }
+        ),
+        Tool(
+          name="get_sbc_series",
+          description=(
+            "Stock-based compensation over recent annual filings, with its share "
+            "of revenue and of operating cash flow.\n\n"
+            "SBC is the largest single line between GAAP earnings and the adjusted "
+            "figures companies prefer to be judged on, and it is the other engine "
+            "of dilution alongside shelf issuance. A company whose SBC is a large "
+            "and rising share of revenue is paying employees with your ownership.\n\n"
+            "Returns the consolidated figure per filing, not a sum of award-type "
+            "breakdowns -- filers tag dozens of component facts and adding them "
+            "would report several times the real expense. 'concept_used' names "
+            "which XBRL tag the figure came from."
+          ),
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Ticker symbol"},
+              "limit":  {"type": "integer", "description": "How many filings to walk back", "default": 5},
+              "form":   {"type": "string", "description": "10-K for annual, 10-Q for quarterly", "default": "10-K"}
+            },
+            "required": ["ticker"]
+          }
         )]
 
     @self.server.call_tool()
@@ -598,6 +623,10 @@ class WebSearchServer:
           return result
         elif name == 'get_urls_content':
           return await parent.get_urls_content(args['urls'])
+
+        elif name == 'get_sbc_series':
+          return await parent.get_sbc_series(
+            args['ticker'], args.get('limit', 5), args.get('form', '10-K'))
 
         # Dilution / share count
         elif name == 'get_share_count_series':
@@ -732,6 +761,11 @@ class WebSearchServer:
     )]
 
   # SEC XBRL Tools
+  async def get_sbc_series(self, ticker: str, limit: int = 5,
+                          form: str = '10-K') -> List[TextContent]:
+    result = await asyncio.to_thread(get_sbc_series, ticker, limit, form)
+    return [TextContent(type="text", text=safe_json_dumps(result))]
+
   async def get_share_count_series(self, ticker: str, limit: int = 8,
                                    form: str = '10-Q') -> List[TextContent]:
     result = await asyncio.to_thread(get_share_count_series, ticker, limit, form)
