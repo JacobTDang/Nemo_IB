@@ -18,6 +18,10 @@ from tools.web_search_server.earnings_quality import (
 )
 from tools.web_search_server.peers import find_peers_by_sic, get_sic_code
 from tools.web_search_server.debt_maturity import get_debt_maturity_schedule
+from tools.web_search_server.foreign_issuer import (
+  get_annual_revenue,
+  get_foreign_filer_profile,
+)
 from tools.web_search_server.sbc import get_sbc_series
 from tools.web_search_server.dilution import (
   get_share_count_series,
@@ -130,7 +134,17 @@ def _build_all_tools() -> List[Tool]:
         # SEC XBRL Tools
         Tool(
           name="get_revenue_base",
-          description="Get company's primary revenue from SEC filings (10-K/10-Q)",
+          description=(
+            "Company's primary revenue from SEC filings.\n\n"
+            "Reports 'currency' -- do not assume dollars. Pass form_type='20-F' "
+            "('40-F' for Canada) for a foreign private issuer such as TSM, "
+            "ASML, SAP, NVO or BABA; those route to the guarded reader that "
+            "takes the consolidated undimensioned fact, because an IFRS filer "
+            "also tags constant-currency and pro-forma variants that look like "
+            "revenue. With the default 10-K an ADR gets an explanation of the "
+            "form mismatch rather than an empty result. Prefer "
+            "get_annual_revenue when you do not know which form applies."
+          ),
           inputSchema={
             "type": "object",
             "properties": {
@@ -761,11 +775,24 @@ def _build_all_tools() -> List[Tool]:
             "country codes with company-specific groupings, so check "
             "'regions_found'. Percentages are of the disclosed geographic total, "
             "which can differ from consolidated revenue when part is grouped "
-            "under 'other'."
+            "under 'other'.\n\n"
+            "'members_overlap' true means the filer tagged nested regions on "
+            "one axis -- SAP tags EMEA, EMEA-excluding-Germany and Germany "
+            "together -- so percentages are of consolidated revenue and do NOT "
+            "sum to 100. Read regions individually and never add them.\n\n"
+            "For an ADR pass form='20-F' ('40-F' for Canada); with the default "
+            "10-K the result explains the mismatch instead of reporting no "
+            "geographic disclosure. IFRS filers are covered -- TSM splits 74% "
+            "United States, 9% China, 8% Taiwan."
           ),
           inputSchema={
             "type": "object",
-            "properties": {"ticker": {"type": "string", "description": "Ticker symbol"}},
+            "properties": {
+              "ticker": {"type": "string", "description": "Ticker symbol"},
+              "form":   {"type": "string",
+                         "description": "10-K, or 20-F/40-F for a foreign private issuer",
+                         "default": "10-K"}
+            },
             "required": ["ticker"]
           }
         ),
@@ -782,11 +809,19 @@ def _build_all_tools() -> List[Tool]:
             "total shares means less stock changes hands than the share count "
             "implies. Measured at the filer's second-quarter close, so it lags; "
             "'as_of' gives the measurement date rather than leaving you to "
-            "assume it is current."
+            "assume it is current.\n\n"
+            "Foreign private issuers file 20-F; pass form='20-F' for one. With "
+            "the default the result says so rather than implying no float was "
+            "disclosed."
           ),
           inputSchema={
             "type": "object",
-            "properties": {"ticker": {"type": "string", "description": "Ticker symbol"}},
+            "properties": {
+              "ticker": {"type": "string", "description": "Ticker symbol"},
+              "form":   {"type": "string",
+                         "description": "10-K, or 20-F/40-F for a foreign private issuer",
+                         "default": "10-K"}
+            },
             "required": ["ticker"]
           }
         ),
@@ -894,7 +929,8 @@ def _build_all_tools() -> List[Tool]:
             },
             "required": ["ticker"]
           }
-        ),        Tool(
+        ),
+        Tool(
           name="extract_guidance",
           description=(
             "Company-issued forward guidance, verbatim, from 8-K Item 2.02 "
@@ -938,6 +974,81 @@ def _build_all_tools() -> List[Tool]:
             "properties": {
               "ticker":   {"type": "string", "description": "Ticker symbol"},
               "quarters": {"type": "integer", "description": "How many recent earnings releases to scan", "default": 4}
+            },
+            "required": ["ticker"]
+          }
+        ),
+        Tool(
+          name="get_foreign_filer_profile",
+          description=(
+            "Which SEC forms a company actually files, under which accounting "
+            "standard, in which currency.\n\n"
+            "CALL THIS FIRST for any ADR or non-US company -- TSM, ASML, BABA, "
+            "SAP, NVO, BCE, TM, SHOP. Foreign private issuers file 20-F (or "
+            "40-F for Canada) instead of 10-K, and every other SEC tool here "
+            "defaults to 10-K. Without this you cannot tell \"foreign issuer, "
+            "use its form\" from \"nothing to report\", and the second reading "
+            "is how an ADR gets a clean bill of health it never earned.\n\n"
+            "'is_foreign_private_issuer' is decided by the MOST RECENT annual "
+            "form, not by history: Shopify filed 40-F through 2024 and files "
+            "10-K now, so it reads false. null means no annual filing was found "
+            "at all, which is a lookup failure rather than an answer.\n\n"
+            "'taxonomy' is read from the filing, not guessed from the form, "
+            "because the two disagree. TSM, SAP and NVO file 20-F under IFRS "
+            "(ifrs-full concepts); ASML and BABA file the same form under US "
+            "GAAP. Picking concepts from the form would miss two of those "
+            "five.\n\n"
+            "'interim_xbrl' false is the field to act on. A foreign issuer "
+            "reports interim results on 6-K, and 6-K carries NO XBRL at all -- "
+            "verified across TSM, ASML and BABA. No quarterly tagged figure "
+            "exists for these filers anywhere, so any 10-Q-based tool "
+            "(get_share_count_series, quarterly accruals) cannot be served for "
+            "them at all. Use the annual form.\n\n"
+            "'reporting_currency' is never assumed to be USD: TSM reports TWD, "
+            "SAP and ASML EUR, NVO DKK, BABA CNY. When "
+            "'usd_convenience_translation' is true the filer also tagged a "
+            "dollar figure for the latest year at its own rate -- their number, "
+            "not a live conversion. A null currency means the filing's units "
+            "were untagged or opaque, not that it reports in dollars."
+          ),
+          inputSchema={
+            "type": "object",
+            "properties": {"ticker": {"type": "string", "description": "Ticker symbol"}},
+            "required": ["ticker"]
+          }
+        ),
+        Tool(
+          name="get_annual_revenue",
+          description=(
+            "Consolidated annual revenue in the currency it was actually "
+            "reported in, for domestic and foreign filers alike.\n\n"
+            "Use this instead of get_revenue_base whenever the company might "
+            "not be American, or when you do not know. It resolves the annual "
+            "form itself (10-K, 20-F or 40-F) and tries both the IFRS and US "
+            "GAAP concept chains, so an ADR does not cost a second call to "
+            "discover which form to ask for.\n\n"
+            "ALWAYS read 'currency' before using 'latest_revenue'. TSM's FY2025 "
+            "revenue is 3,809,054,300,000 -- New Taiwan dollars, about $121bn. "
+            "Read as dollars it overstates the company roughly 31x, and nothing "
+            "about the number looks wrong. 'latest_revenue_usd' is populated "
+            "only when the filer itself tagged a dollar convenience translation "
+            "(TSM and BABA do) or reports in dollars already; "
+            "'usd_is_filer_translation' says which. It is never computed here, "
+            "and null does NOT mean the company is small.\n\n"
+            "A concept only answers if it answers in the newest annual filing. "
+            "TSM stopped tagging ifrs-full:Revenue undimensioned in 2026, and "
+            "accepting the older filings' rows reported FY2024 as current -- a "
+            "year stale and 24% low. success:false with 'concepts_tried' means "
+            "this filer tags revenue under an element in neither chain, or only "
+            "with dimensions."
+          ),
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Ticker symbol"},
+              "limit":  {"type": "integer",
+                         "description": "Annual filings to walk for history",
+                         "default": 3}
             },
             "required": ["ticker"]
           }
@@ -1018,9 +1129,16 @@ class WebSearchServer:
         elif name == 'get_contracted_revenue':
           return await parent.get_contracted_revenue(args['ticker'], args.get('limit', 3))
         elif name == 'get_geographic_revenue':
-          return await parent.get_geographic_revenue(args['ticker'])
+          return await parent.get_geographic_revenue(
+            args['ticker'], args.get('form', '10-K'))
         elif name == 'get_public_float':
-          return await parent.get_public_float(args['ticker'])
+          return await parent.get_public_float(
+            args['ticker'], args.get('form', '10-K'))
+        elif name == 'get_foreign_filer_profile':
+          return await parent.get_foreign_filer_profile(args['ticker'])
+        elif name == 'get_annual_revenue':
+          return await parent.get_annual_revenue(
+            args['ticker'], args.get('limit', 3))
         elif name == 'get_accruals_quality':
           return await parent.get_accruals_quality(
             args['ticker'], args.get('limit', 2), args.get('form', '10-K'))
@@ -1187,12 +1305,23 @@ class WebSearchServer:
     result = await asyncio.to_thread(get_contracted_revenue, ticker, limit)
     return [TextContent(type="text", text=safe_json_dumps(result))]
 
-  async def get_geographic_revenue(self, ticker: str) -> List[TextContent]:
-    result = await asyncio.to_thread(get_geographic_revenue, ticker)
+  async def get_geographic_revenue(self, ticker: str,
+                                   form: str = '10-K') -> List[TextContent]:
+    result = await asyncio.to_thread(get_geographic_revenue, ticker, 1, form)
     return [TextContent(type="text", text=safe_json_dumps(result))]
 
-  async def get_public_float(self, ticker: str) -> List[TextContent]:
-    result = await asyncio.to_thread(get_public_float, ticker)
+  async def get_public_float(self, ticker: str,
+                             form: str = '10-K') -> List[TextContent]:
+    result = await asyncio.to_thread(get_public_float, ticker, form)
+    return [TextContent(type="text", text=safe_json_dumps(result))]
+
+  async def get_foreign_filer_profile(self, ticker: str) -> List[TextContent]:
+    result = await asyncio.to_thread(get_foreign_filer_profile, ticker)
+    return [TextContent(type="text", text=safe_json_dumps(result))]
+
+  async def get_annual_revenue(self, ticker: str,
+                               limit: int = 3) -> List[TextContent]:
+    result = await asyncio.to_thread(get_annual_revenue, ticker, limit)
     return [TextContent(type="text", text=safe_json_dumps(result))]
 
   async def get_accruals_quality(self, ticker: str, limit: int = 2,
