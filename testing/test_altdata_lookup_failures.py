@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import datetime
 
 import pytest
 import requests
@@ -620,6 +621,118 @@ def test_policy_live_unknown_ticker_fails():
 
     assert out["success"] is False
     assert out["reason"] == "unknown_ticker"
+
+
+# ---------------------------------------------------------------------------
+# get_government_contracts
+# ---------------------------------------------------------------------------
+
+def _usaspending(monkeypatch, *, trailing=0.0, prior=0.0, agencies=None,
+                  count=0, fail=()):
+    """Patch the four USASpending queries. Names in `fail` raise instead."""
+    calls = []
+
+    def obligations(company_name, start, end, award_types):
+        # The two windows run concurrently, so identify by date, not by order:
+        # only the trailing window ends today.
+        window = "trailing" if end == datetime.now().strftime("%Y-%m-%d") else "prior"
+        calls.append(("obligations", window))
+        if window in fail:
+            raise requests.exceptions.HTTPError("500 Server Error")
+        return trailing if window == "trailing" else prior
+
+    def top_agencies(*a):
+        calls.append(("agencies", None))
+        if "agencies" in fail:
+            raise requests.exceptions.HTTPError("500 Server Error")
+        return agencies or []
+
+    def award_count(*a):
+        calls.append(("count", None))
+        if "count" in fail:
+            raise requests.exceptions.HTTPError("500 Server Error")
+        return count
+
+    monkeypatch.setattr(alt, "_usa_obligations_total", obligations)
+    monkeypatch.setattr(alt, "_usa_top_agencies", top_agencies)
+    monkeypatch.setattr(alt, "_usa_award_count", award_count)
+    return calls
+
+
+def test_gov_unknown_ticker_is_a_failure(monkeypatch):
+    _fake_yfinance(monkeypatch)
+    calls = _usaspending(monkeypatch)
+
+    out = alt._fetch_government_contracts("ZZZZ", "", 12, False)
+
+    assert out["success"] is False
+    assert out["reason"] == "unknown_ticker"
+    assert out["signal"] is None, "judged a company that does not exist"
+    assert calls == [], "queried USASpending for a symbol that does not exist"
+
+
+def test_gov_zero_obligations_for_a_real_company_is_a_genuine_zero(monkeypatch):
+    _usaspending(monkeypatch, trailing=0.0, prior=0.0, count=0)
+
+    out = alt._fetch_government_contracts("KO", "Coca-Cola Company", 12, False)
+
+    assert out["success"] is True
+    assert out["coverage"] == "full"
+    assert out["trailing_awards_usd"] == 0
+    assert out["signal"] == "not_applicable"
+
+
+def test_gov_trailing_query_failure_is_a_failed_lookup(monkeypatch):
+    _usaspending(monkeypatch, fail=("trailing",))
+
+    out = alt._fetch_government_contracts("LMT", "Lockheed Martin", 12, False)
+
+    assert out["success"] is False
+    assert out["coverage"] == "not_covered"
+    assert out["reason"] == "provider_unavailable"
+    assert "usaspending" in out["error"].lower()
+
+
+def test_gov_prior_query_failure_is_partial_not_a_zero_prior(monkeypatch):
+    """A failed prior fetch read as "no prior federal business", which
+    manufactures a new-entrant story."""
+    _usaspending(monkeypatch, trailing=45e9, count=10, fail=("prior",))
+
+    out = alt._fetch_government_contracts("LMT", "Lockheed Martin", 12, False)
+
+    assert out["success"] is True
+    assert out["coverage"] == "partial"
+    assert out["prior_period_awards_usd"] is None
+    assert out["signal"] != "bullish"
+    assert any("prior" in e for e in out["partial_errors"])
+
+
+def test_gov_handler_envelope_reports_the_failure(monkeypatch):
+    _fake_yfinance(monkeypatch)
+    _usaspending(monkeypatch)
+
+    payload = _envelope(_run(alt.AltDataServer().government_contracts(
+        {"ticker": "ZZZZ"})))
+
+    assert payload["success"] is False
+    assert payload["data"]["reason"] == "unknown_ticker"
+
+
+@network
+def test_gov_live_unknown_ticker_fails():
+    out = alt._fetch_government_contracts("ZZZZ", "", 12, False)
+
+    assert out["success"] is False
+    assert out["reason"] == "unknown_ticker"
+
+
+@network
+def test_gov_live_defense_prime_is_covered():
+    out = alt._fetch_government_contracts("LMT", "Lockheed Martin", 12, False)
+
+    assert out["success"] is True, out.get("error")
+    assert out["coverage"] == "full"
+    assert out["trailing_awards_usd"] > 0
 
 
 @network

@@ -955,8 +955,20 @@ def _gov_windows(today, months: int):
 
 def _fetch_government_contracts(ticker: str, company_name: str,
                                   months: int, include_grants: bool) -> Dict[str, Any]:
+    base = {"ticker": ticker, "company_name": company_name or None,
+            "period_months": months, "trailing_awards_usd": None,
+            "prior_period_awards_usd": None, "yoy_change_pct": None,
+            "signal": None, "top_agencies": [], "source": "usaspending.gov"}
+
+    # An explicit company_name is the caller asserting the entity; only derive
+    # it when they did not, and refuse to search for a symbol that does not
+    # resolve (USASpending answers "$0 of federal business" for any string).
     if not company_name:
-        company_name = _ticker_to_company_name(ticker)
+        try:
+            company_name = _resolve_ticker(ticker)["name"]
+        except LookupFailure as exc:
+            return _lookup_failed(exc, **base)
+        base["company_name"] = company_name
 
     trailing_start, end, prior_start, prior_end = _gov_windows(datetime.now(), months)
 
@@ -986,8 +998,14 @@ def _fetch_government_contracts(ticker: str, company_name: str,
 
     # Trailing obligations drive the core YoY signal; without it we cannot proceed.
     if "trailing" not in results:
-        return {"error": f"USASpending.gov request failed: {'; '.join(errors) or 'no data'}",
-                "ticker": ticker}
+        return {
+            **base, "company_name": company_name,
+            "success": False, "coverage": "not_covered",
+            "reason": "provider_unavailable",
+            "error": (f"USASpending.gov returned no trailing obligations for "
+                      f"{company_name!r}: {'; '.join(errors) or 'no data'}"),
+            "partial_errors": errors,
+        }
 
     trailing_total = results.get("trailing", 0) or 0
     # MISSING is not ZERO: a failed prior fetch must not read as "no prior
@@ -1009,7 +1027,11 @@ def _fetch_government_contracts(ticker: str, company_name: str,
 
     signal = _gov_contracts_signal(trailing_total, prior_total, yoy_pct)
 
+    # prior/agencies/count are supporting detail: missing any of them narrows
+    # the answer without invalidating the trailing total.
     return {
+        "success": True,
+        "coverage": "partial" if errors else "full",
         "company_name": company_name,
         "ticker": ticker,
         "period_months": months,
@@ -1575,6 +1597,11 @@ class AltDataServer:
                         "top awarding agencies, and award count. "
                         "Signal: YoY > +15% = bullish; YoY < -15% = bearish; "
                         "< $10M total = not_applicable (consumer/B2C company). "
+                        "A ticker the quote provider cannot resolve returns success=false "
+                        "(USASpending answers '$0 of federal business' for any string, so "
+                        "an unknown company would otherwise read as a real zero). If the "
+                        "prior-period, agency or count query fails the trailing total is "
+                        "still returned with coverage='partial' and the failures named. "
                         "Most relevant for: defense (LMT, RTX, NOC), cloud (AMZN, MSFT), "
                         "IT services, biotech (with include_grants=true)."
                     ),
@@ -1750,9 +1777,7 @@ class AltDataServer:
         except Exception as exc:
             return _err("get_government_contracts",
                         f"{type(exc).__name__}: {str(exc)[:200]}", ticker)
-        if "error" in result:
-            return _err("get_government_contracts", result["error"], ticker)
-        return _ok("get_government_contracts", result, ticker)
+        return _dispatch("get_government_contracts", result, ticker)
 
     async def policy_signals(self, args: Dict[str, Any]) -> List[TextContent]:
         ticker = str(args.get("ticker", "")).upper()
