@@ -87,8 +87,11 @@ Unblocks 14 tests.
 
 ### D2 — One service-gate module
 
-`testing/_gates.py` exporting `requires_llm`, `requires_searxng`, `requires_playbook`,
-and `requires_sec`. Each skips with a reason naming exactly what is missing, and flips
+`testing/_gates.py` exporting `requires_groq`, `requires_openrouter`, `requires_searxng`,
+`requires_playbook`, and `requires_sec`. The two LLM gates are separate because the
+providers are separately configured and separately broken: `OPENROUTER_API_KEY` is set,
+while `GROQ_API_KEY` is present as a name with an empty value. A single `requires_llm`
+would skip OpenRouter-backed tests that can actually run. Each skips with a reason naming exactly what is missing, and flips
 to a hard failure under `NEMO_REQUIRE_SERVICES=1`.
 
 This replaces the dead `network` alias at `testing/test_altdata_tools.py:31`, which is a
@@ -157,7 +160,57 @@ fail-loud rule.
   sets the `NEMO_CACHE_DB_PATH` override that same file exists to protect. Assert the
   invariant (different files), and test the default separately. This defect was
   introduced on the truth-source branch.
+- **The OpenRouter model pool trusts a malformed override.** Three stacked defects,
+  confirmed at runtime — every `OpenRouterModel` built without an explicit model name
+  currently defaults to the literal string
+  `'# optional override; if unset, pool auto-resolves'`:
+  1. `.env.example:3` ships `PRIMARY_REASONING_MODEL=` followed by an inline comment.
+     dotenv reads the comment as the value, so every clone inherits this. Fix the
+     template, not just one machine's `.env`.
+  2. `_build_reasoning_pool()` (`agent/openrouter_template.py:56-86`) puts the override
+     at position 0 without checking it looks like `vendor/model`.
+  3. `_verify_model_alive()` (`:24-42`) ends in `except Exception: return True`, so the
+     malformed id's error was swallowed and the string was declared alive. **This is the
+     load-bearing defect** — the pool's own guard is what let the garbage through, and a
+     bare `except: return True` is precisely the silent fallback the project forbids.
+     Distinguish a malformed-request error from a transient one (rate limit, auth)
+     instead of treating every non-404 as healthy.
 - Delete the untracked scratch files `debug_test.xlsx` and `simple_test.xlsx`.
+
+## Which components actually need an LLM
+
+Established 2026-08-21 by importing every server with all LLM keys unset, then tracing
+each tool handler. This scopes what D2 gates and what the 24/7 server needs.
+
+| Component | Needs an LLM? | Evidence |
+|---|---|---|
+| All 8 MCP servers | **No** | all import with every key unset; every handler traces to deterministic code |
+| `rss_aggregator`, `gdelt_poller`, `news_watcher` | **Yes — Groq** | all three import `Materiality_Classifier(GroqModel)` |
+| `main.py` front-end | **Yes — Groq + OpenRouter** | `WorkFlow.__init__` constructs `Bull_Agent`/`Bear_Agent`/`Arbiter_Agent`, all `GroqModel` |
+| `falsifier_watcher`, `sentry_triage`, `sentry_discovery` | No | `falsifier_evaluator`, `event_scorer`, `rag.search` are deterministic |
+
+The apparent tool-layer dependencies on the agent cluster are not real: `Risk_Officer` is
+plain dataclasses, `analysis_tools.py:145` is a comment, and `tools/alpaca/server.py:206`
+imports `ArbiterVerdict`, a pydantic schema.
+
+**Consequence:** the truth-source servers need no LLM credential at all. Everything the
+28 gated LLM tests cover belongs to the news daemons or to the second front-end.
+
+**Current state:** `GROQ_API_KEY` is set to an empty value, so `main.py` and all three
+news daemons raise on construction today. This is configuration, not a code defect, and
+is not in scope here beyond being recorded.
+
+## Deferred: the second front-end
+
+`main.py` drives a LangGraph workflow over 12 `agent/*_Agent.py` modules that reference
+only each other — zero references from `tools/`, `daemons/`, or `.claude/skills/`. It
+reaches only 4 of the 8 MCP servers (no alpaca, sentry, or altdata), so it cannot trade,
+run the sentry queue, or use the merged options tool.
+
+It resembles dead code but is not: `main.py:9` imports it, and it is the only headless
+path that runs without a Claude Code session. **Keep or retire is a product decision and
+gets its own spec.** This spec gates its tests and changes nothing about it.
+
 
 ## Ordering
 
@@ -189,6 +242,11 @@ D4, D5, D6, D7 are independent of each other and of everything above.
    merge: agreement under degenerate conditions is not evidence.
 6. **Schema proof (D4).** Against a fresh database, `init_schema()` alone must create
    `falsifier_alerts`, and the sentry tool must raise rather than return a note.
+7. **Model-pool proof (D7).** Given `PRIMARY_REASONING_MODEL` set to a non-model string,
+   the pool must reject it rather than seat it at position 0. Test `_verify_model_alive`
+   directly against a malformed id and against a simulated rate-limit error: the first
+   must return False, the second True. Asserting only the pool's final contents would
+   pass even if the override were dropped for the wrong reason.
 
 ## Risks
 
