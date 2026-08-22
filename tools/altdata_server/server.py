@@ -619,10 +619,22 @@ def _fetch_taiwan_revenue_finmind(company_codes: List[str], months: int) -> Dict
             results[code] = {"error": f"{type(exc).__name__}: {str(exc)[:150]}"}
             continue
 
-        if payload.get("status") != 200 or not payload.get("data"):
+        if payload.get("status") != 200:
             results[code] = {
                 "error": (f"FinMind status {payload.get('status')}: "
-                          f"{payload.get('msg', 'no data returned')}")
+                          f"{payload.get('msg', 'no message')}")
+            }
+            continue
+
+        if not payload.get("data"):
+            # FinMind answers an unknown code with status 200 / msg 'success'
+            # and an empty list, which folded into the branch above as the
+            # self-contradicting error "FinMind status 200: success".
+            results[code] = {
+                "error": (f"FinMind returned no TaiwanStockMonthRevenue rows for "
+                          f"code {code} since {start_date}. Check the code is a "
+                          "Taiwan-listed ticker (TSMC=2330, Foxconn=2317, "
+                          "MediaTek=2454, ASE Group=3711).")
             }
             continue
 
