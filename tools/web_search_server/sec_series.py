@@ -26,6 +26,7 @@ that looks entirely plausible.
 from __future__ import annotations
 
 import os
+from datetime import date
 import threading
 import time
 from dataclasses import dataclass, field
@@ -81,6 +82,74 @@ def _throttle() -> None:
         _last_request_at = time.monotonic()
 
 
+def _clean_number(value: Any) -> Optional[float]:
+    """Coerce a cell to a float, treating NaN and blanks as absent.
+
+    pandas yields float('nan') for a missing numeric cell, and nan is truthy.
+    That makes the obvious `row.get(a) or row.get(b)` fallback silently keep the
+    nan instead of falling through, and float(nan) succeeds, so a bad value
+    propagates all the way into the series looking like real data.
+    """
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number:  # NaN
+        return None
+    return number
+
+
+def _clean_period(row: Any) -> str:
+    """Best available period label for a fact.
+
+    Instant concepts (share count) populate period_instant. Duration concepts
+    (SBC, revenue) leave it NaN and carry period_key instead.
+    """
+    def _get(key: str) -> Optional[str]:
+        try:
+            value = row.get(key)
+        except AttributeError:
+            return None
+        if value is None:
+            return None
+        text = str(value)
+        if not text or text.lower() == "nan":
+            return None
+        return text
+
+    return _get("period_instant") or _get("period_key") or ""
+
+
+def _period_rank(period: str) -> tuple:
+    """Sort key for a period label: (end date, span in days).
+
+    Handles "duration_START_END", "instant_DATE", and a bare date. Anything
+    unparseable sorts lowest so it never displaces a well-formed period.
+    """
+    if not period:
+        return ("", -1)
+    text = period.strip()
+    for prefix in ("duration_", "instant_"):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    parts = [p for p in text.split("_") if p]
+    dates: List[date] = []
+    for part in parts:
+        try:
+            dates.append(date.fromisoformat(part))
+        except ValueError:
+            continue
+    if not dates:
+        return ("", -1)
+    if len(dates) == 1:
+        return (dates[0].isoformat(), 0)
+    start, end = min(dates), max(dates)
+    return (end.isoformat(), (end - start).days)
+
+
 def resolve_dimensions(xbrl: Any, context_ref: str) -> Dict[str, str]:
     """Map a fact's context reference to its dimension members.
 
@@ -133,6 +202,35 @@ class FilingPoint:
             return None
         return float(sum(f.value for f in self.facts))
 
+    def undimensioned(self) -> List[ConceptFact]:
+        """Facts carrying no dimensions -- the consolidated figures.
+
+        Dimensioned facts are usually a breakdown of the total, not additions
+        to it. NVDA reports 59+ SBC facts in one 10-K, nearly all split by
+        award type; summing them would report several times the real expense.
+        Share count is the exception where dimensions are additive, which is
+        why `total()` exists separately.
+        """
+        return [f for f in self.facts if not f.dimensions]
+
+    def latest_undimensioned(self) -> Optional[ConceptFact]:
+        """The consolidated fact for the most recent, longest period here.
+
+        A 10-K's XBRL carries three comparative years for a duration concept,
+        and often quarterly durations alongside them. Sorting on the raw period
+        string is wrong: "duration_2025-10-27_2026-01-25" (Q4) sorts above
+        "duration_2025-01-27_2026-01-25" (FY) because "10" > "01" at the month
+        position, so a quarter's figure would be returned as the year's -- a
+        roughly 4x understatement wearing a plausible face.
+
+        Ranked by period end first, then by span, so the annual fact wins over
+        a quarter ending the same day.
+        """
+        candidates = self.undimensioned()
+        if not candidates:
+            return None
+        return max(candidates, key=lambda f: _period_rank(f.period))
+
     def by_axis(self, axis: str) -> Dict[str, float]:
         """Facts keyed by their member on one axis.
 
@@ -177,18 +275,13 @@ def fetch_concept_series(ticker: str, concept: str, form: str = "10-Q",
 
         facts: List[ConceptFact] = []
         for _, row in frame.iterrows():
-            numeric = row.get("numeric_value")
-            if numeric is None:
-                continue
-            try:
-                value = float(numeric)
-            except (TypeError, ValueError):
+            value = _clean_number(row.get("numeric_value"))
+            if value is None:
                 continue
             context_ref = str(row.get("context_ref") or "")
             facts.append(ConceptFact(
                 value=value,
-                period=str(row.get("period_instant")
-                           or row.get("period_key") or ""),
+                period=_clean_period(row),
                 dimensions=resolve_dimensions(xbrl, context_ref),
                 context_ref=context_ref,
             ))
