@@ -1,6 +1,6 @@
-"""Are these earnings real? Accruals and working-capital dynamics.
+"""Are these earnings real? Accruals, working capital, and operating leases.
 
-Two questions the SEC layer could not answer:
+Three questions the SEC layer could not answer:
 
 **Accruals.** Net income rising while operating cash flow does not is the
 classic pre-blowup signature -- earnings arriving as promises rather than cash.
@@ -11,6 +11,11 @@ inventory and payables and stops at net working capital. It never divides them
 by revenue, so receivables growing faster than sales (channel stuffing, or
 customers who have stopped paying) and inventory building ahead of demand were
 both invisible.
+
+**Operating leases.** ASC 842 put them on the balance sheet in 2019. There was
+zero coverage here, which left a hole beside `get_debt_maturity_schedule`: for
+a retailer the lease book is the larger fixed obligation, and it comes due on a
+schedule nobody was reading.
 
 Everything is period-joined on the fiscal period end date, so a balance-sheet
 instant is matched to the income-statement duration that ends the same day.
@@ -75,6 +80,31 @@ COST_OF_REVENUE_CONCEPTS = (
     "us-gaap:CostOfGoodsAndServicesSold",
     "us-gaap:CostOfGoodsSold",
     "us-gaap:CostOfServices",
+)
+
+LEASE_LIABILITY_CONCEPTS = ("us-gaap:OperatingLeaseLiability",)
+LEASE_LIABILITY_CURRENT_CONCEPTS = ("us-gaap:OperatingLeaseLiabilityCurrent",)
+LEASE_LIABILITY_NONCURRENT_CONCEPTS = ("us-gaap:OperatingLeaseLiabilityNoncurrent",)
+ROU_ASSET_CONCEPTS = ("us-gaap:OperatingLeaseRightOfUseAsset",)
+
+_LEASE_DUE = "us-gaap:LesseeOperatingLeaseLiabilityPaymentsDue"
+
+# Same two families as the debt schedule: fixed years or rolling years. The
+# rolling names are not formed the same way as the fixed ones -- the taxonomy
+# spells them "...PaymentsDueInRollingYearTwo", with an "In" the fixed variant
+# does not have. Guessing the pattern gave PFE two buckets out of six.
+LEASE_MATURITY_CONCEPTS: Dict[str, tuple] = {
+    "year_1": (f"{_LEASE_DUE}NextTwelveMonths", f"{_LEASE_DUE}NextRollingTwelveMonths"),
+    "year_2": (f"{_LEASE_DUE}YearTwo", f"{_LEASE_DUE}InRollingYearTwo"),
+    "year_3": (f"{_LEASE_DUE}YearThree", f"{_LEASE_DUE}InRollingYearThree"),
+    "year_4": (f"{_LEASE_DUE}YearFour", f"{_LEASE_DUE}InRollingYearFour"),
+    "year_5": (f"{_LEASE_DUE}YearFive", f"{_LEASE_DUE}InRollingYearFive"),
+    "after_year_5": (f"{_LEASE_DUE}AfterYearFive", f"{_LEASE_DUE}AfterRollingYearFive"),
+}
+
+LEASE_PAYMENTS_TOTAL_CONCEPTS = (_LEASE_DUE,)
+LEASE_IMPUTED_INTEREST_CONCEPTS = (
+    "us-gaap:LesseeOperatingLeaseLiabilityUndiscountedExcessAmount",
 )
 
 # Accrual ratio bands, applied to the latest period. Sloan's original work
@@ -434,4 +464,128 @@ def get_working_capital_trends(ticker: str, limit: int = 2,
                  "the more reliable signal. receivables_vs_revenue_gap_pct "
                  "above roughly 10 points means receivables are outrunning "
                  "sales, which is channel stuffing or a collection problem."),
+    }
+
+
+# =========================================================== operating leases
+
+def _latest_value(rows: Dict[str, Dict[str, Any]]) -> Optional[float]:
+    """Most recent period's value, or None when the concept was not tagged."""
+    if not rows:
+        return None
+    return rows[max(rows)]["value"]
+
+
+def get_operating_leases(ticker: str, limit: int = 1,
+                         form: str = "10-K") -> Dict[str, Any]:
+    """Operating lease obligations and when the payments come due.
+
+    ASC 842 put these on the balance sheet, but the maturity ladder stayed in
+    the footnote. For an asset-light retailer or restaurant chain the lease
+    book is the larger fixed obligation and it belongs next to the debt
+    schedule, not in a separate mental bucket.
+    """
+    balance_chains = (LEASE_LIABILITY_CONCEPTS, LEASE_LIABILITY_CURRENT_CONCEPTS,
+                      LEASE_LIABILITY_NONCURRENT_CONCEPTS, ROU_ASSET_CONCEPTS,
+                      LEASE_PAYMENTS_TOTAL_CONCEPTS,
+                      LEASE_IMPUTED_INTEREST_CONCEPTS)
+    tried = _flat(tuple(balance_chains) + tuple(LEASE_MATURITY_CONCEPTS.values()))
+    try:
+        total_rows, _ = _series(ticker, LEASE_LIABILITY_CONCEPTS, form, limit)
+        current_rows, _ = _series(
+            ticker, LEASE_LIABILITY_CURRENT_CONCEPTS, form, limit)
+        noncurrent_rows, _ = _series(
+            ticker, LEASE_LIABILITY_NONCURRENT_CONCEPTS, form, limit)
+        rou_rows, _ = _series(ticker, ROU_ASSET_CONCEPTS, form, limit)
+        payments_rows, _ = _series(
+            ticker, LEASE_PAYMENTS_TOTAL_CONCEPTS, form, limit)
+        interest_rows, _ = _series(
+            ticker, LEASE_IMPUTED_INTEREST_CONCEPTS, form, limit)
+        schedule: Dict[str, Optional[float]] = {}
+        for bucket, concepts in LEASE_MATURITY_CONCEPTS.items():
+            rows, _ = _series(ticker, concepts, form, 1)
+            # None means untagged; 0.0 means the filer disclosed nothing due.
+            schedule[bucket] = _latest_value(rows)
+    except Exception as exc:  # noqa: BLE001
+        return {"ticker": ticker, "success": False,
+                "error": f"fetching operating-lease concepts failed: {exc}",
+                "lease_liability": None, "maturity_schedule": {},
+                "periods": [], "concepts_tried": tried}
+
+    liability = _latest_value(total_rows)
+    rou_asset = _latest_value(rou_rows)
+    buckets_found = sum(1 for v in schedule.values() if v is not None)
+
+    if liability is None and rou_asset is None and buckets_found == 0:
+        return {
+            "ticker": ticker, "success": False, "coverage": "not_covered",
+            "error": (f"{ticker} tags no operating-lease concepts in its "
+                      f"{form}. Either the filer has no material operating "
+                      f"leases or it did not tag them; this is not a zero "
+                      f"obligation."),
+            "lease_liability": None, "lease_liability_current": None,
+            "lease_liability_noncurrent": None, "right_of_use_asset": None,
+            "maturity_schedule": schedule, "buckets_found": 0,
+            "periods": [], "concepts_tried": tried,
+        }
+
+    tagged_payments = _latest_value(payments_rows)
+    bucket_values = [v for v in schedule.values() if v is not None]
+    if tagged_payments is not None:
+        payments_total: Optional[float] = tagged_payments
+        payments_source = "tagged"
+    elif bucket_values:
+        payments_total = float(sum(bucket_values))
+        payments_source = "sum_of_buckets"
+    else:
+        payments_total = None
+        payments_source = None
+
+    # One 10-K carries two balance-sheet dates, which is the trend.
+    period_ends = sorted(set(total_rows) | set(rou_rows) | set(current_rows)
+                         | set(noncurrent_rows), reverse=True)
+    periods = [{
+        "period_end": end,
+        "filing_date": (total_rows.get(end) or rou_rows.get(end)
+                        or current_rows.get(end)
+                        or noncurrent_rows.get(end))["filing_date"],
+        "lease_liability": total_rows[end]["value"] if end in total_rows else None,
+        "lease_liability_current": (current_rows[end]["value"]
+                                    if end in current_rows else None),
+        "lease_liability_noncurrent": (noncurrent_rows[end]["value"]
+                                       if end in noncurrent_rows else None),
+        "right_of_use_asset": rou_rows[end]["value"] if end in rou_rows else None,
+    } for end in period_ends]
+
+    covered = (liability is not None and rou_asset is not None
+               and buckets_found == len(LEASE_MATURITY_CONCEPTS))
+    return {
+        "ticker": ticker, "success": True,
+        "coverage": "full" if covered else "partial",
+        "as_of": period_ends[0] if period_ends else None,
+        "lease_liability": liability,
+        "lease_liability_current": _latest_value(current_rows),
+        "lease_liability_noncurrent": _latest_value(noncurrent_rows),
+        "right_of_use_asset": rou_asset,
+        "maturity_schedule": schedule,
+        "buckets_found": buckets_found,
+        "buckets_expected": len(LEASE_MATURITY_CONCEPTS),
+        "undiscounted_payments_total": payments_total,
+        "undiscounted_payments_source": payments_source,
+        "imputed_interest": _latest_value(interest_rows),
+        "pct_due_within_one_year": _ratio(
+            schedule.get("year_1"), payments_total, 100.0),
+        "periods": periods,
+        "concepts_tried": tried,
+        "note": ("lease_liability is the discounted present value on the "
+                 "balance sheet; the maturity schedule and "
+                 "undiscounted_payments_total are the contractual cash "
+                 "payments, and the difference between them is "
+                 "imputed_interest. A null bucket means the filer did not tag "
+                 "that year, while 0.0 means it disclosed nothing due -- the "
+                 "two are never merged. A missing current portion is left null "
+                 "rather than backed out of the total, because a derived "
+                 "figure is not a disclosure. Read alongside "
+                 "get_debt_maturity_schedule: for retailers and restaurants "
+                 "the lease ladder is the larger of the two."),
     }

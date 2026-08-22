@@ -13,6 +13,7 @@ from tools.web_search_server.forward_metrics import (
 )
 from tools.web_search_server.earnings_quality import (
   get_accruals_quality,
+  get_operating_leases,
   get_working_capital_trends,
 )
 from tools.web_search_server.peers import find_peers_by_sic, get_sic_code
@@ -860,6 +861,38 @@ def _build_all_tools() -> List[Tool]:
             },
             "required": ["ticker"]
           }
+        ),
+        Tool(
+          name="get_operating_leases",
+          description=(
+            "Operating lease obligations and the year-by-year payment "
+            "ladder.\n\n"
+            "ASC 842 put the liability on the balance sheet but left the "
+            "maturity profile in the footnote, so a lease book larger than the "
+            "bond stack stays invisible beside get_debt_maturity_schedule. For "
+            "retailers, restaurants and anything asset-light this is the "
+            "bigger fixed obligation and it does not appear in leverage ratios "
+            "built from debt alone. Call it whenever the debt schedule looks "
+            "reassuringly light.\n\n"
+            "'lease_liability' is the discounted balance-sheet figure. "
+            "'maturity_schedule' and 'undiscounted_payments_total' are the "
+            "contractual cash payments, and the difference between them is "
+            "'imputed_interest'.\n\n"
+            "A null bucket means the filer did not tag that year; 0.0 means it "
+            "disclosed nothing due, and the two are never merged. A missing "
+            "current portion stays null rather than being backed out of the "
+            "total, because a derived figure is not a disclosure. Coverage is "
+            "'full' only when the liability, the right-of-use asset and all "
+            "six buckets are tagged -- check 'buckets_found'."
+          ),
+          inputSchema={
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string", "description": "Ticker symbol"},
+              "form":   {"type": "string", "description": "10-K or 10-Q", "default": "10-K"}
+            },
+            "required": ["ticker"]
+          }
         )]
 
 
@@ -946,6 +979,9 @@ class WebSearchServer:
         elif name == 'get_working_capital_trends':
           return await parent.get_working_capital_trends(
             args['ticker'], args.get('limit', 2), args.get('form', '10-K'))
+        elif name == 'get_operating_leases':
+          return await parent.get_operating_leases(
+            args['ticker'], args.get('form', '10-K'))
         elif name == 'find_peers_by_sic':
           return await parent.find_peers_by_sic(args['ticker'], args.get('limit', 20))
         elif name == 'get_sic_code':
@@ -1117,6 +1153,11 @@ class WebSearchServer:
                                        form: str = '10-K') -> List[TextContent]:
     result = await asyncio.to_thread(
       get_working_capital_trends, ticker, limit, form)
+    return [TextContent(type="text", text=safe_json_dumps(result))]
+
+  async def get_operating_leases(self, ticker: str,
+                                 form: str = '10-K') -> List[TextContent]:
+    result = await asyncio.to_thread(get_operating_leases, ticker, 1, form)
     return [TextContent(type="text", text=safe_json_dumps(result))]
 
   async def find_peers_by_sic(self, ticker: str, limit: int = 20) -> List[TextContent]:

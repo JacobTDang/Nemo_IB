@@ -1,6 +1,6 @@
-"""Earnings quality: accruals and working-capital dynamics.
+"""Earnings quality: accruals, working-capital dynamics, operating leases.
 
-Two gaps that let a company look healthy right up to the point it does not:
+Three gaps that let a company look healthy right up to the point it does not:
 
 - **Accruals.** Net income rising while operating cash flow does not is the
   classic pre-blowup signature. Nothing here compared the two.
@@ -8,6 +8,8 @@ Two gaps that let a company look healthy right up to the point it does not:
   stops at net working capital. Receivables growing faster than revenue is
   channel stuffing or a collection problem; inventory building is demand
   deterioration. Neither was computable.
+- **Operating leases.** Post-ASC 842 they sit on the balance sheet, and there
+  was zero coverage -- a hole next to get_debt_maturity_schedule.
 
 The live figures below were read off the filings before the code was written,
 so a passing test means the arithmetic matches EDGAR rather than matching my
@@ -412,6 +414,101 @@ def test_a_tagged_zero_receivable_is_kept(monkeypatch):
     assert latest["dso"] == 0.0
 
 
+# ========================================================== operating leases
+
+LEASE_TOTAL = "us-gaap:OperatingLeaseLiability"
+LEASE_CURRENT = "us-gaap:OperatingLeaseLiabilityCurrent"
+LEASE_NONCURRENT = "us-gaap:OperatingLeaseLiabilityNoncurrent"
+ROU = "us-gaap:OperatingLeaseRightOfUseAsset"
+DUE_1 = "us-gaap:LesseeOperatingLeaseLiabilityPaymentsDueNextTwelveMonths"
+DUE_2 = "us-gaap:LesseeOperatingLeaseLiabilityPaymentsDueYearTwo"
+DUE_1_ROLLING = "us-gaap:LesseeOperatingLeaseLiabilityPaymentsDueNextRollingTwelveMonths"
+DUE_2_ROLLING = "us-gaap:LesseeOperatingLeaseLiabilityPaymentsDueInRollingYearTwo"
+
+
+def test_lease_liability_and_right_of_use_asset_are_reported(monkeypatch):
+    monkeypatch.setattr(eq, "fetch_concept_series", _chain({
+        LEASE_TOTAL: [_point([_instant(21_925_000_000.0)])],
+        LEASE_NONCURRENT: [_point([_instant(16_532_000_000.0)])],
+        ROU: [_point([_instant(24_177_000_000.0)])],
+        DUE_1: [_point([_instant(6_082_000_000.0)])],
+    }))
+    result = eq.get_operating_leases("MSFT")
+    assert result["success"] is True
+    assert result["lease_liability"] == 21_925_000_000.0
+    assert result["right_of_use_asset"] == 24_177_000_000.0
+
+
+def test_an_untagged_current_portion_is_null_and_never_derived(monkeypatch):
+    """MSFT tags the total and the noncurrent portion but not the current one.
+    Backing it out would publish a figure the filer never disclosed."""
+    monkeypatch.setattr(eq, "fetch_concept_series", _chain({
+        LEASE_TOTAL: [_point([_instant(21_925_000_000.0)])],
+        LEASE_NONCURRENT: [_point([_instant(16_532_000_000.0)])],
+    }))
+    result = eq.get_operating_leases("MSFT")
+    assert result["lease_liability_current"] is None
+    assert result["lease_liability"] == 21_925_000_000.0
+
+
+def test_a_tagged_zero_maturity_bucket_is_kept(monkeypatch):
+    """Same trap as the debt schedule: zero is a disclosure, not a gap."""
+    monkeypatch.setattr(eq, "fetch_concept_series", _chain({
+        LEASE_TOTAL: [_point([_instant(100.0)])],
+        DUE_1: [_point([_instant(0.0)])],
+    }))
+    result = eq.get_operating_leases("X")
+    assert result["maturity_schedule"]["year_1"] == 0.0
+    assert result["maturity_schedule"]["year_2"] is None
+
+
+def test_the_maturity_ladder_falls_through_to_the_rolling_concepts(monkeypatch):
+    """The rolling family is not the fixed family with 'Rolling' inserted --
+    year two is 'PaymentsDueInRollingYearTwo'. Guessing the pattern found two
+    of PFE's six buckets and reported the other four as untagged."""
+    monkeypatch.setattr(eq, "fetch_concept_series", _chain({
+        LEASE_TOTAL: [_point([_instant(100.0)])],
+        DUE_1_ROLLING: [_point([_instant(25.0)])],
+        DUE_2_ROLLING: [_point([_instant(30.0)])],
+    }))
+    result = eq.get_operating_leases("X")
+    assert result["maturity_schedule"]["year_1"] == 25.0
+    assert result["maturity_schedule"]["year_2"] == 30.0
+
+
+def test_percentage_due_within_a_year(monkeypatch):
+    monkeypatch.setattr(eq, "fetch_concept_series", _chain({
+        LEASE_TOTAL: [_point([_instant(1000.0)])],
+        DUE_1: [_point([_instant(250.0)])],
+        DUE_2: [_point([_instant(750.0)])],
+    }))
+    result = eq.get_operating_leases("X")
+    assert result["undiscounted_payments_total"] == 1000.0
+    assert result["pct_due_within_one_year"] == pytest.approx(25.0)
+
+
+def test_no_lease_tags_at_all_is_an_explicit_not_covered(monkeypatch):
+    monkeypatch.setattr(eq, "fetch_concept_series", _chain({}))
+    result = eq.get_operating_leases("NOLEASES")
+    assert result["success"] is False
+    assert result["coverage"] == "not_covered"
+    assert result["lease_liability"] is None
+    assert LEASE_TOTAL in " ".join(result["concepts_tried"])
+    assert "not" in result["error"].lower()
+
+
+def test_the_liability_series_carries_more_than_one_period(monkeypatch):
+    """One 10-K holds two balance-sheet dates, which is the trend."""
+    monkeypatch.setattr(eq, "fetch_concept_series", _chain({
+        LEASE_TOTAL: [_point([
+            _instant(21_925_000_000.0, end="2026-06-30"),
+            _instant(22_861_000_000.0, end="2025-06-30", ref="c-2")])],
+    }))
+    result = eq.get_operating_leases("MSFT")
+    assert [p["lease_liability"] for p in result["periods"]] == [
+        21_925_000_000.0, 22_861_000_000.0]
+
+
 # ============================================================ live golden set
 
 @pytest.fixture(scope="module", autouse=True)
@@ -560,3 +657,53 @@ def test_ba_inventory_is_the_aerospace_concept():
     row = _period(result, "2025-12-31")
     assert row["inventory"] == 84_679_000_000.0
     assert row["dio"] == pytest.approx(362.0, abs=3.0)
+
+
+@network
+def test_msft_operating_leases_match_the_fy2026_10k():
+    """MSFT FY2026: 21.925bn lease liability, 24.177bn right-of-use asset,
+    24.706bn undiscounted payments with 6.082bn due inside a year. MSFT does
+    not tag the current portion, so that stays null."""
+    result = eq.get_operating_leases("MSFT")
+    assert result["success"] is True
+    assert result["lease_liability"] == 21_925_000_000.0
+    assert result["right_of_use_asset"] == 24_177_000_000.0
+    assert result["maturity_schedule"]["year_1"] == 6_082_000_000.0
+    assert result["undiscounted_payments_total"] == 24_706_000_000.0
+    assert result["lease_liability_current"] is None
+
+
+@network
+def test_pfe_uses_the_rolling_maturity_family():
+    """PFE tags none of the fixed-year buckets; its ladder is the rolling
+    family, 417m due in the next twelve months against 3.199bn of total
+    undiscounted payments."""
+    result = eq.get_operating_leases("PFE")
+    assert result["success"] is True
+    assert result["buckets_found"] == 6
+    assert result["maturity_schedule"]["year_1"] == 417_000_000.0
+    assert result["undiscounted_payments_total"] == 3_199_000_000.0
+
+
+@network
+def test_tsla_is_not_reported_as_having_no_leases():
+    """Tesla's latest 10-K filing on EDGAR is a 10-K/A with no financial
+    statements. Reading it reported Tesla as tagging no lease concepts at
+    all, which for a company with a global store and factory footprint is the
+    most misleading answer available."""
+    result = eq.get_operating_leases("TSLA")
+    assert result["success"] is True
+    assert result["lease_liability"] > 1e9
+    assert result["right_of_use_asset"] > 1e9
+
+
+@network
+def test_wmt_operating_leases_cover_every_bucket():
+    """WMT FY2026: 15.572bn liability, 22.624bn of undiscounted payments,
+    11.792bn of it beyond year five -- a long-dated store lease book."""
+    result = eq.get_operating_leases("WMT")
+    assert result["success"] is True
+    assert result["coverage"] == "full"
+    assert result["lease_liability"] == 15_572_000_000.0
+    assert result["maturity_schedule"]["after_year_5"] == 11_792_000_000.0
+    assert result["buckets_found"] == 6
