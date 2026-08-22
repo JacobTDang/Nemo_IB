@@ -283,22 +283,50 @@ def _capex_signal(announcements: List[Dict]) -> str:
 # Company name resolution (ticker → display name)
 # ---------------------------------------------------------------------------
 
-def _ticker_to_company_name(ticker: str) -> str:
-    try:
-        import yfinance as yf
-        info = yf.Ticker(ticker).info
-        return info.get("longName") or info.get("shortName") or ticker
-    except Exception:
-        return ticker
+class LookupFailure(Exception):
+    """A lookup that could not be performed. Never an empty result."""
+    reason = "lookup_failed"
 
 
-def _ticker_to_sector(ticker: str) -> str:
+class UnknownTicker(LookupFailure):
+    """The quote provider has no such symbol."""
+    reason = "unknown_ticker"
+
+
+class ResolverUnavailable(LookupFailure):
+    """The quote provider could not be reached, so the symbol is unjudged."""
+    reason = "resolver_unavailable"
+
+
+def _resolve_ticker(ticker: str) -> Dict[str, str]:
+    """Company name and sector for a ticker, or raise.
+
+    The old helpers swallowed every failure and echoed the symbol back as the
+    company name, so `capex_announcements(ticker="ZZZZ")` searched the news for
+    "ZZZZ", found nothing and reported success. yfinance answers an unknown
+    symbol with a logged 404 and a near-empty dict rather than an exception, so
+    a missing name is the signal that the symbol does not exist.
+    """
     try:
         import yfinance as yf
-        info = yf.Ticker(ticker).info
-        return info.get("sector", "")
-    except Exception:
-        return ""
+        info = yf.Ticker(ticker).info or {}
+    except Exception as exc:  # noqa: BLE001 - reported, never swallowed
+        raise ResolverUnavailable(
+            f"could not resolve ticker '{ticker}': yfinance raised "
+            f"{type(exc).__name__}: {str(exc)[:150]}") from exc
+
+    name = info.get("longName") or info.get("shortName")
+    if not name:
+        raise UnknownTicker(
+            f"'{ticker}' is not a symbol yfinance can resolve (no longName or "
+            f"shortName in its quote response). No lookup was attempted.")
+    return {"name": name, "sector": info.get("sector") or ""}
+
+
+def _lookup_failed(exc: LookupFailure, **payload: Any) -> Dict[str, Any]:
+    """Failure envelope body for a lookup that could not be performed."""
+    return {"success": False, "coverage": "not_covered",
+            "reason": exc.reason, "error": str(exc), **payload}
 
 
 # ---------------------------------------------------------------------------
@@ -1246,11 +1274,22 @@ def _fetch_capex_announcements(ticker: str, company_name: str,
     try:
         from ddgs import DDGS
     except ImportError:
-        return {"error": "ddgs not installed — pip install ddgs",
+        return {"success": False, "coverage": "not_covered",
+                "reason": "provider_unavailable",
+                "error": "ddgs not installed — pip install ddgs",
                 "ticker": ticker}
 
+    # An explicit company_name is the caller asserting the entity; only derive
+    # it when they did not, and fail loudly when the symbol does not resolve.
     if not company_name:
-        company_name = _ticker_to_company_name(ticker)
+        try:
+            company_name = _resolve_ticker(ticker)["name"]
+        except LookupFailure as exc:
+            return _lookup_failed(exc, ticker=ticker, company_name=None,
+                                  lookback_days=lookback_days,
+                                  announcement_count=None,
+                                  total_announced_usd=None,
+                                  signal="data_gap", announcements=[])
 
     # Sector-agnostic queries: the first two capture capex events in ANY sector
     # (retail distribution, energy refinery, pharma manufacturing, REIT
@@ -1265,6 +1304,9 @@ def _fetch_capex_announcements(ticker: str, company_name: str,
     name_tokens = _company_name_tokens(company_name)
     all_articles: List[Dict] = []
     seen_titles: set = set()
+    # A query that errored is not a query that found nothing; the two were
+    # indistinguishable while every failure was swallowed by `continue`.
+    query_errors: List[str] = []
 
     try:
         with DDGS() as ddgs:
@@ -1282,17 +1324,48 @@ def _fetch_capex_announcements(ticker: str, company_name: str,
                         if pub_date is None or pub_date >= cutoff:
                             seen_titles.add(title)
                             all_articles.append(r)
-                except Exception:
+                except Exception as exc:  # noqa: BLE001 - recorded, not hidden
+                    query_errors.append(
+                        f"{query!r}: {type(exc).__name__}: {str(exc)[:120]}")
                     continue
     except Exception as exc:
-        return {"error": f"DuckDuckGo search failed: {type(exc).__name__}: {str(exc)[:200]}",
-                "ticker": ticker}
+        return {
+            "success": False, "coverage": "not_covered",
+            "reason": "provider_unavailable",
+            "error": (f"DuckDuckGo news search failed: {type(exc).__name__}: "
+                      f"{str(exc)[:200]}"),
+            "ticker": ticker, "company_name": company_name,
+            "queries_tried": queries, "announcement_count": None,
+            "signal": "data_gap", "announcements": [],
+        }
+
+    if query_errors and len(query_errors) == len(queries):
+        return {
+            "success": False, "coverage": "not_covered",
+            "reason": "provider_unavailable",
+            "error": ("every DuckDuckGo news query failed: "
+                      + "; ".join(query_errors)),
+            "ticker": ticker, "company_name": company_name,
+            "queries_tried": queries, "announcement_count": None,
+            "signal": "data_gap", "announcements": [],
+        }
 
     if not all_articles:
+        # A news corpus cannot assert absence: no matching article is not
+        # evidence that no capex was announced, so this is an uncovered
+        # lookup rather than a count of zero.
         return {
+            "success": False, "coverage": "not_covered",
+            "reason": "no_results",
+            "error": (f"no news article naming {company_name} matched any of "
+                      f"{len(queries)} capex queries in the last "
+                      f"{lookback_days} days. Absence of news is not evidence "
+                      f"that no capital investment was announced."),
             "ticker": ticker, "company_name": company_name,
             "lookback_days": lookback_days, "announcement_count": 0,
             "total_announced_usd": 0, "signal": "data_gap",
+            "queries_tried": queries,
+            "partial_errors": query_errors,
             "announcements": [],
         }
 
@@ -1318,11 +1391,15 @@ def _fetch_capex_announcements(ticker: str, company_name: str,
     signal = _capex_signal(announcements)
 
     return {
+        "success": True,
+        "coverage": "full" if not query_errors else "partial",
         "ticker": ticker, "company_name": company_name,
         "lookback_days": lookback_days,
         "announcement_count": len(announcements),
         "total_announced_usd": total_usd,
         "signal": signal,
+        "queries_tried": queries,
+        "partial_errors": query_errors,
         "announcements": announcements[:8],
     }
 
@@ -1480,6 +1557,10 @@ class AltDataServer:
                         "bullish / bearish / neutral / data_gap signal. "
                         "bullish: new investment announced; bearish: cancellation/delay/cut. "
                         "Any announcement >= $1B → strong bullish signal. "
+                        "Returns success=false with reason='unknown_ticker' for a symbol "
+                        "the quote provider cannot resolve, and reason='no_results' when "
+                        "no article matched — a news corpus cannot assert that no capex "
+                        "was announced, so that is never reported as a zero. "
                         "Uses DuckDuckGo news (ddgs). Best for: semiconductors, industrials, "
                         "energy, cloud hyperscalers."
                     ),
@@ -1620,9 +1701,7 @@ class AltDataServer:
         except Exception as exc:
             return _err("get_capex_announcements",
                         f"{type(exc).__name__}: {str(exc)[:200]}", ticker)
-        if "error" in result:
-            return _err("get_capex_announcements", result["error"], ticker)
-        return _ok("get_capex_announcements", result, ticker)
+        return _dispatch("get_capex_announcements", result, ticker)
 
     async def run_server(self):
         async with stdio_server() as (read, write):

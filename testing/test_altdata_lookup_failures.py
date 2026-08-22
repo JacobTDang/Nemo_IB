@@ -297,3 +297,191 @@ def test_jobs_live_unknown_company_is_an_explicit_failure():
     assert out["success"] is False
     assert out["coverage"] == "not_covered"
     assert out["total_postings"] is None
+
+
+# ---------------------------------------------------------------------------
+# Ticker resolution -- shared by the capex, policy and contracts tools
+# ---------------------------------------------------------------------------
+
+class _FakeYF:
+    """yfinance double. `.info` is {'trailingPegRatio': None} for an unknown
+    symbol -- yfinance logs the 404 and returns that rather than raising."""
+
+    def __init__(self, info=None, raises=None):
+        self._info = info if info is not None else {"trailingPegRatio": None}
+        self._raises = raises
+
+    def Ticker(self, symbol):
+        outer = self
+
+        class _T:
+            @property
+            def info(self):
+                if outer._raises:
+                    raise outer._raises
+                return outer._info
+
+        return _T()
+
+
+def _fake_yfinance(monkeypatch, info=None, raises=None):
+    monkeypatch.setitem(sys.modules, "yfinance", _FakeYF(info, raises))
+
+
+def test_unknown_ticker_raises_rather_than_echoing_the_symbol(monkeypatch):
+    _fake_yfinance(monkeypatch)
+
+    with pytest.raises(alt.UnknownTicker) as exc:
+        alt._resolve_ticker("ZZZZ")
+
+    assert "ZZZZ" in str(exc.value)
+    assert exc.value.reason == "unknown_ticker"
+
+
+def test_resolver_outage_is_not_reported_as_an_unknown_ticker(monkeypatch):
+    _fake_yfinance(monkeypatch, raises=RuntimeError("connection reset"))
+
+    with pytest.raises(alt.ResolverUnavailable) as exc:
+        alt._resolve_ticker("NVDA")
+
+    assert exc.value.reason == "resolver_unavailable"
+
+
+def test_known_ticker_resolves_to_name_and_sector(monkeypatch):
+    _fake_yfinance(monkeypatch, info={"longName": "NVIDIA Corporation",
+                                      "sector": "Technology"})
+
+    assert alt._resolve_ticker("NVDA") == {"name": "NVIDIA Corporation",
+                                           "sector": "Technology"}
+
+
+# ---------------------------------------------------------------------------
+# get_capex_announcements
+# ---------------------------------------------------------------------------
+
+class _FakeDDGS:
+    def __init__(self, articles=None, raises=None):
+        self._articles = articles or []
+        self._raises = raises
+        self.queries = []
+
+    def __call__(self):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def news(self, query, **k):
+        self.queries.append(query)
+        if self._raises:
+            raise self._raises
+        return list(self._articles)
+
+
+def _fake_ddgs(monkeypatch, ddgs):
+    import types
+    module = types.ModuleType("ddgs")
+    module.DDGS = ddgs
+    monkeypatch.setitem(sys.modules, "ddgs", module)
+
+
+def test_capex_unknown_ticker_is_a_failure_not_a_data_gap(monkeypatch):
+    _fake_yfinance(monkeypatch)
+    _fake_ddgs(monkeypatch, _FakeDDGS())
+
+    out = alt._fetch_capex_announcements("ZZZZ", "", 90)
+
+    assert out["success"] is False
+    assert out["reason"] == "unknown_ticker"
+    assert out["coverage"] == "not_covered"
+    assert "ZZZZ" in out["error"]
+    assert out["company_name"] != "ZZZZ", "echoed the symbol back as a name"
+
+
+def test_capex_unknown_ticker_never_reaches_the_news_search(monkeypatch):
+    _fake_yfinance(monkeypatch)
+    ddgs = _FakeDDGS()
+    _fake_ddgs(monkeypatch, ddgs)
+
+    alt._fetch_capex_announcements("ZZZZ", "", 90)
+
+    assert ddgs.queries == [], "searched news for a symbol that does not exist"
+
+
+def test_capex_handler_envelope_reports_the_failure(monkeypatch):
+    _fake_yfinance(monkeypatch)
+    _fake_ddgs(monkeypatch, _FakeDDGS())
+
+    payload = _envelope(_run(alt.AltDataServer().capex_announcements(
+        {"ticker": "ZZZZ"})))
+
+    assert payload["success"] is False
+    assert payload["metadata"]["errors"]
+    assert payload["data"]["reason"] == "unknown_ticker"
+
+
+def test_capex_no_articles_names_the_queries_it_ran(monkeypatch):
+    """Zero news hits is not evidence that no capex was announced, so it is
+    reported as an uncovered lookup rather than a count of zero."""
+    _fake_yfinance(monkeypatch, info={"longName": "Coca-Cola Company"})
+    ddgs = _FakeDDGS([])
+    _fake_ddgs(monkeypatch, ddgs)
+
+    out = alt._fetch_capex_announcements("KO", "", 90)
+
+    assert out["success"] is False
+    assert out["coverage"] == "not_covered"
+    assert out["reason"] == "no_results"
+    assert out["announcement_count"] == 0
+    assert out["signal"] == "data_gap"
+    assert out["queries_tried"] == ddgs.queries
+    assert len(ddgs.queries) == 3
+
+
+def test_capex_search_outage_is_distinct_from_no_articles(monkeypatch):
+    _fake_yfinance(monkeypatch, info={"longName": "Coca-Cola Company"})
+    _fake_ddgs(monkeypatch, _FakeDDGS(raises=RuntimeError("ratelimit")))
+
+    out = alt._fetch_capex_announcements("KO", "", 90)
+
+    assert out["success"] is False
+    assert out["reason"] == "provider_unavailable"
+    assert "ratelimit" in out["error"]
+
+
+def test_capex_found_announcements_are_a_covered_success(monkeypatch):
+    _fake_yfinance(monkeypatch, info={"longName": "Intel Corporation"})
+    _fake_ddgs(monkeypatch, _FakeDDGS([
+        {"title": "Intel to invest $20 billion in new Ohio factory",
+         "body": "Intel said it will build the site.", "date": "", "url": "u"},
+    ]))
+
+    out = alt._fetch_capex_announcements("INTC", "", 90)
+
+    assert out["success"] is True
+    assert out["coverage"] == "full"
+    assert out["announcement_count"] == 1
+    assert out["signal"] == "bullish"
+
+
+def test_capex_explicit_company_name_skips_ticker_resolution(monkeypatch):
+    _fake_yfinance(monkeypatch, raises=AssertionError("resolver must not run"))
+    _fake_ddgs(monkeypatch, _FakeDDGS([
+        {"title": "Acme to build $3 billion plant", "body": "", "date": "",
+         "url": "u"}]))
+
+    out = alt._fetch_capex_announcements("PRIVATECO", "Acme Holdings", 90)
+
+    assert out["success"] is True
+    assert out["company_name"] == "Acme Holdings"
+
+
+@network
+def test_capex_live_unknown_ticker_fails():
+    out = alt._fetch_capex_announcements("ZZZZ", "", 90)
+
+    assert out["success"] is False
+    assert out["reason"] == "unknown_ticker"
