@@ -340,6 +340,19 @@ def _lbo_math(entry_ev: float, revenue_base: float, ebitda_margin: float,
 
   entry_ebitda = revenue_base * ebitda_margin
   debt_amount = entry_ebitda * leverage_turns
+  if debt_amount >= entry_ev:
+    # Debt is sized off EBITDA and equity off EV, so an entry multiple below
+    # the leverage turns puts more debt in the deal than the whole purchase
+    # price. The 10% floor below would invent an equity cheque and the model
+    # would report a fictitious MOIC and IRR with achieves_20pct_irr True.
+    raise ValueError(
+      f"acquisition debt {debt_amount:,.0f} ({leverage_turns}x entry EBITDA "
+      f"{entry_ebitda:,.0f}) meets or exceeds the entry_ev {entry_ev:,.0f}. "
+      f"That is an entry multiple of "
+      f"{(entry_ev / entry_ebitda if entry_ebitda else 0):.2f}x against "
+      f"{leverage_turns}x of leverage -- the structure cannot be funded. "
+      "Lower leverage_turns or raise entry_ev."
+    )
   equity_invested = max(entry_ev - debt_amount, entry_ev * 0.10)  # floor: 10% equity
 
   current_revenue = revenue_base
@@ -1694,19 +1707,25 @@ class Financial_Analysis:
     return [TextContent(type='text', text=json.dumps(result))]
 
   async def calculate_lbo(self, args: Dict[str, Any]) -> List[TextContent]:
-    result = _lbo_math(
-      entry_ev=args['entry_ev'],
-      revenue_base=args['revenue_base'],
-      ebitda_margin=args['ebitda_margin'],
-      capex_pct_revenue=args['capex_pct_revenue'],
-      depreciation=args['depreciation'],
-      tax_rate=args['tax_rate'],
-      revenue_growth=args['revenue_growth'],
-      debt_interest_rate=args['debt_interest_rate'],
-      leverage_turns=args['leverage_turns'],
-      exit_multiple=args['exit_multiple'],
-      hold_years=args.get('hold_years', 5),
-    )
+    try:
+      result = _lbo_math(
+        entry_ev=args['entry_ev'],
+        revenue_base=args['revenue_base'],
+        ebitda_margin=args['ebitda_margin'],
+        capex_pct_revenue=args['capex_pct_revenue'],
+        depreciation=args['depreciation'],
+        tax_rate=args['tax_rate'],
+        revenue_growth=args['revenue_growth'],
+        debt_interest_rate=args['debt_interest_rate'],
+        leverage_turns=args['leverage_turns'],
+        exit_multiple=args['exit_multiple'],
+        hold_years=args.get('hold_years', 5),
+      )
+    except ValueError as e:
+      # Unfundable capital structure -- surface the refusal rather than a model.
+      return [TextContent(type='text', text=json.dumps({
+        'error': str(e), 'ticker': args.get('ticker', ''),
+      }))]
     result['ticker'] = args.get('ticker', '')
     return [TextContent(type='text', text=json.dumps(result))]
 
