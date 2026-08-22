@@ -533,3 +533,141 @@ def test_the_mismatch_note_fires_for_a_real_adr():
     note = fi.form_mismatch_note("TSM", "10-K")
     assert note and "20-F" in note
     assert fi.form_mismatch_note("MSFT", "10-K") is None
+
+
+# --------------------------------------------------------------------------
+# The wiring. The point of this work is not any single figure -- it is that a
+# tool asked about a filer it cannot serve says why, instead of returning an
+# empty result that reads as a finding.
+# --------------------------------------------------------------------------
+
+def _foreign(monkeypatch, ticker="TSM", form="20-F", filed="2026-04-16"):
+    monkeypatch.setattr(fi, "_annual_filing_index", lambda t: {form: filed})
+
+
+def test_debt_maturity_says_wrong_form_instead_of_no_debt(monkeypatch):
+    """Before: "TSM does not tag long-term debt maturities in its 10-K",
+    which reads as a company with no disclosed maturity wall."""
+    from tools.web_search_server import debt_maturity as dm
+    _foreign(monkeypatch)
+    monkeypatch.setattr(dm, "fetch_concept_series",
+                        lambda t, c, **k: (_ for _ in ()).throw(NotCovered(c)))
+    result = dm.get_debt_maturity_schedule("TSM")
+    assert result["success"] is False
+    assert result["wrong_form"] is True
+    assert "20-F" in result["error"]
+    assert "does not tag long-term debt maturities" not in result["error"]
+
+
+def test_geographic_revenue_says_wrong_form_instead_of_no_disaggregation(monkeypatch):
+    """Before: "TSM does not disaggregate revenue by geography in its 10-K".
+    Its 20-F splits revenue four ways, US 74% and China 9%."""
+    from tools.web_search_server import forward_metrics as fm
+    _foreign(monkeypatch)
+    monkeypatch.setattr(fm, "fetch_concept_series",
+                        lambda t, c, **k: (_ for _ in ()).throw(NotCovered(c)))
+    result = fm.get_geographic_revenue("TSM")
+    assert result["wrong_form"] is True
+    assert "20-F" in result["error"]
+
+
+def test_sbc_and_float_and_contracted_revenue_all_say_wrong_form(monkeypatch):
+    from tools.web_search_server import forward_metrics as fm
+    from tools.web_search_server import sbc
+    _foreign(monkeypatch)
+    for module in (fm, sbc):
+        monkeypatch.setattr(module, "fetch_concept_series",
+                            lambda t, c, **k: (_ for _ in ()).throw(NotCovered(c)))
+    for result in (sbc.get_sbc_series("TSM"),
+                   fm.get_public_float("TSM"),
+                   fm.get_contracted_revenue("TSM")):
+        assert result["wrong_form"] is True, result
+        assert "20-F" in result["error"]
+
+
+def test_share_count_tells_a_foreign_issuer_there_is_no_quarterly_xbrl(monkeypatch):
+    """get_share_count_series defaults to 10-Q. An FPI files 6-K, which is
+    untagged, so no quarterly share count exists for it anywhere."""
+    from tools.web_search_server import dilution
+    _foreign(monkeypatch)
+    monkeypatch.setattr(dilution, "fetch_concept_series",
+                        lambda t, c, **k: (_ for _ in ()).throw(NotCovered(c)))
+    result = dilution.get_share_count_series("TSM")
+    assert result["wrong_form"] is True
+    assert "6-K" in result["error"]
+
+
+def test_a_domestic_filer_keeps_its_original_message(monkeypatch):
+    """The guard must stay silent on the normal path. Ford tags no maturity
+    buckets and that is a real finding about Ford."""
+    from tools.web_search_server import debt_maturity as dm
+    monkeypatch.setattr(fi, "_annual_filing_index",
+                        lambda t: {"10-K": "2026-02-05"})
+    monkeypatch.setattr(dm, "fetch_concept_series",
+                        lambda t, c, **k: (_ for _ in ()).throw(NotCovered(c)))
+    result = dm.get_debt_maturity_schedule("F")
+    assert result["wrong_form"] is False
+    assert "does not tag long-term debt maturities" in result["error"]
+
+
+def test_sec_utils_revenue_base_explains_the_missing_10k(monkeypatch):
+    from tools.web_search_server import sec_utils as su
+    _foreign(monkeypatch)
+    monkeypatch.setattr(su, "get_latest_filing", lambda t, f='10-K': None)
+    result = su.get_revenue_base("TSM")
+    assert result["success"] is False
+    assert "20-F" in result["error"]
+
+
+def test_sec_utils_routes_a_foreign_form_to_the_guarded_reader(monkeypatch):
+    """filter_annual_data takes the largest fact for the latest period, and
+    an IFRS filer tags adjusted variants on dimension axes. On SAP's FY2025
+    20-F that max is EUR 37,804,000,000 -- a constant-currency segment figure
+    -- against a real 36,800,000,000."""
+    from tools.web_search_server import sec_utils as su
+    monkeypatch.setattr(su, "get_latest_filing", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("must not touch the unguarded selector")))
+    monkeypatch.setattr(fi, "get_annual_revenue", lambda t, *a, **k: {
+        "success": True, "latest_revenue": 36_800_000_000.0, "currency": "EUR",
+        "latest_revenue_usd": None, "concept_used": "ifrs-full:Revenue",
+        "latest_period": "duration_2025-01-01_2025-12-31",
+        "annual_filing_date": "2026-02-26", "form": "20-F",
+        "taxonomy_used": "ifrs-full"})
+    result = su.get_revenue_base("SAP", "20-F")
+    assert result["revenue_base"] == 36_800_000_000.0
+    assert result["currency"] == "EUR"
+    assert "NOT dollars" in result["note"]
+
+
+@network
+def test_every_adr_in_the_basket_gets_a_form_note_not_an_empty_result():
+    """The measured outcome. Each of these returned a confident sentence about
+    a 10-K that does not exist."""
+    from tools.web_search_server import debt_maturity as dm
+    for ticker in ("TSM", "ASML", "SAP", "NVO", "BABA"):
+        result = dm.get_debt_maturity_schedule(ticker)
+        assert result["wrong_form"] is True, ticker
+        assert "20-F" in result["error"], ticker
+
+
+@network
+def test_revenue_base_serves_the_whole_basket_in_the_right_currency():
+    from tools.web_search_server import sec_utils as su
+    expected = {"TSM": ("TWD", 3.8090543e12), "ASML": ("EUR", 3.26673e10),
+                "SAP": ("EUR", 3.68e10), "NVO": ("DKK", 3.09064e11),
+                "BABA": ("CNY", 1.02367e12)}
+    for ticker, (currency, value) in expected.items():
+        result = su.get_revenue_base(ticker, "20-F")
+        assert result["success"] is True, ticker
+        assert result["currency"] == currency, ticker
+        assert result["revenue_base"] == pytest.approx(value, rel=1e-4), ticker
+
+
+@network
+def test_a_domestic_filer_is_byte_for_byte_unaffected():
+    from tools.web_search_server import sec_utils as su
+    result = su.get_revenue_base("MSFT")
+    assert result["success"] is True
+    assert result["currency"] == "USD"
+    assert result["revenue_base"] > 3.0e11
+    assert result["note"] is None

@@ -71,9 +71,13 @@ def filter_annual_data(xbrl, concept: str, form_type: str = '10-K') -> Optional[
   """
   Helper function to filter XBRL facts for period data based on form type
   Returns latest period data or None if not found
-  - 10-K: Annual data (350+ days)
+  - 10-K / 20-F / 40-F: Annual data (350+ days)
   - 10-Q: Quarterly data (80-95 days)
   - Others: Most recent available
+
+  20-F and 40-F are the annual reports of foreign private issuers and carry
+  the same 12-month durations as a 10-K. They previously fell to the "most
+  recent available" branch, which does not filter by span at all.
   """
   try:
     facts = xbrl.facts.query().by_concept(concept).to_dataframe()
@@ -87,7 +91,7 @@ def filter_annual_data(xbrl, concept: str, form_type: str = '10-K') -> Optional[
     facts['duration_days'] = (facts['period_end_dt'] - facts['period_start_dt']).dt.days
 
     # Set period filters based on form type
-    if form_type == '10-K':
+    if form_type in ('10-K', '20-F', '40-F'):
       # Annual data (350+ days for fiscal year variations)
       target_periods = facts[facts['duration_days'] >= 350]
     elif form_type == '10-Q':
@@ -118,17 +122,41 @@ def filter_annual_data(xbrl, concept: str, form_type: str = '10-K') -> Optional[
     if period_data is not None and not (hasattr(period_data, 'empty') and period_data.empty):
       latest_row = period_data
 
+      # Currency matters the moment a foreign filer is in scope: TSM tags
+      # TWD, SAP and ASML EUR, NVO DKK, BABA CNY. None means the unit was
+      # not a plain amount of money, or was not tagged at all.
+      from .sec_series import currency_of
       return {
         'value': latest_row['numeric_value'],
         'concept_used': concept,
         'period_end': latest_row['period_end'],
-        'duration_days': latest_row['duration_days']
+        'duration_days': latest_row['duration_days'],
+        'currency': currency_of(latest_row.get('unit_ref')),
       }
 
     return None
 
   except Exception:
     return None
+
+def _filing_miss(ticker: str, form_type: str, fallback: str) -> str:
+  """Say "this filer uses a different form" when that is why nothing was found.
+
+  Every function here defaults to form_type='10-K'. A foreign private issuer
+  has no 10-K at all, so `get_latest_filing` returned None and the caller
+  reported "No 10-K filing found for TSM" -- which reads as a fact about
+  Taiwan Semiconductor rather than about this tool. TSMC files 20-F.
+
+  Falls back to the caller's own message when there is no mismatch, and the
+  guard never raises, so annotating an error can never replace one error with
+  another.
+  """
+  try:
+    from .foreign_issuer import form_mismatch_note
+    return form_mismatch_note(ticker, form_type) or fallback
+  except Exception:  # noqa: BLE001 - an annotation must not become the failure
+    return fallback
+
 
 def get_latest_filing(ticker: str, form_type: str = '10-K') -> Optional[Dict[str, Any]]:
   """Get latest SEC filing with XBRL data.
@@ -371,7 +399,8 @@ def extract_disclosure_data(ticker: str, disclosure_name: str, form_type: str = 
       return {
         'ticker': ticker,
         'success': False,
-        'error': f"Unable to get latest filing for {ticker}"
+        'error': _filing_miss(ticker, form_type,
+                              f"Unable to get latest filing for {ticker}")
       }
   except Exception as e:
     return {
@@ -380,8 +409,50 @@ def extract_disclosure_data(ticker: str, disclosure_name: str, form_type: str = 
       'success': False
     }
 
+def _foreign_revenue_base(ticker: str) -> Dict[str, Any]:
+  """get_revenue_base's shape, filled from the foreign-issuer reader."""
+  from .foreign_issuer import get_annual_revenue
+  result = get_annual_revenue(ticker)
+  if not result.get('success'):
+    return {'ticker': ticker, 'success': False,
+            'error': result.get('error'), 'revenue_base': None}
+  currency = result.get('currency')
+  return {
+    'ticker': ticker,
+    'revenue_base': float(result['latest_revenue']),
+    'currency': currency,
+    'revenue_base_usd': result.get('latest_revenue_usd'),
+    'concept_used': result.get('concept_used'),
+    'period_end': result.get('latest_period'),
+    'filing_date': result.get('annual_filing_date'),
+    'form_type': result.get('form'),
+    'taxonomy': result.get('taxonomy_used'),
+    'note': (f"Denominated in {currency}, NOT dollars. revenue_base_usd, when "
+             f"present, is the filer's own convenience translation at its own "
+             f"rate -- never a live conversion."
+             if currency not in (None, 'USD') else None),
+    'success': True,
+  }
+
+
 def get_revenue_base(ticker: str, form_type: str= "10-K") -> Dict[str, Any]:
-  # this is the company's recurring revenue from its primary business operations. It will be the starting point for nearly all financial analysis
+  """Consolidated annual revenue -- the starting point for nearly all analysis.
+
+  Foreign private issuers are routed to `get_annual_revenue`, which reads the
+  same filing through the exact-concept, undimensioned selection in
+  sec_series. `filter_annual_data` below cannot serve them: it takes the
+  largest fact for the latest period, and an IFRS filer tags adjusted
+  variants on dimension axes. Measured on SAP's FY2025 20-F, the max is
+  EUR 37,804,000,000 -- a CONSTANT-CURRENCY segment figure -- against a real
+  EUR 36,800,000,000, with `ifrs-full:RevenueOfCombinedEntity` (a pro-forma
+  acquisition number) sitting at 36,861,000,000 in between. All three look
+  like revenue and only one is.
+
+  `currency` is never assumed. TSM reports NT$3.8tn and BABA RMB 1.02tn; a
+  DCF built on either without converting the share price is off by ~30x.
+  """
+  if str(form_type).strip().upper() in ('20-F', '40-F'):
+    return _foreign_revenue_base(ticker)
   try:
     filing_data = get_latest_filing(ticker, form_type)
 
@@ -404,24 +475,32 @@ def get_revenue_base(ticker: str, form_type: str= "10-K") -> Dict[str, Any]:
       for concept in revenue_concepts:
         result = filter_annual_data(xbrl, concept, form_type)
         if result:
+          currency = result.get('currency')
           return {
             'ticker': ticker,
-            'revenue_base': float(result['value']),  # keep in raw dollars
+            'revenue_base': float(result['value']),  # raw units, not scaled
+            'currency': currency,
             'concept_used': result['concept_used'],
             'period_end': result['period_end'],
             'filing_date': filing_data['filing_date'],
+            'form_type': form_type,
+            'note': (None if currency in (None, 'USD') else
+                     f'Denominated in {currency}, NOT dollars. Any valuation '
+                     f'built on this must use a matching share count and '
+                     f'price, or convert both consistently.'),
             'success': True
           }
 
       return {
         'ticker': ticker,
-        'error': 'No revenue concept found',
+        'error': _filing_miss(ticker, form_type,
+                              'No revenue concept found'),
         'success': False
       }
 
     return {
       'ticker': ticker,
-      'error': 'No XBRL data available',
+      'error': _filing_miss(ticker, form_type, 'No XBRL data available'),
       'success': False
     }
 
@@ -539,7 +618,8 @@ def get_ebitda_margin(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
       }
     else:
       return {
-        'error': f'Unable to get latest filing for {ticker}',
+        'error': _filing_miss(ticker, form_type,
+                              f'Unable to get latest filing for {ticker}'),
         'success': False
       }
 
@@ -764,7 +844,8 @@ def get_depreciation(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
 
     else:
       return{
-        'error': f"Unable to get filing for {ticker}",
+        'error': _filing_miss(ticker, form_type,
+                              f"Unable to get filing for {ticker}"),
         'success': False
       }
 
@@ -796,7 +877,9 @@ def get_margin_breakdown(ticker: str, form_type: str = '10-K') -> Dict[str, Any]
   try:
     filing_data = get_latest_filing(ticker, form_type)
     if not filing_data or not filing_data.get('xbrl_data'):
-      return {'error': f'No filing found for {ticker}', 'success': False}
+      return {'error': _filing_miss(ticker, form_type,
+                                    f'No filing found for {ticker}'),
+              'success': False}
 
     xbrl = filing_data['xbrl_data']
     rev_tuple = _get_revenue_from_xbrl(xbrl, form_type)
@@ -848,7 +931,9 @@ def get_historical_fcf(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
   try:
     filing_data = get_latest_filing(ticker, form_type)
     if not filing_data or not filing_data.get('xbrl_data'):
-      return {'error': f'No filing found for {ticker}', 'success': False}
+      return {'error': _filing_miss(ticker, form_type,
+                                    f'No filing found for {ticker}'),
+              'success': False}
 
     xbrl = filing_data['xbrl_data']
     ocf = None
@@ -897,7 +982,8 @@ def get_working_capital(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
   try:
     filing_data = get_latest_filing(ticker, form_type)
     if not filing_data or not filing_data.get('xbrl_data'):
-      return {'error': 'No filing', 'success': False}
+      return {'error': _filing_miss(ticker, form_type, 'No filing'),
+              'success': False}
 
     xbrl = filing_data['xbrl_data']
     ca = filter_instant_data(xbrl, 'us-gaap:AssetsCurrent')
@@ -1494,7 +1580,9 @@ def get_company_filings_history(ticker: str, form_type: str = '10-K',
 
   if not filings:
     return {'ticker': ticker, 'success': False,
-            'error': f'No {form_type} filings found for {ticker}'}
+            'error': _filing_miss(
+                ticker, form_type,
+                f'No {form_type} filings found for {ticker}')}
 
   out_filings = []
   try:
@@ -1870,7 +1958,9 @@ def extract_mda(ticker: str, form_type: str = '10-K',
     filing_data = get_latest_filing(ticker, form_type)
     if not filing_data:
       return {'ticker': ticker, 'success': False,
-              'error': f'No {form_type} filing found for {ticker}'}
+              'error': _filing_miss(
+                  ticker, form_type,
+                  f'No {form_type} filing found for {ticker}')}
 
     filing_obj = filing_data.get('filing_object')
     if filing_obj is None:
@@ -1986,7 +2076,9 @@ def extract_risk_factors(ticker: str, form_type: str = '10-K',
     filing_data = get_latest_filing(ticker, form_type)
     if not filing_data:
       return {'ticker': ticker, 'success': False,
-              'error': f'No {form_type} filing found for {ticker}'}
+              'error': _filing_miss(
+                  ticker, form_type,
+                  f'No {form_type} filing found for {ticker}')}
 
     filing_obj = filing_data.get('filing_object')
     if filing_obj is None:
@@ -2213,7 +2305,9 @@ def get_segment_financials(ticker: str, form_type: str = '10-K') -> Dict[str, An
     filing_data = get_latest_filing(ticker, form_type)
     if not filing_data or not filing_data.get('xbrl_data'):
       return {'ticker': ticker, 'success': False,
-              'error': f'No {form_type} filing or XBRL data found for {ticker}'}
+              'error': _filing_miss(
+                  ticker, form_type,
+                  f'No {form_type} filing or XBRL data found for {ticker}')}
 
     xbrl = filing_data['xbrl_data']
 
@@ -2350,7 +2444,9 @@ def get_buyback_history(ticker: str, form_type: str = '10-K', max_years: int = 5
   try:
     filing_data = get_latest_filing(ticker, form_type)
     if not filing_data or not filing_data.get('xbrl_data'):
-      return {'ticker': ticker, 'error': f'No filing found for {ticker}',
+      return {'ticker': ticker,
+              'error': _filing_miss(ticker, form_type,
+                                    f'No filing found for {ticker}'),
               'success': False}
 
     xbrl = filing_data['xbrl_data']
@@ -3072,7 +3168,9 @@ def extract_litigation(ticker: str, form_type: str = '10-K',
     filing_data = get_latest_filing(ticker, form_type)
     if not filing_data:
       return {'ticker': ticker, 'success': False,
-              'error': f'No {form_type} filing found for {ticker}'}
+              'error': _filing_miss(
+                  ticker, form_type,
+                  f'No {form_type} filing found for {ticker}')}
 
     filing_obj = filing_data.get('filing_object')
     if filing_obj is None:

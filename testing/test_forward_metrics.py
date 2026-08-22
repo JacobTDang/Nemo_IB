@@ -154,6 +154,56 @@ def test_concentration_pct_is_reported(monkeypatch):
     assert top["pct_of_total"] == pytest.approx(75.0)
 
 
+def test_overlapping_geographic_members_are_flagged_not_silently_double_counted():
+    """SAP tags EMEA, EMEA-excluding-Germany and country-of-domicile as three
+    members of one axis, so their sum double-counts the parent. Measured on
+    the FY2025 20-F the members sum to about EUR 73.7bn against consolidated
+    revenue of 36.8bn, so dividing by the sum reported EMEA at 23.1% of a
+    company where it is really 46.3%. Dividing by consolidated revenue makes
+    each percentage true on its own and the overlap explicit."""
+    import tools.web_search_server.forward_metrics as mod
+    mod_fetch = lambda t, c, **k: [_point([
+        _fact(36_800_000_000.0),  # consolidated, undimensioned
+        _fact(17_025_000_000.0, {GEO_AXIS: "sap:EuropeMiddleEastAndAfricaMember"}),
+        _fact(14_499_000_000.0, {GEO_AXIS: "sap:AmericasMember"}),
+        _fact(11_537_000_000.0, {GEO_AXIS: "country:US"}),
+        _fact(11_197_000_000.0, {GEO_AXIS: "sap:EuropeMiddleEastAndAfricaExcludingGermanyMember"}),
+        _fact(5_828_000_000.0, {GEO_AXIS: "ifrs-full:CountryOfDomicileMember"}),
+    ])]
+    import pytest as _pytest
+    monkey = _pytest.MonkeyPatch()
+    monkey.setattr(mod, "fetch_concept_series", mod_fetch)
+    try:
+        result = mod.get_geographic_revenue("SAP", form="20-F")
+    finally:
+        monkey.undo()
+    assert result["members_overlap"] is True
+    assert result["consolidated_revenue"] == 36_800_000_000.0
+    top = result["by_region"][0]
+    assert top["pct_of_total"] == pytest.approx(17_025 / 36_800 * 100, rel=1e-3)
+    assert "OVERLAP" in result["note"]
+    assert "do NOT sum to 100" in result["note"]
+
+
+def test_non_overlapping_members_keep_the_disclosed_total_as_denominator():
+    """NVDA's regions are disjoint, so the sum is the right denominator and
+    the flag stays off."""
+    import tools.web_search_server.forward_metrics as mod
+    import pytest as _pytest
+    monkey = _pytest.MonkeyPatch()
+    monkey.setattr(mod, "fetch_concept_series", lambda t, c, **k: [_point([
+        _fact(1000.0),
+        _fact(750.0, {GEO_AXIS: "country:US"}),
+        _fact(250.0, {GEO_AXIS: "country:TW"}),
+    ])])
+    try:
+        result = mod.get_geographic_revenue("NVDA")
+    finally:
+        monkey.undo()
+    assert result["members_overlap"] is False
+    assert result["by_region"][0]["pct_of_total"] == pytest.approx(75.0)
+
+
 # ---------------------------------------------------------------- public float
 
 def test_float_is_reported_with_its_filing_date(monkeypatch):

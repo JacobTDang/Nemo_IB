@@ -25,6 +25,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional
 
+from .foreign_issuer import form_mismatch_note
 from .sec_series import NotCovered, fetch_concept_series
 
 RPO_CONCEPTS = (
@@ -41,10 +42,16 @@ DEFERRED_CONCEPTS = (
     "us-gaap:DeferredRevenue",
 )
 
+# The IFRS members matter only for foreign private issuers, and they are
+# tried last so nothing changes for a domestic filer. A 20-F filer splits
+# revenue on `ifrs-full:GeographicalAreasAxis`, which the "Geograph" hint
+# below already matches -- the concept chain was the only thing missing.
 REVENUE_CONCEPTS = (
     "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",
     "us-gaap:Revenues",
     "us-gaap:SalesRevenueNet",
+    "ifrs-full:Revenue",
+    "ifrs-full:RevenueFromContractsWithCustomers",
 )
 
 FLOAT_CONCEPT = "dei:EntityPublicFloat"
@@ -117,9 +124,12 @@ def get_contracted_revenue(ticker: str, limit: int = 3,
     deferred, deferred_concept = _series_for(ticker, DEFERRED_CONCEPTS, form, limit)
 
     if not rpo and not deferred:
+        mismatch = form_mismatch_note(ticker, form)
         return {
             "ticker": ticker, "success": False,
-            "error": (f"contracted revenue not covered: neither "
+            "wrong_form": bool(mismatch),
+            "error": mismatch or (
+                      f"contracted revenue not covered: neither "
                       f"{RPO_CONCEPTS[0]} nor any deferred-revenue concept "
                       f"appears in the last {limit} {form} filings"),
             "rpo": [], "deferred_revenue": [],
@@ -154,7 +164,11 @@ def get_geographic_revenue(ticker: str, limit: int = 1,
             continue
 
         by_region: Dict[str, List[Dict[str, Any]]] = {}
+        consolidated: Optional[float] = None
         for point in points:
+            total_fact = point.latest_undimensioned()
+            if total_fact is not None and consolidated is None:
+                consolidated = total_fact.value
             for fact in point.deduplicated():
                 member = None
                 for axis, value in fact.dimensions.items():
@@ -174,27 +188,54 @@ def get_geographic_revenue(ticker: str, limit: int = 1,
             rows.sort(key=lambda r: r["period"], reverse=True)
 
         latest_total = sum(rows[0]["value"] for rows in by_region.values())
+
+        # Members can nest, and IFRS filers nest aggressively: SAP tags
+        # "EMEA", "EMEA excluding Germany" and "country of domicile" as three
+        # separate members of the same axis, so their parent is counted twice
+        # and every percentage comes out low. Detected by comparing the sum
+        # against the consolidated fact already in hand rather than by trying
+        # to recognise parent labels, which cannot be done from a tag name.
+        nested = bool(consolidated) and latest_total > consolidated * 1.02
+        denominator = consolidated if nested else latest_total
+
         regions = [
             {"region": region, "periods": rows,
-             "pct_of_total": (rows[0]["value"] / latest_total * 100.0)
-                             if latest_total else None}
+             "pct_of_total": (rows[0]["value"] / denominator * 100.0)
+                             if denominator else None}
             for region, rows in by_region.items()
         ]
         regions.sort(key=lambda r: r["periods"][0]["value"], reverse=True)
 
+        note = ("Percentages are of the disclosed geographic total, which "
+                "may differ from consolidated revenue when a filer groups "
+                "part of it under an 'other' region.")
+        if nested:
+            note = (
+                "This filer's geographic members OVERLAP: they sum to "
+                f"{latest_total:,.0f} against consolidated revenue of "
+                f"{consolidated:,.0f}, so at least one region is a parent of "
+                "another (SAP tags EMEA, EMEA-excluding-Germany and Germany "
+                "on the same axis). Percentages are of consolidated revenue "
+                "and therefore do NOT sum to 100. Read individual regions, "
+                "not the ranking, and do not add them together.")
         return {
             "ticker": ticker, "success": True, "concept_used": concept,
             "by_region": regions,
             "regions_found": [r["region"] for r in regions],
             "disclosed_total": latest_total,
-            "note": ("Percentages are of the disclosed geographic total, which "
-                     "may differ from consolidated revenue when a filer groups "
-                     "part of it under an 'other' region."),
+            "consolidated_revenue": consolidated,
+            "members_overlap": nested,
+            "note": note,
         }
 
+    # "TSM does not disaggregate revenue by geography in its 10-K" was the
+    # answer here. TSMC has no 10-K, and its 20-F splits revenue four ways.
+    mismatch = form_mismatch_note(ticker, form)
     return {
         "ticker": ticker, "success": False,
-        "error": f"{ticker} does not disaggregate revenue by geography in its {form}",
+        "wrong_form": bool(mismatch),
+        "error": mismatch or (
+            f"{ticker} does not disaggregate revenue by geography in its {form}"),
         "by_region": [], "regions_found": [],
     }
 
@@ -209,9 +250,12 @@ def get_public_float(ticker: str, form: str = "10-K") -> Dict[str, Any]:
     """
     rows, _ = _series_for(ticker, (FLOAT_CONCEPT,), form, 1)
     if not rows:
+        mismatch = form_mismatch_note(ticker, form)
         return {
             "ticker": ticker, "success": False,
-            "error": (f"{ticker} does not tag {FLOAT_CONCEPT} in its {form}. "
+            "wrong_form": bool(mismatch),
+            "error": mismatch or (
+                      f"{ticker} does not tag {FLOAT_CONCEPT} in its {form}. "
                       f"Smaller reporting companies sometimes omit it."),
             "public_float": None, "filing_date": None,
         }

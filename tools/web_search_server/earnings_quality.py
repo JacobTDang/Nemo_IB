@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from .foreign_issuer import form_mismatch_note
 from .sec_series import NotCovered, _period_rank, fetch_concept_series
 
 NET_INCOME_CONCEPTS = (
@@ -252,9 +253,12 @@ def get_accruals_quality(ticker: str, limit: int = 2,
                                        ("operating cash flow", ocf_rows))
                if not rows]
     if missing:
+        mismatch = form_mismatch_note(ticker, form)
         return {
             "ticker": ticker, "success": False, "coverage": "not_covered",
-            "error": (f"{ticker} does not tag {' and '.join(missing)} in the "
+            "wrong_form": bool(mismatch),
+            "error": mismatch or (
+                      f"{ticker} does not tag {' and '.join(missing)} in the "
                       f"last {limit} {form} filings, so accruals cannot be "
                       f"computed. This is a tagging gap, not zero accruals."),
             "periods": [], "latest": None, "trend": None, "flag": None,
@@ -370,7 +374,8 @@ def get_working_capital_trends(ticker: str, limit: int = 2,
     if not rev_rows:
         return {
             "ticker": ticker, "success": False, "coverage": "not_covered",
-            "error": (f"{ticker} does not tag revenue in the last {limit} "
+            "error": form_mismatch_note(ticker, form) or (
+                      f"{ticker} does not tag revenue in the last {limit} "
                       f"{form} filings. Every ratio here is per revenue-day, "
                       f"so none can be computed."),
             "periods": [], "latest": None, "concepts_tried": tried,
@@ -519,7 +524,8 @@ def get_operating_leases(ticker: str, limit: int = 1,
     if liability is None and rou_asset is None and buckets_found == 0:
         return {
             "ticker": ticker, "success": False, "coverage": "not_covered",
-            "error": (f"{ticker} tags no operating-lease concepts in its "
+            "error": form_mismatch_note(ticker, form) or (
+                      f"{ticker} tags no operating-lease concepts in its "
                       f"{form}. Either the filer has no material operating "
                       f"leases or it did not tag them; this is not a zero "
                       f"obligation."),
