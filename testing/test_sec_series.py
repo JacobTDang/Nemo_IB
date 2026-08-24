@@ -668,3 +668,55 @@ def test_tsm_revenue_is_reported_in_twd_not_dollars():
     assert fact.value == pytest.approx(3.8090543e12, rel=1e-6)
     assert points[0].reporting_currency() == "TWD"
     assert "USD" in points[0].currencies()
+
+
+# --------------------------------------------------------------------------
+# Precision tie-break.
+#
+# A filer may tag the same concept twice in one context at different
+# precisions. Amazon's FY2024 income tax appears as both 9,265,000,000 and a
+# rounded 9,300,000,000 under us-gaap:IncomeTaxExpenseBenefit in context c-4;
+# FY2023 likewise as 7,120,000,000 and 7,100,000,000.
+#
+# Ties fell to document order, which happened to yield the precise figure in
+# both observed cases. That is luck, not a rule, and the wrong side of it is a
+# 0.4% error that nothing would flag. XBRL's `decimals` attribute states the
+# precision outright: a higher value means accurate to a smaller unit, so the
+# larger `decimals` wins.
+# --------------------------------------------------------------------------
+
+def test_concept_fact_carries_decimals():
+    fact = ConceptFact(9_265_000_000.0, "duration_2024", {}, "c-4", decimals=-6)
+    assert fact.decimals == -6
+
+
+def test_the_more_precise_fact_wins_a_tie():
+    """decimals=-6 is accurate to millions; -8 only to hundred millions."""
+    point = FilingPoint("2026-02-06", "10-K", "acc", facts=[
+        ConceptFact(9_300_000_000.0, "duration_2024-01-01_2024-12-31", {}, "c-4",
+                    decimals=-8),
+        ConceptFact(9_265_000_000.0, "duration_2024-01-01_2024-12-31", {}, "c-4",
+                    decimals=-6),
+    ])
+    assert point.latest_undimensioned().value == 9_265_000_000.0
+
+
+def test_precision_does_not_override_a_later_period():
+    """A newer period beats a more precise older one -- freshness first."""
+    point = FilingPoint("2026-02-06", "10-K", "acc", facts=[
+        ConceptFact(7_120_000_000.0, "duration_2023-01-01_2023-12-31", {}, "c-8",
+                    decimals=-6),
+        ConceptFact(9_300_000_000.0, "duration_2024-01-01_2024-12-31", {}, "c-4",
+                    decimals=-8),
+    ])
+    assert point.latest_undimensioned().value == 9_300_000_000.0
+
+
+def test_absent_decimals_does_not_lose_to_a_present_one_by_default():
+    """An untagged precision is unknown, not worst. Falling back to document
+    order there preserves the behaviour that was already correct."""
+    point = FilingPoint("2026-02-06", "10-K", "acc", facts=[
+        ConceptFact(100.0, "duration_2024", {}, "c-1", decimals=None),
+        ConceptFact(200.0, "duration_2024", {}, "c-1", decimals=None),
+    ])
+    assert point.latest_undimensioned().value == 100.0

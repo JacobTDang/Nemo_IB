@@ -103,6 +103,24 @@ def _clean_number(value: Any) -> Optional[float]:
     return number
 
 
+def _clean_decimals(value: Any) -> Optional[int]:
+    """XBRL `decimals`, or None when absent or non-numeric.
+
+    "INF" marks an exactly-stated value and is treated as maximum precision.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() == "nan":
+        return None
+    if text.upper() == "INF":
+        return 99
+    try:
+        return int(float(text))
+    except (TypeError, ValueError):
+        return None
+
+
 def _clean_period(row: Any) -> str:
     """Best available period label for a fact.
 
@@ -256,6 +274,10 @@ class ConceptFact:
     context_ref: str = ""
     concept: str = ""
     unit: str = ""
+    # XBRL precision. Higher means accurate to a smaller unit: -6 is millions,
+    # -8 only hundred millions. None when the filer did not state it, which is
+    # unknown precision rather than poor precision.
+    decimals: Optional[int] = None
 
     def dimension_member(self, axis: str) -> Optional[str]:
         return self.dimensions.get(axis)
@@ -412,7 +434,12 @@ class FilingPoint:
                           if _in_span(_period_rank(f.period)[1], low, high)]
         if not candidates:
             return None
-        return max(candidates, key=lambda f: _period_rank(f.period))
+        # Period first -- freshness beats precision. Precision settles only a
+        # tie, where a filer tagged one concept twice in one context at two
+        # different roundings. Amazon does exactly that for income tax.
+        return max(candidates,
+                   key=lambda f: (_period_rank(f.period),
+                                  f.decimals if f.decimals is not None else -999))
 
     def by_axis(self, axis: str) -> Dict[str, float]:
         """Facts keyed by their member on one axis.
@@ -469,6 +496,7 @@ def concept_point(xbrl: Any, concept: str, filing_date: str, form: str,
             # column, so a currency-unaware edgartools degrades to the
             # old behaviour instead of raising.
             unit=str(row.get("unit_ref") or ""),
+            decimals=_clean_decimals(row.get("decimals")),
         ))
 
     if not facts:
