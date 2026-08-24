@@ -994,6 +994,42 @@ def get_margin_breakdown(ticker: str, form_type: str = '10-K') -> Dict[str, Any]
     return {'ticker': ticker, 'error': f'get_margin_breakdown failed: {e}', 'success': False}
 
 
+def _consolidated_series(xbrl, concepts, min_span=300, max_span=400):
+  """Every annual undimensioned period for the first covered concept.
+
+  A 10-K's cash-flow statement carries three comparative years, so the trend is
+  available from one filing without walking filings. The span window keeps
+  quarterly durations out: a 10-K tags those beside the annual ones and they
+  end on the same day.
+
+  Returns (list of {period_end, value} newest first, concept_used).
+  """
+  from tools.web_search_server.sec_series import _period_rank, concept_point
+  for concept in concepts:
+    try:
+      point = concept_point(xbrl, concept, "", "")
+    except Exception:  # noqa: BLE001 - try the next concept
+      continue
+    if point is None:
+      continue
+
+    # One period can carry two roundings; keep the precise one.
+    best = {}
+    for fact in point.undimensioned():
+      end, span = _period_rank(fact.period)
+      if not end or not (min_span <= span <= max_span):
+        continue
+      prior = best.get(end)
+      if prior is None or (fact.decimals or -999) > (prior[1] or -999):
+        best[end] = (fact.value, fact.decimals)
+
+    if best:
+      series = [{'period_end': end, 'value': value}
+                for end, (value, _) in sorted(best.items(), reverse=True)]
+      return series, concept
+  return [], None
+
+
 def get_historical_fcf(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
   """Operating cash flow, capex, and free cash flow from the latest filing.
 
@@ -1041,6 +1077,27 @@ def get_historical_fcf(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
     revenue = rev_tuple[0] if rev_tuple else None
     period_end = rev_tuple[1] if rev_tuple else None
 
+    # The name promises history, so return it. A single period cannot show a
+    # divergence, which is what callers reach for this tool to see.
+    ocf_series, _ = _consolidated_series(xbrl, OPERATING_CASH_FLOW_CONCEPTS)
+    capex_series, _ = _consolidated_series(xbrl, CAPEX_CONCEPTS)
+    capex_by_end = {row['period_end']: abs(row['value']) for row in capex_series}
+
+    series = []
+    for row in ocf_series:
+      end = row['period_end']
+      period_ocf = row['value']
+      period_capex = capex_by_end.get(end)
+      series.append({
+        'period_end': end,
+        'operating_cash_flow': period_ocf,
+        'capex': period_capex,
+        # None, never a zero standing in for a missing input -- that is what
+        # made Amazon's free cash flow read 18x its real value.
+        'free_cash_flow': (period_ocf - period_capex)
+                          if period_capex is not None else None,
+      })
+
     result = {
       'ticker': ticker,
       'operating_cash_flow': ocf,
@@ -1048,6 +1105,7 @@ def get_historical_fcf(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
       'capex': capex,
       'capex_concept_used': capex_concept,
       'period_end': period_end,
+      'series': series,
     }
 
     if capex is None:

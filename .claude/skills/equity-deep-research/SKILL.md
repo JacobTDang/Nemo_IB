@@ -205,9 +205,16 @@ Output:
 NEW required step. If adjusted numbers are materially better than
 GAAP / cash numbers, the analysis must explain why.
 
-Tools: `get_financial_statements` (compute cash conversion = OCF / net
-income), `get_basic_financials` (Finnhub ratios),
-`get_historical_fcf` (FCF vs reported earnings divergence).
+Tools: `get_accruals_quality` (net income against operating cash flow over
+several periods, with the accrual ratio -- this is the divergence check),
+`get_working_capital_trends` (DSO/DIO/DPO: receivables growing faster than
+revenue is the same story earlier), `get_historical_fcf` (OCF, capex and FCF
+per period), `get_basic_financials` (Finnhub ratios).
+
+`get_accruals_quality` returns `coverage` and refuses rather than guessing;
+`get_historical_fcf` returns `free_cash_flow: null` with
+`coverage: "not_covered"` for filers tagging no capex element (banks do not).
+Neither absence means zero.
 
 Required checks:
 - Cash conversion (OCF / NI)
