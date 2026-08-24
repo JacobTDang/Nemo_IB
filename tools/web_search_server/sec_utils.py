@@ -36,6 +36,39 @@ def _get_filing_lock(key: tuple) -> threading.Lock:
     return lock
 
 
+# Revenue elements, broadest first. Order is load-bearing, and the previous
+# order -- ASC 606 first -- was wrong wherever a filer earns anything outside a
+# customer contract:
+#
+#   AMT   reported   935,900,000 against 10,644,600,000. Tower rents are lease
+#         income under ASC 842; AMT labels the ASC 606 element "Total non-lease
+#         revenue" and it is 8.8% of revenue.
+#   WFC   reported 10,498,000,000 against 83,699,000,000 -- the fact WFC labels
+#         "Fee income".
+#   WMT   reported 706,413,000,000 against 713,163,000,000.
+#   GE    reported 30,163,000,000 against 45,855,000,000.
+#
+# `RevenuesNetOfInterestExpense` is the total-revenue line on a bank's income
+# statement and is the only one GS and WFC tag undimensioned; it used to be
+# reached by accident, through the prefix match on `us-gaap:Revenues`, and
+# reported under that name. GS does not tag `us-gaap:Revenues` at all.
+#
+# Reordering alone is not enough and makes two filers worse on its own: the
+# largest `us-gaap:Revenues` fact is 452.209bn for XOM against a consolidated
+# 332.238bn, and 48.024bn for GE against 45.855bn. It only works because
+# `filter_annual_data` now returns the undimensioned fact rather than the
+# largest one.
+#
+# The unprefixed spellings that used to trail this list ('Revenues', 'Revenue',
+# 'TotalRevenues', 'SalesRevenueNet') are gone. No filing tags them; they only
+# ever matched through the prefix search, which no longer answers.
+REVENUE_CONCEPTS = (
+  'us-gaap:Revenues',
+  'us-gaap:RevenuesNetOfInterestExpense',
+  'us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax',
+  'us-gaap:SalesRevenueNet',
+)
+
 # Period length, in days, that each form's primary reporting period runs for.
 # A fiscal year is 364 or 365 days and a 52/53-week retailer's runs 371, so the
 # annual floor sits below the shortest of those and above any half-year. A
@@ -468,18 +501,7 @@ def get_revenue_base(ticker: str, form_type: str= "10-K") -> Dict[str, Any]:
 
 
       # Try different revenue concept names - prioritize Google's specific concepts
-      revenue_concepts = [
-        'us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax',  # Google's main revenue concept
-        'us-gaap:Revenues',  # Total revenues (most comprehensive)
-        'us-gaap:SalesRevenueNet',
-        'RevenueFromContractWithCustomerExcludingAssessedTax',  # Without prefix
-        'Revenues',
-        'Revenue',
-        'TotalRevenues',
-        'SalesRevenueNet'
-      ]
-
-      for concept in revenue_concepts:
+      for concept in REVENUE_CONCEPTS:
         result = filter_annual_data(xbrl, concept, form_type)
         if result:
           currency = result.get('currency')
@@ -864,10 +886,8 @@ def get_depreciation(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
 
 
 def _get_revenue_from_xbrl(xbrl, form_type: str):
-  """Helper: try the two most common revenue concepts; return (value, period_end) or None."""
-  for concept in ('us-gaap:Revenues',
-                  'us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax',
-                  'us-gaap:SalesRevenueNet'):
+  """Revenue for the filing's own period; (value, period_end) or None."""
+  for concept in REVENUE_CONCEPTS:
     d = filter_annual_data(xbrl, concept, form_type)
     if d:
       return d['value'], d['period_end']
