@@ -36,108 +36,115 @@ def _get_filing_lock(key: tuple) -> threading.Lock:
     return lock
 
 
-def filter_instant_data(xbrl, concept: str) -> Optional[Dict[str, Any]]:
-  """Filter XBRL for instant (point-in-time) facts -- balance sheet items.
+# Period length, in days, that each form's primary reporting period runs for.
+# A fiscal year is 364 or 365 days and a 52/53-week retailer's runs 371, so the
+# annual floor sits below the shortest of those and above any half-year. A
+# quarter is 89-92 days; the window has to exclude the year-to-date duration a
+# 10-Q carries beside it, which ends on the same day.
+_PERIOD_SPAN_DAYS = {
+  '10-K': (350, None),
+  '20-F': (350, None),
+  '40-F': (350, None),
+  '10-Q': (80, 95),
+}
 
-  Balance sheet items use 'period_instant' rather than 'period_start'/'period_end'.
-  Returns the most recent fact and its as-of date.
+
+def _consolidated_fact(xbrl, concept: str, span_days=None):
+  """The undimensioned fact for `concept`, or None if the filer tags none.
+
+  The single selection path behind every reader in this module. It exists
+  because the two it replaces were wrong in the same two ways, and both ways
+  produce a plausible number rather than a crash:
+
+  1. `xbrl.facts.query().by_concept(name)` matches by **prefix**. Asking for
+     `us-gaap:Assets` also returns `us-gaap:AssetsCurrent`, and asking for
+     `us-gaap:Revenues` also returns `us-gaap:RevenuesNetOfInterestExpense`.
+     Goldman does not tag `us-gaap:Revenues` at all, yet the old path reported
+     its net revenues under that name -- a caller reconciling against the
+     filing would find nothing there.
+  2. Ties were broken with `idxmax`, on the stated assumption that the
+     consolidated total is the largest fact for the period. It is not. A
+     segment aggregate is struck before intersegment eliminations (CVX:
+     231.4bn against 189.0bn), an unconsolidated joint venture's revenue is
+     not the filer's revenue at all (SPG: 12.5bn against 6.4bn), and where the
+     consolidated figure is negative the largest fact is the parent-company-
+     only Schedule I figure, so the sign flips (JPM's operating cash flow:
+     +44.5bn against -147.8bn).
+
+  `sec_series` already solved both -- exact-concept filtering in
+  `concept_point`, consolidated selection by *absence of dimensions* in
+  `FilingPoint.undimensioned()` -- and every tool built on it reconciled
+  cleanly in both audit sweeps. This routes through that rather than adding a
+  third mechanism.
+
+  None means "this filer does not tag this concept undimensioned", which is
+  what lets a caller's concept chain move on to the element that it does tag.
+  It is never a reason to substitute a dimensioned fact.
   """
+  if xbrl is None:
+    return None
+  from .sec_series import concept_point
   try:
-    facts = xbrl.facts.query().by_concept(concept).to_dataframe()
-    if facts.empty:
-      return None
-    # Filter to instant-type rows (balance sheet); period_instant has the as-of date
-    if 'period_type' in facts.columns:
-      facts = facts[facts['period_type'] == 'instant']
-    if facts.empty:
-      return None
-    facts['instant_dt'] = pd.to_datetime(facts['period_instant'])
-    latest = facts[facts['instant_dt'] == facts['instant_dt'].max()]
-    if len(latest) > 1:
-      # Consolidated total = largest absolute value among segments
-      latest = latest.loc[latest['numeric_value'].abs().idxmax()]
-    else:
-      latest = latest.iloc[0]
-    return {
-      'value': latest['numeric_value'],
-      'concept_used': concept,
-      'period_end': latest['period_instant'],
-    }
+    point = concept_point(xbrl, concept, filing_date='', form='')
   except Exception:
     return None
+  if point is None:
+    return None
+  return point.latest_undimensioned(span_days=span_days)
+
+
+def _fact_result(fact, concept: str) -> Optional[Dict[str, Any]]:
+  """A selected fact in the shape every caller in this module reads.
+
+  `concept_used` names the element the value is actually tagged under rather
+  than the one that was asked for. Those differed whenever the prefix match
+  answered, and provenance that names an absent element is wrong even when the
+  number beside it is right.
+  """
+  if fact is None:
+    return None
+  from .sec_series import _period_rank
+  period_end, duration_days = _period_rank(fact.period)
+  return {
+    'value': fact.value,
+    'concept_used': fact.concept or concept,
+    'period_end': period_end,
+    'duration_days': duration_days,
+    # Currency matters the moment a foreign filer is in scope: TSM tags TWD,
+    # SAP and ASML EUR, NVO DKK, BABA CNY. None means the unit was not a plain
+    # amount of money, or was not tagged at all.
+    'currency': fact.currency,
+  }
+
+
+def filter_instant_data(xbrl, concept: str) -> Optional[Dict[str, Any]]:
+  """The consolidated instant fact for a concept -- balance sheet items.
+
+  Balance sheet items are tagged as an instant rather than a duration, so the
+  span window is exactly zero days. See `_consolidated_fact` for why selection
+  is by absence of dimensions rather than by size.
+  """
+  return _fact_result(_consolidated_fact(xbrl, concept, span_days=(0, 0)),
+                      concept)
 
 
 def filter_annual_data(xbrl, concept: str, form_type: str = '10-K') -> Optional[Dict[str, Any]]:
-  """
-  Helper function to filter XBRL facts for period data based on form type
-  Returns latest period data or None if not found
-  - 10-K / 20-F / 40-F: Annual data (350+ days)
-  - 10-Q: Quarterly data (80-95 days)
-  - Others: Most recent available
+  """The consolidated fact for a concept over the period `form_type` implies.
+
+  - 10-K / 20-F / 40-F: the fiscal year (350+ days)
+  - 10-Q: the quarter (80-95 days)
+  - Others: the most recent period of any length
 
   20-F and 40-F are the annual reports of foreign private issuers and carry
-  the same 12-month durations as a 10-K. They previously fell to the "most
-  recent available" branch, which does not filter by span at all.
+  the same 12-month durations as a 10-K.
+
+  Returns None when the filer tags no undimensioned fact for this concept in
+  the window. That is a coverage fact the caller needs, not a reason to hand
+  back a segment or a parent-company-only figure -- see `_consolidated_fact`.
   """
-  try:
-    facts = xbrl.facts.query().by_concept(concept).to_dataframe()
-
-    if facts.empty:
-      return None
-
-    # Filter for appropriate periods based on form type
-    facts['period_start_dt'] = pd.to_datetime(facts['period_start'])
-    facts['period_end_dt'] = pd.to_datetime(facts['period_end'])
-    facts['duration_days'] = (facts['period_end_dt'] - facts['period_start_dt']).dt.days
-
-    # Set period filters based on form type
-    if form_type in ('10-K', '20-F', '40-F'):
-      # Annual data (350+ days for fiscal year variations)
-      target_periods = facts[facts['duration_days'] >= 350]
-    elif form_type == '10-Q':
-      # Quarterly data (80-95 days typically)
-      target_periods = facts[(facts['duration_days'] >= 80) & (facts['duration_days'] <= 95)]
-    else:
-      # For other forms (8-K, S-1, etc.), get most recent regardless of duration
-      target_periods = facts
-
-    if not target_periods.empty:
-      period_data = target_periods[target_periods['period_end_dt'] == target_periods['period_end_dt'].max()]
-      # XBRL often has multiple facts for the same concept and period
-      # (segments + consolidated total). The consolidated total is always
-      # the largest positive value, so take the max for any concept that
-      # can have segment breakdowns.
-      if len(period_data) > 1:
-        period_data = period_data.loc[period_data['numeric_value'].idxmax()]
-      else:
-        period_data = period_data.iloc[0]
-    else:
-      # Fallback to most recent data if no target periods found
-      period_data = facts[facts['period_end_dt'] == facts['period_end_dt'].max()]
-      if len(period_data) > 1:
-        period_data = period_data.loc[period_data['numeric_value'].idxmax()]
-      else:
-        period_data = period_data.iloc[0]
-
-    if period_data is not None and not (hasattr(period_data, 'empty') and period_data.empty):
-      latest_row = period_data
-
-      # Currency matters the moment a foreign filer is in scope: TSM tags
-      # TWD, SAP and ASML EUR, NVO DKK, BABA CNY. None means the unit was
-      # not a plain amount of money, or was not tagged at all.
-      from .sec_series import currency_of
-      return {
-        'value': latest_row['numeric_value'],
-        'concept_used': concept,
-        'period_end': latest_row['period_end'],
-        'duration_days': latest_row['duration_days'],
-        'currency': currency_of(latest_row.get('unit_ref')),
-      }
-
-    return None
-
-  except Exception:
-    return None
+  span = _PERIOD_SPAN_DAYS.get(str(form_type).strip().upper())
+  return _fact_result(_consolidated_fact(xbrl, concept, span_days=span),
+                      concept)
 
 def _filing_miss(ticker: str, form_type: str, fallback: str) -> str:
   """Say "this filer uses a different form" when that is why nothing was found.

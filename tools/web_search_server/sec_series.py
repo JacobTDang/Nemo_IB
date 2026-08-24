@@ -152,6 +152,22 @@ def _period_rank(period: str) -> tuple:
     return (end.isoformat(), (end - start).days)
 
 
+def _in_span(days: int, low: Optional[int], high: Optional[int]) -> bool:
+    """Whether a period length falls inside an inclusive window.
+
+    `_period_rank` returns -1 for a period it could not parse. That is outside
+    every window deliberately: a fact whose period is unknown must not be
+    handed back as the annual figure because no lower bound happened to be set.
+    """
+    if days < 0:
+        return False
+    if low is not None and days < low:
+        return False
+    if high is not None and days > high:
+        return False
+    return True
+
+
 def _concept_matches(row_concept: Any, requested: str) -> bool:
     """Whether a fact row is the requested concept rather than a longer name.
 
@@ -360,7 +376,8 @@ class FilingPoint:
         return [f for f in self.deduplicated() if not f.dimensions]
 
     def latest_undimensioned(
-            self, currency: Optional[str] = None) -> Optional[ConceptFact]:
+            self, currency: Optional[str] = None,
+            span_days: Optional[tuple] = None) -> Optional[ConceptFact]:
         """The consolidated fact for the most recent, longest period here.
 
         A 10-K's XBRL carries three comparative years for a duration concept,
@@ -379,8 +396,20 @@ class FilingPoint:
         whichever row pandas produced first. Candidates are narrowed to one
         currency before ranking; pass `currency` to ask for the translation
         deliberately, and get None rather than a substitute if it is absent.
+
+        Nor is ranking enough when the caller wants a period of a particular
+        length. A 10-Q carries the year-to-date duration alongside the quarter
+        and both end on the same day, so the longest-span rule returns nine
+        months where three were asked for. `span_days` is an inclusive
+        (minimum, maximum) window on the period length, either bound optional
+        as None; a period whose length cannot be determined is outside every
+        window rather than inside the first one.
         """
         candidates = self._in_reporting_currency(self.undimensioned(), currency)
+        if span_days is not None:
+            low, high = span_days
+            candidates = [f for f in candidates
+                          if _in_span(_period_rank(f.period)[1], low, high)]
         if not candidates:
             return None
         return max(candidates, key=lambda f: _period_rank(f.period))

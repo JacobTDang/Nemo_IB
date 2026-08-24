@@ -314,30 +314,50 @@ def mega_cap_tickers():
     return ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "JPM", "JNJ", "V", "WMT"]
 
 
+def fake_xbrl(rows):
+    """An XBRL stand-in in the shape edgartools actually produces.
+
+    Every column the selection path reads has to be here. The frames these
+    tests used to build carried `concept`, `numeric_value`, `period_start`,
+    `period_end` and `unit` -- no `period_key`, no `context_ref`, no
+    `unit_ref`, and no contexts at all -- so a fact could not be dimensioned
+    even in principle and the two defects the audits found were unreachable
+    from this file. Each row is (concept, value, period_start, period_end,
+    context_ref, dimensions).
+    """
+    frame = pd.DataFrame([{
+        'concept': concept,
+        'numeric_value': value,
+        'period_key': f'duration_{start}_{end}' if start else f'instant_{end}',
+        'period_start': start,
+        'period_end': end,
+        'context_ref': context,
+        'unit_ref': 'usd',
+    } for concept, value, start, end, context, _ in rows])
+
+    class _Context:
+        def __init__(self, dimensions):
+            self.dimensions = dict(dimensions)
+
+    query = MagicMock()
+    query.to_dataframe.return_value = frame
+    query.by_concept.return_value = query
+    facts = MagicMock()
+    facts.query.return_value = query
+
+    mock = MagicMock()
+    mock.facts = facts
+    mock.contexts = {row[4]: _Context(row[5]) for row in rows}
+    return mock
+
+
 @pytest.fixture
 def mock_xbrl_data():
     """Create mock XBRL data for unit testing."""
-    mock = MagicMock()
-
-    # Create mock facts
-    mock_facts = MagicMock()
-    mock_query = MagicMock()
-
-    # Sample DataFrame for revenue
-    sample_df = pd.DataFrame({
-        'concept': ['us-gaap:Revenues'],
-        'numeric_value': [100000000000.0],
-        'period_start': ['2023-01-01'],
-        'period_end': ['2023-12-31'],
-        'unit': ['USD']
-    })
-
-    mock_query.to_dataframe.return_value = sample_df
-    mock_query.by_concept.return_value = mock_query
-    mock_facts.query.return_value = mock_query
-    mock.facts = mock_facts
-
-    return mock
+    return fake_xbrl([
+        ('us-gaap:Revenues', 100000000000.0, '2023-01-01', '2023-12-31',
+         'c-1', {}),
+    ])
 
 
 @pytest.fixture
@@ -465,78 +485,53 @@ class TestFilterAnnualData:
 
     def test_filter_annual_data_quarterly_vs_annual(self):
         """Test that quarterly data is properly excluded."""
-        mock_xbrl = MagicMock()
-        mock_facts = MagicMock()
-        mock_query = MagicMock()
-
-        # Create DataFrame with both quarterly and annual data
-        df = pd.DataFrame({
-            'concept': ['us-gaap:Revenues'] * 4,
-            'numeric_value': [25000000000.0, 25000000000.0, 25000000000.0, 100000000000.0],
-            'period_start': ['2023-01-01', '2023-04-01', '2023-07-01', '2023-01-01'],
-            'period_end': ['2023-03-31', '2023-06-30', '2023-09-30', '2023-12-31'],
-            'unit': ['USD'] * 4
-        })
-
-        mock_query.to_dataframe.return_value = df
-        mock_query.by_concept.return_value = mock_query
-        mock_facts.query.return_value = mock_query
-        mock_xbrl.facts = mock_facts
+        mock_xbrl = fake_xbrl([
+            ('us-gaap:Revenues', 25000000000.0, '2023-01-01', '2023-03-31', 'c-2', {}),
+            ('us-gaap:Revenues', 25000000000.0, '2023-04-01', '2023-06-30', 'c-3', {}),
+            ('us-gaap:Revenues', 25000000000.0, '2023-07-01', '2023-09-30', 'c-4', {}),
+            ('us-gaap:Revenues', 100000000000.0, '2023-01-01', '2023-12-31', 'c-1', {}),
+        ])
 
         result = filter_annual_data(mock_xbrl, 'us-gaap:Revenues')
 
-        if result is not None:
-            # Should return the annual value (100B), not quarterly
-            assert result['duration_days'] >= 350 or result['value'] == 100000000000.0
+        assert result is not None
+        # Should return the annual value (100B), not quarterly
+        assert result['duration_days'] >= 350
+        assert result['value'] == 100000000000.0
 
-    def test_filter_annual_data_revenue_max_selection(self):
-        """Test that for revenue, the maximum value is selected."""
-        mock_xbrl = MagicMock()
-        mock_facts = MagicMock()
-        mock_query = MagicMock()
+    def test_filter_annual_data_ignores_the_segment_breakdown(self):
+        """The consolidated total is NOT "the largest fact for the period".
 
-        # Create DataFrame with multiple revenue values for same period
-        df = pd.DataFrame({
-            'concept': ['us-gaap:Revenues'] * 3,
-            'numeric_value': [50000000000.0, 100000000000.0, 75000000000.0],
-            'period_start': ['2023-01-01'] * 3,
-            'period_end': ['2023-12-31'] * 3,
-            'unit': ['USD'] * 3
-        })
-
-        mock_query.to_dataframe.return_value = df
-        mock_query.by_concept.return_value = mock_query
-        mock_facts.query.return_value = mock_query
-        mock_xbrl.facts = mock_facts
+        This test used to assert that it was, which is the assumption two audit
+        sweeps disproved: an operating-segment aggregate is struck before
+        intersegment eliminations and lands above the consolidated line, and a
+        joint-venture disclosure is not the filer's revenue at all. The fact to
+        return is the one carrying no dimensions, whatever its size.
+        """
+        mock_xbrl = fake_xbrl([
+            ('us-gaap:Revenues', 100000000000.0, '2023-01-01', '2023-12-31',
+             'c-9', {'srt:ConsolidationItemsAxis': 'us-gaap:OperatingSegmentsMember'}),
+            ('us-gaap:Revenues', 75000000000.0, '2023-01-01', '2023-12-31', 'c-1', {}),
+            ('us-gaap:Revenues', 50000000000.0, '2023-01-01', '2023-12-31',
+             'c-10', {'srt:StatementGeographicalAxis': 'country:US'}),
+        ])
 
         result = filter_annual_data(mock_xbrl, 'us-gaap:Revenues')
 
-        if result is not None:
-            # Should select the maximum revenue value
-            assert result['value'] == 100000000000.0
+        assert result is not None
+        assert result['value'] == 75000000000.0
 
     def test_filter_annual_data_handles_nan_values(self):
         """Test handling of NaN values in data."""
-        mock_xbrl = MagicMock()
-        mock_facts = MagicMock()
-        mock_query = MagicMock()
-
-        df = pd.DataFrame({
-            'concept': ['us-gaap:Revenues'] * 2,
-            'numeric_value': [np.nan, 100000000000.0],
-            'period_start': ['2023-01-01'] * 2,
-            'period_end': ['2023-12-31'] * 2,
-            'unit': ['USD'] * 2
-        })
-
-        mock_query.to_dataframe.return_value = df
-        mock_query.by_concept.return_value = mock_query
-        mock_facts.query.return_value = mock_query
-        mock_xbrl.facts = mock_facts
+        mock_xbrl = fake_xbrl([
+            ('us-gaap:Revenues', np.nan, '2023-01-01', '2023-12-31', 'c-2', {}),
+            ('us-gaap:Revenues', 100000000000.0, '2023-01-01', '2023-12-31', 'c-1', {}),
+        ])
 
         result = filter_annual_data(mock_xbrl, 'us-gaap:Revenues')
         # Should handle NaN gracefully
-        assert result is None or (result is not None and not np.isnan(result.get('value', np.nan)))
+        assert result is not None
+        assert result['value'] == 100000000000.0
 
 
 # =============================================================================
@@ -1660,28 +1655,16 @@ class TestRegression:
 
     def test_negative_value_handling(self):
         """Test handling of negative values in XBRL data."""
-        mock_xbrl = MagicMock()
-        mock_facts = MagicMock()
-        mock_query = MagicMock()
-
-        df = pd.DataFrame({
-            'concept': ['us-gaap:OperatingIncomeLoss'],
-            'numeric_value': [-1000000000.0],  # Negative operating income
-            'period_start': ['2023-01-01'],
-            'period_end': ['2023-12-31'],
-            'unit': ['USD']
-        })
-
-        mock_query.to_dataframe.return_value = df
-        mock_query.by_concept.return_value = mock_query
-        mock_facts.query.return_value = mock_query
-        mock_xbrl.facts = mock_facts
+        mock_xbrl = fake_xbrl([
+            ('us-gaap:OperatingIncomeLoss', -1000000000.0, '2023-01-01',
+             '2023-12-31', 'c-1', {}),
+        ])
 
         result = filter_annual_data(mock_xbrl, 'us-gaap:OperatingIncomeLoss')
 
-        if result is not None:
-            # Should preserve negative values
-            assert result['value'] == -1000000000.0
+        assert result is not None
+        # Should preserve negative values
+        assert result['value'] == -1000000000.0
 
 
 # =============================================================================
