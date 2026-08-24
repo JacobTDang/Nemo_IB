@@ -69,6 +69,29 @@ REVENUE_CONCEPTS = (
   'us-gaap:SalesRevenueNet',
 )
 
+OPERATING_CASH_FLOW_CONCEPTS = (
+  'us-gaap:NetCashProvidedByUsedInOperatingActivities',
+  'us-gaap:NetCashProvidedByUsedInOperatingActivitiesContinuingOperations',
+)
+
+# Capital expenditure, in the order a filer is most likely to mean it. The
+# first two are the whole chain this project shipped with, and between them
+# they miss what AMZN, T, NVDA, CVX, HD, REGN and SPG tag
+# (PaymentsToAcquireProductiveAssets) and what PLD tags
+# (PaymentsToDevelopRealEstateAssets).
+#
+# PaymentsToAcquireRealEstate and PaymentsToAcquireCommercialRealEstate are
+# deliberately absent: buying a finished building is closer to an acquisition
+# than to capital expenditure, and whether a REIT's property purchases belong
+# in free cash flow is a judgement call rather than an identity.
+CAPEX_CONCEPTS = (
+  'us-gaap:PaymentsToAcquirePropertyPlantAndEquipment',
+  'us-gaap:PaymentsForCapitalImprovements',
+  'us-gaap:PaymentsToAcquireProductiveAssets',
+  'us-gaap:PaymentsToAcquireOtherProductiveAssets',
+  'us-gaap:PaymentsToDevelopRealEstateAssets',
+)
+
 # Period length, in days, that each form's primary reporting period runs for.
 # A fiscal year is 364 or 365 days and a 52/53-week retailer's runs 371, so the
 # annual floor sits below the shortest of those and above any half-year. A
@@ -670,12 +693,11 @@ def get_capex_pct_revenue(ticker: str, form_type: str = '10-K') -> Dict[str, Any
     if filing and filing['xbrl_data']:
       xbrl = filing['xbrl_data']
 
-      primary_capex_concepts = [
-      'us-gaap:PaymentsToAcquirePropertyPlantAndEquipment',  # Total PP&E (most common)
-      'us-gaap:PaymentsForCapitalExpenditures',              # Direct total CapEx
-      'PaymentsToAcquirePropertyPlantAndEquipment',          # Fallback
-      'CapitalExpenditures'                                  # Basic total
-      ]
+      # The shared chain, so this tool and get_historical_fcf cannot disagree
+      # about what capex a filer tags. Before it, HD, GE, CVX and T all fell
+      # through to the component sum below and came back "Unable to find any
+      # concepts" -- each of them tags PaymentsToAcquireProductiveAssets.
+      primary_capex_concepts = CAPEX_CONCEPTS
       total_capex = 0
       capex_concept_used = None
 
@@ -954,7 +976,19 @@ def get_margin_breakdown(ticker: str, form_type: str = '10-K') -> Dict[str, Any]
 
 
 def get_historical_fcf(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
-  """Extract operating cash flow, capex, and compute FCF and FCF margin from latest filing."""
+  """Operating cash flow, capex, and free cash flow from the latest filing.
+
+  A filer that tags no capital-expenditure element gets `success: False` and
+  `coverage: 'not_covered'` rather than a free cash flow. The previous
+  `fcf = ocf - (capex or 0)` turned a missing input into a zero one, which
+  reports operating cash flow as free cash flow: Amazon read 139,514,000,000
+  against a real 7,695,000,000, an 18x overstatement, because its capex is
+  tagged under an element the two-concept chain did not try. Widening the
+  chain fixes the eight filers in the audit basket that did tag capex; the
+  loud failure is for the ones that genuinely do not, which is every bank in
+  it. The operating cash flow that was read is still returned, so nothing
+  found is thrown away.
+  """
   try:
     filing_data = get_latest_filing(ticker, form_type)
     if not filing_data or not filing_data.get('xbrl_data'):
@@ -964,38 +998,60 @@ def get_historical_fcf(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
 
     xbrl = filing_data['xbrl_data']
     ocf = None
-    for c in ('us-gaap:NetCashProvidedByUsedInOperatingActivities',
-              'us-gaap:NetCashProvidedByUsedInOperatingActivitiesContinuingOperations'):
+    ocf_concept = None
+    for c in OPERATING_CASH_FLOW_CONCEPTS:
       d = filter_annual_data(xbrl, c, form_type)
       if d:
         ocf = d['value']
+        ocf_concept = d['concept_used']
         break
 
     capex = None
-    for c in ('us-gaap:PaymentsToAcquirePropertyPlantAndEquipment',
-              'us-gaap:PaymentsForCapitalImprovements'):
+    capex_concept = None
+    for c in CAPEX_CONCEPTS:
       d = filter_annual_data(xbrl, c, form_type)
       if d:
-        capex = abs(d['value'])  # capex usually reported negative on CF statement
+        capex = abs(d['value'])  # capex is reported negative on the CF statement
+        capex_concept = d['concept_used']
         break
 
     if ocf is None:
       return {'ticker': ticker, 'error': 'OCF concept not found', 'success': False}
 
-    fcf = ocf - (capex or 0)
     rev_tuple = _get_revenue_from_xbrl(xbrl, form_type)
     revenue = rev_tuple[0] if rev_tuple else None
     period_end = rev_tuple[1] if rev_tuple else None
 
-    return {
+    result = {
       'ticker': ticker,
       'operating_cash_flow': ocf,
+      'operating_cash_flow_concept_used': ocf_concept,
       'capex': capex,
+      'capex_concept_used': capex_concept,
+      'period_end': period_end,
+    }
+
+    if capex is None:
+      result.update({
+        'free_cash_flow': None,
+        'fcf_margin_pct': None,
+        'coverage': 'not_covered',
+        'success': False,
+        'error': (f'{ticker} tags no capex concept in its {form_type}; free '
+                  f'cash flow cannot be computed. Tried: '
+                  f'{", ".join(CAPEX_CONCEPTS)}'),
+      })
+      return result
+
+    fcf = ocf - capex
+    result.update({
       'free_cash_flow': fcf,
       'fcf_margin_pct': (fcf / revenue * 100) if revenue else None,
-      'period_end': period_end,
-      'success': True
-    }
+      'coverage': 'full',
+      'success': True,
+      'error': None,
+    })
+    return result
   except Exception as e:
     return {'ticker': ticker, 'error': f'get_historical_fcf failed: {e}', 'success': False}
 
