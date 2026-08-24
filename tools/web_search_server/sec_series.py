@@ -397,6 +397,57 @@ class FilingPoint:
         return out
 
 
+def concept_point(xbrl: Any, concept: str, filing_date: str, form: str,
+                  accession: str = "") -> Optional[FilingPoint]:
+    """Every fact for one concept in one already-parsed filing, or None.
+
+    Split out of `fetch_concept_series` so a caller holding an XBRL object can
+    read many concepts from it without re-fetching the filing once per concept.
+    Reading thirty concepts for one filer costs thirty filing downloads through
+    the series walk and one through this, which is the difference between a
+    sweep that completes and a sweep that earns an SEC 429.
+
+    None means the concept is not in this filing, which is distinct from a
+    filing that could not be parsed -- that is the caller's exception to catch.
+    """
+    frame = xbrl.facts.query().by_concept(concept).to_dataframe()
+    if frame is None or len(frame) == 0:
+        return None
+
+    # by_concept is a prefix match. Keep only the concept actually asked
+    # for. When the frame carries no concept column at all there is nothing
+    # to filter on, so the rows pass through as before rather than every
+    # filer being reported uncovered.
+    if "concept" in getattr(frame, "columns", []):
+        frame = frame[frame["concept"].map(
+            lambda c: _concept_matches(c, concept))]
+        if len(frame) == 0:
+            return None
+
+    facts: List[ConceptFact] = []
+    for _, row in frame.iterrows():
+        value = _clean_number(row.get("numeric_value"))
+        if value is None:
+            continue
+        context_ref = str(row.get("context_ref") or "")
+        facts.append(ConceptFact(
+            value=value,
+            period=_clean_period(row),
+            dimensions=resolve_dimensions(xbrl, context_ref),
+            context_ref=context_ref,
+            concept=str(row.get("concept") or concept),
+            # Blank rather than absent when the frame carries no unit
+            # column, so a currency-unaware edgartools degrades to the
+            # old behaviour instead of raising.
+            unit=str(row.get("unit_ref") or ""),
+        ))
+
+    if not facts:
+        return None
+    return FilingPoint(filing_date=filing_date, form=form,
+                       accession=accession, facts=facts)
+
+
 def fetch_concept_series(ticker: str, concept: str, form: str = "10-Q",
                          limit: int = 8) -> List[FilingPoint]:
     """Walk the most recent `limit` filings and pull `concept` from each.
@@ -423,49 +474,17 @@ def fetch_concept_series(ticker: str, concept: str, form: str = "10-Q",
             xbrl = filing.xbrl()
             if xbrl is None:
                 continue
-            frame = xbrl.facts.query().by_concept(concept).to_dataframe()
+            point = concept_point(
+                xbrl, concept,
+                filing_date=str(filing.filing_date),
+                form=str(filing.form),
+                accession=str(getattr(filing, "accession_no", "")))
         except Exception:
             # A single unparseable filing must not sink the whole series.
             continue
 
-        if frame is None or len(frame) == 0:
-            continue
-
-        # by_concept is a prefix match. Keep only the concept actually asked
-        # for. When the frame carries no concept column at all there is nothing
-        # to filter on, so the rows pass through as before rather than every
-        # filer being reported uncovered.
-        if "concept" in getattr(frame, "columns", []):
-            frame = frame[frame["concept"].map(
-                lambda c: _concept_matches(c, concept))]
-            if len(frame) == 0:
-                continue
-
-        facts: List[ConceptFact] = []
-        for _, row in frame.iterrows():
-            value = _clean_number(row.get("numeric_value"))
-            if value is None:
-                continue
-            context_ref = str(row.get("context_ref") or "")
-            facts.append(ConceptFact(
-                value=value,
-                period=_clean_period(row),
-                dimensions=resolve_dimensions(xbrl, context_ref),
-                context_ref=context_ref,
-                concept=str(row.get("concept") or concept),
-                # Blank rather than absent when the frame carries no unit
-                # column, so a currency-unaware edgartools degrades to the
-                # old behaviour instead of raising.
-                unit=str(row.get("unit_ref") or ""),
-            ))
-
-        if facts:
-            points.append(FilingPoint(
-                filing_date=str(filing.filing_date),
-                form=str(filing.form),
-                accession=str(getattr(filing, "accession_no", "")),
-                facts=facts,
-            ))
+        if point is not None:
+            points.append(point)
 
     if not points:
         raise NotCovered(
