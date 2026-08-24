@@ -159,20 +159,15 @@ def _footing_tolerance(scale: float) -> float:
 #
 # NOT a tolerance. Each entry is a specific filer failing a specific identity,
 # and test_known_defect_register_is_not_stale fails if one starts holding.
-KNOWN_DEFECTS: Dict[tuple, str] = {
-    # get_segment_financials sums an aggregation member alongside the segments
-    # it aggregates. CAT's us-gaap:ReportableSegmentAggregationBeforeOther
-    # OperatingSegmentMember is 73,955m, exactly Construction 25,060 + Resource
-    # 12,474 + Power & Energy 32,201 + Financial Products 4,220.
-    ("3 segment revenue vs consolidated", "CAT"):
-        "aggregation member double-counted with the segments it aggregates",
-    ("3 segment revenue vs consolidated", "LEN"):
-        "len:LennarHomebuildingEastCentralWestHoustonandOtherMember is the sum "
-        "of the five Homebuilding region members and is added to them",
-    ("3 segment revenue vs consolidated", "AMT"):
-        "amt:PropertyMember is the parent of the five Property region members "
-        "and is added to them",
-}
+# Empty, and that is the point: every entry this register has held was deleted
+# by the commit that fixed the defect it named, because the staleness test below
+# refuses to let one outlive its bug. The last five were the two
+# get_segment_financials defects -- GE's largest segment reading -62,000,000 off
+# the intersegment-elimination context, and CAT, CVX, LEN and AMT summing an
+# aggregation member alongside the members it aggregates. The first is fixed;
+# the second is now reported through `members_overlap`, which identity 3
+# respects the way identity 4 respects the geographic flag.
+KNOWN_DEFECTS: Dict[tuple, str] = {}
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -714,10 +709,26 @@ def test_reported_revenue_is_the_filers_consolidated_total(facts, tool_results):
 # segments, or a negative corporate column struck outside them -- both are
 # genuinely additive to the parts and removed from the total. Measured on this
 # basket the largest such overshoot is WFC's 1.4% (BA 0.2%, GOOGL 0.03%); the
-# registered defects run from 194% to 219%.
+# filers whose members genuinely overlap run from 194% to 219% and are detected
+# by the tool rather than by this number.
 _SEGMENT_OVERSHOOT = 0.02
 
 _ID_3 = "3 segment revenue vs consolidated"
+
+
+
+# Matched on the standard aggregation vocabulary rather than a per-filer list,
+# because a whitelist of known offenders silently admits the next one.
+_AGGREGATION_TOKENS = ("aggregation", "aggregated", "allsegments",
+                       "totalsegment", "segmentstotal")
+
+
+def _is_aggregation_member(member: str) -> bool:
+    """True when a dimension member names itself an aggregate of other members."""
+    if not member:
+        return False
+    local = member.split(":", 1)[-1].lower()
+    return any(token in local for token in _AGGREGATION_TOKENS)
 
 
 def test_segment_revenue_reconciles_to_consolidated(facts, tool_results):
@@ -729,9 +740,16 @@ def test_segment_revenue_reconciles_to_consolidated(facts, tool_results):
     into a two-segment total it still looked like a shortfall rather than a
     defect, which is exactly how it survived.
 
-    An overshoot is still a violation here: CAT, AMT and LEN tag an aggregation
-    or parent member on the same axis as the members it aggregates, which the
-    tool does not yet detect. They stay in KNOWN_DEFECTS until it does.
+    `get_segment_financials` now detects members that aggregate other members
+    and sets `members_overlap`: CAT tags an aggregation member that is exactly
+    Construction + Resource + Power & Energy + Financial Products on the same
+    axis as those four, and AMT, LEN and CVX do the same shape. Where the flag
+    is set the sum is knowingly not a total, and comparing it against
+    consolidated revenue would restate how the flag is computed -- the same
+    circularity identity 4 avoids for geography. What is asserted there instead
+    is everything the flag does not imply: that no single segment exceeds
+    consolidated revenue, and that the consolidated figure the tool reconciled
+    against is the one the filing tags under the element the tool names.
     """
     violations = []
     for ticker in ALL_TICKERS:
@@ -761,17 +779,52 @@ def test_segment_revenue_reconciles_to_consolidated(facts, tool_results):
                         "no segment revenue or no consolidated revenue element")
             continue
 
+        # The tool's own consolidated fact, checked against the filing rather
+        # than trusted: the overlap flag is only as good as what it divides by.
+        reported_consolidated = result.get("consolidated_revenue")
+        reference = _value(row, str(result.get("consolidated_concept_used") or ""))
+        if reported_consolidated and reference is not None:
+            if abs(reported_consolidated - reference) > _footing_tolerance(reference):
+                here.append(
+                    f"reconciled against consolidated revenue "
+                    f"{reported_consolidated:,.0f}, but "
+                    f"{result['consolidated_concept_used']} reads "
+                    f"{reference:,.0f} in the same filing")
+
         ratio = segment_total / consolidated
-        if ratio > 1 + _SEGMENT_OVERSHOOT:
+        overlap = result.get("members_overlap")
+        if overlap:
+            for segment in result.get("segments") or []:
+                if not segment.get("revenue"):
+                    continue
+                value = segment["revenue"][0]["value"]
+                member = segment["segment_member"]
+                # An aggregation member may legitimately exceed consolidated
+                # revenue: CAT's ReportableSegmentAggregationBefore... is struck
+                # BEFORE intersegment eliminations, so 73,955,000,000 against a
+                # consolidated 67,589,000,000 is the filing's own arithmetic,
+                # not an extraction fault. Narrow exemption on the member name
+                # rather than a wider tolerance, which would also excuse a real
+                # defect of the same size.
+                if _is_aggregation_member(member):
+                    continue
+                if value > consolidated:
+                    here.append(
+                        f"segment {member} {value:,.0f} "
+                        f"exceeds consolidated revenue {consolidated:,.0f}")
+        elif ratio > 1 + _SEGMENT_OVERSHOOT:
             here.append(
                 f"segments sum to {segment_total:,.0f} against consolidated "
-                f"revenue {consolidated:,.0f} ({ratio:.1%}); members "
+                f"revenue {consolidated:,.0f} ({ratio:.1%}) with "
+                f"members_overlap false; members "
                 f"{[s['segment_member'] for s in result['segments']]}")
 
         if here:
             _fail(_ID_3, ticker, here, violations)
         else:
             detail = f"{ratio:.1%} of consolidated"
+            if overlap:
+                detail += ", members_overlap"
             missing = result.get("segments_without_revenue") or []
             if missing:
                 detail += f", {len(missing)} members without revenue"

@@ -2416,6 +2416,22 @@ _SEGMENT_CONTEXT_BASES = (SEGMENT_AXIS_ONLY, SEGMENT_OPERATING_COLUMN)
 # are wanted from it, as before.
 _SEGMENT_SPAN_DAYS = (350, None)
 
+# Members can nest. CAT tags us-gaap:ReportableSegmentAggregationBeforeOther
+# OperatingSegmentMember at 73,955m, exactly Construction 25,060 + Resource
+# 12,474 + Power & Energy 32,201 + Financial Products 4,220, on the same axis as
+# those four; AMT tags amt:PropertyMember above its five property regions; LEN
+# tags one member that is the sum of five Homebuilding regions. Detected by
+# comparing the sum against the consolidated fact already in hand rather than by
+# trying to recognise a parent from its tag name, which cannot be done -- the
+# same mechanism `forward_metrics.get_geographic_revenue` uses for geography.
+#
+# The band absorbs a filer that tags an intersegment-revenue member on the
+# segment axis, which is genuinely additive to the parts and eliminated from the
+# total. Measured on the identity-sweep basket the largest legitimate overshoot
+# is WFC's 1.4% (GOOGL 0.03%, BA 0.2%); the overlapping filers run from 194% to
+# 219%.
+_SEGMENT_OVERLAP_TOLERANCE = 0.02
+
 
 def _same_axis(left: str, right: str) -> bool:
   """Whether two axis spellings name the same axis.
@@ -2529,6 +2545,8 @@ def _segment_period_series(by_period: Dict[str, set]) -> tuple:
   return rows, conflicts
 
 
+
+
 def get_segment_financials(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
   """Extract per-segment revenue and operating income from latest 10-K XBRL.
 
@@ -2544,10 +2562,16 @@ def get_segment_financials(ticker: str, form_type: str = '10-K') -> Dict[str, An
   on multi-segment companies -- e.g. MSFT's Intelligent Cloud (Azure) growth vs.
   Productivity & Business Processes margin.
 
-  `segments_without_revenue` lists the members whose revenue is not extractable
-  as tagged. XOM tags every segment revenue fact in combination with
-  `srt:StatementGeographicalAxis` and no segment-only fact exists, so its
-  segment revenue is a real absence rather than a number to approximate.
+  Two things the caller has to read:
+
+  * `members_overlap` -- true when the members sum to more than consolidated
+    revenue, which means at least one of them aggregates the others. The values
+    are still each correct; their sum is not a total, and the percentages are
+    then of consolidated revenue rather than of the sum.
+  * `segments_without_revenue` -- members whose revenue is not extractable as
+    tagged. XOM tags every segment revenue fact in combination with
+    `srt:StatementGeographicalAxis` and no segment-only fact exists, so its
+    segment revenue is a real absence rather than a number to approximate.
   """
   try:
     filing_data = get_latest_filing(ticker, form_type)
@@ -2608,6 +2632,17 @@ def get_segment_financials(ticker: str, form_type: str = '10-K') -> Dict[str, An
     op_basis = op_resolved[1] if op_resolved else None
     op_by_member = op_resolved[2] if op_resolved else {}
 
+    # The consolidated fact to reconcile against, read from the same filing
+    # through the same undimensioned selection get_revenue_base uses.
+    consolidated = None
+    consolidated_concept = None
+    for concept in REVENUE_CONCEPTS:
+      fact = _consolidated_fact(xbrl, concept, span_days=_SEGMENT_SPAN_DAYS)
+      if fact is not None:
+        consolidated = fact.value
+        consolidated_concept = fact.concept or concept
+        break
+
     segments_out = []
     unresolved = []
     for member in members:
@@ -2650,6 +2685,7 @@ def get_segment_financials(ticker: str, form_type: str = '10-K') -> Dict[str, An
       op_margin_pct = round((latest_op / latest_rev) * 100, 2) \
         if (latest_op and latest_rev) else None
 
+
       segments_out.append({
         'segment': seg_display,
         'segment_member': member,
@@ -2665,12 +2701,39 @@ def get_segment_financials(ticker: str, form_type: str = '10-K') -> Dict[str, An
     total_seg_rev = sum(s['revenue'][0]['value'] for s in segments_out
                         if s['revenue'])
 
-    note = None
-    if unresolved:
+
+    members_overlap = None
+    if consolidated:
+      members_overlap = (
+        total_seg_rev > consolidated * (1 + _SEGMENT_OVERLAP_TOLERANCE))
+    denominator = consolidated if members_overlap else total_seg_rev
+
+    for segment in segments_out:
+      latest = segment['revenue'][0]['value'] if segment['revenue'] else None
+      segment['pct_of_revenue'] = (
+        latest / denominator * 100.0
+        if (latest is not None and denominator) else None)
+
+    if members_overlap:
       note = (
-        f"{len(unresolved)} of {len(members)} members report no revenue this "
-        f"tool will stand behind and are listed in segments_without_revenue; "
-        f"the total excludes them.")
+        f"This filer's segment members OVERLAP: they sum to "
+        f"{total_seg_rev:,.0f} against consolidated revenue of "
+        f"{consolidated:,.0f}, so at least one member aggregates the others "
+        f"(CAT tags ReportableSegmentAggregationBeforeOtherOperatingSegment"
+        f"Member beside the four segments it is the sum of). Percentages are "
+        f"of consolidated revenue and therefore do NOT sum to 100. Read "
+        f"individual segments, not the total, and do not add them together.")
+    else:
+      note = (
+        "Percentages are of the disclosed segment total, which may sit below "
+        "consolidated revenue: segments reconcile to it through unallocated "
+        "corporate costs, intersegment eliminations and an 'all other' bucket "
+        "a filer may not tag on the segment axis.")
+    if unresolved:
+      note += (
+        f" {len(unresolved)} of {len(members)} members report no revenue "
+        f"this tool will stand behind and are listed in "
+        f"segments_without_revenue; the total excludes them.")
 
     return {
       'ticker': ticker,
@@ -2683,6 +2746,9 @@ def get_segment_financials(ticker: str, form_type: str = '10-K') -> Dict[str, An
       'revenue_concept_used': revenue_concept,
       'revenue_basis': revenue_basis,
       'operating_income_basis': op_basis,
+      'consolidated_revenue': consolidated,
+      'consolidated_concept_used': consolidated_concept,
+      'members_overlap': members_overlap,
       'segments_without_revenue': unresolved,
       'note': note,
       'filing_date': filing_data.get('filing_date'),

@@ -1,15 +1,26 @@
-"""Which fact answers for a segment.
+"""Which fact answers for a segment, and what happens when members overlap.
 
 `get_segment_financials` queried `by_dimension(axis, member)` and took the
-first row of the result. Facts carrying the segment axis *plus another* axis --
-`srt:ConsolidationItemsAxis`, `srt:ProductOrServiceAxis`,
-`srt:StatementGeographicalAxis` -- are in that result and could win it. GE's
-largest segment reported **-62,000,000** of revenue, the intersegment-
-elimination context, against 33,252,000,000 tagged on the segment-only context
-in the same filing; both GE segments came back negative and the tool reported
-total segment revenue of -1,748,000,000. A negative number for a company's
-largest segment is the visible symptom; the general fault is that a fact
-qualified by a second dimension is not the segment's figure.
+first row of the result. Two defects fell out of that, both adjudicated
+against filings by the accounting-identity sweep and registered in
+`KNOWN_DEFECTS`:
+
+1. **A fact carrying a second axis won the segment.** A query for the segment
+   axis also returns the facts qualified by `srt:ConsolidationItemsAxis`,
+   `srt:ProductOrServiceAxis` and `srt:StatementGeographicalAxis`, and any of
+   them could come back first. GE's largest segment reported **-62,000,000** of
+   revenue -- the intersegment-elimination context -- against 33,252,000,000
+   tagged on the segment-only context in the same filing. Both GE segments came
+   back negative and the tool reported total segment revenue of -1,748,000,000.
+   A negative number for a company's largest segment is the visible symptom;
+   the general fault is that a fact qualified by a second dimension is not the
+   segment's figure.
+
+2. **No overlap detection.** Filers tag aggregation and parent members on the
+   same axis as the segments those members aggregate, and both were summed.
+   CAT's `us-gaap:ReportableSegmentAggregationBeforeOtherOperatingSegment
+   Member` is 73,955m, exactly Construction 25,060 + Resource 12,474 + Power &
+   Energy 32,201 + Financial Products 4,220. CVX, LEN and AMT do the same.
 
 The selection rule the fix implements, and what each half of it is for:
 
@@ -28,6 +39,12 @@ The selection rule the fix implements, and what each half of it is for:
   segment axis alone and all seven members' total revenue on the operating-
   segments column, and picking each member's most specific fact reports
   935,900,000 of revenue beside 10,305,000,000.
+
+Overlap is then handled the way `forward_metrics.get_geographic_revenue`
+already handles it for geography: compare the summed members against the
+consolidated fact, set `members_overlap`, re-base percentages on consolidated
+revenue and say so. The values are not withheld -- each is individually
+correct.
 
 The offline half builds frames in the shape edgartools produces. The network
 half asserts figures read out of each filing's raw XBRL -- concept, context and
@@ -365,6 +382,90 @@ def test_an_earlier_year_keeps_its_own_context(run_segments):
                                                     30_000_000_000]
 
 
+# ================================================ defect 2: overlapping members
+
+# CAT's FY2025 10-K. The aggregation member is exactly the sum of the four
+# reportable segments beside it.
+CAT_MEMBERS = {
+    "cat:ConstructionIndustriesMember": 25_060_000_000,
+    "cat:ResourceIndustriesMember": 12_474_000_000,
+    "cat:PowerEnergyMember": 32_201_000_000,
+    "cat:FinancialProductsSegmentMember": 4_220_000_000,
+    "us-gaap:AllOtherSegmentsMember": 327_000_000,
+    "us-gaap:ReportableSegmentAggregationBeforeOtherOperatingSegmentMember":
+        73_955_000_000,
+}
+CAT_ROWS = [
+    _fact(REVENUES, value, f"c-87{i}",
+          _segment(member, {CONSOLIDATION_AXIS: OPERATING_SEGMENTS}))
+    for i, (member, value) in enumerate(CAT_MEMBERS.items())
+] + [_fact(REVENUES, 67_589_000_000, "c-1")]
+
+
+def test_an_aggregation_member_is_flagged_rather_than_silently_summed(
+        run_segments):
+    """CAT's members sum to 219% of consolidated revenue because the
+    aggregation member is counted alongside its own children."""
+    result = run_segments(CAT_ROWS, "CAT")
+    assert result["success"], result.get("error")
+    assert result["members_overlap"] is True
+    assert result["consolidated_revenue"] == 67_589_000_000
+    assert result["total_latest_segment_revenue"] == sum(CAT_MEMBERS.values())
+
+
+def test_overlapping_segment_values_are_reported_not_withheld(run_segments):
+    """Each figure is individually correct. It is their sum that is not a
+    total, so the sum is what carries the warning."""
+    result = run_segments(CAT_ROWS, "CAT")
+    assert _by_member(result) == CAT_MEMBERS
+
+
+def test_percentages_are_re_based_on_consolidated_revenue_when_members_overlap(
+        run_segments):
+    """The same call `get_geographic_revenue` makes: percentages of the
+    disclosed sum are meaningless when the sum double-counts, so they are of
+    consolidated revenue and do not add to 100."""
+    result = run_segments(CAT_ROWS, "CAT")
+    shares = {s["segment_member"]: s["pct_of_revenue"]
+              for s in result["segments"]}
+    assert shares["cat:ConstructionIndustriesMember"] == pytest.approx(
+        25_060_000_000 / 67_589_000_000 * 100.0)
+    assert sum(shares.values()) > 150.0
+    assert "OVERLAP" in result["note"]
+
+
+def test_percentages_are_of_the_disclosed_total_when_members_do_not_overlap(
+        run_segments):
+    result = run_segments(GE_ROWS, "GE")
+    assert result["members_overlap"] is False
+    shares = {s["segment_member"]: s["pct_of_revenue"]
+              for s in result["segments"]}
+    assert sum(shares.values()) == pytest.approx(100.0)
+    assert shares[CES] == pytest.approx(33_252_000_000 / 42_120_000_000 * 100.0)
+
+
+def test_a_shortfall_is_not_an_overlap(run_segments):
+    """Segments reconcile to consolidated revenue through unallocated corporate
+    costs and an "all other" bucket a filer may not tag, so summing to less
+    than the total is ordinary."""
+    result = run_segments(GE_ROWS, "GE")
+    assert result["members_overlap"] is False
+    assert result["consolidated_revenue"] == 45_855_000_000
+
+
+def test_a_filing_with_no_consolidated_revenue_element_says_so(run_segments):
+    """Without a consolidated fact there is nothing to compare the sum
+    against, so overlap is unknown rather than false."""
+    rows = [
+        _fact(REVENUES, 30_000_000_000, "c-2", _segment("x:AMember")),
+        _fact(REVENUES, 20_000_000_000, "c-3", _segment("x:BMember")),
+    ]
+    result = run_segments(rows, "TEST")
+    assert result["success"], result.get("error")
+    assert result["consolidated_revenue"] is None
+    assert result["members_overlap"] is None
+
+
 # ================================================================ live filings
 #
 # Every figure below was read out of the filing's raw XBRL -- concept, context
@@ -373,17 +474,25 @@ def test_an_earlier_year_keeps_its_own_context(run_segments):
 # ticker -> {member: latest annual revenue}
 SEGMENT_REVENUE = {
     "GE": {CES: 33_252_000_000, DPT: 8_868_000_000},
-    "CAT": {
-        "cat:ConstructionIndustriesMember": 25_060_000_000,
-        "cat:ResourceIndustriesMember": 12_474_000_000,
-        "cat:PowerEnergyMember": 32_201_000_000,
-        "cat:FinancialProductsSegmentMember": 4_220_000_000,
-        "us-gaap:AllOtherSegmentsMember": 327_000_000,
-        "us-gaap:ReportableSegmentAggregationBeforeOtherOperatingSegmentMember":
-            73_955_000_000,
-    },
+    "CAT": CAT_MEMBERS,
     "HD": {"hd:PrimarySegmentMember": 151_966_000_000,
            "us-gaap:AllOtherSegmentsMember": 12_717_000_000},
+}
+
+# ticker -> (segment total, consolidated revenue, members_overlap)
+SEGMENT_TOTALS = {
+    "GE": (42_120_000_000, 45_855_000_000, False),
+    "CAT": (148_237_000_000, 67_589_000_000, True),
+    "AMT": (20_949_600_000, 10_644_600_000, True),
+    "LEN": (66_453_614_000, 34_186_934_000, True),
+    "HD": (164_683_000_000, 164_683_000_000, False),
+    "BA": (89_651_000_000, 89_463_000_000, False),
+    "HON": (37_412_000_000, 37_442_000_000, False),
+    "BIIB": (9_890_600_000, 9_890_600_000, False),
+    "CVX": (184_432_000_000, 189_031_000_000, False),
+    "GOOGL": (402_963_000_000, 402_836_000_000, False),
+    "MSFT": (331_839_000_000, 331_839_000_000, False),
+    "WFC": (84_900_000_000, 83_699_000_000, False),
 }
 
 # Filers whose segment revenue is not extractable as tagged, with the reason.
@@ -425,6 +534,21 @@ def test_each_segment_reports_the_figure_the_filing_tags(ticker):
 
 
 @network
+@pytest.mark.parametrize("ticker", sorted(SEGMENT_TOTALS))
+def test_segment_totals_reconcile_to_the_filing(ticker):
+    from tools.web_search_server.sec_utils import get_segment_financials
+
+    total, consolidated, overlap = SEGMENT_TOTALS[ticker]
+    result = get_segment_financials(ticker)
+    assert result["success"], result.get("error")
+    assert result["total_latest_segment_revenue"] == pytest.approx(total,
+                                                                   rel=1e-9)
+    assert result["consolidated_revenue"] == pytest.approx(consolidated,
+                                                           rel=1e-9)
+    assert result["members_overlap"] is overlap
+
+
+@network
 @pytest.mark.parametrize("ticker", sorted(NOT_EXTRACTABLE))
 def test_a_filer_whose_segments_cannot_be_resolved_says_so(ticker):
     """Not a number. XOM's segment revenue is a real absence, and a tool that
@@ -437,3 +561,4 @@ def test_a_filer_whose_segments_cannot_be_resolved_says_so(ticker):
         f"{ticker}: {NOT_EXTRACTABLE[ticker]}, but the tool returned "
         f"{result.get('total_latest_segment_revenue')}")
     assert result.get("total_latest_segment_revenue") in (None, 0)
+
