@@ -409,7 +409,7 @@ def _build_all_tools() -> List[Tool]:
         ),
         Tool(
           name="get_segment_financials",
-          description="Extract per-segment revenue and operating income from the latest 10-K XBRL using the us-gaap:StatementBusinessSegmentsAxis. Returns up to 5 years of history per segment, plus the most recent YoY growth and operating margin. Critical for resolving variant-perception questions on multi-segment companies (e.g. Azure inside MSFT's Intelligent Cloud segment). Segments are SEC-defined by the company itself, so trust is highest.",
+          description="Extract per-segment revenue and operating income from the latest 10-K XBRL using the us-gaap:StatementBusinessSegmentsAxis. Returns up to 5 years of history per segment, plus the most recent YoY growth and operating margin. Critical for resolving variant-perception questions on multi-segment companies (e.g. Azure inside MSFT's Intelligent Cloud segment). Segments are SEC-defined by the company itself, so trust is highest. segments_without_revenue lists members whose revenue is not extractable as tagged, and a filer that tags no segment-level fact at all (XOM tags every one in combination with a geography axis) returns success=false rather than a partial total.",
           inputSchema={
             "type": "object",
             "properties": {

@@ -621,23 +621,75 @@ were returning "Unable to find any concepts" and now resolve, and AMZN, NVDA,
 REGN and O were returning a small unrelated fact the prefix match had reached
 (O: 300,000 against a real 131,800,000).
 
-#### 4. `get_segment_financials` picks the wrong fact within a segment (P0)
+#### 4. FIXED — `get_segment_financials` picked the wrong fact within a segment (P0)
 
-`_annual_series` queries `by_dimension(axis, member)` and takes the first row of
+`_annual_series` queried `by_dimension(axis, member)` and took the first row of
 the result. Facts carrying the segment axis *plus another* axis
-(`srt:ConsolidationItemsAxis`, `srt:ProductOrServiceAxis`) are in that result
-and win arbitrarily.
+(`srt:ConsolidationItemsAxis`, `srt:ProductOrServiceAxis`,
+`srt:StatementGeographicalAxis`) are in that result and won arbitrarily.
 
-**GE**: Commercial Engines & Services reports **−62,000,000** of revenue. That is
-the `us-gaap:IntersegmentEliminationMember` context. The segment-only context in
-the same filing carries **33,252,000,000**. Both GE segments come back negative
-and the tool reports total segment revenue of −1,748,000,000.
+**GE**: Commercial Engines & Services reported **−62,000,000** of revenue. That
+is the `us-gaap:IntersegmentEliminationMember` context. The segment-only context
+in the same filing carries **33,252,000,000**. Both GE segments came back
+negative and the tool reported total segment revenue of −1,748,000,000.
 
-The same defect understates BA (50.1% of consolidated), HON (30.2%), XOM (41.4%)
-and BIIB (35.9%).
+**Fixed** on `tier1-data-gaps` (2026-08-24). The selection rule, and what each
+half of it is for:
 
-A prototype that selects the fact whose only dimension is the segment axis fixes
-GE (91.9%), BA (100.2%), HON (99.9%), BIIB (100.0%) and CVX (97.6%).
+- a fact whose only dimension is the segment axis is the segment's figure;
+- where a filer tags none, the fact additionally qualified by
+  `srt:ConsolidationItemsAxis = us-gaap:OperatingSegmentsMember` is — that is
+  the segment column of the reconciliation table rather than a breakdown of it.
+  AAPL, BA, COST, HON, JPM, NVDA, PLD, SPG and WFC tag their segments only that
+  way, so a rule that demanded the segment axis alone would report nine filers
+  in this basket as tagging nothing;
+- anything else — a product, a geography, an intersegment elimination, a
+  corporate reconciling item — is a piece of a segment or an adjustment to it,
+  never the segment;
+- the choice between the two is made **once per filing**, by which resolves more
+  members, so every segment of one filer is on one basis. Per-member preference
+  mixes them: AMT tags five members' non-lease revenue on the segment axis alone
+  and all seven members' total revenue on the operating-segments column.
+
+The concept chain is `sec_utils.REVENUE_CONCEPTS`, the same broadest-first chain
+finding 2 established, for the same reason: AMT's ASC 606 element is the one
+tagged on the segment axis alone and it is 8.8% of revenue. The read routes
+through `sec_series.concept_point`, so the exact-concept filter and the
+dimension resolution are the ones the rest of the module uses rather than a
+third mechanism — which is also what recovers the banks, whose segment revenue
+is `us-gaap:RevenuesNetOfInterestExpense` and used to be reached by prefix
+accident and reported under `us-gaap:Revenues`.
+
+Measured against the filings, latest segment total as a share of consolidated
+revenue:
+
+| filer | before | after | what changed |
+|---|---|---|---|
+| GE | −1,748,000,000 (−3.8%) | 42,120,000,000 (91.9%) | intersegment-elimination contexts, both segments negative |
+| WFC | 6.1% | 101.4% | the ASC 606 fee-income fragment; segments are tagged `RevenuesNetOfInterestExpense` |
+| HON | 30.2% | 99.9% | a product breakdown answered for the segment |
+| BIIB | 35.9% | 100.0% | ditto |
+| BA | 50.1% | 100.2% | ditto |
+| GOOGL | 70.7% | 100.0% | Google Services answered by a `ProductOrServiceAxis` slice |
+| PLD | 91.0% | 100.0% | ditto |
+| T | 98.7% | 99.7% | ditto |
+| META | 98.7% | 100.0% | ditto |
+| WMT | 99.1% | 100.0% | segment total revenue rather than the net-sales fragment |
+| CVX | 184.8% | 97.6% | the aggregation member read off its `OperatingSegmentsMember` context |
+| XOM | 41.4% | **not extractable** | every segment fact also carries a geography axis |
+
+AAPL, AMZN, COST, FOXA, HD, MSFT, NVDA, SPG, TGT and VRTX are unchanged. GS and
+JPM return the same figures under the element they are actually tagged with
+rather than under `us-gaap:Revenues`.
+
+XOM is the case the tool now refuses rather than approximates: `success: False`,
+naming the members and the reason. 41.4% was the sum of whichever
+geography-qualified facts happened to come back first, and it is not a figure
+the filing reports.
+
+Regression: `testing/test_segment_fact_selection.py`, offline for the mechanism
+against GE's, CAT's, AMT's, AAPL's and XOM's real context shapes, and
+network-gated for the filings.
 
 #### 5. `get_segment_financials` has no overlap detection (P1)
 

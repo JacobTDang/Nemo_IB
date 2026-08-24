@@ -2395,19 +2395,159 @@ def track_segment_growth(ticker: str, form_type: str = '10-K') -> Dict[str, Any]
   }
 
 
+# --------------------------------------------------------------- segment axis
+
+# The axis a filer uses to say "this fact is the segment column of the
+# reconciliation table" rather than a breakdown of it. Standard us-gaap, and
+# the only extra dimension a segment's own revenue is allowed to carry: AAPL,
+# BA, HON, JPM, NVDA and WFC tag every segment fact this way and nothing else,
+# so a rule that demanded the segment axis alone would report all six as
+# tagging no segment revenue.
+CONSOLIDATION_ITEMS_AXIS = 'srt:ConsolidationItemsAxis'
+OPERATING_SEGMENTS_MEMBER = 'us-gaap:OperatingSegmentsMember'
+
+SEGMENT_AXIS_ONLY = 'segment axis only'
+SEGMENT_OPERATING_COLUMN = (f'segment axis + {CONSOLIDATION_ITEMS_AXIS}='
+                            f'{OPERATING_SEGMENTS_MEMBER}')
+# Order is the preference used to break a coverage tie, best first.
+_SEGMENT_CONTEXT_BASES = (SEGMENT_AXIS_ONLY, SEGMENT_OPERATING_COLUMN)
+
+# A 10-K's segment note carries three comparative years; only annual durations
+# are wanted from it, as before.
+_SEGMENT_SPAN_DAYS = (350, None)
+
+
+def _same_axis(left: str, right: str) -> bool:
+  """Whether two axis spellings name the same axis.
+
+  `get_unique_dimensions()` keys axes with '_' where a context's dimensions use
+  ':'. Comparing the raw strings silently resolves nothing for every filer.
+  """
+  return str(left).replace('_', ':', 1) == str(right).replace('_', ':', 1)
+
+
+def _segment_context_basis(dimensions: Dict[str, str], axis: str) -> Optional[str]:
+  """Which selection basis a fact belongs to, or None if it is not a segment's
+  own figure.
+
+  A fact carrying the segment axis *plus another* axis is a piece of a segment
+  or an adjustment to it -- a product line, a geography, an intersegment
+  elimination, a corporate reconciling item -- and never the segment. GE's
+  largest segment reported -62,000,000 of revenue because the elimination
+  context answered a query for the segment; the segment-only context in the
+  same filing carries 33,252,000,000.
+  """
+  # Both spellings of a prefix compare equal, as they do everywhere else in
+  # this package: the same axis reaches us as 'srt:ConsolidationItemsAxis' from
+  # a context and 'srt_ConsolidationItemsAxis' from the dimension index.
+  extra = {str(a).replace('_', ':', 1): str(m).replace('_', ':', 1)
+           for a, m in dimensions.items() if not _same_axis(a, axis)}
+  if not extra:
+    return SEGMENT_AXIS_ONLY
+  if (len(extra) == 1
+      and extra.get(CONSOLIDATION_ITEMS_AXIS) == OPERATING_SEGMENTS_MEMBER):
+    return SEGMENT_OPERATING_COLUMN
+  return None
+
+
+def _segment_facts(xbrl, concept: str, axis: str) -> Dict[str, Dict[str, Dict[str, set]]]:
+  """{basis: {member: {period_end: {values}}}} for one concept.
+
+  Reads through `sec_series.concept_point`, so the exact-concept filter and the
+  dimension resolution are the ones every other reader in this module uses
+  rather than a third copy. `by_dimension(axis, member)`, which this replaces,
+  returns the facts carrying a second axis alongside the segment's own.
+  """
+  from .sec_series import _in_span, _period_rank, concept_point
+  try:
+    point = concept_point(xbrl, concept, filing_date='', form='')
+  except Exception:  # noqa: BLE001 - an unreadable concept is not a segment
+    return {}
+  if point is None:
+    return {}
+
+  out: Dict[str, Dict[str, Dict[str, set]]] = {}
+  for fact in point.deduplicated():
+    member = None
+    for a, m in fact.dimensions.items():
+      if _same_axis(a, axis):
+        member = m
+        break
+    if member is None:
+      continue
+    period_end, days = _period_rank(fact.period)
+    if not _in_span(days, *_SEGMENT_SPAN_DAYS):
+      continue
+    basis = _segment_context_basis(fact.dimensions, axis)
+    if basis is None:
+      continue
+    (out.setdefault(basis, {}).setdefault(member, {})
+        .setdefault(period_end, set()).add(fact.value))
+  return out
+
+
+def _resolve_segment_basis(xbrl, concepts, axis: str):
+  """(concept, basis, {member: {period_end: {values}}}) or None.
+
+  The concept and the basis are chosen **once for the filing**, by which pair
+  resolves the most members, so every segment of one filer is measured the same
+  way. Per-member preference mixes them: AMT tags five members' non-lease
+  revenue on the segment axis alone and all seven members' total revenue on the
+  operating-segments column, and taking each member's most specific fact puts
+  935,900,000 beside 10,305,000,000 in one total.
+
+  Ties break to the earlier concept -- the chain is broadest-first, for the
+  reason `REVENUE_CONCEPTS` documents -- and then to the segment-only basis.
+  """
+  best = None
+  for rank, concept in enumerate(concepts):
+    bases = _segment_facts(xbrl, concept, axis)
+    for preference, basis in enumerate(_SEGMENT_CONTEXT_BASES):
+      by_member = bases.get(basis)
+      if not by_member:
+        continue
+      key = (len(by_member), -rank, -preference)
+      if best is None or key > best[0]:
+        best = (key, concept, basis, by_member)
+  return None if best is None else (best[1], best[2], best[3])
+
+
+def _segment_period_series(by_period: Dict[str, set]) -> tuple:
+  """([{period_end, value}] newest first, [(period_end, values)] in conflict).
+
+  Two different values tagged for one member, one period and one basis cannot
+  both be that segment's figure, and there is nothing in the frame to choose
+  between them, so the period is dropped and named rather than guessed at.
+  """
+  rows, conflicts = [], []
+  for period_end in sorted(by_period, reverse=True):
+    values = by_period[period_end]
+    if len(values) > 1:
+      conflicts.append((period_end, sorted(values)))
+      continue
+    rows.append({'period_end': period_end, 'value': float(next(iter(values)))})
+  return rows, conflicts
+
+
 def get_segment_financials(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
   """Extract per-segment revenue and operating income from latest 10-K XBRL.
 
   Uses the `us-gaap:StatementBusinessSegmentsAxis` (or any axis whose name
-  contains 'Segment') and pulls the company-defined segment members. For
-  each segment, fetches annual revenue (RevenueFromContractWithCustomer
-  ExcludingAssessedTax / Revenues / SalesRevenueNet) and operating income
-  (OperatingIncomeLoss) by joining the concept to the segment dimension.
+  contains 'Segment') and pulls the company-defined segment members. For each
+  member the fact returned is the one that is the segment's own figure --
+  qualified by the segment axis alone, or by the segment axis plus the
+  operating-segments column of the reconciliation table where the filer tags
+  nothing else. See `_segment_context_basis` and `_resolve_segment_basis`.
 
-  Returns up to 5 years of history per segment plus the most recent YoY
-  growth and operating margin. Critical for resolving the variant-
-  perception question on multi-segment companies — e.g. MSFT's Intelligent
-  Cloud (Azure) growth vs. Productivity & Business Processes margin.
+  Returns up to 5 years of history per segment plus the most recent YoY growth
+  and operating margin. Critical for resolving the variant-perception question
+  on multi-segment companies -- e.g. MSFT's Intelligent Cloud (Azure) growth vs.
+  Productivity & Business Processes margin.
+
+  `segments_without_revenue` lists the members whose revenue is not extractable
+  as tagged. XOM tags every segment revenue fact in combination with
+  `srt:StatementGeographicalAxis` and no segment-only fact exists, so its
+  segment revenue is a real absence rather than a number to approximate.
   """
   try:
     filing_data = get_latest_filing(ticker, form_type)
@@ -2420,15 +2560,14 @@ def get_segment_financials(ticker: str, form_type: str = '10-K') -> Dict[str, An
     xbrl = filing_data['xbrl_data']
 
     # Discover the segment axis. edgartools normalizes ':' to '_' in the
-    # unique_dimensions dict keys, but by_dimension() accepts the colon form.
+    # unique_dimensions dict keys, but the contexts carry the colon form.
     unique_dims = xbrl.facts.get_unique_dimensions()
     segment_axis_key = None
-    segment_axis_for_query = None
+    segment_axis = None
     for key in unique_dims.keys():
       if 'StatementBusinessSegments' in key or key.endswith('SegmentsAxis'):
         segment_axis_key = key
-        # Normalize to colon form for by_dimension query
-        segment_axis_for_query = key.replace('_', ':', 1)
+        segment_axis = key.replace('_', ':', 1)
         break
 
     if not segment_axis_key:
@@ -2436,41 +2575,42 @@ def get_segment_financials(ticker: str, form_type: str = '10-K') -> Dict[str, An
               'error': 'No business-segment axis in XBRL — company may not have reportable segments',
               'axes_available': list(unique_dims.keys())[:10]}
 
-    members = unique_dims.get(segment_axis_key, set())
+    members = sorted(unique_dims.get(segment_axis_key, set()))
     if not members:
       return {'ticker': ticker, 'success': False,
               'error': f'No segment members under {segment_axis_key}'}
 
-    revenue_concepts = [
-      'us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax',
-      'us-gaap:Revenues',
-      'us-gaap:SalesRevenueNet',
-      'us-gaap:RevenueFromContractWithCustomerIncludingAssessedTax',
-    ]
-    op_income_concept = 'us-gaap:OperatingIncomeLoss'
+    # Broadest element first, and shared with the consolidated reader below so
+    # the two cannot disagree about what a filer tags. Trying the ASC 606
+    # element first returns AMT's 935,900,000 of non-lease revenue against
+    # 10,644,600,000 of revenue -- tower rent is lease income under ASC 842.
+    resolved = _resolve_segment_basis(xbrl, REVENUE_CONCEPTS, segment_axis)
+    if resolved is None:
+      return {
+        'ticker': ticker, 'success': False,
+        'error': (
+          f'{ticker} tags no segment revenue fact that is a segment\'s own '
+          f'figure. Every fact on {segment_axis} carries a further dimension '
+          f'-- a product, a geography, an intersegment elimination or a '
+          f'corporate reconciling item -- or no revenue element is tagged on '
+          f'that axis at all. Summing across the further axis is not something '
+          f'this tool does, so segment revenue is not extractable as tagged '
+          f'for {members}.'),
+        'segment_axis': segment_axis,
+        'segments_available': members,
+        'total_latest_segment_revenue': None,
+        'filing_date': filing_data.get('filing_date'),
+      }
+    revenue_concept, revenue_basis, revenue_by_member = resolved
 
-    def _annual_series(concept: str, member: str) -> tuple:
-      """Return (concept_used, [{period_end, value}, ...]) sorted newest-first."""
-      try:
-        q = xbrl.facts.query().by_concept(concept).by_dimension(
-          segment_axis_for_query, member)
-        df = q.to_dataframe()
-      except Exception:
-        return (None, [])
-      if df.empty:
-        return (None, [])
-      df = df.copy()
-      df['period_start_dt'] = pd.to_datetime(df['period_start'])
-      df['period_end_dt'] = pd.to_datetime(df['period_end'])
-      df['duration_days'] = (df['period_end_dt'] - df['period_start_dt']).dt.days
-      annual = df[df['duration_days'] >= 350].sort_values('period_end_dt', ascending=False)
-      series = [{'period_end': r['period_end'], 'value': float(r['numeric_value'])}
-                for _, r in annual.iterrows()]
-      return (concept, series)
+    op_resolved = _resolve_segment_basis(
+      xbrl, ('us-gaap:OperatingIncomeLoss',), segment_axis)
+    op_basis = op_resolved[1] if op_resolved else None
+    op_by_member = op_resolved[2] if op_resolved else {}
 
     segments_out = []
-    revenue_concept_used = None
-    for member in sorted(members):
+    unresolved = []
+    for member in members:
       # Pretty name: "msft:ProductivityAndBusinessProcessesMember"
       # -> "Productivity And Business Processes"
       seg_short = member.split(':')[-1]
@@ -2478,19 +2618,26 @@ def get_segment_financials(ticker: str, form_type: str = '10-K') -> Dict[str, An
         seg_short = seg_short[:-len('Member')]
       seg_display = re.sub(r'([a-z])([A-Z])', r'\1 \2', seg_short).strip()
 
-      # Revenue (try each concept in priority order)
-      rev_series: list = []
-      for c in revenue_concepts:
-        used, series = _annual_series(c, member)
-        if series:
-          rev_series = series
-          revenue_concept_used = revenue_concept_used or used
-          break
+      rev_series, rev_conflicts = _segment_period_series(
+        revenue_by_member.get(member, {}))
+      op_series, _ = _segment_period_series(op_by_member.get(member, {}))
 
-      # Operating income
-      _, op_series = _annual_series(op_income_concept, member)
+      unresolved_reason = None
+      if not rev_series:
+        if rev_conflicts:
+          period, values = rev_conflicts[0]
+          unresolved_reason = (
+            f'{revenue_concept} is tagged more than once for {period} on the '
+            f'{revenue_basis} basis ({values}); which of them is the segment\'s '
+            f'revenue cannot be determined from the filing')
+        else:
+          unresolved_reason = (
+            f'no {revenue_concept} fact for this member on the {revenue_basis} '
+            f'basis this filing is read on; the facts it does tag carry a '
+            f'further dimension')
+        unresolved.append({'segment': seg_display, 'segment_member': member,
+                           'reason': unresolved_reason})
 
-      # Derived metrics on the latest period
       latest_rev = rev_series[0]['value'] if rev_series else None
       prev_rev = rev_series[1]['value'] if len(rev_series) > 1 else None
       rev_yoy_pct = round(((latest_rev / prev_rev) - 1) * 100, 2) \
@@ -2512,20 +2659,32 @@ def get_segment_financials(ticker: str, form_type: str = '10-K') -> Dict[str, An
         'revenue_yoy_pct': rev_yoy_pct,
         'op_income_yoy_pct': op_yoy_pct,
         'op_margin_pct': op_margin_pct,
+        'unresolved_reason': unresolved_reason,
       })
 
-    # Total check: sum latest-period revenues vs. consolidated revenue base
-    total_seg_rev = sum(s['revenue'][0]['value'] for s in segments_out if s['revenue'])
+    total_seg_rev = sum(s['revenue'][0]['value'] for s in segments_out
+                        if s['revenue'])
+
+    note = None
+    if unresolved:
+      note = (
+        f"{len(unresolved)} of {len(members)} members report no revenue this "
+        f"tool will stand behind and are listed in segments_without_revenue; "
+        f"the total excludes them.")
 
     return {
       'ticker': ticker,
       'success': True,
       'error': None,
       'segments': segments_out,
-      'segment_axis': segment_axis_for_query,
+      'segment_axis': segment_axis,
       'segment_count': len(segments_out),
       'total_latest_segment_revenue': total_seg_rev,
-      'revenue_concept_used': revenue_concept_used,
+      'revenue_concept_used': revenue_concept,
+      'revenue_basis': revenue_basis,
+      'operating_income_basis': op_basis,
+      'segments_without_revenue': unresolved,
+      'note': note,
       'filing_date': filing_data.get('filing_date'),
     }
 

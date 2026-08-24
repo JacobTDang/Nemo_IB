@@ -162,22 +162,16 @@ def _footing_tolerance(scale: float) -> float:
 KNOWN_DEFECTS: Dict[tuple, str] = {
     # get_segment_financials sums an aggregation member alongside the segments
     # it aggregates. CAT's us-gaap:ReportableSegmentAggregationBeforeOther
-    # OperatingSegmentMember is 37,106m, exactly Construction 14,064 +
-    # Financial Products 2,841 + Power & Energy 15,558 + Resource 4,643.
+    # OperatingSegmentMember is 73,955m, exactly Construction 25,060 + Resource
+    # 12,474 + Power & Energy 32,201 + Financial Products 4,220.
     ("3 segment revenue vs consolidated", "CAT"):
         "aggregation member double-counted with the segments it aggregates",
-    ("3 segment revenue vs consolidated", "CVX"):
-        "aggregation member double-counted with Upstream and Downstream",
     ("3 segment revenue vs consolidated", "LEN"):
         "len:LennarHomebuildingEastCentralWestHoustonandOtherMember is the sum "
         "of the five Homebuilding region members and is added to them",
     ("3 segment revenue vs consolidated", "AMT"):
         "amt:PropertyMember is the parent of the five Property region members "
         "and is added to them",
-    ("3 segment revenue vs consolidated", "GE"):
-        "segment revenue read off the intersegment-elimination context: "
-        "Commercial Engines & Services reads -62,000,000 against "
-        "33,252,000,000 tagged on the segment-only context in the same filing",
 }
 
 
@@ -717,9 +711,10 @@ def test_reported_revenue_is_the_filers_consolidated_total(facts, tool_results):
 # number rather than a failure. An overshoot is not: it means a member is a
 # parent of the others, or is counted twice. The 2% allowance covers a filer
 # that tags an intersegment-revenue member on the same axis as its operating
-# segments -- that member is genuinely additive to the parts and eliminated from
-# the total. Measured on this basket, the largest legitimate overshoot is
-# GOOGL's 0.03%; the registered defects run from 5.6% to 88%.
+# segments, or a negative corporate column struck outside them -- both are
+# genuinely additive to the parts and removed from the total. Measured on this
+# basket the largest such overshoot is WFC's 1.4% (BA 0.2%, GOOGL 0.03%); the
+# registered defects run from 194% to 219%.
 _SEGMENT_OVERSHOOT = 0.02
 
 _ID_3 = "3 segment revenue vs consolidated"
@@ -729,10 +724,14 @@ def test_segment_revenue_reconciles_to_consolidated(facts, tool_results):
     """Segments sum to no more than consolidated revenue, and none is negative.
 
     The negative check is not redundant with the sum. GE's Commercial Engines &
-    Services reads -62,000,000 -- the intersegment-elimination context -- while
+    Services read -62,000,000 -- the intersegment-elimination context -- while
     the segment-only context in the same filing carries 33,252,000,000. Netted
     into a two-segment total it still looked like a shortfall rather than a
     defect, which is exactly how it survived.
+
+    An overshoot is still a violation here: CAT, AMT and LEN tag an aggregation
+    or parent member on the same axis as the members it aggregates, which the
+    tool does not yet detect. They stay in KNOWN_DEFECTS until it does.
     """
     violations = []
     for ticker in ALL_TICKERS:
@@ -772,7 +771,11 @@ def test_segment_revenue_reconciles_to_consolidated(facts, tool_results):
         if here:
             _fail(_ID_3, ticker, here, violations)
         else:
-            _record(_ID_3, "holds", ticker, f"{ratio:.1%} of consolidated")
+            detail = f"{ratio:.1%} of consolidated"
+            missing = result.get("segments_without_revenue") or []
+            if missing:
+                detail += f", {len(missing)} members without revenue"
+            _record(_ID_3, "holds", ticker, detail)
 
     assert not violations, (
         "segment revenue does not reconcile:\n" +
