@@ -681,3 +681,318 @@ numbers on megacaps and banks. Each is registered in
 `KNOWN_DEFECTS` in `testing/test_accounting_identities.py`, and
 `test_known_defect_register_is_not_stale` fails the moment one is fixed, so the
 register cannot outlive the bug.
+
+## Cross-source reconciliation sweep (2026-08-22)
+
+Branch `tier1-data-gaps`. New test:
+`testing/test_cross_source_reconciliation.py`, network-gated the same way as
+`testing/test_research_coverage_sweep.py`. 37 tickers, 444 comparisons,
+about 7 minutes when EDGAR is not throttling and roughly twice that when it
+is.
+
+The premise: every defect this project has shipped passed its own tests,
+because a test written beside the code inherits the code's blind spots.
+Reconciliation does not. The same fact is available from SEC XBRL, from
+Yahoo and from Finnhub, and where they disagree materially at least one is
+wrong. Nothing below was being looked for; all of it fell out of comparing
+feeds.
+
+Every disagreement was adjudicated by pulling the raw XBRL facts out of the
+filing — concept, label, statement and context dimensions — not by preferring
+whichever source looked nicer. **No tolerance was widened to make a check
+pass.** Adjudicated cases live in the test's `ADJUDICATED` table; a
+disagreement outside it fails the run, and an entry inside it that starts
+agreeing also fails, so entries get deleted when bugs get fixed rather than
+outliving them.
+
+### Reconciliation table
+
+| check | agree | disagree | not comparable | absent |
+|---|---|---|---|---|
+| revenue_annual (SEC XBRL vs vendor 10-K) | 27 | 9 | 1 | 0 |
+| revenue_ttm (Yahoo vs Finnhub) | 27 | 7 | 2 | 1 |
+| vendor_internal_revenue (Finnhub vs Finnhub) | 33 | 3 | 0 | 1 |
+| shares (SEC dei vs Yahoo) | 29 | 5 | 0 | 3 |
+| shares_finnhub (SEC dei vs Finnhub profile) | 36 | 0 | 0 | 1 |
+| market_cap (SEC shares x price vs Yahoo) | 32 | 2 | 0 | 3 |
+| market_cap_internal (Yahoo vs Yahoo) | 29 | 5 | 0 | 3 |
+| enterprise_value_internal (Yahoo vs Yahoo) | 27 | 3 | 4 | 3 |
+| net_income (SEC XBRL vs vendor) | 33 | 2 | 2 | 0 |
+| operating_cash_flow (SEC XBRL vs vendor) | 33 | 0 | 4 | 0 |
+| total_assets (SEC XBRL vs vendor) | 35 | 0 | 2 | 0 |
+| pe_ratio (ours vs Yahoo's own trailingPE) | 29 | 1 | 0 | 7 |
+
+Tolerances come from the measured spread rather than being chosen. Each band
+sits above the widest drift among the pairs that genuinely agree and below the
+narrowest genuine disagreement: 1% on period-matched statement lines (widest
+agreement 0.24%), 2% on annual revenue (1.14% vs 3.6%), 2% on share counts
+(1.82% vs 15%), 5% on market cap (4.01% vs 13.4%), 3% on TTM revenue (1.55%
+vs 3.3%), 10% on Finnhub's internal revenue consistency (8.1% vs 115%), 20%
+on P/E (16.5% vs 96.9%). The one band not set that way is enterprise value at
+10%: market cap + debt − cash omits minority interest and preferred, which a
+proper EV includes, and that incompleteness — not vendor drift — is what puts
+AMT at 5.2% while the rest of the basket sits inside 3.2%. The failure that
+check exists to catch is 5500% away.
+
+SPG straddles that 10% band as its price moves — measured at 9.7% and 10.3%
+a day apart — and it was adjudicated rather than accommodated. Widening the
+band to swallow it would have cost the AMT-sized signal and bought nothing,
+and chasing it turned out to be the strongest single piece of evidence in the
+sweep (see the SPG entry under vendor behaviour below).
+
+Basket: MSFT AAPL GOOGL AMZN META NVDA (megacap), WSM DKS EXPD (mid),
+PLUG RIOT SAVA (small), O SPG PLD AMT (REIT), JPM BAC WFC GS (bank),
+BIIB MRNA REGN (biotech), WMT COST TGT HD (retail), ARM RDDT CART (recent
+IPO), GOOGL META RDDT DKS (multi-class), F CAT GE (industrial), XOM CVX
+(energy), TSM ASML (foreign/ADR).
+
+**A second caveat: SEC rate limiting silently degrades this table.** A
+throttled EDGAR request comes back looking exactly like a company that does
+not tag a concept, so a 429 storm turns into false "not covered" rows and,
+worse, could turn into a false disagreement. One evidence-gathering run was
+hit this way and lost six `revenue_annual` comparisons and eight share
+counts. Three things keep it honest: `_sec_call` retries with exponential
+backoff and evicts the poisoned negative cache entry, every check carries a
+minimum-comparisons floor that fails loudly rather than passing on an empty
+set, and the table above was taken from a clean run and cross-checked against
+an earlier clean run. The two clean runs produced the same 36 disagreements;
+the 37th, SPG's enterprise value, is a price-dependent case that crossed the
+band between them and is adjudicated below. None of the adjudications came
+from a throttled run: every one was settled by reading the filing's raw XBRL
+facts directly.
+
+All 37 material disagreements are adjudicated. Nothing in the table is
+recorded as "sources differ, unclear why".
+
+**One caveat on the table.** Finnhub's `/stock/financials` is paywalled on
+the free tier, so `get_financial_statements` falls back to yfinance and tags
+itself `_source: yfinance_fallback`. Every statement comparison above is
+therefore SEC XBRL against Yahoo, not against Finnhub. Finnhub contributes
+genuinely independent data only through `/stock/metric` and `/stock/profile2`.
+`test_vendor_statements_declare_their_true_source` asserts the tag is present
+so the table cannot be misread as a three-way agreement.
+
+### Confirmed defects, in severity order
+
+**1. `get_revenue_base` returns the wrong revenue for 9 of the 36 filers
+it could be compared on.**
+`tools/web_search_server/sec_utils.py`. Two independent causes, both
+verified against the filings.
+
+*Cause A — the ASC 606 element is tried ahead of `us-gaap:Revenues`.* For a
+lessor, a bank or a segment-reporting filer that element covers a fragment
+of revenue, and the consolidated total sits on `us-gaap:Revenues`:
+
+| ticker | tool | filing | error | what the tool actually returned |
+|---|---|---|---|---|
+| AMT | 0.9359bn | 10.6446bn | -91.2% | the fact AMT labels "Total non-lease revenue"; tower rents are ASC 842 lease income |
+| WFC | 10.498bn | 83.699bn | -87.5% | the fact WFC labels "Fee income" |
+| GE | 30.163bn | 45.855bn | -34.2% | the fact GE labels "Sales" |
+| XOM | 226.909bn | 332.238bn | -29.9% | one segment, off `DisclosuresaboutSegments...SalesandOtherOperatingRevenuesDetails` |
+| GOOGL | 342.721bn | 402.836bn | -14.9% | Google Services. Every ASC 606 fact in Alphabet's FY2025 10-K is on the segment disclosure; none is on the income statement |
+
+*Cause B — `filter_annual_data` takes the largest fact for the period.* Its
+comment states "the consolidated total is always the largest positive value".
+It is not: a segment aggregate is struck before intersegment eliminations,
+and a joint-venture disclosure is not the filer's revenue at all.
+
+| ticker | tool | filing (undimensioned context) | error | context the tool picked |
+|---|---|---|---|---|
+| SPG | 12.4613bn | 6.3645bn | +95.8% | `EquityMethodInvestmentNonconsolidatedInvesteeAxis=spg:PlatformInvestmentsExcludingTrgAndKlepierre` — the unconsolidated JVs' revenue |
+| CVX | 231.370bn | 184.432bn | +25.5% | `srt:ConsolidationItemsAxis=us-gaap:OperatingSegmentsMember` |
+| CAT | 73.955bn | 67.589bn | +9.4% | a dimensioned context; consolidated is c-1 |
+| RIOT | 670.718m | 647.435m | +3.6% | `OperatingSegmentsMember` + `ReportableSegmentAggregationBeforeOtherOperatingSegment` |
+
+Fixing cause A alone makes XOM and GE worse, not better: the largest
+`us-gaap:Revenues` fact is 452.209bn for XOM (against a consolidated
+332.238bn) and 48.024bn for GE (against 45.855bn). Both causes have to go.
+
+The fix already exists in this codebase. `sec_series.FilingPoint.undimensioned()`
+and `latest_undimensioned()` select the consolidated fact by *absence of
+dimensions* rather than by size, and every tool built on them —
+`get_accruals_quality`, `get_working_capital_trends`, `get_share_count_series`
+— reconciles cleanly here. `get_revenue_base` is the only revenue path that
+still uses `filter_annual_data`.
+
+**2. `get_market_data` mixes currencies inside a single response.**
+`tools/financial_modeling_engine/utils.py`. For a foreign filer `marketCap`
+and `currentPrice` come back in the quote currency while `totalRevenue`,
+`ebitda`, `netIncomeToCommon`, `totalDebt`, `totalCash` and `enterpriseValue`
+come back in the reporting currency, and `pe_ratio`/`pb_ratio` divide one by
+the other. The response carries no currency field at all.
+
+- TSM: `pe_ratio` = **0.98** against Yahoo's own `trailingPE` of **31.24** —
+  off by the TWD/USD rate. `pb_ratio` = 0.41 on the same mix.
+- ASML: `pe_ratio` = 63.68 against Yahoo's 59.97, inflated by EUR/USD.
+
+Yahoo already publishes the correct `trailingPE` in the same `info` dict the
+tool has in hand.
+
+**3. `get_market_data` publishes EV multiples three orders of magnitude out
+without a plausibility check.** ASML's yfinance `enterpriseValue` reads
+37,631bn against a 677bn market cap and roughly 2bn of net debt. The tool
+divides it straight into revenue and EBIT and returns
+`ev_revenue = 1065x`, `ev_ebitda = 2790x`, `ev_ebit = 3330x`. Reconciling EV
+against market cap + debt − cash from the same response catches it: every
+non-financial in the basket lands within 5.2% apart from SPG (adjudicated
+separately below), and ASML and TSM at 5500%.
+
+**4. `get_market_data.revenue_ttm` does not reconcile to Yahoo's own
+quarters.** Settled by summing the four most recent reported quarters from
+yfinance's own quarterly income statement. Finnhub's implied TTM
+(`marketCapitalization / psTTM`) matches that sum to within 0.0004% — the
+rounding of `psTTM` itself. Yahoo's `info.totalRevenue`, which the tool
+returns as `revenue_ttm` and divides into enterprise value for `ev_revenue`,
+matches no four-quarter window of Yahoo's own statements:
+
+| ticker | Yahoo `info.totalRevenue` | sum of last 4 reported quarters (= Finnhub) | gap |
+|---|---|---|---|
+| PLD | 9.657bn | 9.1898bn | +5.1% |
+| SPG | 6.941bn | 6.6486bn | +4.4% |
+| RIOT | 674.5m | 653.3m | +3.3% |
+
+Finnhub is right here and Yahoo is the unreconcilable side — the reverse of
+the usual direction, which is the point of running the check both ways.
+
+**5. `get_accruals_quality` picks arbitrarily between two conflicting facts
+in the same context.** AMT tags `us-gaap:NetIncomeLoss` twice in the
+undimensioned context c-1: 2.6285bn labelled "Net income (loss)" on
+`CONSOLIDATEDSTATEMENTSOFEQUITY`, and 2.5295bn labelled "NET INCOME
+ATTRIBUTABLE TO AMERICAN TOWER CORPORATION COMMON STOCKHOLDERS" on the income
+statement. `_by_period` keeps whichever appears first in document order and
+returns the equity-statement figure. The income statement and both vendors
+say 2.5295bn. Net income reads 3.9% high and the accrual ratio inherits it.
+
+**6. A rate limit is reported as "No XBRL data available", and cached.**
+`get_latest_filing` in `sec_utils.py` wraps the whole fetch in
+`except Exception: result = None`, caches the None, and the caller renders it
+as "No XBRL data available" — a statement about the filer. Reproduced twice
+while building this sweep: once from an HTTP 429 partway through the basket
+(19 tickers turned "uncovered" in one step) and once from an unset
+`SEC_EMAIL`. Because the failure is cached, a retry inside the same process
+cannot recover; the harness has to evict the entry, which is why
+`_sec_call()` in the new test reaches into `_filing_cache_lru`. Contrast
+`get_accruals_quality` and `get_share_count_series`, which surfaced the same
+429 as "Too Many Requests".
+
+**7. `get_revenue_base` raises for 20-F/40-F filers.** The foreign branch
+`return _foreign_revenue_base(ticker)` sits *above* the function's own
+`try`, so anything the foreign reader raises propagates instead of coming
+back as `{'success': False, ...}`. Observed live: a missing `SEC_EMAIL`
+raised `ValueError` out of `get_revenue_base('TSM', '20-F')` while the same
+condition on the domestic path returned a result dict.
+
+**8. `get_revenue_base` returns two different `period_end` formats.** The
+10-K path returns `'2025-12-31'`; the 20-F path returns the raw XBRL period
+key, `'duration_2025-01-01_2025-12-31'`. Any caller parsing it as a date
+breaks on every foreign private issuer. The test normalises both forms and
+notes why — without that, ASML, TSM and ARM all read "not comparable" when in
+fact all three match the vendor to the dollar (EUR 32,667,300,000 /
+TWD 3,809,054,300,000 / USD 4,920,000,000).
+
+**9. `get_basic_financials` contradicts itself, and drops currency.**
+`tools/news_agregator/finnhub_server.py`, `_condense_basic_financials`.
+
+- *Two TTM revenues from one payload.* `marketCapitalization / psTTM` and
+  `revenuePerShareTTM x shareOutstanding` are the same quantity by
+  construction. For banks they are not: JPM 332.6bn vs 138.6bn (2.4x), BAC
+  192.1bn vs 87.4bn, WFC 141.1bn vs 65.7bn. Yahoo says 186.3 / 113.9 / 83.0bn.
+  Non-financials agree within 8%. Nothing in the response says which basis
+  either figure is on.
+- *No currency.* The condenser keeps `marketCapitalization` and
+  `enterpriseValue` but drops every currency signal. TSM's
+  `marketCapitalization` is 63,145,320 — **millions of TWD** (~$2.0tn), read
+  as USD it is $63tn. `get_company_profile` keeps `currency` in its allow-list
+  and correctly reports TWD for the same company.
+- *Stale.* `/stock/metric`'s `marketCapitalization` drifts from the live
+  figure by up to 12% across the basket and by **-56.5% for MRNA** (25.19bn
+  against 57.94bn). `/stock/profile2`'s market cap matched Yahoo's to the
+  dollar for MRNA, META and DKS, so the staleness is specific to the metric
+  endpoint. `psTTM`, `peTTM` and the rest of that block inherit it.
+
+**10. `get_share_count_series` returns ordinary shares for an ADR with no
+note.** TSM: SEC dei reports 25,932,524,521 ordinary shares, Yahoo 5,186,474,013
+ADS, and the ratio is 5.00003 — TSM's 5:1 ADR ratio. Finnhub's profile also
+reports ordinary shares, so two of three sources agree and the tool is right in
+its own unit. But the quote is per ADS, so `latest_total x price` gives a
+$10.86tn market cap against a real $2.17tn, and nothing in the result warns
+that the two cannot be multiplied.
+
+**11. `get_market_data` returns a null market cap for HD and TGT.**
+Reproducible across repeated calls: `marketCap` and `sharesOutstanding` come
+back `None` while `currentPrice` and `revenue` are populated. `get_data` then
+omits `pe_ratio` and `pb_ratio` from the dict entirely rather than setting them
+to None, so a caller indexing them gets a `KeyError` on exactly the tickers
+where the data is thinnest. SEC dei has HD at 997,116,682 shares and TGT at
+454,191,112, so the fallback exists.
+
+**12. `_yf_financial_statements` misses an operating-cash-flow label.** Its
+`cf` map has only `"Operating Cash Flow"`. ASML's yfinance cash-flow statement
+carries no such row — only `"Cash Flow From Continuing Operating Activities"` —
+so `operatingCashFlow` comes back absent for it. (RIOT is a genuine vendor
+gap by contrast: the row exists and is NaN for 2022-2025.)
+
+### Vendor behaviour our outputs inherit — adjudicated, not our bug
+
+- **yfinance `sharesOutstanding` is the quoted class, not the company.**
+  GOOGL 5.867bn vs an SEC dei total of 12.23bn (+108%), META 2.205 vs 2.5475bn,
+  RDDT 146.1 vs 192.4m, DKS 65.9 vs 89.5m. Settled two ways: Finnhub's profile
+  count agrees with SEC dei for all 36 tickers where both exist, and Yahoo's
+  own `marketCap` reconciles with the SEC total at the quoted price rather than
+  with its own share count. The consequence is that `get_market_data` returns a
+  `marketCap` and a `sharesOutstanding` that cannot both be right — 52% apart
+  for GOOGL, 26% for DKS, 24% for RDDT, 13% for META.
+- **yfinance `marketCap` for SPG includes operating-partnership units.** Three
+  independent measures agree on the share count and Yahoo's `marketCap` is the
+  one that does not: SEC dei says 323,559,515, Yahoo's own `sharesOutstanding`
+  says 323,551,515 (0.002% apart), Finnhub's profile agrees, and Yahoo's
+  `marketCap` divided by Yahoo's own price implies 379.6m — 56.1m more, which
+  is the SPG LP unit count. The fourth measure is Yahoo's own
+  `enterpriseValue`: it reconciles to SEC-shares x price + debt − cash within
+  **0.78%** (99.73bn against a reported 100.50bn) but sits 10.3% away from its
+  own `marketCap` + debt − cash. So Yahoo builds EV on the common-only market
+  cap while publishing an OP-unit-inclusive `marketCap` in the same payload.
+  A fully-exchanged market cap is a defensible number; shipping it beside a
+  `sharesOutstanding` and an `enterpriseValue` that both assume the other one
+  is not. `get_market_data` passes all three through untouched, so a caller can
+  compute SPG's equity value two ways from one response and get 70.6bn or
+  83.7bn.
+- **Bank revenue, gross vs net of interest expense.** Finnhub's `psTTM` implies
+  gross revenue including total interest income; Yahoo's `totalRevenue` is net.
+  GS 135.0 vs 67.6bn, JPM 332.6 vs 186.3bn, WFC 141.1 vs 83.0bn, BAC 192.1 vs
+  113.9bn. Both are real measures of a bank. Neither source labels which.
+
+### Definitional divergence worth a warning, not a fix
+
+**SPG net income, 5.36412bn vs 4.6276bn (+15.9%).** SPG tags no
+`us-gaap:NetIncomeLoss` at all — only `NetIncomeLossAvailableToCommon
+StockholdersBasic` and siblings — so `get_accruals_quality`'s concept chain
+falls through to `us-gaap:ProfitLoss` = "Consolidated Net Income", which
+includes the operating partnership's noncontrolling interests. Yahoo reports
+4.6276bn to common. The 15.9% gap is SPG's NCI. `concepts_used` does name
+ProfitLoss, but nothing warns that this figure is not the per-share numerator,
+and for an UPREIT the two differ by a sixth.
+
+### Not resolved
+
+- **XOM's "revenue" has two defensible answers.** `us-gaap:Revenues`
+  undimensioned = 332.238bn ("total revenues and other income", including
+  equity-affiliate and other income); the `ProductOrServiceAxis=
+  SalesAndOtherOperatingRevenue` line = 323.905bn, which is what Yahoo reports.
+  The tool's 226.909bn is neither. Which one `get_revenue_base` should return
+  is a definitional call somebody has to make.
+- **ASML's `enterpriseValue` of 37,631bn.** Not EUR, not USD, not a
+  share-count artefact — could not determine what Yahoo computed. The
+  actionable half (we publish it as an EV multiple unchecked) is defect 3.
+- **SAVA has no Yahoo quote.** `Quote not found for symbol: SAVA` on every
+  attempt, while SEC has 10-Q filings through 2026-07 and a 48,307,896 share
+  count. Ticker change or Yahoo delisting; not investigated further. All 11
+  price-side checks report absent for it, which is the correct behaviour.
+
+### Priority
+
+1 (revenue), 2 (currency mix) and 5 (net income) are wrong numbers reaching
+valuation code and should be fixed first. 6 (rate limit as "no data") is the
+highest-leverage robustness fix: it silently converts an outage into a claim
+about a company. 3, 4, 9 and 11 are wrong or missing numbers with narrower
+blast radius. 7, 8 and 12 are contract and coverage fixes.
