@@ -424,3 +424,260 @@ code deployment. The lesson is to restart daemons after any commit
 touching `daemons/*.py`.
 
 **Priority:** none. Expected behavior.
+
+## Accounting-identity sweep (2026-08-22)
+
+**Surfaced by:** `testing/test_accounting_identities.py` — a network-gated
+sweep over 32 filers (megacap, bank, REIT, retailer, biotech, industrial,
+energy, minority-interest-heavy, multi-class) asserting relationships that
+arithmetic forces to hold for every filer in every year. No golden values.
+Run against each filer's latest 10-K.
+
+The point of the approach: every serious extraction defect in this project
+passed its own tests, because nothing compared one number to another. MSFT's
+total assets read 207.7bn against a real 758.4bn and looked entirely
+plausible. These checks catch that class of defect without anyone having
+predicted the specific bug.
+
+### Identity results (32 filers)
+
+| identity | holds | violated | not checkable |
+|---|---|---|---|
+| 1a `Assets` == `LiabilitiesAndStockholdersEquity` | 32 | 0 | 0 |
+| 1b `Assets` == `Liabilities` + equity + mezzanine | 25 | 0 | 7 |
+| 2 component <= parent (24 concept pairs) | 32 | 0 | 0 |
+| 2b reported revenue is the consolidated total | 21 | 11 | 0 |
+| 3 segment revenue vs consolidated | 20 | 5 | 7 |
+| 4 geographic revenue vs consolidated | 25 | 0 | 7 |
+| 5 debt buckets vs long-term debt | 18 | 0 | 14 |
+| 6a FCF == OCF − capex | 19 | 13 | 0 |
+| 6b accruals == net income − OCF | 32 | 0 | 0 |
+| 7 float <= shares × price | 31 | 0 | 1 |
+
+Identities 1a, 1b, 2, 6b and 7 hold everywhere they can be evaluated. The
+balance sheet foots to **exactly zero** for all 32 filers, so those checks
+carry no meaningful tolerance — the allowance is 1e-9 of total assets, which
+exists only so a float64 sum at JPM's 4.4tn scale cannot fail on
+representation.
+
+Not-checkable is a coverage fact, not a pass:
+
+- **1b** — AMZN, CHTR, FOXA, HON, T, TGT and WMT do not tag
+  `us-gaap:Liabilities` at all. Identity 1a covers them.
+- **5** — 14 filers either tag a partial ladder or none. `get_debt_maturity_
+  schedule`'s own `coverage` field already says so; the identity is only
+  asserted where coverage is `full`.
+- **3 / 4** — banks and single-segment filers.
+
+### Confirmed wrong numbers
+
+#### 1. `sec_utils.filter_annual_data` returns dimensioned and prefix-matched facts (P0)
+
+This is the shared read path behind `get_revenue_base`, `get_ebitda_margin`,
+`get_capex_pct_revenue`, `get_tax_rate`, `get_depreciation`,
+`get_margin_breakdown`, `get_historical_fcf` and `get_working_capital`. Two
+defects compound:
+
+1. It passes `xbrl.facts.query().by_concept(...)` straight through. `by_concept`
+   is a **prefix match** — the same bug fixed in `sec_series._concept_matches`
+   and never fixed here.
+2. It resolves multiple facts for a period with `idxmax` — "the consolidated
+   total is always the largest positive value". That is false. Segment,
+   geography and parent-company-only facts sit in the same frame, and where the
+   filer does not tag the requested concept undimensioned, one of those wins.
+
+Measured against the filings:
+
+| filer | tool reports | filing reports | what the tool actually returned |
+|---|---|---|---|
+| GOOGL | 342,721,000,000 | 402,836,000,000 | the Google Services **segment** |
+| BA | 41,332,000,000 | 89,463,000,000 | a dimensioned slice |
+| XOM | 226,909,000,000 | 332,238,000,000 | a dimensioned slice |
+| GE | 30,163,000,000 | 45,855,000,000 | a dimensioned slice |
+| WFC | 10,498,000,000 | order of magnitude larger | a dimensioned slice |
+| SPG | 12,461,291,000 | 6,364,505,000 | a dimensioned fact, ~2x the total |
+| CVX | 231,370,000,000 | 189,031,000,000 | a dimensioned fact |
+| CAT | 73,955,000,000 | 67,589,000,000 | the reportable-segment aggregation member |
+
+Alphabet's revenue is understated by 15% and Boeing's by 54% by the function
+whose own docstring calls it "the starting point for nearly all analysis".
+
+The same path drives operating cash flow in `get_historical_fcf`. For a bank
+the consolidated figure is often negative, so `idxmax` picks the
+parent-company-only Schedule I cash flow (`srt:ConsolidatedEntitiesAxis` /
+`srt:ParentCompanyMember`):
+
+| filer | tool reports | consolidated statement |
+|---|---|---|
+| JPM | +44,468,000,000 | **−147,782,000,000** |
+| GS | +17,007,000,000 | **−45,154,000,000** |
+| WFC | +25,946,000,000 | **−19,001,000,000** |
+| BAC | +46,937,000,000 | +12,613,000,000 |
+
+Three of the four flip sign. GE is the prefix-match half of the same defect:
+8,543,000,000 is `NetCashProvidedByUsedInOperatingActivitiesContinuingOperations`
+reached by prefix, against 8,537,000,000 for the concept actually asked for.
+
+GS is the provenance-only case: the **value** 58,283,000,000 is Goldman's total
+net revenues and is correct, but it is reported under `concept_used:
+us-gaap:Revenues`, which GS does not tag at all — the fact is
+`us-gaap:RevenuesNetOfInterestExpense`, reached by prefix match. A caller
+reconciling against the filing would find nothing under the named concept.
+
+**Fix:** apply `sec_series._concept_matches` to the frame, and prefer
+undimensioned facts over `idxmax`. Not shipped here: `filter_annual_data` is
+the read path for ten tools and several rely on its current selection, so the
+change needs its own regression pass over the golden tests.
+
+#### 2. Revenue concept chains prefer the ASC 606 subset (P1)
+
+Every revenue chain in the codebase tries
+`us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax` before
+`us-gaap:Revenues`. ASC 606 contract revenue is a *component* of revenue
+whenever a filer earns anything outside a customer contract. A REIT earns
+almost all of it under ASC 842 lease accounting:
+
+- **AMT**: reported 935,900,000 against 10,644,600,000 of revenue — 8.8% of it.
+- **WMT**: 706,413,000,000 against 713,163,000,000.
+
+**Fix:** where a filer tags both, take `us-gaap:Revenues`. The containment
+identity (`ASC 606 <= Revenues`) holds for every filer in the basket, so
+"largest wins" is safe.
+
+#### 3. `get_historical_fcf` reports operating cash flow as free cash flow (P0)
+
+The capex chain is two concepts wide — `PaymentsToAcquirePropertyPlantAnd
+Equipment` and `PaymentsForCapitalImprovements` — and `fcf = ocf - (capex or 0)`
+turns a missing capex into zero rather than into "not covered".
+
+| filer | reported FCF | capex the filing tags | real FCF |
+|---|---|---|---|
+| AMZN | 139,514,000,000 | 131,819,000,000 | **7,695,000,000** |
+| T | 40,284,000,000 | 20,842,000,000 | 19,442,000,000 |
+| NVDA | 102,718,000,000 | 6,042,000,000 | 96,676,000,000 |
+| CVX | 33,939,000,000 | 17,347,000,000 | 16,592,000,000 |
+| HD | 16,325,000,000 | 3,679,000,000 | 12,646,000,000 |
+| SPG | 4,136,551,000 | 934,346,000 | 3,202,205,000 |
+| REGN | 4,978,900,000 | 898,400,000 | 4,080,500,000 |
+| PLD | 5,008,434,000 | 2,781,260,000 | 2,227,174,000 |
+
+Amazon's free cash flow is overstated **18x**. All of these filers tag
+`us-gaap:PaymentsToAcquireProductiveAssets` (PLD:
+`PaymentsToDevelopRealEstateAssets`), which the chain never tries.
+
+**Fix:** widen the chain, and return `coverage: "not_covered"` instead of
+substituting zero — a silent fallback masking a missing input is exactly the
+failure mode this project keeps relearning.
+
+#### 4. `get_segment_financials` picks the wrong fact within a segment (P0)
+
+`_annual_series` queries `by_dimension(axis, member)` and takes the first row of
+the result. Facts carrying the segment axis *plus another* axis
+(`srt:ConsolidationItemsAxis`, `srt:ProductOrServiceAxis`) are in that result
+and win arbitrarily.
+
+**GE**: Commercial Engines & Services reports **−62,000,000** of revenue. That is
+the `us-gaap:IntersegmentEliminationMember` context. The segment-only context in
+the same filing carries **33,252,000,000**. Both GE segments come back negative
+and the tool reports total segment revenue of −1,748,000,000.
+
+The same defect understates BA (50.1% of consolidated), HON (30.2%), XOM (41.4%)
+and BIIB (35.9%).
+
+A prototype that selects the fact whose only dimension is the segment axis fixes
+GE (91.9%), BA (100.2%), HON (99.9%), BIIB (100.0%) and CVX (97.6%).
+
+#### 5. `get_segment_financials` has no overlap detection (P1)
+
+`get_geographic_revenue` detects nested members and sets `members_overlap`. The
+segment tool has no equivalent, so aggregation and parent members are summed
+alongside the members they aggregate:
+
+- **CAT**: `us-gaap:ReportableSegmentAggregationBeforeOtherOperatingSegment
+  Member` is 37,106m — exactly Construction 14,064 + Financial Products 2,841 +
+  Power & Energy 15,558 + Resource 4,643. Segments sum to 109.8% of revenue.
+- **CVX**: same member, 184.8%.
+- **LEN**: `len:LennarHomebuildingEastCentralWestHoustonandOtherMember` is the
+  sum of the five Homebuilding regions. 187.8%.
+- **AMT**: `amt:PropertyMember` is the parent of the five Property regions.
+  105.6%.
+
+**Fix:** mirror `get_geographic_revenue` — compare the sum against consolidated
+revenue and flag the overlap rather than trying to recognise parent members from
+tag names, which cannot be done.
+
+#### 6. `get_share_count_series` calls a corporate separation a buyback (P2)
+
+HON's share count halves from 633,653,119 (2026-04-23 10-Q) to 316,940,010
+(2026-07-23 10-Q). Both figures are correct — Honeywell separated — but the tool
+reports `direction: "buyback"` and `change_pct: -50.1%`. A 50% "buyback" in one
+quarter is not a buyback.
+
+This also broke the first draft of identity 7: comparing the post-separation
+10-Q share count against the 10-K's public float read as a 180% violation of an
+identity that was not violated. The check now reads the share count off the same
+cover page as the float, so both describe the same capital structure.
+
+#### 7. `forward_metrics` reports a credential failure as "not disclosed" (P2)
+
+`get_geographic_revenue` and `_series_for` wrap each concept attempt in
+`except Exception: continue`. With `SEC_EMAIL` unset, `get_geographic_revenue`
+returns *"NVDA does not disaggregate revenue by geography in its 10-K"* —
+a statement about NVIDIA, caused by a missing environment variable. NVDA
+discloses four geographies. `earnings_quality._series` swallows only
+`NotCovered` and documents why; `forward_metrics` should match it.
+
+### Legitimate violations, encoded narrowly
+
+- **Mezzanine equity.** SPG carries 233,306,000 of redeemable interests, which
+  sit between liabilities and equity and belong to neither total. Identity 1b
+  fails by exactly that amount without the term. Added as an explicit term, not
+  absorbed by a wider tolerance.
+- **Minority interest.** Total equity is
+  `StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest` where
+  tagged, otherwise `StockholdersEquity` + `MinorityInterest`. Checking the
+  parent figure alone would report every filer with a subsidiary as broken
+  (CHTR's NCI is 4.5bn). With the fallback, all 25 checkable filers foot exactly
+  — including all four banks, where a naive check would have produced the
+  loudest false alarms.
+- **MSFT's debt ladder, 14.5% from the balance sheet.** Adjudicated against the
+  filing, which reconciles it itself: face value 46,136 − 1,081 discount − 11
+  hedge − 4,750 premium on debt exchange = 40,294 carrying. Both sides are
+  correct. Encoded as a named per-filer exception at 16%, leaving the general
+  tolerance at 10% (worst other filer: T at 7.4%).
+- **`members_overlap` on geographic revenue.** BAC, CAT, GE, JPM, META, MRNA and
+  VRTX tag nested regions. The tool already detects this; identity 4 respects
+  the flag and checks the things the flag does not imply instead.
+
+### Rate limiting is a silent-failure mode
+
+Roughly 70 SEC requests per filer across seven tools. Two thousand back to back
+earns a 429 that blocks the host for ~9 minutes — and every tool reports it as
+"No filing found" or "not covered". A throttled run therefore produces false
+"not checkable" verdicts and can make a defect register look stale.
+
+The sweep detects rate-limited results, retries with backoff, and
+`test_no_tool_result_is_a_throttled_request` fails the run if any survive, so a
+degraded sweep can never be read as coverage.
+
+### Unresolved
+
+- **XOM segment revenue is not extractable as tagged.** XOM tags every segment
+  revenue fact in combination with `srt:StatementGeographicalAxis`; there is no
+  segment-only fact. A correct segment figure requires summing across the
+  geography axis, which no current tool does.
+- **`filter_annual_data` is not fixed.** Ten tools read through it; the fix is
+  clear (exact-concept filter, prefer undimensioned) but needs its own
+  regression pass.
+- **Identity 5 reaches only 18 of 32 filers**, and identity 3 only 27, because
+  of genuine tagging gaps rather than tool defects.
+- **Real-estate acquisition spend** (`PaymentsToAcquireRealEstate`,
+  `PaymentsToAcquireCommercialRealEstate`) is deliberately excluded from the
+  capex identity. Whether a REIT's property acquisitions belong in free cash
+  flow is a judgement call, not an identity.
+
+**Priority:** findings 1, 3 and 4 are P0 — they produce confidently wrong
+numbers on megacaps and banks. Each is registered in
+`KNOWN_DEFECTS` in `testing/test_accounting_identities.py`, and
+`test_known_defect_register_is_not_stale` fails the moment one is fixed, so the
+register cannot outlive the bug.
