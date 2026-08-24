@@ -79,7 +79,14 @@ TEMP_EQUITY_NCI = ("us-gaap:RedeemableNoncontrollingInterestEquity"
 
 REVENUES = "us-gaap:Revenues"
 REVENUE_ASC606 = "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax"
-REVENUE_ELEMENTS = (REVENUES, REVENUE_ASC606, "us-gaap:SalesRevenueNet")
+# The total-revenue line on a bank's income statement, and the only revenue
+# element GS and WFC tag undimensioned -- GS does not tag us-gaap:Revenues at
+# all. Without it here, identity 2b can only report that a bank's revenue came
+# off an element the check does not know about, which is a gap in the check
+# rather than a finding about the filer.
+REVENUES_NET_OF_INTEREST = "us-gaap:RevenuesNetOfInterestExpense"
+REVENUE_ELEMENTS = (REVENUES, REVENUES_NET_OF_INTEREST, REVENUE_ASC606,
+                    "us-gaap:SalesRevenueNet")
 OPERATING_INCOME = "us-gaap:OperatingIncomeLoss"
 OCF = "us-gaap:NetCashProvidedByUsedInOperatingActivities"
 
@@ -171,85 +178,6 @@ KNOWN_DEFECTS: Dict[tuple, str] = {
         "segment revenue read off the intersegment-elimination context: "
         "Commercial Engines & Services reads -62,000,000 against "
         "33,252,000,000 tagged on the segment-only context in the same filing",
-
-    # get_revenue_base reads through sec_utils.filter_annual_data, which does
-    # not filter by_concept's prefix match and resolves ties by taking the
-    # largest fact -- including dimensioned ones. Where a filer does not tag the
-    # chain's first element undimensioned, a segment fact wins.
-    ("2b reported revenue is the consolidated total", "GOOGL"):
-        "342,721,000,000 is the Google Services segment; us-gaap:Revenues is "
-        "402,836,000,000 in the same filing",
-    ("2b reported revenue is the consolidated total", "BA"):
-        "41,332,000,000 against us-gaap:Revenues of 89,463,000,000",
-    ("2b reported revenue is the consolidated total", "CAT"):
-        "73,955,000,000 is the reportable-segment aggregation member; "
-        "us-gaap:Revenues is 67,589,000,000",
-    ("2b reported revenue is the consolidated total", "CVX"):
-        "231,370,000,000 against us-gaap:Revenues of 189,031,000,000",
-    ("2b reported revenue is the consolidated total", "GE"):
-        "30,163,000,000 against us-gaap:Revenues of 45,855,000,000",
-    ("2b reported revenue is the consolidated total", "SPG"):
-        "12,461,291,000 against us-gaap:Revenues of 6,364,505,000",
-    ("2b reported revenue is the consolidated total", "WFC"):
-        "10,498,000,000 for a bank whose total revenue is an order of "
-        "magnitude larger; no undimensioned fact exists for the concept used",
-    ("2b reported revenue is the consolidated total", "XOM"):
-        "226,909,000,000 against us-gaap:Revenues of 332,238,000,000",
-    ("2b reported revenue is the consolidated total", "AMT"):
-        "935,900,000 is the ASC 606 portion of a REIT whose revenue is "
-        "10,644,600,000; almost all of it is ASC 842 lease income",
-    ("2b reported revenue is the consolidated total", "WMT"):
-        "706,413,000,000 is the ASC 606 element; us-gaap:Revenues is "
-        "713,163,000,000",
-    # GS is the provenance half of the same defect. The value 58,283,000,000 is
-    # Goldman's total net revenues and is correct; the concept it is attributed
-    # to is not. GS tags us-gaap:RevenuesNetOfInterestExpense and does not tag
-    # us-gaap:Revenues at all -- by_concept reached it by prefix match, so
-    # concept_used names an element that is absent from the filing and a caller
-    # reconciling against the filing would find nothing there.
-    ("2b reported revenue is the consolidated total", "GS"):
-        "value correct, provenance wrong: reported under us-gaap:Revenues, "
-        "which GS does not tag; the fact is "
-        "us-gaap:RevenuesNetOfInterestExpense reached by prefix match",
-
-    # get_historical_fcf, same filter_annual_data path. For a bank the
-    # consolidated operating cash flow is negative, so the largest fact is the
-    # parent-company-only Schedule I figure on srt:ConsolidatedEntitiesAxis.
-    ("6a fcf == ocf - capex", "JPM"):
-        "operating cash flow +44,468,000,000 is the parent-company-only "
-        "figure; the consolidated statement reads -147,782,000,000",
-    ("6a fcf == ocf - capex", "GS"):
-        "+17,007,000,000 parent-company-only against -45,154,000,000 "
-        "consolidated",
-    ("6a fcf == ocf - capex", "WFC"):
-        "+25,946,000,000 parent-company-only against -19,001,000,000 "
-        "consolidated",
-    ("6a fcf == ocf - capex", "BAC"):
-        "+46,937,000,000 parent-company-only against +12,613,000,000 "
-        "consolidated",
-    ("6a fcf == ocf - capex", "GE"):
-        "8,543,000,000 is NetCashProvidedByUsedInOperatingActivities"
-        "ContinuingOperations reached by prefix match; the concept asked for "
-        "reads 8,537,000,000",
-    # Capex chain is two concepts wide and misses the one these filers use, and
-    # `ocf - (capex or 0)` then reports operating cash flow as free cash flow.
-    ("6a fcf == ocf - capex", "AMZN"):
-        "capex untagged so FCF returned as 139,514,000,000; the filing tags "
-        "PaymentsToAcquireProductiveAssets at 131,819,000,000, making FCF "
-        "7,695,000,000",
-    ("6a fcf == ocf - capex", "T"):
-        "capex untagged so FCF returned as operating cash flow; the filing "
-        "tags PaymentsToAcquireProductiveAssets at 20,842,000,000",
-    ("6a fcf == ocf - capex", "NVDA"):
-        "capex untagged so FCF returned as operating cash flow; the filing "
-        "tags PaymentsToAcquireProductiveAssets at 6,042,000,000",
-    ("6a fcf == ocf - capex", "CVX"): "capex untagged, FCF returned as OCF",
-    ("6a fcf == ocf - capex", "HD"): "capex untagged, FCF returned as OCF",
-    ("6a fcf == ocf - capex", "PLD"):
-        "capex untagged so FCF returned as operating cash flow 5,008,434,000; "
-        "the filing tags PaymentsToDevelopRealEstateAssets at 2,781,260,000",
-    ("6a fcf == ocf - capex", "REGN"): "capex untagged, FCF returned as OCF",
-    ("6a fcf == ocf - capex", "SPG"): "capex untagged, FCF returned as OCF",
 }
 
 

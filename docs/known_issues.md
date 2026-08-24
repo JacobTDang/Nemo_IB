@@ -441,18 +441,26 @@ predicted the specific bug.
 
 ### Identity results (32 filers)
 
-| identity | holds | violated | not checkable |
-|---|---|---|---|
-| 1a `Assets` == `LiabilitiesAndStockholdersEquity` | 32 | 0 | 0 |
-| 1b `Assets` == `Liabilities` + equity + mezzanine | 25 | 0 | 7 |
-| 2 component <= parent (24 concept pairs) | 32 | 0 | 0 |
-| 2b reported revenue is the consolidated total | 21 | 11 | 0 |
-| 3 segment revenue vs consolidated | 20 | 5 | 7 |
-| 4 geographic revenue vs consolidated | 25 | 0 | 7 |
-| 5 debt buckets vs long-term debt | 18 | 0 | 14 |
-| 6a FCF == OCF − capex | 19 | 13 | 0 |
-| 6b accruals == net income − OCF | 32 | 0 | 0 |
-| 7 float <= shares × price | 31 | 0 | 1 |
+As first measured (2026-08-22), and re-measured after findings 1, 2 and 3
+were fixed on `tier1-data-gaps` (2026-08-24):
+
+| identity | holds | violated | not checkable | after the fix |
+|---|---|---|---|---|
+| 1a `Assets` == `LiabilitiesAndStockholdersEquity` | 32 | 0 | 0 | 32 / 0 / 0 |
+| 1b `Assets` == `Liabilities` + equity + mezzanine | 25 | 0 | 7 | 25 / 0 / 7 |
+| 2 component <= parent (24 concept pairs) | 32 | 0 | 0 | 32 / 0 / 0 |
+| 2b reported revenue is the consolidated total | 21 | 11 | 0 | **32 / 0 / 0** |
+| 3 segment revenue vs consolidated | 20 | 5 | 7 | 22 / 5 / 5 |
+| 4 geographic revenue vs consolidated | 25 | 0 | 7 | 25 / 0 / 7 |
+| 5 debt buckets vs long-term debt | 18 | 0 | 14 | 18 / 0 / 14 |
+| 6a FCF == OCF − capex | 19 | 13 | 0 | **29 / 0 / 3** |
+| 6b accruals == net income − OCF | 32 | 0 | 0 | 32 / 0 / 0 |
+| 7 float <= shares × price | 31 | 0 | 1 | 31 / 0 / 1 |
+
+The three filers 6a can no longer check are JPM, BAC and WFC: a bank tags no
+capital-expenditure element, and `get_historical_fcf` now says so instead of
+returning operating cash flow as free cash flow. The five 3 gains are filers
+whose consolidated revenue the identity could not previously read.
 
 Identities 1a, 1b, 2, 6b and 7 hold everywhere they can be evaluated. The
 balance sheet foots to **exactly zero** for all 32 filers, so those checks
@@ -471,7 +479,7 @@ Not-checkable is a coverage fact, not a pass:
 
 ### Confirmed wrong numbers
 
-#### 1. `sec_utils.filter_annual_data` returns dimensioned and prefix-matched facts (P0)
+#### 1. FIXED — `sec_utils.filter_annual_data` returned dimensioned and prefix-matched facts (P0)
 
 This is the shared read path behind `get_revenue_base`, `get_ebitda_margin`,
 `get_capex_pct_revenue`, `get_tax_rate`, `get_depreciation`,
@@ -524,12 +532,23 @@ us-gaap:Revenues`, which GS does not tag at all — the fact is
 `us-gaap:RevenuesNetOfInterestExpense`, reached by prefix match. A caller
 reconciling against the filing would find nothing under the named concept.
 
-**Fix:** apply `sec_series._concept_matches` to the frame, and prefer
-undimensioned facts over `idxmax`. Not shipped here: `filter_annual_data` is
-the read path for ten tools and several rely on its current selection, so the
-change needs its own regression pass over the golden tests.
+**Fixed** on `tier1-data-gaps` (2026-08-24). `filter_annual_data` and
+`filter_instant_data` route through `sec_series.concept_point` for exact-
+concept filtering and `FilingPoint.undimensioned()` for consolidated selection,
+so neither mechanism is reimplemented. `concept_used` names the element the
+value is tagged under rather than the one that was asked for, which closes the
+GS provenance case. A concept tagged only on dimensions returns None, so the
+caller's chain moves to the element the filer does tag rather than being handed
+a segment.
 
-#### 2. Revenue concept chains prefer the ASC 606 subset (P1)
+`latest_undimensioned()` grew an optional `span_days` window: a 10-Q carries the
+year-to-date duration beside the quarter and both end on the same day, so
+ranking by period alone returns nine months where three were asked for.
+
+Regressions: `testing/test_consolidated_fact_selection.py`, one per figure
+above, offline for the mechanism and network-gated for the filings.
+
+#### 2. FIXED — revenue concept chains preferred the ASC 606 subset (P1)
 
 Every revenue chain in the codebase tries
 `us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax` before
@@ -540,11 +559,31 @@ almost all of it under ASC 842 lease accounting:
 - **AMT**: reported 935,900,000 against 10,644,600,000 of revenue — 8.8% of it.
 - **WMT**: 706,413,000,000 against 713,163,000,000.
 
-**Fix:** where a filer tags both, take `us-gaap:Revenues`. The containment
-identity (`ASC 606 <= Revenues`) holds for every filer in the basket, so
-"largest wins" is safe.
+**Fixed** on `tier1-data-gaps` (2026-08-24). One shared chain,
+`sec_utils.REVENUE_CONCEPTS`, broadest element first:
 
-#### 3. `get_historical_fcf` reports operating cash flow as free cash flow (P0)
+    us-gaap:Revenues
+    us-gaap:RevenuesNetOfInterestExpense
+    us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax
+    us-gaap:SalesRevenueNet
+
+`RevenuesNetOfInterestExpense` is named explicitly because it is the total-
+revenue line on a bank's income statement and the only element GS and WFC tag
+undimensioned — GS does not tag `us-gaap:Revenues` at all. It used to be
+reached by accident through the prefix match and reported under the wrong name.
+The unprefixed spellings that trailed the old chain are gone; no filing tags
+them.
+
+Reordering alone would have made two filers worse, which is why finding 1 had
+to ship with it: with the order corrected and the selection still `idxmax`, the
+largest `us-gaap:Revenues` fact is 452.209bn for XOM against a consolidated
+332.238bn, and 48.024bn for GE against 45.855bn.
+
+`REVENUE_ELEMENTS` in the identity test gained the same bank element, so
+identity 2b can see a bank's revenue rather than reporting that it came off an
+element the check does not know about.
+
+#### 3. FIXED — `get_historical_fcf` reported operating cash flow as free cash flow (P0)
 
 The capex chain is two concepts wide — `PaymentsToAcquirePropertyPlantAnd
 Equipment` and `PaymentsForCapitalImprovements` — and `fcf = ocf - (capex or 0)`
@@ -565,9 +604,22 @@ Amazon's free cash flow is overstated **18x**. All of these filers tag
 `us-gaap:PaymentsToAcquireProductiveAssets` (PLD:
 `PaymentsToDevelopRealEstateAssets`), which the chain never tries.
 
-**Fix:** widen the chain, and return `coverage: "not_covered"` instead of
-substituting zero — a silent fallback masking a missing input is exactly the
-failure mode this project keeps relearning.
+**Fixed** on `tier1-data-gaps` (2026-08-24). `sec_utils.CAPEX_CONCEPTS` is five
+elements wide and shared with `get_capex_pct_revenue`, so the two tools cannot
+disagree about what a filer tags. Every filer in the table above now reports the
+real FCF in the right-hand column.
+
+A filer that genuinely tags no capex — JPM, BAC and WFC in this basket — gets
+`success: False`, `coverage: "not_covered"` and the list of elements tried,
+never `ocf - 0`. The operating cash flow that was read is returned in the same
+payload so nothing found is discarded. Identity 6a records those three as not
+checkable, which is the honest verdict: free cash flow is not a meaningful
+figure for a bank and the filing does not supply the input.
+
+`get_capex_pct_revenue` gained coverage from the same change: HD, GE, CVX and T
+were returning "Unable to find any concepts" and now resolve, and AMZN, NVDA,
+REGN and O were returning a small unrelated fact the prefix match had reached
+(O: 300,000 against a real 131,800,000).
 
 #### 4. `get_segment_financials` picks the wrong fact within a segment (P0)
 
@@ -666,9 +718,24 @@ degraded sweep can never be read as coverage.
   revenue fact in combination with `srt:StatementGeographicalAxis`; there is no
   segment-only fact. A correct segment figure requires summing across the
   geography axis, which no current tool does.
-- **`filter_annual_data` is not fixed.** Ten tools read through it; the fix is
-  clear (exact-concept filter, prefer undimensioned) but needs its own
-  regression pass.
+- **Two facts in the same context, same period, same label.** AMZN tags
+  `IncomeTaxExpenseBenefit` twice undimensioned in c-1 — 19,087,000,000 and a
+  rounded 19,100,000,000 — and TGT tags pre-tax income as 4,767,000,000 and
+  4,800,000,000. `latest_undimensioned` ranks by period, so a tie falls to
+  document order, which happens to be the precise figure in both cases. It is
+  not a rule: the frame carries a `decimals` column that would settle it and
+  `ConceptFact` does not keep it. Same class as the AMT `NetIncomeLoss` case
+  under the reconciliation sweep's defect 5.
+- **`get_ebitda_margin` cannot serve a filer that tags no operating income.**
+  Eleven of the 32 — every bank, both REITs in the basket, XOM, CVX, GE, BIIB,
+  FOXA and LEN — return a "missing EBITDA components" error where they used to
+  return an EBITDA built on pre-tax income reached by prefix match (JPM:
+  72,595,000,000; GS: a fact worth $1). The error is correct and the coverage
+  gap is real: there is no consolidated operating income in those filings.
+- **`get_margin_breakdown` gross profit is unavailable for AMT, GE, HON and
+  RIOT.** Each tags `us-gaap:GrossProfit` only on a dimension, or not for an
+  annual period. The tool used to report the dimensioned segment figure as
+  consolidated.
 - **Identity 5 reaches only 18 of 32 filers**, and identity 3 only 27, because
   of genuine tagging gaps rather than tool defects.
 - **Real-estate acquisition spend** (`PaymentsToAcquireRealEstate`,
@@ -676,9 +743,10 @@ degraded sweep can never be read as coverage.
   capex identity. Whether a REIT's property acquisitions belong in free cash
   flow is a judgement call, not an identity.
 
-**Priority:** findings 1, 3 and 4 are P0 — they produce confidently wrong
-numbers on megacaps and banks. Each is registered in
-`KNOWN_DEFECTS` in `testing/test_accounting_identities.py`, and
+**Priority:** findings 1, 2 and 3 were P0/P1 and are fixed — the sweep now runs
+14/14 green with 2b at 32/0/0 and 6a at 29/0/3. Findings 4 and 5
+(`get_segment_financials`) are still open and are the only entries left in
+`KNOWN_DEFECTS` in `testing/test_accounting_identities.py`;
 `test_known_defect_register_is_not_stale` fails the moment one is fixed, so the
 register cannot outlive the bug.
 
@@ -706,6 +774,10 @@ agreeing also fails, so entries get deleted when bugs get fixed rather than
 outliving them.
 
 ### Reconciliation table
+
+As first measured (2026-08-22). `revenue_annual` was re-measured after
+defect 1 was fixed and reads **34 / 2 / 1 / 0**; nothing else in the table
+moved.
 
 | check | agree | disagree | not comparable | absent |
 |---|---|---|---|---|
@@ -774,10 +846,13 @@ so the table cannot be misread as a three-way agreement.
 
 ### Confirmed defects, in severity order
 
-**1. `get_revenue_base` returns the wrong revenue for 9 of the 36 filers
-it could be compared on.**
+**1. FIXED — `get_revenue_base` returned the wrong revenue for 9 of the 36
+filers it could be compared on.**
 `tools/web_search_server/sec_utils.py`. Two independent causes, both
-verified against the filings.
+verified against the filings. Fixed on `tier1-data-gaps` (2026-08-24); the
+re-run reads **34 agree / 2 disagree / 1 not comparable**, and the two
+remaining are a definitional split rather than the same defect — see the end
+of this entry.
 
 *Cause A — the ASC 606 element is tried ahead of `us-gaap:Revenues`.* For a
 lessor, a bank or a segment-reporting filer that element covers a fragment
@@ -807,12 +882,33 @@ Fixing cause A alone makes XOM and GE worse, not better: the largest
 `us-gaap:Revenues` fact is 452.209bn for XOM (against a consolidated
 332.238bn) and 48.024bn for GE (against 45.855bn). Both causes have to go.
 
-The fix already exists in this codebase. `sec_series.FilingPoint.undimensioned()`
+The fix already existed in this codebase. `sec_series.FilingPoint.undimensioned()`
 and `latest_undimensioned()` select the consolidated fact by *absence of
 dimensions* rather than by size, and every tool built on them —
 `get_accruals_quality`, `get_working_capital_trends`, `get_share_count_series`
-— reconciles cleanly here. `get_revenue_base` is the only revenue path that
-still uses `filter_annual_data`.
+— reconciled cleanly here. `filter_annual_data` now routes through
+`sec_series.concept_point` and that same selection rather than reimplementing
+either half, and the revenue chain is reordered broadest-first with
+`us-gaap:RevenuesNetOfInterestExpense` named explicitly for the banks. The
+mechanism is written up under the accounting-identity sweep's findings 1 and 2
+above.
+
+Seven of the nine now agree and their `ADJUDICATED` entries are deleted. **XOM
+and CVX still disagree, and not for the same reason.** Both now return the
+consolidated total the filer tags, and Yahoo reports the narrower sales-only
+line:
+
+| ticker | tool now | Yahoo | gap | what the two figures are |
+|---|---|---|---|---|
+| XOM | 332.238bn | 323.905bn | +2.6% | `us-gaap:Revenues`, "total revenues and other income", against the `ProductOrServiceAxis=SalesAndOtherOperatingRevenue` line |
+| CVX | 189.031bn | 184.432bn | +2.5% | `us-gaap:Revenues`, "total revenues and other income", against the ASC 606 "sales and other operating revenues" element |
+
+Identity 2b requires the broader element — a tool returning the narrower one
+while the filer tags a larger revenue element undimensioned is reporting a
+fragment — so the definitional call is settled in favour of `us-gaap:Revenues`,
+and the divergence from Yahoo is recorded rather than tuned away. This also
+settles the "XOM's revenue has two defensible answers" item under **Not
+resolved** below.
 
 **2. `get_market_data` mixes currencies inside a single response.**
 `tools/financial_modeling_engine/utils.py`. For a foreign filer `marketCap`
@@ -975,12 +1071,14 @@ and for an UPREIT the two differ by a sixth.
 
 ### Not resolved
 
-- **XOM's "revenue" has two defensible answers.** `us-gaap:Revenues`
+- **XOM's "revenue" has two defensible answers — decided.** `us-gaap:Revenues`
   undimensioned = 332.238bn ("total revenues and other income", including
   equity-affiliate and other income); the `ProductOrServiceAxis=
   SalesAndOtherOperatingRevenue` line = 323.905bn, which is what Yahoo reports.
-  The tool's 226.909bn is neither. Which one `get_revenue_base` should return
-  is a definitional call somebody has to make.
+  The tool used to return 226.909bn, which is neither. `get_revenue_base` now
+  returns 332.238bn, because identity 2b forbids returning a narrower element
+  while a broader one is tagged undimensioned. CVX is the same call at 189.031
+  against 184.432bn. Both stay in `ADJUDICATED` as definitional divergence.
 - **ASML's `enterpriseValue` of 37,631bn.** Not EUR, not USD, not a
   share-count artefact — could not determine what Yahoo computed. The
   actionable half (we publish it as an EV multiple unchecked) is defect 3.
@@ -991,8 +1089,8 @@ and for an UPREIT the two differ by a sixth.
 
 ### Priority
 
-1 (revenue), 2 (currency mix) and 5 (net income) are wrong numbers reaching
-valuation code and should be fixed first. 6 (rate limit as "no data") is the
+1 (revenue) is fixed. 2 (currency mix) and 5 (net income) are wrong numbers
+reaching valuation code and are the next to fix. 6 (rate limit as "no data") is the
 highest-leverage robustness fix: it silently converts an outage into a claim
 about a company. 3, 4, 9 and 11 are wrong or missing numbers with narrower
 blast radius. 7, 8 and 12 are contract and coverage fixes.

@@ -118,58 +118,30 @@ PERIOD_MATCH_DAYS = 7
 
 ADJUDICATED: Dict[tuple, str] = {
 
-    # ---- get_revenue_base: the ASC 606 element is tried before us-gaap:Revenues,
-    # and for a lessor, a bank or a segment-reporting filer that element is a
-    # fragment of revenue rather than revenue.
-    ("GOOGL", "revenue_annual"): (
-        "wrong=get_revenue_base. Every RevenueFromContractWithCustomer fact in "
-        "Alphabet's FY2025 10-K sits on the segment disclosure; the largest is "
-        "Google Services at 342.721bn. Consolidated total revenues are tagged "
-        "us-gaap:Revenues = 402.836bn on CONSOLIDATEDSTATEMENTSOFINCOME. "
-        "Understated by 60.1bn."),
-    ("AMT", "revenue_annual"): (
-        "wrong=get_revenue_base. AMT labels the ASC 606 element 'Total non-lease "
-        "revenue' = 0.9359bn. Tower rents are lease income under ASC 842. Total "
-        "operating revenues (us-gaap:Revenues) = 10.6446bn. The tool returns 8.8% "
-        "of AMT's revenue."),
-    ("WFC", "revenue_annual"): (
-        "wrong=get_revenue_base. WFC labels the ASC 606 element 'Fee income' = "
-        "10.498bn on ConsolidatedStatementofIncome. 'Total revenue' "
-        "(us-gaap:Revenues) on the same statement = 83.699bn. Understated by "
-        "73.2bn."),
-    ("GE", "revenue_annual"): (
-        "wrong=get_revenue_base. The ASC 606 element is labelled 'Sales' = "
-        "30.163bn; 'Total revenue' = 45.855bn in the undimensioned context. "
-        "Understated by 15.7bn."),
+    # ---- get_revenue_base returns us-gaap:Revenues undimensioned. Nine filers
+    # used to disagree here, from two compounding causes -- the ASC 606 element
+    # tried ahead of us-gaap:Revenues, and filter_annual_data taking the largest
+    # fact for the period rather than the undimensioned one. Both are fixed;
+    # seven of the nine now agree and their entries are gone. The two below are
+    # not the same finding. Both sides read the filing correctly and disagree
+    # about which line of it is "revenue", which is a definitional call rather
+    # than an extraction defect, and neither is inside the 2% band.
     ("XOM", "revenue_annual"): (
-        "wrong=get_revenue_base. XOM's only ASC 606 fact is on the segment "
-        "disclosure under ProductOrServiceAxis = 226.909bn. Consolidated "
-        "us-gaap:Revenues (undimensioned) = 332.238bn; Yahoo reports the "
-        "323.905bn sales-only line. The tool returns one segment."),
-
-    # ---- filter_annual_data takes the largest fact for the period. Its comment
-    # asserts the consolidated total is always the largest positive value. It is
-    # not: an operating-segment aggregate is struck before intersegment
-    # eliminations, and a joint-venture disclosure is not the filer's revenue.
+        "definitional, both defensible. us-gaap:Revenues undimensioned = "
+        "332.238bn, XOM's 'Total revenues and other income', which includes "
+        "income from equity affiliates and other income. Yahoo reports the "
+        "ProductOrServiceAxis=SalesAndOtherOperatingRevenue line, 323.905bn. "
+        "The tool now returns the consolidated total the filer tags; the 2.6% "
+        "gap is the other-income line, not a wrong fact. (Before the fix it "
+        "returned 226.909bn, one segment off the segment disclosure.)"),
     ("CVX", "revenue_annual"): (
-        "wrong=get_revenue_base. The undimensioned FY2025 fact is 184.432bn, "
-        "which Yahoo matches. The tool returns 231.370bn from the context "
-        "srt:ConsolidationItemsAxis=OperatingSegmentsMember -- segment revenue "
-        "before eliminations. Overstated by 46.9bn."),
-    ("CAT", "revenue_annual"): (
-        "wrong=get_revenue_base. Consolidated 'Total sales and revenues' = "
-        "67.589bn (context c-1, no dimensions). The tool returns 73.955bn from a "
-        "dimensioned context. Overstated by 6.4bn."),
-    ("SPG", "revenue_annual"): (
-        "wrong=get_revenue_base. The tool returns 12.461bn from the context "
-        "EquityMethodInvestmentNonconsolidatedInvesteeAxis="
-        "spg:PlatformInvestmentsExcludingTrgAndKlepierre -- the revenue of "
-        "Simon's unconsolidated joint ventures. Simon's own total revenue is "
-        "6.3645bn. Overstated by 96%."),
-    ("RIOT", "revenue_annual"): (
-        "wrong=get_revenue_base. Consolidated total revenue 647.435m; the tool "
-        "returns 670.718m from ConsolidationItemsAxis=OperatingSegmentsMember "
-        "combined with ReportableSegmentAggregationBeforeOtherOperatingSegment."),
+        "definitional, both defensible. us-gaap:Revenues undimensioned = "
+        "189.031bn, 'Total revenues and other income'. The ASC 606 element, "
+        "'Sales and other operating revenues', is 184.432bn undimensioned and "
+        "is what Yahoo reports. Identity 2b requires the broader element, so "
+        "the tool returns 189.031bn. (Before the fix it returned 231.370bn "
+        "from srt:ConsolidationItemsAxis=OperatingSegmentsMember -- segment "
+        "revenue struck before intersegment eliminations.)"),
 
     # ---- get_accruals_quality
     ("AMT", "net_income"): (
@@ -738,12 +710,19 @@ def test_net_income_agrees_with_the_vendor(reconciliation):
 
 
 def test_annual_revenue_agrees_with_the_vendor(reconciliation):
-    """Nine of these are open defects in get_revenue_base -- see ADJUDICATED.
+    """Nine of these were open defects in get_revenue_base; seven are fixed.
 
-    Two independent causes, both in sec_utils: the ASC 606 element is tried
-    ahead of us-gaap:Revenues even where it covers a fragment of revenue, and
-    filter_annual_data then takes the largest fact for the period on the stated
-    assumption that the consolidated total is always the largest positive value.
+    Two independent causes, both in sec_utils and both now closed: the ASC 606
+    element was tried ahead of us-gaap:Revenues even where it covers a fragment
+    of revenue, and filter_annual_data took the largest fact for the period on
+    the stated assumption that the consolidated total is always the largest
+    positive value. Neither could be fixed alone -- with the concept order
+    corrected and the selection still `idxmax`, XOM read 452.209bn against a
+    consolidated 332.238bn and GE 48.024bn against 45.855bn.
+
+    XOM and CVX remain in ADJUDICATED, and not as the same finding. Both now
+    return the consolidated total the filer tags; Yahoo reports the narrower
+    sales-only line, and which of the two is "revenue" is a definitional call.
     """
     _assert_reconciles(reconciliation["rows"], "revenue_annual", minimum=20)
 
