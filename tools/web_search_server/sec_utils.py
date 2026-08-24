@@ -69,6 +69,39 @@ REVENUE_CONCEPTS = (
   'us-gaap:SalesRevenueNet',
 )
 
+# Depreciation and amortisation, combined totals first. The bare
+# `us-gaap:Depreciation` used to sit second and reached the combined elements
+# by prefix, so it looked like the right answer while naming the wrong element.
+# Matched exactly it returns depreciation only: AMT 1,100,000,000 against
+# 2,041,600,000 of depreciation, amortisation and accretion, CHTR
+# 8,100,000,000 against 8,711,000,000, WFC 1,700,000,000 against 7,713,000,000.
+# It stays last, for the filers -- MSFT, GOOGL -- that tag nothing else.
+DA_CONCEPTS = (
+  'us-gaap:DepreciationDepletionAndAmortization',
+  'us-gaap:DepreciationAmortizationAndAccretionNet',
+  'us-gaap:DepreciationAndAmortization',
+  'us-gaap:DepreciationDepletionAndAmortizationExcludingAmortizationOfDebtIssuanceCosts',
+  'us-gaap:Depreciation',
+)
+
+TAX_EXPENSE_CONCEPTS = (
+  'us-gaap:IncomeTaxExpenseBenefit',
+  'us-gaap:ProvisionForIncomeTaxes',
+  'us-gaap:CurrentIncomeTaxExpense',
+  'us-gaap:IncomeTaxesPaid',
+)
+
+# Pre-tax income. AMZN, CAT and CVX tag only the
+# MinorityInterestAndIncomeLossFromEquityMethodInvestments variant --
+# 97,311,000,000, 11,541,000,000 and 19,743,000,000 -- which the prefix match
+# used to reach from the shorter name beside it.
+PRETAX_INCOME_CONCEPTS = (
+  'us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest',
+  'us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments',
+  'us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxes',
+  'us-gaap:EarningsBeforeIncomeTaxes',
+)
+
 OPERATING_CASH_FLOW_CONCEPTS = (
   'us-gaap:NetCashProvidedByUsedInOperatingActivities',
   'us-gaap:NetCashProvidedByUsedInOperatingActivitiesContinuingOperations',
@@ -575,11 +608,16 @@ def get_ebitda_margin(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
     if filing and filing['xbrl_data']:
       xbrl = filing['xbrl_data']
 
-      # get the operating income from income statement
+      # Operating income. `IncomeLossFromContinuingOperations` used to trail
+      # this list and reached, by prefix,
+      # `IncomeLossFromContinuingOperationsBeforeIncomeTaxes...` -- pre-tax
+      # income, reported as operating income. JPM's EBITDA was built on
+      # 72,595,000,000 of pre-tax income that way, XOM's on 45,969,000,000,
+      # and GS's on a fact worth $1. A bank, a REIT and an oil major do not
+      # tag operating income at all, and the honest answer for them is that
+      # EBITDA cannot be computed from this filing.
       operating_income_concepts = [
       'us-gaap:OperatingIncomeLoss',        # 95% of companies
-      'OperatingIncomeLoss',                # Fallback
-      'IncomeLossFromContinuingOperations'  # Edge cases
       ]
 
       for concept in operating_income_concepts:
@@ -592,11 +630,7 @@ def get_ebitda_margin(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
 
 
       # get the depreciation & amorization from the cash flow statement
-      cashflow_statement_concepts = [
-      'us-gaap:DepreciationDepletionAndAmortization',  # First choice - combined total
-      'us-gaap:DepreciationAndAmortization',           # Alternative combined
-      'DepreciationDepletionAndAmortization'           # Fallback without prefix
-      ]
+      cashflow_statement_concepts = DA_CONCEPTS[:-1]  # combined totals only
 
 
       for concept in cashflow_statement_concepts:
@@ -771,41 +805,33 @@ def get_tax_rate(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
     if filing and filing['xbrl_data']:
       xbrl = filing['xbrl_data']
 
-      tax_expense_concepts = [
-      'us-gaap:IncomeTaxExpenseBenefit',                           # Most common - total tax expense
-      'us-gaap:ProvisionForIncomeTaxes',                           # Alternative provision concept
-      'us-gaap:IncomeTaxesPaid',                                   # Cash taxes paid
-      'us-gaap:CurrentIncomeTaxExpense',                           # Current year tax expense
-      'IncomeTaxExpenseBenefit',                                   # Without prefix
-      'ProvisionForIncomeTaxes',                                   # Without prefix
-      'IncomeTaxExpense'                                           # Basic form
-      ]
-      tax_expense = 0.0 # bc panda dataframe return np.float64
+      tax_expense = None
       tax_concept_used = None
-      for concept in tax_expense_concepts:
+      for concept in TAX_EXPENSE_CONCEPTS:
         result = filter_annual_data(xbrl, concept, form_type)
         if result:
           tax_expense = float(result['value'])
-          tax_concept_used = concept
+          tax_concept_used = result['concept_used']
           break
-
-      pretax_income_concepts = [
-        'us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest',  # Full concept
-        'us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxes',                                          # Most common
-        'us-gaap:EarningsBeforeIncomeTaxes',                                                                    # Alternative
-        'IncomeLossFromContinuingOperationsBeforeIncomeTaxes',                                                  # Without prefix
-        'EarningsBeforeIncomeTaxes',                                                                            # Without prefix
-        'IncomeBeforeTaxes'                                                                                     # Basic form
-      ]
 
       pretax_income = 0.0
       pretax_concept_used = None
-      for concept in pretax_income_concepts:
+      for concept in PRETAX_INCOME_CONCEPTS:
         result = filter_annual_data(xbrl, concept, form_type)
         if result:
           pretax_income = float(result['value'])
-          pretax_concept_used = concept
+          pretax_concept_used = result['concept_used']
           break
+
+      # A tax expense that was never found is not a tax expense of zero. The
+      # default used to be 0.0, which returned an effective rate of 0% for a
+      # filer whose tax line the chain could not reach.
+      if tax_expense is None:
+        return{
+          'error': (f'{ticker} tags no income tax expense concept in its '
+                    f'{form_type}. Tried: {", ".join(TAX_EXPENSE_CONCEPTS)}'),
+          'success': False
+        }
 
       # calulate the effective tax rate: Effective tax rate = provision for income taxes / earnings before taxes
       if pretax_income != 0: # prevent divide by 0 error
@@ -848,29 +874,18 @@ def get_depreciation(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
     if filing and filing['xbrl_data']:
       xbrl = filing['xbrl_data']
 
-      depreciation_concepts = [
-      'us-gaap:DepreciationDepletionAndAmortization',           # Combined D&A (most common)
-      'us-gaap:Depreciation',                                   # Depreciation only
-      'us-gaap:DepreciationAndAmortization',                    # Alternative combined
-      'us-gaap:DepreciationAmortizationAndAccretionNet',        # With accretion
-      'us-gaap:DepreciationDepletionAndAmortizationExcludingAmortizationOfDebtIssuanceCosts',  # Excluding debt costs
-      'DepreciationDepletionAndAmortization',                   # Without prefix
-      'Depreciation',                                           # Basic depreciation
-      'DepreciationAndAmortization'                            # Basic combined
-      ]
-
       d_a_value = 0.0
       d_a_concept = None
-      for concept in depreciation_concepts:
+      for concept in DA_CONCEPTS:
         results = filter_annual_data(xbrl, concept, form_type)
         if results:
           d_a_value = float(results['value'])
-          d_a_concept = concept
+          d_a_concept = results['concept_used']
           break
 
       if d_a_value == 0.0:
         return{
-          'error': f"Unable to find concept for {ticker}: Concepts used = {depreciation_concepts}",
+          'error': f"Unable to find concept for {ticker}: Concepts used = {list(DA_CONCEPTS)}",
           'success': False
         }
 
@@ -944,7 +959,7 @@ def get_margin_breakdown(ticker: str, form_type: str = '10-K') -> Dict[str, Any]
       if gp:
         result['gross_profit'] = gp['value']
         result['gross_margin_pct'] = (gp['value'] / revenue) * 100
-        concepts_used['gross_profit'] = c
+        concepts_used['gross_profit'] = gp['concept_used']
         break
 
     for c in ('us-gaap:SellingGeneralAndAdministrativeExpense',
@@ -953,15 +968,19 @@ def get_margin_breakdown(ticker: str, form_type: str = '10-K') -> Dict[str, Any]
       if sga:
         result['sga'] = sga['value']
         result['sga_pct_revenue'] = (sga['value'] / revenue) * 100
-        concepts_used['sga'] = c
+        concepts_used['sga'] = sga['concept_used']
         break
 
-    for c in ('us-gaap:ResearchAndDevelopmentExpense',):
+    # BIIB and VRTX tag only the ExcludingAcquiredInProcessCost element --
+    # 1,778,600,000 and 3,909,500,000 -- which the prefix match used to reach
+    # from a query for us-gaap:ResearchAndDevelopmentExpense.
+    for c in ('us-gaap:ResearchAndDevelopmentExpense',
+              'us-gaap:ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost'):
       rnd = filter_annual_data(xbrl, c, form_type)
       if rnd:
         result['rnd'] = rnd['value']
         result['rnd_pct_revenue'] = (rnd['value'] / revenue) * 100
-        concepts_used['rnd'] = c
+        concepts_used['rnd'] = rnd['concept_used']
         break
 
     result['concepts_used'] = concepts_used
@@ -1072,7 +1091,13 @@ def get_working_capital(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
     ca = filter_instant_data(xbrl, 'us-gaap:AssetsCurrent')
     cl = filter_instant_data(xbrl, 'us-gaap:LiabilitiesCurrent')
     ar = filter_instant_data(xbrl, 'us-gaap:AccountsReceivableNetCurrent')
-    inv = filter_instant_data(xbrl, 'us-gaap:InventoryNet')
+    # A long-term-contract manufacturer nets customer advances and progress
+    # billings against inventory and tags that element instead. BA's
+    # 84,679,000,000 used to be reached from `us-gaap:InventoryNet` by prefix.
+    inv = (filter_instant_data(xbrl, 'us-gaap:InventoryNet')
+           or filter_instant_data(
+               xbrl,
+               'us-gaap:InventoryNetOfAllowancesCustomerAdvancesAndProgressBillings'))
     ap = filter_instant_data(xbrl, 'us-gaap:AccountsPayableCurrent')
     rev_tuple = _get_revenue_from_xbrl(xbrl, form_type)
 
