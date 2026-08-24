@@ -13,6 +13,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tools.web_search_server.web_search import WebSearchServer
 from agent.cache import Session_Cache
 
+from testing._gates import requires_searxng
+
+pytestmark = requires_searxng
+
 
 async def test_full_research_flow():
   server = WebSearchServer()

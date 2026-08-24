@@ -10,15 +10,25 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Disposable tool/news/scrape caches. Deliberately a different file from the
 # state database -- cache rows are regenerable, book state is not, and mixing
 # them means a cache-clearing mistake can take theses and positions with it.
-CACHE_DB_PATH = os.environ.get(
-    "NEMO_CACHE_DB_PATH", os.path.join(_REPO_ROOT, "db_cache", "tool_cache.db")
-)
+_DEFAULT_CACHE_DB_PATH = os.path.join(_REPO_ROOT, "db_cache", "tool_cache.db")
+
+
+def current_cache_db_path() -> str:
+    """Resolve the tool-cache database path on every call. See
+    state.schema.current_db_path for why this is not a bound default."""
+    return os.environ.get("NEMO_CACHE_DB_PATH", _DEFAULT_CACHE_DB_PATH)
+
+
+# Convenience alias for readers that want the path at import time. Callers that
+# need to honour a later override must call current_cache_db_path() instead.
+CACHE_DB_PATH = current_cache_db_path()
 
 
 class Session_Cache():
     def __init__(self):
-        os.makedirs(os.path.dirname(CACHE_DB_PATH), exist_ok=True)
-        self.connection = sqlite3.connect(CACHE_DB_PATH, timeout=5.0)
+        db_path = current_cache_db_path()
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        self.connection = sqlite3.connect(db_path, timeout=5.0)
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA busy_timeout=5000")
         self.cursor = self.connection.cursor()

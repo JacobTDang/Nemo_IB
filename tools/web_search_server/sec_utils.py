@@ -36,99 +36,223 @@ def _get_filing_lock(key: tuple) -> threading.Lock:
     return lock
 
 
-def filter_instant_data(xbrl, concept: str) -> Optional[Dict[str, Any]]:
-  """Filter XBRL for instant (point-in-time) facts -- balance sheet items.
+# Revenue elements, broadest first. Order is load-bearing, and the previous
+# order -- ASC 606 first -- was wrong wherever a filer earns anything outside a
+# customer contract:
+#
+#   AMT   reported   935,900,000 against 10,644,600,000. Tower rents are lease
+#         income under ASC 842; AMT labels the ASC 606 element "Total non-lease
+#         revenue" and it is 8.8% of revenue.
+#   WFC   reported 10,498,000,000 against 83,699,000,000 -- the fact WFC labels
+#         "Fee income".
+#   WMT   reported 706,413,000,000 against 713,163,000,000.
+#   GE    reported 30,163,000,000 against 45,855,000,000.
+#
+# `RevenuesNetOfInterestExpense` is the total-revenue line on a bank's income
+# statement and is the only one GS and WFC tag undimensioned; it used to be
+# reached by accident, through the prefix match on `us-gaap:Revenues`, and
+# reported under that name. GS does not tag `us-gaap:Revenues` at all.
+#
+# Reordering alone is not enough and makes two filers worse on its own: the
+# largest `us-gaap:Revenues` fact is 452.209bn for XOM against a consolidated
+# 332.238bn, and 48.024bn for GE against 45.855bn. It only works because
+# `filter_annual_data` now returns the undimensioned fact rather than the
+# largest one.
+#
+# The unprefixed spellings that used to trail this list ('Revenues', 'Revenue',
+# 'TotalRevenues', 'SalesRevenueNet') are gone. No filing tags them; they only
+# ever matched through the prefix search, which no longer answers.
+REVENUE_CONCEPTS = (
+  'us-gaap:Revenues',
+  'us-gaap:RevenuesNetOfInterestExpense',
+  'us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax',
+  'us-gaap:SalesRevenueNet',
+)
 
-  Balance sheet items use 'period_instant' rather than 'period_start'/'period_end'.
-  Returns the most recent fact and its as-of date.
+# Depreciation and amortisation, combined totals first. The bare
+# `us-gaap:Depreciation` used to sit second and reached the combined elements
+# by prefix, so it looked like the right answer while naming the wrong element.
+# Matched exactly it returns depreciation only: AMT 1,100,000,000 against
+# 2,041,600,000 of depreciation, amortisation and accretion, CHTR
+# 8,100,000,000 against 8,711,000,000, WFC 1,700,000,000 against 7,713,000,000.
+# It stays last, for the filers -- MSFT, GOOGL -- that tag nothing else.
+DA_CONCEPTS = (
+  'us-gaap:DepreciationDepletionAndAmortization',
+  'us-gaap:DepreciationAmortizationAndAccretionNet',
+  'us-gaap:DepreciationAndAmortization',
+  'us-gaap:DepreciationDepletionAndAmortizationExcludingAmortizationOfDebtIssuanceCosts',
+  'us-gaap:Depreciation',
+)
+
+TAX_EXPENSE_CONCEPTS = (
+  'us-gaap:IncomeTaxExpenseBenefit',
+  'us-gaap:ProvisionForIncomeTaxes',
+  'us-gaap:CurrentIncomeTaxExpense',
+  'us-gaap:IncomeTaxesPaid',
+)
+
+# Pre-tax income. AMZN, CAT and CVX tag only the
+# MinorityInterestAndIncomeLossFromEquityMethodInvestments variant --
+# 97,311,000,000, 11,541,000,000 and 19,743,000,000 -- which the prefix match
+# used to reach from the shorter name beside it.
+PRETAX_INCOME_CONCEPTS = (
+  'us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest',
+  'us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments',
+  'us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxes',
+  'us-gaap:EarningsBeforeIncomeTaxes',
+)
+
+OPERATING_CASH_FLOW_CONCEPTS = (
+  'us-gaap:NetCashProvidedByUsedInOperatingActivities',
+  'us-gaap:NetCashProvidedByUsedInOperatingActivitiesContinuingOperations',
+)
+
+# Capital expenditure, in the order a filer is most likely to mean it. The
+# first two are the whole chain this project shipped with, and between them
+# they miss what AMZN, T, NVDA, CVX, HD, REGN and SPG tag
+# (PaymentsToAcquireProductiveAssets) and what PLD tags
+# (PaymentsToDevelopRealEstateAssets).
+#
+# PaymentsToAcquireRealEstate and PaymentsToAcquireCommercialRealEstate are
+# deliberately absent: buying a finished building is closer to an acquisition
+# than to capital expenditure, and whether a REIT's property purchases belong
+# in free cash flow is a judgement call rather than an identity.
+CAPEX_CONCEPTS = (
+  'us-gaap:PaymentsToAcquirePropertyPlantAndEquipment',
+  'us-gaap:PaymentsForCapitalImprovements',
+  'us-gaap:PaymentsToAcquireProductiveAssets',
+  'us-gaap:PaymentsToAcquireOtherProductiveAssets',
+  'us-gaap:PaymentsToDevelopRealEstateAssets',
+)
+
+# Period length, in days, that each form's primary reporting period runs for.
+# A fiscal year is 364 or 365 days and a 52/53-week retailer's runs 371, so the
+# annual floor sits below the shortest of those and above any half-year. A
+# quarter is 89-92 days; the window has to exclude the year-to-date duration a
+# 10-Q carries beside it, which ends on the same day.
+_PERIOD_SPAN_DAYS = {
+  '10-K': (350, None),
+  '20-F': (350, None),
+  '40-F': (350, None),
+  '10-Q': (80, 95),
+}
+
+
+def _consolidated_fact(xbrl, concept: str, span_days=None):
+  """The undimensioned fact for `concept`, or None if the filer tags none.
+
+  The single selection path behind every reader in this module. It exists
+  because the two it replaces were wrong in the same two ways, and both ways
+  produce a plausible number rather than a crash:
+
+  1. `xbrl.facts.query().by_concept(name)` matches by **prefix**. Asking for
+     `us-gaap:Assets` also returns `us-gaap:AssetsCurrent`, and asking for
+     `us-gaap:Revenues` also returns `us-gaap:RevenuesNetOfInterestExpense`.
+     Goldman does not tag `us-gaap:Revenues` at all, yet the old path reported
+     its net revenues under that name -- a caller reconciling against the
+     filing would find nothing there.
+  2. Ties were broken with `idxmax`, on the stated assumption that the
+     consolidated total is the largest fact for the period. It is not. A
+     segment aggregate is struck before intersegment eliminations (CVX:
+     231.4bn against 189.0bn), an unconsolidated joint venture's revenue is
+     not the filer's revenue at all (SPG: 12.5bn against 6.4bn), and where the
+     consolidated figure is negative the largest fact is the parent-company-
+     only Schedule I figure, so the sign flips (JPM's operating cash flow:
+     +44.5bn against -147.8bn).
+
+  `sec_series` already solved both -- exact-concept filtering in
+  `concept_point`, consolidated selection by *absence of dimensions* in
+  `FilingPoint.undimensioned()` -- and every tool built on it reconciled
+  cleanly in both audit sweeps. This routes through that rather than adding a
+  third mechanism.
+
+  None means "this filer does not tag this concept undimensioned", which is
+  what lets a caller's concept chain move on to the element that it does tag.
+  It is never a reason to substitute a dimensioned fact.
   """
+  if xbrl is None:
+    return None
+  from .sec_series import concept_point
   try:
-    facts = xbrl.facts.query().by_concept(concept).to_dataframe()
-    if facts.empty:
-      return None
-    # Filter to instant-type rows (balance sheet); period_instant has the as-of date
-    if 'period_type' in facts.columns:
-      facts = facts[facts['period_type'] == 'instant']
-    if facts.empty:
-      return None
-    facts['instant_dt'] = pd.to_datetime(facts['period_instant'])
-    latest = facts[facts['instant_dt'] == facts['instant_dt'].max()]
-    if len(latest) > 1:
-      # Consolidated total = largest absolute value among segments
-      latest = latest.loc[latest['numeric_value'].abs().idxmax()]
-    else:
-      latest = latest.iloc[0]
-    return {
-      'value': latest['numeric_value'],
-      'concept_used': concept,
-      'period_end': latest['period_instant'],
-    }
+    point = concept_point(xbrl, concept, filing_date='', form='')
   except Exception:
     return None
+  if point is None:
+    return None
+  return point.latest_undimensioned(span_days=span_days)
+
+
+def _fact_result(fact, concept: str) -> Optional[Dict[str, Any]]:
+  """A selected fact in the shape every caller in this module reads.
+
+  `concept_used` names the element the value is actually tagged under rather
+  than the one that was asked for. Those differed whenever the prefix match
+  answered, and provenance that names an absent element is wrong even when the
+  number beside it is right.
+  """
+  if fact is None:
+    return None
+  from .sec_series import _period_rank
+  period_end, duration_days = _period_rank(fact.period)
+  return {
+    'value': fact.value,
+    'concept_used': fact.concept or concept,
+    'period_end': period_end,
+    'duration_days': duration_days,
+    # Currency matters the moment a foreign filer is in scope: TSM tags TWD,
+    # SAP and ASML EUR, NVO DKK, BABA CNY. None means the unit was not a plain
+    # amount of money, or was not tagged at all.
+    'currency': fact.currency,
+  }
+
+
+def filter_instant_data(xbrl, concept: str) -> Optional[Dict[str, Any]]:
+  """The consolidated instant fact for a concept -- balance sheet items.
+
+  Balance sheet items are tagged as an instant rather than a duration, so the
+  span window is exactly zero days. See `_consolidated_fact` for why selection
+  is by absence of dimensions rather than by size.
+  """
+  return _fact_result(_consolidated_fact(xbrl, concept, span_days=(0, 0)),
+                      concept)
 
 
 def filter_annual_data(xbrl, concept: str, form_type: str = '10-K') -> Optional[Dict[str, Any]]:
+  """The consolidated fact for a concept over the period `form_type` implies.
+
+  - 10-K / 20-F / 40-F: the fiscal year (350+ days)
+  - 10-Q: the quarter (80-95 days)
+  - Others: the most recent period of any length
+
+  20-F and 40-F are the annual reports of foreign private issuers and carry
+  the same 12-month durations as a 10-K.
+
+  Returns None when the filer tags no undimensioned fact for this concept in
+  the window. That is a coverage fact the caller needs, not a reason to hand
+  back a segment or a parent-company-only figure -- see `_consolidated_fact`.
   """
-  Helper function to filter XBRL facts for period data based on form type
-  Returns latest period data or None if not found
-  - 10-K: Annual data (350+ days)
-  - 10-Q: Quarterly data (80-95 days)
-  - Others: Most recent available
+  span = _PERIOD_SPAN_DAYS.get(str(form_type).strip().upper())
+  return _fact_result(_consolidated_fact(xbrl, concept, span_days=span),
+                      concept)
+
+def _filing_miss(ticker: str, form_type: str, fallback: str) -> str:
+  """Say "this filer uses a different form" when that is why nothing was found.
+
+  Every function here defaults to form_type='10-K'. A foreign private issuer
+  has no 10-K at all, so `get_latest_filing` returned None and the caller
+  reported "No 10-K filing found for TSM" -- which reads as a fact about
+  Taiwan Semiconductor rather than about this tool. TSMC files 20-F.
+
+  Falls back to the caller's own message when there is no mismatch, and the
+  guard never raises, so annotating an error can never replace one error with
+  another.
   """
   try:
-    facts = xbrl.facts.query().by_concept(concept).to_dataframe()
+    from .foreign_issuer import form_mismatch_note
+    return form_mismatch_note(ticker, form_type) or fallback
+  except Exception:  # noqa: BLE001 - an annotation must not become the failure
+    return fallback
 
-    if facts.empty:
-      return None
-
-    # Filter for appropriate periods based on form type
-    facts['period_start_dt'] = pd.to_datetime(facts['period_start'])
-    facts['period_end_dt'] = pd.to_datetime(facts['period_end'])
-    facts['duration_days'] = (facts['period_end_dt'] - facts['period_start_dt']).dt.days
-
-    # Set period filters based on form type
-    if form_type == '10-K':
-      # Annual data (350+ days for fiscal year variations)
-      target_periods = facts[facts['duration_days'] >= 350]
-    elif form_type == '10-Q':
-      # Quarterly data (80-95 days typically)
-      target_periods = facts[(facts['duration_days'] >= 80) & (facts['duration_days'] <= 95)]
-    else:
-      # For other forms (8-K, S-1, etc.), get most recent regardless of duration
-      target_periods = facts
-
-    if not target_periods.empty:
-      period_data = target_periods[target_periods['period_end_dt'] == target_periods['period_end_dt'].max()]
-      # XBRL often has multiple facts for the same concept and period
-      # (segments + consolidated total). The consolidated total is always
-      # the largest positive value, so take the max for any concept that
-      # can have segment breakdowns.
-      if len(period_data) > 1:
-        period_data = period_data.loc[period_data['numeric_value'].idxmax()]
-      else:
-        period_data = period_data.iloc[0]
-    else:
-      # Fallback to most recent data if no target periods found
-      period_data = facts[facts['period_end_dt'] == facts['period_end_dt'].max()]
-      if len(period_data) > 1:
-        period_data = period_data.loc[period_data['numeric_value'].idxmax()]
-      else:
-        period_data = period_data.iloc[0]
-
-    if period_data is not None and not (hasattr(period_data, 'empty') and period_data.empty):
-      latest_row = period_data
-
-      return {
-        'value': latest_row['numeric_value'],
-        'concept_used': concept,
-        'period_end': latest_row['period_end'],
-        'duration_days': latest_row['duration_days']
-      }
-
-    return None
-
-  except Exception:
-    return None
 
 def get_latest_filing(ticker: str, form_type: str = '10-K') -> Optional[Dict[str, Any]]:
   """Get latest SEC filing with XBRL data.
@@ -371,7 +495,8 @@ def extract_disclosure_data(ticker: str, disclosure_name: str, form_type: str = 
       return {
         'ticker': ticker,
         'success': False,
-        'error': f"Unable to get latest filing for {ticker}"
+        'error': _filing_miss(ticker, form_type,
+                              f"Unable to get latest filing for {ticker}")
       }
   except Exception as e:
     return {
@@ -380,8 +505,50 @@ def extract_disclosure_data(ticker: str, disclosure_name: str, form_type: str = 
       'success': False
     }
 
+def _foreign_revenue_base(ticker: str) -> Dict[str, Any]:
+  """get_revenue_base's shape, filled from the foreign-issuer reader."""
+  from .foreign_issuer import get_annual_revenue
+  result = get_annual_revenue(ticker)
+  if not result.get('success'):
+    return {'ticker': ticker, 'success': False,
+            'error': result.get('error'), 'revenue_base': None}
+  currency = result.get('currency')
+  return {
+    'ticker': ticker,
+    'revenue_base': float(result['latest_revenue']),
+    'currency': currency,
+    'revenue_base_usd': result.get('latest_revenue_usd'),
+    'concept_used': result.get('concept_used'),
+    'period_end': result.get('latest_period'),
+    'filing_date': result.get('annual_filing_date'),
+    'form_type': result.get('form'),
+    'taxonomy': result.get('taxonomy_used'),
+    'note': (f"Denominated in {currency}, NOT dollars. revenue_base_usd, when "
+             f"present, is the filer's own convenience translation at its own "
+             f"rate -- never a live conversion."
+             if currency not in (None, 'USD') else None),
+    'success': True,
+  }
+
+
 def get_revenue_base(ticker: str, form_type: str= "10-K") -> Dict[str, Any]:
-  # this is the company's recurring revenue from its primary business operations. It will be the starting point for nearly all financial analysis
+  """Consolidated annual revenue -- the starting point for nearly all analysis.
+
+  Foreign private issuers are routed to `get_annual_revenue`, which reads the
+  same filing through the exact-concept, undimensioned selection in
+  sec_series. `filter_annual_data` below cannot serve them: it takes the
+  largest fact for the latest period, and an IFRS filer tags adjusted
+  variants on dimension axes. Measured on SAP's FY2025 20-F, the max is
+  EUR 37,804,000,000 -- a CONSTANT-CURRENCY segment figure -- against a real
+  EUR 36,800,000,000, with `ifrs-full:RevenueOfCombinedEntity` (a pro-forma
+  acquisition number) sitting at 36,861,000,000 in between. All three look
+  like revenue and only one is.
+
+  `currency` is never assumed. TSM reports NT$3.8tn and BABA RMB 1.02tn; a
+  DCF built on either without converting the share price is off by ~30x.
+  """
+  if str(form_type).strip().upper() in ('20-F', '40-F'):
+    return _foreign_revenue_base(ticker)
   try:
     filing_data = get_latest_filing(ticker, form_type)
 
@@ -390,38 +557,35 @@ def get_revenue_base(ticker: str, form_type: str= "10-K") -> Dict[str, Any]:
 
 
       # Try different revenue concept names - prioritize Google's specific concepts
-      revenue_concepts = [
-        'us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax',  # Google's main revenue concept
-        'us-gaap:Revenues',  # Total revenues (most comprehensive)
-        'us-gaap:SalesRevenueNet',
-        'RevenueFromContractWithCustomerExcludingAssessedTax',  # Without prefix
-        'Revenues',
-        'Revenue',
-        'TotalRevenues',
-        'SalesRevenueNet'
-      ]
-
-      for concept in revenue_concepts:
+      for concept in REVENUE_CONCEPTS:
         result = filter_annual_data(xbrl, concept, form_type)
         if result:
+          currency = result.get('currency')
           return {
             'ticker': ticker,
-            'revenue_base': float(result['value']),  # keep in raw dollars
+            'revenue_base': float(result['value']),  # raw units, not scaled
+            'currency': currency,
             'concept_used': result['concept_used'],
             'period_end': result['period_end'],
             'filing_date': filing_data['filing_date'],
+            'form_type': form_type,
+            'note': (None if currency in (None, 'USD') else
+                     f'Denominated in {currency}, NOT dollars. Any valuation '
+                     f'built on this must use a matching share count and '
+                     f'price, or convert both consistently.'),
             'success': True
           }
 
       return {
         'ticker': ticker,
-        'error': 'No revenue concept found',
+        'error': _filing_miss(ticker, form_type,
+                              'No revenue concept found'),
         'success': False
       }
 
     return {
       'ticker': ticker,
-      'error': 'No XBRL data available',
+      'error': _filing_miss(ticker, form_type, 'No XBRL data available'),
       'success': False
     }
 
@@ -444,11 +608,16 @@ def get_ebitda_margin(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
     if filing and filing['xbrl_data']:
       xbrl = filing['xbrl_data']
 
-      # get the operating income from income statement
+      # Operating income. `IncomeLossFromContinuingOperations` used to trail
+      # this list and reached, by prefix,
+      # `IncomeLossFromContinuingOperationsBeforeIncomeTaxes...` -- pre-tax
+      # income, reported as operating income. JPM's EBITDA was built on
+      # 72,595,000,000 of pre-tax income that way, XOM's on 45,969,000,000,
+      # and GS's on a fact worth $1. A bank, a REIT and an oil major do not
+      # tag operating income at all, and the honest answer for them is that
+      # EBITDA cannot be computed from this filing.
       operating_income_concepts = [
       'us-gaap:OperatingIncomeLoss',        # 95% of companies
-      'OperatingIncomeLoss',                # Fallback
-      'IncomeLossFromContinuingOperations'  # Edge cases
       ]
 
       for concept in operating_income_concepts:
@@ -461,11 +630,7 @@ def get_ebitda_margin(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
 
 
       # get the depreciation & amorization from the cash flow statement
-      cashflow_statement_concepts = [
-      'us-gaap:DepreciationDepletionAndAmortization',  # First choice - combined total
-      'us-gaap:DepreciationAndAmortization',           # Alternative combined
-      'DepreciationDepletionAndAmortization'           # Fallback without prefix
-      ]
+      cashflow_statement_concepts = DA_CONCEPTS[:-1]  # combined totals only
 
 
       for concept in cashflow_statement_concepts:
@@ -539,7 +704,8 @@ def get_ebitda_margin(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
       }
     else:
       return {
-        'error': f'Unable to get latest filing for {ticker}',
+        'error': _filing_miss(ticker, form_type,
+                              f'Unable to get latest filing for {ticker}'),
         'success': False
       }
 
@@ -561,12 +727,11 @@ def get_capex_pct_revenue(ticker: str, form_type: str = '10-K') -> Dict[str, Any
     if filing and filing['xbrl_data']:
       xbrl = filing['xbrl_data']
 
-      primary_capex_concepts = [
-      'us-gaap:PaymentsToAcquirePropertyPlantAndEquipment',  # Total PP&E (most common)
-      'us-gaap:PaymentsForCapitalExpenditures',              # Direct total CapEx
-      'PaymentsToAcquirePropertyPlantAndEquipment',          # Fallback
-      'CapitalExpenditures'                                  # Basic total
-      ]
+      # The shared chain, so this tool and get_historical_fcf cannot disagree
+      # about what capex a filer tags. Before it, HD, GE, CVX and T all fell
+      # through to the component sum below and came back "Unable to find any
+      # concepts" -- each of them tags PaymentsToAcquireProductiveAssets.
+      primary_capex_concepts = CAPEX_CONCEPTS
       total_capex = 0
       capex_concept_used = None
 
@@ -640,41 +805,33 @@ def get_tax_rate(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
     if filing and filing['xbrl_data']:
       xbrl = filing['xbrl_data']
 
-      tax_expense_concepts = [
-      'us-gaap:IncomeTaxExpenseBenefit',                           # Most common - total tax expense
-      'us-gaap:ProvisionForIncomeTaxes',                           # Alternative provision concept
-      'us-gaap:IncomeTaxesPaid',                                   # Cash taxes paid
-      'us-gaap:CurrentIncomeTaxExpense',                           # Current year tax expense
-      'IncomeTaxExpenseBenefit',                                   # Without prefix
-      'ProvisionForIncomeTaxes',                                   # Without prefix
-      'IncomeTaxExpense'                                           # Basic form
-      ]
-      tax_expense = 0.0 # bc panda dataframe return np.float64
+      tax_expense = None
       tax_concept_used = None
-      for concept in tax_expense_concepts:
+      for concept in TAX_EXPENSE_CONCEPTS:
         result = filter_annual_data(xbrl, concept, form_type)
         if result:
           tax_expense = float(result['value'])
-          tax_concept_used = concept
+          tax_concept_used = result['concept_used']
           break
-
-      pretax_income_concepts = [
-        'us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest',  # Full concept
-        'us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxes',                                          # Most common
-        'us-gaap:EarningsBeforeIncomeTaxes',                                                                    # Alternative
-        'IncomeLossFromContinuingOperationsBeforeIncomeTaxes',                                                  # Without prefix
-        'EarningsBeforeIncomeTaxes',                                                                            # Without prefix
-        'IncomeBeforeTaxes'                                                                                     # Basic form
-      ]
 
       pretax_income = 0.0
       pretax_concept_used = None
-      for concept in pretax_income_concepts:
+      for concept in PRETAX_INCOME_CONCEPTS:
         result = filter_annual_data(xbrl, concept, form_type)
         if result:
           pretax_income = float(result['value'])
-          pretax_concept_used = concept
+          pretax_concept_used = result['concept_used']
           break
+
+      # A tax expense that was never found is not a tax expense of zero. The
+      # default used to be 0.0, which returned an effective rate of 0% for a
+      # filer whose tax line the chain could not reach.
+      if tax_expense is None:
+        return{
+          'error': (f'{ticker} tags no income tax expense concept in its '
+                    f'{form_type}. Tried: {", ".join(TAX_EXPENSE_CONCEPTS)}'),
+          'success': False
+        }
 
       # calulate the effective tax rate: Effective tax rate = provision for income taxes / earnings before taxes
       if pretax_income != 0: # prevent divide by 0 error
@@ -717,29 +874,18 @@ def get_depreciation(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
     if filing and filing['xbrl_data']:
       xbrl = filing['xbrl_data']
 
-      depreciation_concepts = [
-      'us-gaap:DepreciationDepletionAndAmortization',           # Combined D&A (most common)
-      'us-gaap:Depreciation',                                   # Depreciation only
-      'us-gaap:DepreciationAndAmortization',                    # Alternative combined
-      'us-gaap:DepreciationAmortizationAndAccretionNet',        # With accretion
-      'us-gaap:DepreciationDepletionAndAmortizationExcludingAmortizationOfDebtIssuanceCosts',  # Excluding debt costs
-      'DepreciationDepletionAndAmortization',                   # Without prefix
-      'Depreciation',                                           # Basic depreciation
-      'DepreciationAndAmortization'                            # Basic combined
-      ]
-
       d_a_value = 0.0
       d_a_concept = None
-      for concept in depreciation_concepts:
+      for concept in DA_CONCEPTS:
         results = filter_annual_data(xbrl, concept, form_type)
         if results:
           d_a_value = float(results['value'])
-          d_a_concept = concept
+          d_a_concept = results['concept_used']
           break
 
       if d_a_value == 0.0:
         return{
-          'error': f"Unable to find concept for {ticker}: Concepts used = {depreciation_concepts}",
+          'error': f"Unable to find concept for {ticker}: Concepts used = {list(DA_CONCEPTS)}",
           'success': False
         }
 
@@ -764,7 +910,8 @@ def get_depreciation(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
 
     else:
       return{
-        'error': f"Unable to get filing for {ticker}",
+        'error': _filing_miss(ticker, form_type,
+                              f"Unable to get filing for {ticker}"),
         'success': False
       }
 
@@ -776,10 +923,8 @@ def get_depreciation(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
 
 
 def _get_revenue_from_xbrl(xbrl, form_type: str):
-  """Helper: try the two most common revenue concepts; return (value, period_end) or None."""
-  for concept in ('us-gaap:Revenues',
-                  'us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax',
-                  'us-gaap:SalesRevenueNet'):
+  """Revenue for the filing's own period; (value, period_end) or None."""
+  for concept in REVENUE_CONCEPTS:
     d = filter_annual_data(xbrl, concept, form_type)
     if d:
       return d['value'], d['period_end']
@@ -796,7 +941,9 @@ def get_margin_breakdown(ticker: str, form_type: str = '10-K') -> Dict[str, Any]
   try:
     filing_data = get_latest_filing(ticker, form_type)
     if not filing_data or not filing_data.get('xbrl_data'):
-      return {'error': f'No filing found for {ticker}', 'success': False}
+      return {'error': _filing_miss(ticker, form_type,
+                                    f'No filing found for {ticker}'),
+              'success': False}
 
     xbrl = filing_data['xbrl_data']
     rev_tuple = _get_revenue_from_xbrl(xbrl, form_type)
@@ -812,7 +959,7 @@ def get_margin_breakdown(ticker: str, form_type: str = '10-K') -> Dict[str, Any]
       if gp:
         result['gross_profit'] = gp['value']
         result['gross_margin_pct'] = (gp['value'] / revenue) * 100
-        concepts_used['gross_profit'] = c
+        concepts_used['gross_profit'] = gp['concept_used']
         break
 
     for c in ('us-gaap:SellingGeneralAndAdministrativeExpense',
@@ -821,15 +968,19 @@ def get_margin_breakdown(ticker: str, form_type: str = '10-K') -> Dict[str, Any]
       if sga:
         result['sga'] = sga['value']
         result['sga_pct_revenue'] = (sga['value'] / revenue) * 100
-        concepts_used['sga'] = c
+        concepts_used['sga'] = sga['concept_used']
         break
 
-    for c in ('us-gaap:ResearchAndDevelopmentExpense',):
+    # BIIB and VRTX tag only the ExcludingAcquiredInProcessCost element --
+    # 1,778,600,000 and 3,909,500,000 -- which the prefix match used to reach
+    # from a query for us-gaap:ResearchAndDevelopmentExpense.
+    for c in ('us-gaap:ResearchAndDevelopmentExpense',
+              'us-gaap:ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost'):
       rnd = filter_annual_data(xbrl, c, form_type)
       if rnd:
         result['rnd'] = rnd['value']
         result['rnd_pct_revenue'] = (rnd['value'] / revenue) * 100
-        concepts_used['rnd'] = c
+        concepts_used['rnd'] = rnd['concept_used']
         break
 
     result['concepts_used'] = concepts_used
@@ -844,46 +995,82 @@ def get_margin_breakdown(ticker: str, form_type: str = '10-K') -> Dict[str, Any]
 
 
 def get_historical_fcf(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
-  """Extract operating cash flow, capex, and compute FCF and FCF margin from latest filing."""
+  """Operating cash flow, capex, and free cash flow from the latest filing.
+
+  A filer that tags no capital-expenditure element gets `success: False` and
+  `coverage: 'not_covered'` rather than a free cash flow. The previous
+  `fcf = ocf - (capex or 0)` turned a missing input into a zero one, which
+  reports operating cash flow as free cash flow: Amazon read 139,514,000,000
+  against a real 7,695,000,000, an 18x overstatement, because its capex is
+  tagged under an element the two-concept chain did not try. Widening the
+  chain fixes the eight filers in the audit basket that did tag capex; the
+  loud failure is for the ones that genuinely do not, which is every bank in
+  it. The operating cash flow that was read is still returned, so nothing
+  found is thrown away.
+  """
   try:
     filing_data = get_latest_filing(ticker, form_type)
     if not filing_data or not filing_data.get('xbrl_data'):
-      return {'error': f'No filing found for {ticker}', 'success': False}
+      return {'error': _filing_miss(ticker, form_type,
+                                    f'No filing found for {ticker}'),
+              'success': False}
 
     xbrl = filing_data['xbrl_data']
     ocf = None
-    for c in ('us-gaap:NetCashProvidedByUsedInOperatingActivities',
-              'us-gaap:NetCashProvidedByUsedInOperatingActivitiesContinuingOperations'):
+    ocf_concept = None
+    for c in OPERATING_CASH_FLOW_CONCEPTS:
       d = filter_annual_data(xbrl, c, form_type)
       if d:
         ocf = d['value']
+        ocf_concept = d['concept_used']
         break
 
     capex = None
-    for c in ('us-gaap:PaymentsToAcquirePropertyPlantAndEquipment',
-              'us-gaap:PaymentsForCapitalImprovements'):
+    capex_concept = None
+    for c in CAPEX_CONCEPTS:
       d = filter_annual_data(xbrl, c, form_type)
       if d:
-        capex = abs(d['value'])  # capex usually reported negative on CF statement
+        capex = abs(d['value'])  # capex is reported negative on the CF statement
+        capex_concept = d['concept_used']
         break
 
     if ocf is None:
       return {'ticker': ticker, 'error': 'OCF concept not found', 'success': False}
 
-    fcf = ocf - (capex or 0)
     rev_tuple = _get_revenue_from_xbrl(xbrl, form_type)
     revenue = rev_tuple[0] if rev_tuple else None
     period_end = rev_tuple[1] if rev_tuple else None
 
-    return {
+    result = {
       'ticker': ticker,
       'operating_cash_flow': ocf,
+      'operating_cash_flow_concept_used': ocf_concept,
       'capex': capex,
+      'capex_concept_used': capex_concept,
+      'period_end': period_end,
+    }
+
+    if capex is None:
+      result.update({
+        'free_cash_flow': None,
+        'fcf_margin_pct': None,
+        'coverage': 'not_covered',
+        'success': False,
+        'error': (f'{ticker} tags no capex concept in its {form_type}; free '
+                  f'cash flow cannot be computed. Tried: '
+                  f'{", ".join(CAPEX_CONCEPTS)}'),
+      })
+      return result
+
+    fcf = ocf - capex
+    result.update({
       'free_cash_flow': fcf,
       'fcf_margin_pct': (fcf / revenue * 100) if revenue else None,
-      'period_end': period_end,
-      'success': True
-    }
+      'coverage': 'full',
+      'success': True,
+      'error': None,
+    })
+    return result
   except Exception as e:
     return {'ticker': ticker, 'error': f'get_historical_fcf failed: {e}', 'success': False}
 
@@ -897,13 +1084,20 @@ def get_working_capital(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
   try:
     filing_data = get_latest_filing(ticker, form_type)
     if not filing_data or not filing_data.get('xbrl_data'):
-      return {'error': 'No filing', 'success': False}
+      return {'error': _filing_miss(ticker, form_type, 'No filing'),
+              'success': False}
 
     xbrl = filing_data['xbrl_data']
     ca = filter_instant_data(xbrl, 'us-gaap:AssetsCurrent')
     cl = filter_instant_data(xbrl, 'us-gaap:LiabilitiesCurrent')
     ar = filter_instant_data(xbrl, 'us-gaap:AccountsReceivableNetCurrent')
-    inv = filter_instant_data(xbrl, 'us-gaap:InventoryNet')
+    # A long-term-contract manufacturer nets customer advances and progress
+    # billings against inventory and tags that element instead. BA's
+    # 84,679,000,000 used to be reached from `us-gaap:InventoryNet` by prefix.
+    inv = (filter_instant_data(xbrl, 'us-gaap:InventoryNet')
+           or filter_instant_data(
+               xbrl,
+               'us-gaap:InventoryNetOfAllowancesCustomerAdvancesAndProgressBillings'))
     ap = filter_instant_data(xbrl, 'us-gaap:AccountsPayableCurrent')
     rev_tuple = _get_revenue_from_xbrl(xbrl, form_type)
 
@@ -1494,7 +1688,9 @@ def get_company_filings_history(ticker: str, form_type: str = '10-K',
 
   if not filings:
     return {'ticker': ticker, 'success': False,
-            'error': f'No {form_type} filings found for {ticker}'}
+            'error': _filing_miss(
+                ticker, form_type,
+                f'No {form_type} filings found for {ticker}')}
 
   out_filings = []
   try:
@@ -1870,7 +2066,9 @@ def extract_mda(ticker: str, form_type: str = '10-K',
     filing_data = get_latest_filing(ticker, form_type)
     if not filing_data:
       return {'ticker': ticker, 'success': False,
-              'error': f'No {form_type} filing found for {ticker}'}
+              'error': _filing_miss(
+                  ticker, form_type,
+                  f'No {form_type} filing found for {ticker}')}
 
     filing_obj = filing_data.get('filing_object')
     if filing_obj is None:
@@ -1986,7 +2184,9 @@ def extract_risk_factors(ticker: str, form_type: str = '10-K',
     filing_data = get_latest_filing(ticker, form_type)
     if not filing_data:
       return {'ticker': ticker, 'success': False,
-              'error': f'No {form_type} filing found for {ticker}'}
+              'error': _filing_miss(
+                  ticker, form_type,
+                  f'No {form_type} filing found for {ticker}')}
 
     filing_obj = filing_data.get('filing_object')
     if filing_obj is None:
@@ -2195,38 +2395,203 @@ def track_segment_growth(ticker: str, form_type: str = '10-K') -> Dict[str, Any]
   }
 
 
+# --------------------------------------------------------------- segment axis
+
+# The axis a filer uses to say "this fact is the segment column of the
+# reconciliation table" rather than a breakdown of it. Standard us-gaap, and
+# the only extra dimension a segment's own revenue is allowed to carry: AAPL,
+# BA, HON, JPM, NVDA and WFC tag every segment fact this way and nothing else,
+# so a rule that demanded the segment axis alone would report all six as
+# tagging no segment revenue.
+CONSOLIDATION_ITEMS_AXIS = 'srt:ConsolidationItemsAxis'
+OPERATING_SEGMENTS_MEMBER = 'us-gaap:OperatingSegmentsMember'
+
+SEGMENT_AXIS_ONLY = 'segment axis only'
+SEGMENT_OPERATING_COLUMN = (f'segment axis + {CONSOLIDATION_ITEMS_AXIS}='
+                            f'{OPERATING_SEGMENTS_MEMBER}')
+# Order is the preference used to break a coverage tie, best first.
+_SEGMENT_CONTEXT_BASES = (SEGMENT_AXIS_ONLY, SEGMENT_OPERATING_COLUMN)
+
+# A 10-K's segment note carries three comparative years; only annual durations
+# are wanted from it, as before.
+_SEGMENT_SPAN_DAYS = (350, None)
+
+# Members can nest. CAT tags us-gaap:ReportableSegmentAggregationBeforeOther
+# OperatingSegmentMember at 73,955m, exactly Construction 25,060 + Resource
+# 12,474 + Power & Energy 32,201 + Financial Products 4,220, on the same axis as
+# those four; AMT tags amt:PropertyMember above its five property regions; LEN
+# tags one member that is the sum of five Homebuilding regions. Detected by
+# comparing the sum against the consolidated fact already in hand rather than by
+# trying to recognise a parent from its tag name, which cannot be done -- the
+# same mechanism `forward_metrics.get_geographic_revenue` uses for geography.
+#
+# The band absorbs a filer that tags an intersegment-revenue member on the
+# segment axis, which is genuinely additive to the parts and eliminated from the
+# total. Measured on the identity-sweep basket the largest legitimate overshoot
+# is WFC's 1.4% (GOOGL 0.03%, BA 0.2%); the overlapping filers run from 194% to
+# 219%.
+_SEGMENT_OVERLAP_TOLERANCE = 0.02
+
+
+def _same_axis(left: str, right: str) -> bool:
+  """Whether two axis spellings name the same axis.
+
+  `get_unique_dimensions()` keys axes with '_' where a context's dimensions use
+  ':'. Comparing the raw strings silently resolves nothing for every filer.
+  """
+  return str(left).replace('_', ':', 1) == str(right).replace('_', ':', 1)
+
+
+def _segment_context_basis(dimensions: Dict[str, str], axis: str) -> Optional[str]:
+  """Which selection basis a fact belongs to, or None if it is not a segment's
+  own figure.
+
+  A fact carrying the segment axis *plus another* axis is a piece of a segment
+  or an adjustment to it -- a product line, a geography, an intersegment
+  elimination, a corporate reconciling item -- and never the segment. GE's
+  largest segment reported -62,000,000 of revenue because the elimination
+  context answered a query for the segment; the segment-only context in the
+  same filing carries 33,252,000,000.
+  """
+  # Both spellings of a prefix compare equal, as they do everywhere else in
+  # this package: the same axis reaches us as 'srt:ConsolidationItemsAxis' from
+  # a context and 'srt_ConsolidationItemsAxis' from the dimension index.
+  extra = {str(a).replace('_', ':', 1): str(m).replace('_', ':', 1)
+           for a, m in dimensions.items() if not _same_axis(a, axis)}
+  if not extra:
+    return SEGMENT_AXIS_ONLY
+  if (len(extra) == 1
+      and extra.get(CONSOLIDATION_ITEMS_AXIS) == OPERATING_SEGMENTS_MEMBER):
+    return SEGMENT_OPERATING_COLUMN
+  return None
+
+
+def _segment_facts(xbrl, concept: str, axis: str) -> Dict[str, Dict[str, Dict[str, set]]]:
+  """{basis: {member: {period_end: {values}}}} for one concept.
+
+  Reads through `sec_series.concept_point`, so the exact-concept filter and the
+  dimension resolution are the ones every other reader in this module uses
+  rather than a third copy. `by_dimension(axis, member)`, which this replaces,
+  returns the facts carrying a second axis alongside the segment's own.
+  """
+  from .sec_series import _in_span, _period_rank, concept_point
+  try:
+    point = concept_point(xbrl, concept, filing_date='', form='')
+  except Exception:  # noqa: BLE001 - an unreadable concept is not a segment
+    return {}
+  if point is None:
+    return {}
+
+  out: Dict[str, Dict[str, Dict[str, set]]] = {}
+  for fact in point.deduplicated():
+    member = None
+    for a, m in fact.dimensions.items():
+      if _same_axis(a, axis):
+        member = m
+        break
+    if member is None:
+      continue
+    period_end, days = _period_rank(fact.period)
+    if not _in_span(days, *_SEGMENT_SPAN_DAYS):
+      continue
+    basis = _segment_context_basis(fact.dimensions, axis)
+    if basis is None:
+      continue
+    (out.setdefault(basis, {}).setdefault(member, {})
+        .setdefault(period_end, set()).add(fact.value))
+  return out
+
+
+def _resolve_segment_basis(xbrl, concepts, axis: str):
+  """(concept, basis, {member: {period_end: {values}}}) or None.
+
+  The concept and the basis are chosen **once for the filing**, by which pair
+  resolves the most members, so every segment of one filer is measured the same
+  way. Per-member preference mixes them: AMT tags five members' non-lease
+  revenue on the segment axis alone and all seven members' total revenue on the
+  operating-segments column, and taking each member's most specific fact puts
+  935,900,000 beside 10,305,000,000 in one total.
+
+  Ties break to the earlier concept -- the chain is broadest-first, for the
+  reason `REVENUE_CONCEPTS` documents -- and then to the segment-only basis.
+  """
+  best = None
+  for rank, concept in enumerate(concepts):
+    bases = _segment_facts(xbrl, concept, axis)
+    for preference, basis in enumerate(_SEGMENT_CONTEXT_BASES):
+      by_member = bases.get(basis)
+      if not by_member:
+        continue
+      key = (len(by_member), -rank, -preference)
+      if best is None or key > best[0]:
+        best = (key, concept, basis, by_member)
+  return None if best is None else (best[1], best[2], best[3])
+
+
+def _segment_period_series(by_period: Dict[str, set]) -> tuple:
+  """([{period_end, value}] newest first, [(period_end, values)] in conflict).
+
+  Two different values tagged for one member, one period and one basis cannot
+  both be that segment's figure, and there is nothing in the frame to choose
+  between them, so the period is dropped and named rather than guessed at.
+  """
+  rows, conflicts = [], []
+  for period_end in sorted(by_period, reverse=True):
+    values = by_period[period_end]
+    if len(values) > 1:
+      conflicts.append((period_end, sorted(values)))
+      continue
+    rows.append({'period_end': period_end, 'value': float(next(iter(values)))})
+  return rows, conflicts
+
+
+
+
 def get_segment_financials(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
   """Extract per-segment revenue and operating income from latest 10-K XBRL.
 
   Uses the `us-gaap:StatementBusinessSegmentsAxis` (or any axis whose name
-  contains 'Segment') and pulls the company-defined segment members. For
-  each segment, fetches annual revenue (RevenueFromContractWithCustomer
-  ExcludingAssessedTax / Revenues / SalesRevenueNet) and operating income
-  (OperatingIncomeLoss) by joining the concept to the segment dimension.
+  contains 'Segment') and pulls the company-defined segment members. For each
+  member the fact returned is the one that is the segment's own figure --
+  qualified by the segment axis alone, or by the segment axis plus the
+  operating-segments column of the reconciliation table where the filer tags
+  nothing else. See `_segment_context_basis` and `_resolve_segment_basis`.
 
-  Returns up to 5 years of history per segment plus the most recent YoY
-  growth and operating margin. Critical for resolving the variant-
-  perception question on multi-segment companies — e.g. MSFT's Intelligent
-  Cloud (Azure) growth vs. Productivity & Business Processes margin.
+  Returns up to 5 years of history per segment plus the most recent YoY growth
+  and operating margin. Critical for resolving the variant-perception question
+  on multi-segment companies -- e.g. MSFT's Intelligent Cloud (Azure) growth vs.
+  Productivity & Business Processes margin.
+
+  Two things the caller has to read:
+
+  * `members_overlap` -- true when the members sum to more than consolidated
+    revenue, which means at least one of them aggregates the others. The values
+    are still each correct; their sum is not a total, and the percentages are
+    then of consolidated revenue rather than of the sum.
+  * `segments_without_revenue` -- members whose revenue is not extractable as
+    tagged. XOM tags every segment revenue fact in combination with
+    `srt:StatementGeographicalAxis` and no segment-only fact exists, so its
+    segment revenue is a real absence rather than a number to approximate.
   """
   try:
     filing_data = get_latest_filing(ticker, form_type)
     if not filing_data or not filing_data.get('xbrl_data'):
       return {'ticker': ticker, 'success': False,
-              'error': f'No {form_type} filing or XBRL data found for {ticker}'}
+              'error': _filing_miss(
+                  ticker, form_type,
+                  f'No {form_type} filing or XBRL data found for {ticker}')}
 
     xbrl = filing_data['xbrl_data']
 
     # Discover the segment axis. edgartools normalizes ':' to '_' in the
-    # unique_dimensions dict keys, but by_dimension() accepts the colon form.
+    # unique_dimensions dict keys, but the contexts carry the colon form.
     unique_dims = xbrl.facts.get_unique_dimensions()
     segment_axis_key = None
-    segment_axis_for_query = None
+    segment_axis = None
     for key in unique_dims.keys():
       if 'StatementBusinessSegments' in key or key.endswith('SegmentsAxis'):
         segment_axis_key = key
-        # Normalize to colon form for by_dimension query
-        segment_axis_for_query = key.replace('_', ':', 1)
+        segment_axis = key.replace('_', ':', 1)
         break
 
     if not segment_axis_key:
@@ -2234,41 +2599,53 @@ def get_segment_financials(ticker: str, form_type: str = '10-K') -> Dict[str, An
               'error': 'No business-segment axis in XBRL — company may not have reportable segments',
               'axes_available': list(unique_dims.keys())[:10]}
 
-    members = unique_dims.get(segment_axis_key, set())
+    members = sorted(unique_dims.get(segment_axis_key, set()))
     if not members:
       return {'ticker': ticker, 'success': False,
               'error': f'No segment members under {segment_axis_key}'}
 
-    revenue_concepts = [
-      'us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax',
-      'us-gaap:Revenues',
-      'us-gaap:SalesRevenueNet',
-      'us-gaap:RevenueFromContractWithCustomerIncludingAssessedTax',
-    ]
-    op_income_concept = 'us-gaap:OperatingIncomeLoss'
+    # Broadest element first, and shared with the consolidated reader below so
+    # the two cannot disagree about what a filer tags. Trying the ASC 606
+    # element first returns AMT's 935,900,000 of non-lease revenue against
+    # 10,644,600,000 of revenue -- tower rent is lease income under ASC 842.
+    resolved = _resolve_segment_basis(xbrl, REVENUE_CONCEPTS, segment_axis)
+    if resolved is None:
+      return {
+        'ticker': ticker, 'success': False,
+        'error': (
+          f'{ticker} tags no segment revenue fact that is a segment\'s own '
+          f'figure. Every fact on {segment_axis} carries a further dimension '
+          f'-- a product, a geography, an intersegment elimination or a '
+          f'corporate reconciling item -- or no revenue element is tagged on '
+          f'that axis at all. Summing across the further axis is not something '
+          f'this tool does, so segment revenue is not extractable as tagged '
+          f'for {members}.'),
+        'segment_axis': segment_axis,
+        'segments_available': members,
+        'total_latest_segment_revenue': None,
+        'filing_date': filing_data.get('filing_date'),
+      }
+    revenue_concept, revenue_basis, revenue_by_member = resolved
 
-    def _annual_series(concept: str, member: str) -> tuple:
-      """Return (concept_used, [{period_end, value}, ...]) sorted newest-first."""
-      try:
-        q = xbrl.facts.query().by_concept(concept).by_dimension(
-          segment_axis_for_query, member)
-        df = q.to_dataframe()
-      except Exception:
-        return (None, [])
-      if df.empty:
-        return (None, [])
-      df = df.copy()
-      df['period_start_dt'] = pd.to_datetime(df['period_start'])
-      df['period_end_dt'] = pd.to_datetime(df['period_end'])
-      df['duration_days'] = (df['period_end_dt'] - df['period_start_dt']).dt.days
-      annual = df[df['duration_days'] >= 350].sort_values('period_end_dt', ascending=False)
-      series = [{'period_end': r['period_end'], 'value': float(r['numeric_value'])}
-                for _, r in annual.iterrows()]
-      return (concept, series)
+    op_resolved = _resolve_segment_basis(
+      xbrl, ('us-gaap:OperatingIncomeLoss',), segment_axis)
+    op_basis = op_resolved[1] if op_resolved else None
+    op_by_member = op_resolved[2] if op_resolved else {}
+
+    # The consolidated fact to reconcile against, read from the same filing
+    # through the same undimensioned selection get_revenue_base uses.
+    consolidated = None
+    consolidated_concept = None
+    for concept in REVENUE_CONCEPTS:
+      fact = _consolidated_fact(xbrl, concept, span_days=_SEGMENT_SPAN_DAYS)
+      if fact is not None:
+        consolidated = fact.value
+        consolidated_concept = fact.concept or concept
+        break
 
     segments_out = []
-    revenue_concept_used = None
-    for member in sorted(members):
+    unresolved = []
+    for member in members:
       # Pretty name: "msft:ProductivityAndBusinessProcessesMember"
       # -> "Productivity And Business Processes"
       seg_short = member.split(':')[-1]
@@ -2276,19 +2653,26 @@ def get_segment_financials(ticker: str, form_type: str = '10-K') -> Dict[str, An
         seg_short = seg_short[:-len('Member')]
       seg_display = re.sub(r'([a-z])([A-Z])', r'\1 \2', seg_short).strip()
 
-      # Revenue (try each concept in priority order)
-      rev_series: list = []
-      for c in revenue_concepts:
-        used, series = _annual_series(c, member)
-        if series:
-          rev_series = series
-          revenue_concept_used = revenue_concept_used or used
-          break
+      rev_series, rev_conflicts = _segment_period_series(
+        revenue_by_member.get(member, {}))
+      op_series, _ = _segment_period_series(op_by_member.get(member, {}))
 
-      # Operating income
-      _, op_series = _annual_series(op_income_concept, member)
+      unresolved_reason = None
+      if not rev_series:
+        if rev_conflicts:
+          period, values = rev_conflicts[0]
+          unresolved_reason = (
+            f'{revenue_concept} is tagged more than once for {period} on the '
+            f'{revenue_basis} basis ({values}); which of them is the segment\'s '
+            f'revenue cannot be determined from the filing')
+        else:
+          unresolved_reason = (
+            f'no {revenue_concept} fact for this member on the {revenue_basis} '
+            f'basis this filing is read on; the facts it does tag carry a '
+            f'further dimension')
+        unresolved.append({'segment': seg_display, 'segment_member': member,
+                           'reason': unresolved_reason})
 
-      # Derived metrics on the latest period
       latest_rev = rev_series[0]['value'] if rev_series else None
       prev_rev = rev_series[1]['value'] if len(rev_series) > 1 else None
       rev_yoy_pct = round(((latest_rev / prev_rev) - 1) * 100, 2) \
@@ -2301,6 +2685,7 @@ def get_segment_financials(ticker: str, form_type: str = '10-K') -> Dict[str, An
       op_margin_pct = round((latest_op / latest_rev) * 100, 2) \
         if (latest_op and latest_rev) else None
 
+
       segments_out.append({
         'segment': seg_display,
         'segment_member': member,
@@ -2310,20 +2695,62 @@ def get_segment_financials(ticker: str, form_type: str = '10-K') -> Dict[str, An
         'revenue_yoy_pct': rev_yoy_pct,
         'op_income_yoy_pct': op_yoy_pct,
         'op_margin_pct': op_margin_pct,
+        'unresolved_reason': unresolved_reason,
       })
 
-    # Total check: sum latest-period revenues vs. consolidated revenue base
-    total_seg_rev = sum(s['revenue'][0]['value'] for s in segments_out if s['revenue'])
+    total_seg_rev = sum(s['revenue'][0]['value'] for s in segments_out
+                        if s['revenue'])
+
+
+    members_overlap = None
+    if consolidated:
+      members_overlap = (
+        total_seg_rev > consolidated * (1 + _SEGMENT_OVERLAP_TOLERANCE))
+    denominator = consolidated if members_overlap else total_seg_rev
+
+    for segment in segments_out:
+      latest = segment['revenue'][0]['value'] if segment['revenue'] else None
+      segment['pct_of_revenue'] = (
+        latest / denominator * 100.0
+        if (latest is not None and denominator) else None)
+
+    if members_overlap:
+      note = (
+        f"This filer's segment members OVERLAP: they sum to "
+        f"{total_seg_rev:,.0f} against consolidated revenue of "
+        f"{consolidated:,.0f}, so at least one member aggregates the others "
+        f"(CAT tags ReportableSegmentAggregationBeforeOtherOperatingSegment"
+        f"Member beside the four segments it is the sum of). Percentages are "
+        f"of consolidated revenue and therefore do NOT sum to 100. Read "
+        f"individual segments, not the total, and do not add them together.")
+    else:
+      note = (
+        "Percentages are of the disclosed segment total, which may sit below "
+        "consolidated revenue: segments reconcile to it through unallocated "
+        "corporate costs, intersegment eliminations and an 'all other' bucket "
+        "a filer may not tag on the segment axis.")
+    if unresolved:
+      note += (
+        f" {len(unresolved)} of {len(members)} members report no revenue "
+        f"this tool will stand behind and are listed in "
+        f"segments_without_revenue; the total excludes them.")
 
     return {
       'ticker': ticker,
       'success': True,
       'error': None,
       'segments': segments_out,
-      'segment_axis': segment_axis_for_query,
+      'segment_axis': segment_axis,
       'segment_count': len(segments_out),
       'total_latest_segment_revenue': total_seg_rev,
-      'revenue_concept_used': revenue_concept_used,
+      'revenue_concept_used': revenue_concept,
+      'revenue_basis': revenue_basis,
+      'operating_income_basis': op_basis,
+      'consolidated_revenue': consolidated,
+      'consolidated_concept_used': consolidated_concept,
+      'members_overlap': members_overlap,
+      'segments_without_revenue': unresolved,
+      'note': note,
       'filing_date': filing_data.get('filing_date'),
     }
 
@@ -2350,7 +2777,9 @@ def get_buyback_history(ticker: str, form_type: str = '10-K', max_years: int = 5
   try:
     filing_data = get_latest_filing(ticker, form_type)
     if not filing_data or not filing_data.get('xbrl_data'):
-      return {'ticker': ticker, 'error': f'No filing found for {ticker}',
+      return {'ticker': ticker,
+              'error': _filing_miss(ticker, form_type,
+                                    f'No filing found for {ticker}'),
               'success': False}
 
     xbrl = filing_data['xbrl_data']
@@ -3072,7 +3501,9 @@ def extract_litigation(ticker: str, form_type: str = '10-K',
     filing_data = get_latest_filing(ticker, form_type)
     if not filing_data:
       return {'ticker': ticker, 'success': False,
-              'error': f'No {form_type} filing found for {ticker}'}
+              'error': _filing_miss(
+                  ticker, form_type,
+                  f'No {form_type} filing found for {ticker}')}
 
     filing_obj = filing_data.get('filing_object')
     if filing_obj is None:

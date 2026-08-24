@@ -14,7 +14,17 @@ import pytest
 from tools.financial_modeling_engine import corporate_actions as ca
 
 SKIP_NETWORK = os.environ.get("SKIP_NETWORK_TESTS") == "1"
-network = pytest.mark.skipif(SKIP_NETWORK, reason="live yfinance test")
+
+
+def network(func):
+  """Apply the real `network` marker plus the offline skip.
+
+  This name used to be bound to a bare pytest.mark.skipif. A skipif is not
+  a registered marker, so `-m network` and `-m "not network"` collected
+  nothing here -- the tests were selectable only by file path.
+  """
+  func = pytest.mark.network(func)
+  return pytest.mark.skipif(SKIP_NETWORK, reason="live yfinance test")(func)
 
 
 def _series(pairs):

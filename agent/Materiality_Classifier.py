@@ -4,7 +4,7 @@ Uses Groq's fast Llama-8B-Instant (cheap; ~50 tokens/sec) since this fires
 hundreds of times per day from the news watcher daemon. Outputs structured
 JSON so downstream handlers can route by category/urgency/signal.
 """
-from .groq_template import GroqModel
+from .groq_template import CredentialsMissing, GroqModel
 from pydantic import BaseModel, Field
 from typing import List, Optional
 import sys
@@ -90,7 +90,13 @@ class Materiality_Classifier(GroqModel):
       response = self.generate_response(prompt=user_prompt, system_prompt=SYSTEM_PROMPT)
       result = self.parse_response(response)
       return result
+    except CredentialsMissing:
+      # Not a parse failure and not per-article: rss_aggregator calls this in a
+      # loop, so an unset key fails every item identically. Swallowing it makes
+      # the daemon spin forever printing the wrong diagnosis.
+      raise
     except Exception as e:
-      print(f"[Materiality] parse failed for headline '{headline[:60]}': {e}",
+      print(f"[Materiality] classification failed for headline "
+            f"'{headline[:60]}': {type(e).__name__}: {e}",
             file=sys.stderr, flush=True)
       return None

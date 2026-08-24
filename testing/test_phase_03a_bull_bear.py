@@ -8,6 +8,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from agent.Bull_Agent import Bull_Agent, BullCase
 from agent.Bear_Agent import Bear_Agent, BearCase
 
+from testing._gates import requires_groq
+
+pytestmark = requires_groq
+
 
 # Fixture analyst report (AAPL-shaped). Both agents see this + variables.
 ANALYST_REPORT = """## EXECUTIVE SUMMARY

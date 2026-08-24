@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from .foreign_issuer import form_mismatch_note, not_covered_reason
 from .sec_series import NotCovered, fetch_concept_series
 
 _BASE = "us-gaap:LongTermDebtMaturitiesRepaymentsOfPrincipal"
@@ -75,13 +76,20 @@ def get_debt_maturity_schedule(ticker: str,
     buckets_found = len(found)
 
     if buckets_found == 0:
+        # "TSM does not tag long-term debt maturities in its 10-K" was the
+        # answer here before this guard. TSMC has no 10-K, and its 20-F
+        # carries a full maturity ladder.
+        mismatch = form_mismatch_note(ticker, form)
         return {
             "ticker": ticker,
             "success": False,
+            "wrong_form": bool(mismatch),
             "coverage": "not_covered",
-            "error": (f"{ticker} does not tag long-term debt maturities in "
-                      f"its {form}. This means the split was not disclosed in "
-                      f"XBRL, not that no debt matures."),
+            "error": not_covered_reason(
+                ticker, form,
+                f"{ticker} does not tag long-term debt maturities in its "
+                f"{form}. This means the split was not disclosed in XBRL, "
+                f"not that no debt matures."),
             "by_year": by_year,
             "total": None,
             "buckets_found": 0,

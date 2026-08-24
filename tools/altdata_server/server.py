@@ -8,6 +8,21 @@
   get_policy_signals         -- Legislative climate via GovTrack (+ Congress.gov if key set)
   get_capex_announcements    -- Capital investment announcements via DuckDuckGo news
 
+Failure vocabulary, shared with tools/web_search_server/debt_maturity.py:
+
+  success: false  -- the lookup could not be performed at all (no provider
+                     answered, unknown entity, upstream 404, missing credential)
+  coverage        -- "full" | "partial" | "not_covered", describing the data
+                     actually obtained
+  reason          -- machine-readable cause on a failure (no_provider,
+                     unknown_ticker, provider_unavailable, ...)
+  degraded        -- named degradations that narrowed the answer without
+                     failing it (e.g. an unset API key)
+
+A lookup that succeeded and found genuinely nothing returns success: true,
+coverage "full" and a zero count. That is a different finding from a lookup
+that could not be performed, and the two are never conflated.
+
 Heavy tools run in isolated subprocesses to avoid asyncio
 conflicts on Windows.
 Light tools (FinMind, job postings, gov contracts, policy, capex) run
@@ -120,6 +135,32 @@ def _err(tool: str, msg: str, ticker: str = "") -> List[TextContent]:
     return [TextContent(type="text",
                         text=json.dumps(_envelope(None, tool, ticker, errors=[msg]),
                                         default=str))]
+
+
+def _fail(tool: str, data: Any, msg: str, ticker: str = "") -> List[TextContent]:
+    """A lookup that could not be performed, with its diagnostic payload kept.
+
+    `_err` drops the data, which throws away what was tried and why it failed.
+    Every fetcher on this server returns that detail (`coverage`, `reason`,
+    the providers/queries attempted), so the failure envelope carries it.
+    """
+    return [TextContent(type="text",
+                        text=json.dumps(_envelope(data, tool, ticker, errors=[msg]),
+                                        default=str))]
+
+
+def _dispatch(tool: str, result: Dict[str, Any], ticker: str = "") -> List[TextContent]:
+    """Route a fetcher result to the success or failure envelope.
+
+    `success: false` in the fetcher payload means the lookup could not be
+    performed -- no provider answered, the entity is unknown, a credential is
+    missing. It is deliberately distinct from a successful lookup whose answer
+    is zero, which returns success with a coverage of "full".
+    """
+    if result.get("success") is False:
+        return _fail(tool, result,
+                     result.get("error") or f"{tool} lookup failed", ticker)
+    return _ok(tool, result, ticker)
 
 
 # ---------------------------------------------------------------------------
@@ -242,22 +283,50 @@ def _capex_signal(announcements: List[Dict]) -> str:
 # Company name resolution (ticker → display name)
 # ---------------------------------------------------------------------------
 
-def _ticker_to_company_name(ticker: str) -> str:
-    try:
-        import yfinance as yf
-        info = yf.Ticker(ticker).info
-        return info.get("longName") or info.get("shortName") or ticker
-    except Exception:
-        return ticker
+class LookupFailure(Exception):
+    """A lookup that could not be performed. Never an empty result."""
+    reason = "lookup_failed"
 
 
-def _ticker_to_sector(ticker: str) -> str:
+class UnknownTicker(LookupFailure):
+    """The quote provider has no such symbol."""
+    reason = "unknown_ticker"
+
+
+class ResolverUnavailable(LookupFailure):
+    """The quote provider could not be reached, so the symbol is unjudged."""
+    reason = "resolver_unavailable"
+
+
+def _resolve_ticker(ticker: str) -> Dict[str, str]:
+    """Company name and sector for a ticker, or raise.
+
+    The old helpers swallowed every failure and echoed the symbol back as the
+    company name, so `capex_announcements(ticker="ZZZZ")` searched the news for
+    "ZZZZ", found nothing and reported success. yfinance answers an unknown
+    symbol with a logged 404 and a near-empty dict rather than an exception, so
+    a missing name is the signal that the symbol does not exist.
+    """
     try:
         import yfinance as yf
-        info = yf.Ticker(ticker).info
-        return info.get("sector", "")
-    except Exception:
-        return ""
+        info = yf.Ticker(ticker).info or {}
+    except Exception as exc:  # noqa: BLE001 - reported, never swallowed
+        raise ResolverUnavailable(
+            f"could not resolve ticker '{ticker}': yfinance raised "
+            f"{type(exc).__name__}: {str(exc)[:150]}") from exc
+
+    name = info.get("longName") or info.get("shortName")
+    if not name:
+        raise UnknownTicker(
+            f"'{ticker}' is not a symbol yfinance can resolve (no longName or "
+            f"shortName in its quote response). No lookup was attempted.")
+    return {"name": name, "sector": info.get("sector") or ""}
+
+
+def _lookup_failed(exc: LookupFailure, **payload: Any) -> Dict[str, Any]:
+    """Failure envelope body for a lookup that could not be performed."""
+    return {"success": False, "coverage": "not_covered",
+            "reason": exc.reason, "error": str(exc), **payload}
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +346,14 @@ _ATS_PATTERNS: List[Tuple[re.Pattern, str]] = [
     (re.compile(r"([a-z0-9-]+)\.jobvite\.com"), "jobvite"),
 ]
 
+# Named in every failure so the caller knows exactly what was attempted.
+_JOB_PROVIDERS_TRIED = (
+    "greenhouse:boards-api.greenhouse.io",
+    "lever:api.lever.co",
+    "workday:tenant auto-discovery",
+    "careers-page ATS fingerprint",
+)
+
 _ATS_UNSUPPORTED_MESSAGES: Dict[str, str] = {
     "taleo": "Oracle Taleo requires authentication — no public job count API",
     "successfactors": "SAP SuccessFactors requires authentication",
@@ -287,47 +364,123 @@ _ATS_UNSUPPORTED_MESSAGES: Dict[str, str] = {
 }
 
 
-def _normalize_ats_jobs(jobs: list, source: str, source_url: str,
-                         slug: str, dept_filter: Optional[str]) -> Dict[str, Any]:
-    by_dept: Dict[str, int] = {}
-    for job in jobs:
-        if source == "greenhouse":
-            dept = (job.get("departments") or [{}])[0].get("name", "Unknown")
-        else:
-            dept = job.get("categories", {}).get("department", "Unknown")
-        by_dept[dept] = by_dept.get(dept, 0) + 1
+def _job_department(job: dict, source: str) -> Optional[str]:
+    """The posting's department, or None when the provider did not disclose one.
 
-    filtered = jobs
-    if dept_filter:
-        filtered = [
-            j for j in jobs
-            if dept_filter.lower() in str(
-                (j.get("departments") or [{}])[0].get("name", "") or
-                j.get("categories", {}).get("department", "")
-            ).lower()
-        ]
+    None is deliberately not the string "Unknown". Greenhouse's plain job
+    listing carries no `departments` key at all, so bucketing it as "Unknown"
+    reported a 100%-Unknown breakdown as if it were a real answer.
+    """
+    if source == "greenhouse":
+        depts = job.get("departments") or []
+        name = depts[0].get("name") if depts else None
+    else:
+        name = (job.get("categories") or {}).get("department")
+    name = (name or "").strip()
+    return name or None
+
+
+def _job_postings_result(*, slug: str, source: str, source_url: str,
+                          total: int, total_all: int, by_dept: Dict[str, int],
+                          undisclosed: int,
+                          dept_filter: Optional[str]) -> Dict[str, Any]:
+    """Shared result shape for every ATS.
+
+    `department_coverage` is reported separately from the count because a
+    provider can return a reliable total with no breakdown whatsoever, and a
+    silently degraded breakdown reads as a real one.
+    """
+    if total_all == 0 or undisclosed == 0:
+        dept_coverage: str = "full"
+        dept_reason: Optional[str] = None
+    elif not by_dept:
+        dept_coverage = "not_covered"
+        dept_reason = (f"{source} returned no department for any of the "
+                       f"{total_all} postings at {source_url}")
+    else:
+        dept_coverage = "partial"
+        dept_reason = (f"{undisclosed} of {total_all} postings carry no "
+                       f"department in the {source} response")
+
+    if dept_filter and dept_coverage == "not_covered":
+        # The unfiltered total was returned here, which reads as "every one of
+        # these roles is in the requested department".
+        return {
+            "success": False,
+            "coverage": "not_covered",
+            "reason": "departments_unavailable",
+            "error": (f"department_filter={dept_filter!r} cannot be applied: "
+                      f"{dept_reason}"),
+            "slug": slug, "ats": source, "source": source,
+            "source_url": source_url,
+            "total_postings": None,
+            "total_all_depts": total_all,
+            "by_department": None,
+            "department_coverage": dept_coverage,
+            "department_coverage_reason": dept_reason,
+            "dept_filter_applied": dept_filter,
+        }
 
     return {
-        "slug": slug, "ats": source, "source_url": source_url,
-        "total": len(filtered),
-        "total_all_depts": len(jobs),
-        "by_department": dict(sorted(by_dept.items(), key=lambda x: -x[1])[:15]),
+        "success": True,
+        "coverage": "full" if dept_coverage == "full" else "partial",
+        "slug": slug, "ats": source, "source": source, "source_url": source_url,
+        "total_postings": total,
+        # `total` / `total_all_depts` predate `total_postings` and are kept so
+        # existing callers keep working.
+        "total": total,
+        "total_all_depts": total_all,
+        "by_department": (dict(sorted(by_dept.items(), key=lambda x: -x[1])[:15])
+                          if by_dept else None),
+        "departments_found": len(by_dept),
+        "department_coverage": dept_coverage,
+        "department_coverage_reason": dept_reason,
         "dept_filter_applied": dept_filter,
     }
 
 
+def _normalize_ats_jobs(jobs: list, source: str, source_url: str,
+                         slug: str, dept_filter: Optional[str]) -> Dict[str, Any]:
+    by_dept: Dict[str, int] = {}
+    undisclosed = 0
+    for job in jobs:
+        dept = _job_department(job, source)
+        if dept is None:
+            undisclosed += 1
+        else:
+            by_dept[dept] = by_dept.get(dept, 0) + 1
+
+    total = len(jobs)
+    if dept_filter:
+        total = sum(1 for j in jobs
+                    if dept_filter.lower() in (_job_department(j, source) or "").lower())
+
+    return _job_postings_result(
+        slug=slug, source=source, source_url=source_url,
+        total=total, total_all=len(jobs), by_dept=by_dept,
+        undisclosed=undisclosed, dept_filter=dept_filter)
+
+
 def _try_greenhouse_norm(slug: str, dept_filter: Optional[str]) -> Optional[Dict]:
+    """None means "not a Greenhouse board" -- try the next provider."""
     import requests
-    url = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
-    try:
-        resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-        if resp.status_code == 404:
-            return None
-        resp.raise_for_status()
-        return _normalize_ats_jobs(resp.json().get("jobs", []),
-                                   "greenhouse", url, slug, dept_filter)
-    except Exception:
-        return None
+    base = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
+    # content=true is the only variant of this endpoint that carries per-job
+    # departments; the plain listing omits the key entirely. The plain listing
+    # is the fallback so a slow/oversized content response still yields a count
+    # (with department_coverage saying the breakdown is missing).
+    for url, timeout in ((f"{base}?content=true", 10), (base, 8)):
+        try:
+            resp = requests.get(url, timeout=timeout,
+                                headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            return _normalize_ats_jobs(resp.json().get("jobs", []),
+                                       "greenhouse", url, slug, dept_filter)
+        except Exception:
+            continue
+    return None
 
 
 def _try_lever_norm(slug: str, dept_filter: Optional[str]) -> Optional[Dict]:
@@ -366,16 +519,22 @@ def _workday_probe(tenant: str, wd_n: int, path: str) -> Optional[Dict]:
         return None
 
 
+# Workday rejects a page size above 20 with HTTP 400. The full fetch asked for
+# 50, so every discovered tenant 400'd and read as "no Workday board".
+_WORKDAY_PAGE_LIMIT = 20
+
+
 def _workday_fetch_full(tenant: str, wd_n: int, path: str,
                          dept_filter: Optional[str]) -> Optional[Dict]:
-    """Full Workday job fetch (limit=50) with facet department breakdown."""
+    """Full Workday job fetch with facet department breakdown."""
     import requests
     url = (f"https://{tenant}.wd{wd_n}.myworkdayjobs.com"
            f"/wday/cxs/{tenant}/{path}/jobs")
     try:
         resp = requests.post(
             url,
-            json={"appliedFacets": {}, "limit": 50, "offset": 0, "searchText": ""},
+            json={"appliedFacets": {}, "limit": _WORKDAY_PAGE_LIMIT,
+                  "offset": 0, "searchText": ""},
             headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
             timeout=8,
         )
@@ -392,7 +551,9 @@ def _workday_fetch_full(tenant: str, wd_n: int, path: str,
             if any(kw in param for kw in ("department", "jobfamily", "workertype",
                                            "organization", "function")):
                 for entry in facet.get("facetValues", []):
-                    by_dept[entry.get("value", "Unknown")] = entry.get("count", 0)
+                    name = (entry.get("value") or "").strip()
+                    if name:
+                        by_dept[name] = entry.get("count", 0)
                 if by_dept:
                     break
 
@@ -401,13 +562,16 @@ def _workday_fetch_full(tenant: str, wd_n: int, path: str,
             filtered_total = sum(v for k, v in by_dept.items()
                                  if dept_filter.lower() in k.lower())
 
-        return {
-            "slug": tenant, "ats": "workday", "source_url": url,
-            "total": filtered_total if dept_filter else total,
-            "total_all_depts": total,
-            "by_department": dict(sorted(by_dept.items(), key=lambda x: -x[1])[:15]),
-            "dept_filter_applied": dept_filter,
-        }
+        # Facet counts can cover fewer postings than the board reports; the
+        # remainder is undisclosed rather than absent.
+        faceted = sum(by_dept.values())
+        undisclosed = max(total - faceted, 0) if by_dept else total
+
+        return _job_postings_result(
+            slug=tenant, source="workday", source_url=url,
+            total=filtered_total if dept_filter else total,
+            total_all=total, by_dept=by_dept, undisclosed=undisclosed,
+            dept_filter=dept_filter)
     except Exception:
         return None
 
@@ -504,7 +668,12 @@ def _fetch_job_postings(slug: str, ats: str,
     Stage 2: Workday auto-discovery (own scope — the heavy nested-pool op never
              races inside the Stage-1 pool, so it can't be orphaned/leak threads).
     Stage 3: ATS fingerprint via company careers URL redirect.
-    Stage 4: Structured error with detected ATS info.
+    Stage 4: Explicit failure -- `success: false`, never a count of zero.
+
+    A provider returning None means "not this provider, try the next one". Only
+    every provider returning None is a failed lookup, and that is reported as
+    one: a reachable board with no open roles returns success with
+    total_postings 0, which is a different finding entirely.
     """
     # Direct workday bypass (explicit request)
     if ats == "workday":
@@ -512,9 +681,14 @@ def _fetch_job_postings(slug: str, ats: str,
         if result:
             return result
         return {
+            "success": False,
+            "coverage": "not_covered",
+            "reason": "no_provider",
             "error": f"Workday not found for '{slug}' — auto-discovery tried "
                      f"all common tenant variants.",
             "ats_detected": "workday_not_found", "slug": slug,
+            "total_postings": None,
+            "providers_tried": ["workday"],
         }
 
     # Stage 1: greenhouse + lever in parallel (both are single fast GETs).
@@ -524,10 +698,14 @@ def _fetch_job_postings(slug: str, ats: str,
         lv_f = pool.submit(_try_lever_norm, slug, dept_filter)
         results: Dict[str, Dict] = {}
         try:
-            for future in as_completed([gh_f, lv_f], timeout=12):
+            # Bounds both providers, including Greenhouse's content=true
+            # attempt and its plain-listing fallback (10s + 8s worst case).
+            # A tighter bound here would report "no provider answered" for a
+            # board that was merely slow.
+            for future in as_completed([gh_f, lv_f], timeout=20):
                 try:
                     result = future.result()
-                    if result and "error" not in result:
+                    if result:
                         results[result.get("ats", "")] = result
                 except Exception:
                     pass
@@ -536,14 +714,17 @@ def _fetch_job_postings(slug: str, ats: str,
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
 
-    # Prefer the explicitly requested ATS, otherwise any hit.
+    # Prefer the explicitly requested ATS, otherwise any hit. A provider that
+    # answered is returned even when its own result is a failure (e.g. a
+    # department filter it cannot apply) -- that is a real finding about a real
+    # board, not a reason to keep hunting.
     chosen = results.get(ats) or (next(iter(results.values())) if results else None)
     if chosen:
         return chosen
 
     # Stage 2: Workday auto-discovery in its own scope (no nested racing pool).
     wd = _try_workday_discovery(slug, dept_filter)
-    if wd and "error" not in wd:
+    if wd:
         return wd
 
     # Stage 3: ATS fingerprinting via website
@@ -552,15 +733,15 @@ def _fetch_job_postings(slug: str, ats: str,
         detected_ats, detected_slug = detected
         if detected_ats == "greenhouse" and detected_slug:
             r = _try_greenhouse_norm(detected_slug, dept_filter)
-            if r and "error" not in r:
+            if r:
                 return r
         elif detected_ats == "lever" and detected_slug:
             r = _try_lever_norm(detected_slug, dept_filter)
-            if r and "error" not in r:
+            if r:
                 return r
         elif detected_ats == "workday":
             r = _try_workday_discovery(detected_slug or slug, dept_filter)
-            if r and "error" not in r:
+            if r:
                 return r
 
         # Detected but not queryable
@@ -568,19 +749,34 @@ def _fetch_job_postings(slug: str, ats: str,
             detected_ats,
             f"'{detected_ats}' ATS is not publicly queryable",
         )
-        return {"error": msg, "ats_detected": detected_ats,
-                "detected_slug": detected_slug, "slug": slug}
+        return {
+            "success": False,
+            "coverage": "not_covered",
+            "reason": "ats_not_queryable",
+            "error": f"{msg} (detected for '{slug}')",
+            "ats_detected": detected_ats,
+            "detected_slug": detected_slug, "slug": slug,
+            "total_postings": None,
+            "providers_tried": list(_JOB_PROVIDERS_TRIED),
+        }
 
-    # Stage 4: clean failure
+    # Stage 4: every provider declined. This is a failed lookup, not zero jobs.
     return {
+        "success": False,
+        "coverage": "not_covered",
+        "reason": "no_provider",
         "error": (
-            f"No public job data found for '{slug}'. "
-            "Tried Greenhouse, Lever, and Workday auto-discovery. "
-            "This company likely uses a proprietary careers portal "
-            "(common for Microsoft, Apple, Google, Meta)."
+            f"No public job board answered for '{slug}'. Tried Greenhouse "
+            "(boards-api.greenhouse.io), Lever (api.lever.co), Workday tenant "
+            "auto-discovery, and ATS fingerprinting via the company careers "
+            "page. This is a failed lookup, not a count of zero: the company "
+            "may use a proprietary portal (Microsoft, Apple, Google, Meta) or "
+            "may not exist."
         ),
         "ats_detected": "unknown",
         "slug": slug,
+        "total_postings": None,
+        "providers_tried": list(_JOB_PROVIDERS_TRIED),
     }
 
 
@@ -593,6 +789,12 @@ def _fetch_taiwan_revenue_finmind(company_codes: List[str], months: int) -> Dict
     lookback_days = (months + 14) * 31
     start_date = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     token = os.environ.get("FINMIND_TOKEN", "")
+    token_hint = ("" if token else
+                  " FINMIND_TOKEN is unset, so this ran on FinMind's anonymous "
+                  "tier (shared per-IP daily quota).")
+    degraded: List[str] = [] if token else [
+        "FINMIND_TOKEN unset — requests use FinMind's anonymous tier, which "
+        "shares a daily quota per IP."]
     results: Dict[str, Any] = {}
 
     for code in company_codes:
@@ -612,13 +814,17 @@ def _fetch_taiwan_revenue_finmind(company_codes: List[str], months: int) -> Dict
             resp.raise_for_status()
             payload = resp.json()
         except Exception as exc:
-            results[code] = {"error": f"{type(exc).__name__}: {str(exc)[:150]}"}
+            results[code] = {
+                "error": (f"FinMind request for code {code} failed: "
+                          f"{type(exc).__name__}: {str(exc)[:150]}")
+            }
             continue
 
         if payload.get("status") != 200:
             results[code] = {
                 "error": (f"FinMind status {payload.get('status')}: "
-                          f"{payload.get('msg', 'no message')}")
+                          f"{payload.get('msg', 'no message')}"
+                          f" (code {code}).{token_hint}")
             }
             continue
 
@@ -654,7 +860,32 @@ def _fetch_taiwan_revenue_finmind(company_codes: List[str], months: int) -> Dict
         results[code] = {"company_code": code, "months_returned": len(parsed),
                          "months": parsed, "source": "finmind"}
 
-    return {"companies": results, "codes_requested": company_codes}
+    failed = [c for c in company_codes if "error" in results.get(c, {})]
+
+    if failed and len(failed) == len(company_codes):
+        # Every code failed. The per-code errors were there all along, nested
+        # inside a payload the envelope still called a success.
+        return {
+            "success": False,
+            "coverage": "not_covered",
+            "reason": "no_data",
+            "error": ("FinMind returned no monthly revenue for any requested "
+                      f"code ({', '.join(company_codes)}): "
+                      + "; ".join(results[c]["error"] for c in failed)),
+            "companies": results,
+            "codes_requested": company_codes,
+            "codes_failed": failed,
+            "degraded": degraded,
+        }
+
+    return {
+        "success": True,
+        "coverage": "partial" if failed else "full",
+        "companies": results,
+        "codes_requested": company_codes,
+        "codes_failed": failed,
+        "degraded": degraded,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -763,8 +994,20 @@ def _gov_windows(today, months: int):
 
 def _fetch_government_contracts(ticker: str, company_name: str,
                                   months: int, include_grants: bool) -> Dict[str, Any]:
+    base = {"ticker": ticker, "company_name": company_name or None,
+            "period_months": months, "trailing_awards_usd": None,
+            "prior_period_awards_usd": None, "yoy_change_pct": None,
+            "signal": None, "top_agencies": [], "source": "usaspending.gov"}
+
+    # An explicit company_name is the caller asserting the entity; only derive
+    # it when they did not, and refuse to search for a symbol that does not
+    # resolve (USASpending answers "$0 of federal business" for any string).
     if not company_name:
-        company_name = _ticker_to_company_name(ticker)
+        try:
+            company_name = _resolve_ticker(ticker)["name"]
+        except LookupFailure as exc:
+            return _lookup_failed(exc, **base)
+        base["company_name"] = company_name
 
     trailing_start, end, prior_start, prior_end = _gov_windows(datetime.now(), months)
 
@@ -794,8 +1037,14 @@ def _fetch_government_contracts(ticker: str, company_name: str,
 
     # Trailing obligations drive the core YoY signal; without it we cannot proceed.
     if "trailing" not in results:
-        return {"error": f"USASpending.gov request failed: {'; '.join(errors) or 'no data'}",
-                "ticker": ticker}
+        return {
+            **base, "company_name": company_name,
+            "success": False, "coverage": "not_covered",
+            "reason": "provider_unavailable",
+            "error": (f"USASpending.gov returned no trailing obligations for "
+                      f"{company_name!r}: {'; '.join(errors) or 'no data'}"),
+            "partial_errors": errors,
+        }
 
     trailing_total = results.get("trailing", 0) or 0
     # MISSING is not ZERO: a failed prior fetch must not read as "no prior
@@ -817,7 +1066,11 @@ def _fetch_government_contracts(ticker: str, company_name: str,
 
     signal = _gov_contracts_signal(trailing_total, prior_total, yoy_pct)
 
+    # prior/agencies/count are supporting detail: missing any of them narrows
+    # the answer without invalidating the trailing total.
     return {
+        "success": True,
+        "coverage": "partial" if errors else "full",
         "company_name": company_name,
         "ticker": ticker,
         "period_months": months,
@@ -911,9 +1164,15 @@ def _score_bill_title(title: str, status: str) -> float:
 
 
 def _govtrack_fetch_bills(keywords: List[str], congress: int,
-                           limit: int = 8) -> List[Dict]:
+                           limit: int = 8) -> Tuple[List[Dict], List[str]]:
+    """(bills, errors). A keyword whose query failed is named in `errors`.
+
+    Swallowing the exception made "GovTrack is down" and "no bill mentions
+    semiconductors" the same answer.
+    """
     import requests
     bills = []
+    errors: List[str] = []
     seen_ids: set = set()
 
     for kw in keywords[:3]:
@@ -946,15 +1205,20 @@ def _govtrack_fetch_bills(keywords: List[str], congress: int,
                         "congress": congress,
                         "source": "govtrack",
                     })
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - recorded, not hidden
+            errors.append(f"govtrack {kw!r} (congress {congress}): "
+                          f"{type(exc).__name__}: {str(exc)[:120]}")
             continue
-    return bills
+    return bills, errors
 
 
 def _congress_api_fetch_bills(keywords: List[str], congress: int,
-                               api_key: str, limit: int = 10) -> List[Dict]:
+                               api_key: str,
+                               limit: int = 10) -> Tuple[List[Dict], List[str]]:
+    """(bills, errors) — same contract as _govtrack_fetch_bills."""
     import requests
     bills = []
+    errors: List[str] = []
     seen_titles: set = set()
 
     for kw in keywords[:3]:
@@ -993,15 +1257,54 @@ def _congress_api_fetch_bills(keywords: List[str], congress: int,
                     "congress": congress,
                     "source": "congress.gov",
                 })
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - recorded, not hidden
+            errors.append(f"congress.gov {kw!r} (congress {congress}): "
+                          f"{type(exc).__name__}: {str(exc)[:120]}")
             continue
-    return bills
+    return bills, errors
 
 
 def _fetch_policy_signals(ticker: str, sector: str,
                            lookback_days: int) -> Dict[str, Any]:
+    """Legislative climate for a sector.
+
+    Every failure mode here used to look like "no relevant bills found": an
+    unknown ticker, a sector with no keyword mapping (which silently answered
+    with the technology/semiconductor/defense default), and GovTrack being
+    unreachable. Each is now named.
+    """
+    base = {"ticker": ticker, "sector": sector or None,
+            "lookback_days": lookback_days, "bill_count": None,
+            "bills": [], "signal": None}
+
     if not sector:
-        sector = _ticker_to_sector(ticker)
+        try:
+            sector = _resolve_ticker(ticker)["sector"]
+        except LookupFailure as exc:
+            return _lookup_failed(exc, **base)
+        if not sector:
+            return {
+                **base, "success": False, "coverage": "not_covered",
+                "reason": "sector_unresolved",
+                "error": (f"no sector for '{ticker}' in the quote response "
+                          f"(ETFs and indices carry none). Pass an explicit "
+                          f"`sector` to search legislation."),
+                "sectors_supported": sorted(SECTOR_BILL_KEYWORDS),
+            }
+        base["sector"] = sector
+
+    keywords = SECTOR_BILL_KEYWORDS.get(sector)
+    if not keywords:
+        # The old default keyword set answered about semiconductors and
+        # defense for any sector it did not recognise.
+        return {
+            **base, "success": False, "coverage": "not_covered",
+            "reason": "sector_not_covered",
+            "error": (f"no bill keywords are mapped for sector "
+                      f"{sector!r}; refusing to answer from another sector's "
+                      f"keywords."),
+            "sectors_supported": sorted(SECTOR_BILL_KEYWORDS),
+        }
 
     # Determine current and prior congress
     year = datetime.now().year
@@ -1009,17 +1312,40 @@ def _fetch_policy_signals(ticker: str, sector: str,
     current_congress = (start_year - 1789) // 2 + 1
     prior_congress = current_congress - 1
 
-    keywords = SECTOR_BILL_KEYWORDS.get(sector, ["technology", "semiconductor", "defense"])
-
     api_key = os.environ.get("CONGRESS_API_KEY", "")
+    source = "congress.gov" if api_key else "govtrack.us"
+    degraded: List[str] = []
+    if not api_key:
+        degraded.append(
+            "CONGRESS_API_KEY unset — Congress.gov was not queried; this "
+            "answer is from GovTrack alone.")
+
+    fetch_errors: List[str] = []
     if api_key:
-        bills = _congress_api_fetch_bills(keywords, current_congress, api_key)
+        bills, errs = _congress_api_fetch_bills(keywords, current_congress, api_key)
+        fetch_errors += errs
         if not bills:
-            bills = _congress_api_fetch_bills(keywords, prior_congress, api_key)
+            bills, errs = _congress_api_fetch_bills(keywords, prior_congress, api_key)
+            fetch_errors += errs
     else:
-        bills = _govtrack_fetch_bills(keywords, current_congress)
+        bills, errs = _govtrack_fetch_bills(keywords, current_congress)
+        fetch_errors += errs
         if len(bills) < 3:
-            bills += _govtrack_fetch_bills(keywords, prior_congress)
+            more, errs = _govtrack_fetch_bills(keywords, prior_congress)
+            bills += more
+            fetch_errors += errs
+
+    if not bills and fetch_errors:
+        # Every query the provider was asked errored. An empty bill list here
+        # means the provider is unreachable, not that Congress is idle.
+        return {
+            **base, "sector": sector, "success": False,
+            "coverage": "not_covered", "reason": "provider_unavailable",
+            "error": (f"{source} returned no usable response for any of "
+                      f"{keywords[:3]}: " + "; ".join(fetch_errors)),
+            "keywords_searched": keywords, "source": source,
+            "degraded": degraded,
+        }
 
     # Apply lookback_days: keep bills with recent legislative activity. Bills with
     # an unparseable/missing date are kept (don't over-filter on bad metadata).
@@ -1029,15 +1355,24 @@ def _fetch_policy_signals(ticker: str, sector: str,
         return d is None or d >= cutoff
     bills = [b for b in bills if _recent(b)]
 
+    coverage = "partial" if (degraded or fetch_errors) else "full"
+
     if not bills:
+        # The provider answered; nothing it returned matched. A genuine empty.
         return {
+            "success": True,
+            "coverage": coverage,
             "ticker": ticker, "sector": sector,
             "keywords_searched": keywords,
             "bill_count": 0,
             "bills": [],
             "signal": "neutral",
-            "signal_basis": "no relevant bills found",
-            "note": "Set CONGRESS_API_KEY env var for more comprehensive legislative data.",
+            "signal_basis": (f"{source} returned no bill matching "
+                             f"{keywords[:3]} with activity in the last "
+                             f"{lookback_days} days"),
+            "source": source,
+            "degraded": degraded,
+            "partial_errors": fetch_errors,
         }
 
     # Score each bill
@@ -1060,6 +1395,8 @@ def _fetch_policy_signals(ticker: str, sector: str,
     bills_out = sorted(bills, key=lambda b: -abs(b["score"]))[:10]
 
     return {
+        "success": True,
+        "coverage": coverage,
         "ticker": ticker, "sector": sector,
         "keywords_searched": keywords,
         "bill_count": len(bills),
@@ -1067,9 +1404,9 @@ def _fetch_policy_signals(ticker: str, sector: str,
         "signal": signal,
         "signal_basis": basis,
         "bills": bills_out,
-        "source": "congress.gov" if api_key else "govtrack.us",
-        "note": (None if api_key
-                 else "Set CONGRESS_API_KEY env var for Congress.gov access."),
+        "source": source,
+        "degraded": degraded,
+        "partial_errors": fetch_errors,
     }
 
 
@@ -1082,11 +1419,22 @@ def _fetch_capex_announcements(ticker: str, company_name: str,
     try:
         from ddgs import DDGS
     except ImportError:
-        return {"error": "ddgs not installed — pip install ddgs",
+        return {"success": False, "coverage": "not_covered",
+                "reason": "provider_unavailable",
+                "error": "ddgs not installed — pip install ddgs",
                 "ticker": ticker}
 
+    # An explicit company_name is the caller asserting the entity; only derive
+    # it when they did not, and fail loudly when the symbol does not resolve.
     if not company_name:
-        company_name = _ticker_to_company_name(ticker)
+        try:
+            company_name = _resolve_ticker(ticker)["name"]
+        except LookupFailure as exc:
+            return _lookup_failed(exc, ticker=ticker, company_name=None,
+                                  lookback_days=lookback_days,
+                                  announcement_count=None,
+                                  total_announced_usd=None,
+                                  signal="data_gap", announcements=[])
 
     # Sector-agnostic queries: the first two capture capex events in ANY sector
     # (retail distribution, energy refinery, pharma manufacturing, REIT
@@ -1101,6 +1449,9 @@ def _fetch_capex_announcements(ticker: str, company_name: str,
     name_tokens = _company_name_tokens(company_name)
     all_articles: List[Dict] = []
     seen_titles: set = set()
+    # A query that errored is not a query that found nothing; the two were
+    # indistinguishable while every failure was swallowed by `continue`.
+    query_errors: List[str] = []
 
     try:
         with DDGS() as ddgs:
@@ -1118,17 +1469,48 @@ def _fetch_capex_announcements(ticker: str, company_name: str,
                         if pub_date is None or pub_date >= cutoff:
                             seen_titles.add(title)
                             all_articles.append(r)
-                except Exception:
+                except Exception as exc:  # noqa: BLE001 - recorded, not hidden
+                    query_errors.append(
+                        f"{query!r}: {type(exc).__name__}: {str(exc)[:120]}")
                     continue
     except Exception as exc:
-        return {"error": f"DuckDuckGo search failed: {type(exc).__name__}: {str(exc)[:200]}",
-                "ticker": ticker}
+        return {
+            "success": False, "coverage": "not_covered",
+            "reason": "provider_unavailable",
+            "error": (f"DuckDuckGo news search failed: {type(exc).__name__}: "
+                      f"{str(exc)[:200]}"),
+            "ticker": ticker, "company_name": company_name,
+            "queries_tried": queries, "announcement_count": None,
+            "signal": "data_gap", "announcements": [],
+        }
+
+    if query_errors and len(query_errors) == len(queries):
+        return {
+            "success": False, "coverage": "not_covered",
+            "reason": "provider_unavailable",
+            "error": ("every DuckDuckGo news query failed: "
+                      + "; ".join(query_errors)),
+            "ticker": ticker, "company_name": company_name,
+            "queries_tried": queries, "announcement_count": None,
+            "signal": "data_gap", "announcements": [],
+        }
 
     if not all_articles:
+        # A news corpus cannot assert absence: no matching article is not
+        # evidence that no capex was announced, so this is an uncovered
+        # lookup rather than a count of zero.
         return {
+            "success": False, "coverage": "not_covered",
+            "reason": "no_results",
+            "error": (f"no news article naming {company_name} matched any of "
+                      f"{len(queries)} capex queries in the last "
+                      f"{lookback_days} days. Absence of news is not evidence "
+                      f"that no capital investment was announced."),
             "ticker": ticker, "company_name": company_name,
             "lookback_days": lookback_days, "announcement_count": 0,
             "total_announced_usd": 0, "signal": "data_gap",
+            "queries_tried": queries,
+            "partial_errors": query_errors,
             "announcements": [],
         }
 
@@ -1154,11 +1536,15 @@ def _fetch_capex_announcements(ticker: str, company_name: str,
     signal = _capex_signal(announcements)
 
     return {
+        "success": True,
+        "coverage": "full" if not query_errors else "partial",
         "ticker": ticker, "company_name": company_name,
         "lookback_days": lookback_days,
         "announcement_count": len(announcements),
         "total_announced_usd": total_usd,
         "signal": signal,
+        "queries_tried": queries,
+        "partial_errors": query_errors,
         "announcements": announcements[:8],
     }
 
@@ -1184,7 +1570,11 @@ class AltDataServer:
                         "Monthly revenue for Taiwan-listed companies via FinMind "
                         "(TWSE feed). Key codes: TSMC=2330, Foxconn=2317, "
                         "MediaTek=2454, ASE Group=3711. "
-                        "Returns NTD millions per month + YoY%."
+                        "Returns NTD millions per month + YoY%. Every requested code "
+                        "failing returns success=false, coverage='not_covered'; some "
+                        "failing returns coverage='partial' with codes_failed listed. "
+                        "An unset FINMIND_TOKEN is named in 'degraded' (anonymous tier, "
+                        "shared per-IP daily quota)."
                     ),
                     inputSchema={
                         "type": "object",
@@ -1211,8 +1601,13 @@ class AltDataServer:
                         "For Workday companies (Oracle, Salesforce, ServiceNow, etc.), "
                         "tenant and URL are discovered automatically. "
                         "Fallback: ATS fingerprinting via the company's careers page. "
-                        "Large companies with proprietary portals (Microsoft, Apple, Google) "
-                        "return a structured error with the detected ATS type."
+                        "A reachable board with no open roles returns success with "
+                        "total_postings 0. When no provider answers (proprietary portal, "
+                        "or the company does not exist) the tool returns success=false, "
+                        "coverage='not_covered' and names every provider tried — that is "
+                        "a failed lookup, never a count of zero. 'department_coverage' "
+                        "is reported separately: 'not_covered' means the board exposes "
+                        "no department breakdown, not that the roles are uncategorised."
                     ),
                     inputSchema={
                         "type": "object",
@@ -1245,6 +1640,11 @@ class AltDataServer:
                         "top awarding agencies, and award count. "
                         "Signal: YoY > +15% = bullish; YoY < -15% = bearish; "
                         "< $10M total = not_applicable (consumer/B2C company). "
+                        "A ticker the quote provider cannot resolve returns success=false "
+                        "(USASpending answers '$0 of federal business' for any string, so "
+                        "an unknown company would otherwise read as a real zero). If the "
+                        "prior-period, agency or count query fails the trailing total is "
+                        "still returned with coverage='partial' and the failures named. "
                         "Most relevant for: defense (LMT, RTX, NOC), cloud (AMZN, MSFT), "
                         "IT services, biotech (with include_grants=true)."
                     ),
@@ -1279,7 +1679,12 @@ class AltDataServer:
                         "Finds recent bills matching sector-specific keywords, scores "
                         "them by title sentiment and status probability, returns "
                         "bullish / bearish / neutral legislative signal. "
-                        "Sector is auto-detected from yfinance if not provided. "
+                        "Sector is auto-detected from yfinance if not provided; an "
+                        "unresolvable ticker, a ticker with no sector, or a sector with "
+                        "no keyword mapping returns success=false rather than answering "
+                        "from another sector's keywords. Without CONGRESS_API_KEY the "
+                        "answer is GovTrack-only: coverage='partial' and the missing key "
+                        "is named in 'degraded'. "
                         "Most relevant for: semiconductors (CHIPS Act), defense (NDAA), "
                         "pharma (drug pricing), energy (IRA credits), fintech (crypto regs)."
                     ),
@@ -1311,6 +1716,10 @@ class AltDataServer:
                         "bullish / bearish / neutral / data_gap signal. "
                         "bullish: new investment announced; bearish: cancellation/delay/cut. "
                         "Any announcement >= $1B → strong bullish signal. "
+                        "Returns success=false with reason='unknown_ticker' for a symbol "
+                        "the quote provider cannot resolve, and reason='no_results' when "
+                        "no article matched — a news corpus cannot assert that no capex "
+                        "was announced, so that is never reported as a zero. "
                         "Uses DuckDuckGo news (ddgs). Best for: semiconductors, industrials, "
                         "energy, cloud hyperscalers."
                     ),
@@ -1367,7 +1776,7 @@ class AltDataServer:
         except Exception as exc:
             return _err("get_taiwan_monthly_revenue",
                         f"{type(exc).__name__}: {str(exc)[:200]}")
-        return _ok("get_taiwan_monthly_revenue", result)
+        return _dispatch("get_taiwan_monthly_revenue", result)
 
     async def job_postings_count(self, args: Dict[str, Any]) -> List[TextContent]:
         slug = str(args.get("company_slug", "")).strip().lower()
@@ -1385,7 +1794,7 @@ class AltDataServer:
         except Exception as exc:
             return _err("get_job_postings_count",
                         f"{type(exc).__name__}: {str(exc)[:200]}")
-        return _ok("get_job_postings_count", result, slug.upper())
+        return _dispatch("get_job_postings_count", result, slug.upper())
 
     # -----------------------------------------------------------------------
     # New tool handlers
@@ -1411,12 +1820,12 @@ class AltDataServer:
         except Exception as exc:
             return _err("get_government_contracts",
                         f"{type(exc).__name__}: {str(exc)[:200]}", ticker)
-        if "error" in result:
-            return _err("get_government_contracts", result["error"], ticker)
-        return _ok("get_government_contracts", result, ticker)
+        return _dispatch("get_government_contracts", result, ticker)
 
     async def policy_signals(self, args: Dict[str, Any]) -> List[TextContent]:
         ticker = str(args.get("ticker", "")).upper()
+        if not ticker:
+            return _err("get_policy_signals", "ticker is required")
         sector = str(args.get("sector", ""))
         lookback_days = int(args.get("lookback_days", 180))
         try:
@@ -1431,7 +1840,7 @@ class AltDataServer:
         except Exception as exc:
             return _err("get_policy_signals",
                         f"{type(exc).__name__}: {str(exc)[:200]}", ticker)
-        return _ok("get_policy_signals", result, ticker)
+        return _dispatch("get_policy_signals", result, ticker)
 
     async def capex_announcements(self, args: Dict[str, Any]) -> List[TextContent]:
         ticker = str(args.get("ticker", "")).upper()
@@ -1451,9 +1860,7 @@ class AltDataServer:
         except Exception as exc:
             return _err("get_capex_announcements",
                         f"{type(exc).__name__}: {str(exc)[:200]}", ticker)
-        if "error" in result:
-            return _err("get_capex_announcements", result["error"], ticker)
-        return _ok("get_capex_announcements", result, ticker)
+        return _dispatch("get_capex_announcements", result, ticker)
 
     async def run_server(self):
         async with stdio_server() as (read, write):
@@ -1466,9 +1873,17 @@ class AltDataServer:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2 or sys.argv[1] != "server":
-        print("Usage: python -m tools.altdata_server.server server", file=sys.stderr)
+    if len(sys.argv) < 2 or sys.argv[1] not in ("server", "http"):
+        print("Usage: python -m tools.altdata_server.server [server|http]", file=sys.stderr)
         sys.exit(1)
-    print("[altdata] starting", file=sys.stderr, flush=True)
-    srv = AltDataServer()
-    asyncio.run(srv.run_server())
+
+    if sys.argv[1] == "http":
+        # Streamable HTTP, for a host a client connects to rather than one
+        # that spawns it. stdio stays the default for local use.
+        from tools.mcp_http import run_http
+        print("[altdata] starting over streamable HTTP", file=sys.stderr, flush=True)
+        run_http(AltDataServer().server)
+    else:
+        print("[altdata] starting", file=sys.stderr, flush=True)
+        srv = AltDataServer()
+        asyncio.run(srv.run_server())

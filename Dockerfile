@@ -39,7 +39,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # sentry, excel and slack as well -- excluded from running but present on disk,
 # which on a LAN-reachable host is the difference between "no trading tools"
 # and "trading tools nobody happens to start".
-COPY tools/__init__.py ./tools/
+COPY tools/__init__.py tools/mcp_http.py ./tools/
 COPY tools/news_agregator/ ./tools/news_agregator/
 COPY tools/web_search_server/ ./tools/web_search_server/
 COPY tools/financial_modeling_engine/ ./tools/financial_modeling_engine/
@@ -66,11 +66,11 @@ ENV NEMO_CACHE_DB_PATH=/app/db_cache/tool_cache.db \
 # reaches the host.
 RUN python -c "\
 import importlib;\
-mods=['tools.news_agregator.fred_server','tools.news_agregator.finnhub_server',\
+mods=['tools.mcp_http','tools.news_agregator.fred_server','tools.news_agregator.finnhub_server',\
 'tools.web_search_server.web_search','tools.financial_modeling_engine.analysis_tools',\
 'tools.altdata_server.server'];\
 [importlib.import_module(m) for m in mods];\
-print('all 5 data-source servers import')"
+print('all 5 data-source servers and the HTTP transport import')"
 
 # Default to the simplest server; compose overrides this per service.
 CMD ["python", "-m", "tools.news_agregator.fred_server", "server"]

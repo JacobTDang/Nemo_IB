@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional
 
 from edgar import Company
 
+from .foreign_issuer import form_mismatch_note, not_covered_reason
 from .sec_series import NotCovered, _require_identity, fetch_concept_series
 
 SHARES_CONCEPT = "dei:EntityCommonStockSharesOutstanding"
@@ -59,11 +60,20 @@ def _class_label(member: Optional[str]) -> str:
     return " ".join(words)
 
 
-def _failure(ticker: str, message: str) -> Dict[str, Any]:
+def _failure(ticker: str, message: str,
+             form: Optional[str] = None) -> Dict[str, Any]:
+    """Every miss in this module funnels here, so the form guard sits here too.
+
+    A foreign private issuer reports on 6-K, which carries no XBRL, so a share
+    count walked over 10-Q filings finds nothing. "Not covered" would read as
+    a filer that does not disclose its share count.
+    """
+    mismatch = form_mismatch_note(ticker, form) if form else None
     return {
         "ticker": ticker,
         "success": False,
-        "error": message,
+        "wrong_form": bool(mismatch),
+        "error": not_covered_reason(ticker, form, message) if form else message,
         "latest_total": None,
         "by_class": {},
         "classes_found": [],
@@ -85,9 +95,9 @@ def get_share_count_series(ticker: str, limit: int = 8,
     try:
         points = fetch_concept_series(ticker, SHARES_CONCEPT, form=form, limit=limit)
     except NotCovered as exc:
-        return _failure(ticker, f"share count not covered: {exc}")
+        return _failure(ticker, f"share count not covered: {exc}", form)
     except Exception as exc:  # noqa: BLE001 - reported, not swallowed
-        return _failure(ticker, f"{type(exc).__name__}: {exc}")
+        return _failure(ticker, f"{type(exc).__name__}: {exc}", form)
 
     by_class: Dict[str, List[Dict[str, Any]]] = {}
     total_series: List[Dict[str, Any]] = []

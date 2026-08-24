@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from .foreign_issuer import form_mismatch_note, not_covered_reason
 from .sec_series import NotCovered, fetch_concept_series
 
 # Filers tag SBC under several concepts. Ordered by how commonly each one
@@ -75,12 +76,16 @@ def get_sbc_series(ticker: str, limit: int = 5,
         ticker, SBC_CONCEPTS, form, limit)
 
     if not sbc_values:
+        mismatch = form_mismatch_note(ticker, form)
         return {
             "ticker": ticker,
             "success": False,
-            "error": (f"stock-based compensation not covered: none of "
-                      f"{list(SBC_CONCEPTS)} found in the last {limit} "
-                      f"{form} filings"),
+            "wrong_form": bool(mismatch),
+            "error": not_covered_reason(
+                ticker, form,
+                f"stock-based compensation not covered: none of "
+                f"{list(SBC_CONCEPTS)} found in the last {limit} {form} "
+                f"filings."),
             "series": [],
             "concept_used": None,
         }

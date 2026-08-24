@@ -8,6 +8,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agent.Thesis_Maintainer import Thesis_Maintainer, ThesisVerdict
 
+from testing._gates import requires_groq
+
+pytestmark = requires_groq
+
 
 # (label, thesis, event, expected_status)
 SCENARIOS = [

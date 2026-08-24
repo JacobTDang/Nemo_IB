@@ -16,7 +16,17 @@ import pytest
 from tools.web_search_server import peers
 
 SKIP_NETWORK = os.environ.get("SKIP_NETWORK_TESTS") == "1"
-network = pytest.mark.skipif(SKIP_NETWORK, reason="live SEC test")
+
+
+def network(func):
+  """Apply the real `network` marker plus the offline skip.
+
+  This name used to be bound to a bare pytest.mark.skipif. A skipif is not
+  a registered marker, so `-m network` and `-m "not network"` collected
+  nothing here -- the tests were selectable only by file path.
+  """
+  func = pytest.mark.network(func)
+  return pytest.mark.skipif(SKIP_NETWORK, reason="live SEC test")(func)
 
 
 def test_ciks_are_parsed_from_the_atom_feed():

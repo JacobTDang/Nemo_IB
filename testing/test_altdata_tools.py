@@ -27,7 +27,19 @@ if not os.path.isfile(_VENV_PY):
 
 
 SKIP_NETWORK = os.getenv("SKIP_NETWORK_TESTS", "0") == "1"
-network = pytest.mark.skipif(SKIP_NETWORK, reason="network tests skipped")
+
+
+def network(func):
+    """Apply the real `network` marker plus the offline skip.
+
+    This name used to be bound to a bare pytest.mark.skipif. A skipif is not a
+    registered marker, so `-m network` and `-m "not network"` collected nothing
+    here -- the tests were selectable only by file path. Registering the marker
+    as well makes the selection work; the skipif keeps the offline behaviour
+    identical.
+    """
+    func = pytest.mark.network(func)
+    return pytest.mark.skipif(SKIP_NETWORK, reason="network tests skipped")(func)
 
 
 def _run(runner, tool_name, kwargs, timeout=60):

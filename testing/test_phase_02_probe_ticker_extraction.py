@@ -10,6 +10,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agent.Probing_Agent import Probing_Agent, ProbingResult
 
+from testing._gates import requires_openrouter
+
+pytestmark = requires_openrouter
+
 
 def _probe(query: str, max_attempts: int = 3) -> dict:
   """Call the probe with retry-to-success on parse failures. The Nemotron

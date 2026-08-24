@@ -341,6 +341,10 @@ def _format_counts(counts: Dict[str, int]) -> str:
 
 async def _main_loop(args) -> None:
   init_schema()
+  # Eager check at boot. tick() builds the classifier itself, and the client is
+  # built lazily now, so without this a missing GROQ_API_KEY would first surface
+  # inside a tick rather than at startup.
+  Materiality_Classifier().validate_credentials()
   _install_signal_handlers()
   print(f"[gdelt_poller] starting | interval={args.interval}s | "
         f"hourly_cap={HOURLY_INSERT_CAP}",

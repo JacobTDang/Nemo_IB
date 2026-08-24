@@ -442,6 +442,22 @@ def get_industry_etfs(theme: str, top_holdings_per_etf: int = 10) -> Dict[str, A
   return out
 
 
+def fetch_daily_bars(ticker: str, period: str = '2y') -> "pd.DataFrame":
+  """The one daily-OHLCV fetch every price-derived tool goes through.
+
+  Split out so that price-history summaries and the trading/timing metrics
+  read the same bars. Two independent yf.Ticker().history() calls with
+  different periods or adjustment settings can disagree about the same
+  session, and nothing downstream would show which one was wrong.
+
+  auto_adjust=True back-adjusts OHLC for splits and dividends. Same-day
+  ratios built from these bars (true range against close, close times
+  volume) stay internally consistent because both legs carry the same
+  adjustment factor.
+  """
+  return yf.Ticker(ticker).history(period=period, auto_adjust=True)
+
+
 def get_price_history(ticker: str, period: str = '2y',
                       include_recent_bars: int = 20) -> Dict[str, Any]:
   """Historical OHLCV summary from yfinance.
@@ -455,8 +471,7 @@ def get_price_history(ticker: str, period: str = '2y',
   from datetime import datetime, timedelta
 
   try:
-    t = yf.Ticker(ticker)
-    df = t.history(period=period, auto_adjust=True)
+    df = fetch_daily_bars(ticker, period)
   except Exception as e:
     return {'ticker': ticker, 'success': False,
             'error': f'yfinance history fetch failed: {type(e).__name__}: {e}'}

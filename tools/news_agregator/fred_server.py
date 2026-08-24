@@ -541,10 +541,17 @@ class FredServer:
 
 if __name__ == "__main__":
   if len(sys.argv) < 2:
-    print("Usage: python -m tools.news_agregator.fred_server server", file=sys.stderr)
+    print("Usage: python -m tools.news_agregator.fred_server [server|http]", file=sys.stderr)
     sys.exit(1)
 
-  if sys.argv[1] == "server":
+  if sys.argv[1] == "http":
+    # Streamable HTTP, for running on a host a client connects to rather than
+    # one that spawns it. stdio stays the default for local use.
+    from tools.mcp_http import run_http
+    print("Starting fred over streamable HTTP", file=sys.stderr, flush=True)
+    run_http(FredServer().server)
+
+  elif sys.argv[1] == "server":
     print("Starting fred process", file=sys.stderr, flush=True)
     try:
       server = FredServer()

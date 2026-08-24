@@ -53,6 +53,18 @@ def test_web_search_research_handlers_serialise(monkeypatch):
         "get_sic_code": (
             "get_sic_code", lambda *a, **k: {"ticker": "X", "success": True},
             lambda: server.get_sic_code("X")),
+        "get_accruals_quality": (
+            "get_accruals_quality", lambda *a, **k: {"ticker": "X", "success": True},
+            lambda: server.get_accruals_quality("X", 2, "10-K")),
+        "get_working_capital_trends": (
+            "get_working_capital_trends", lambda *a, **k: {"ticker": "X", "success": True},
+            lambda: server.get_working_capital_trends("X", 2, "10-K")),
+        "extract_guidance": (
+            "extract_guidance", lambda *a, **k: {"ticker": "X", "success": True},
+            lambda: server.extract_guidance("X", 4)),
+        "get_operating_leases": (
+            "get_operating_leases", lambda *a, **k: {"ticker": "X", "success": True},
+            lambda: server.get_operating_leases("X", "10-K")),
     }
     for label, (attr, stub, call) in cases.items():
         monkeypatch.setattr(ws, attr, stub)
@@ -70,6 +82,23 @@ def test_modeling_corporate_actions_handler_serialises(monkeypatch):
                                          "splits": [], "dividends": []})
     server = at.Financial_Analysis()
     data = _payload(_run(server.get_corporate_actions("NVDA", 6)))
+    assert data["success"] is True
+
+
+def test_modeling_trading_metrics_handler_serialises(monkeypatch):
+    """RVOL/ADV/ATR go out over MCP as JSON.
+
+    numpy floats and pandas Timestamps do not serialise on their own, and the
+    handler is where that breaks -- never in the unit tests, which look at the
+    dict.
+    """
+    import tools.financial_modeling_engine.analysis_tools as at
+
+    monkeypatch.setattr(at, "get_trading_metrics",
+                        lambda *a, **k: {"ticker": "NVDA", "success": True,
+                                         "rvol": {}, "adv": {}, "atr": {}})
+    server = at.Financial_Analysis()
+    data = _payload(_run(server.get_trading_metrics("NVDA", "1y", 20, 14)))
     assert data["success"] is True
 
 

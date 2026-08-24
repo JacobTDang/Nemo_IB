@@ -5,7 +5,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from agent.cache import Session_Cache
 from tools.web_search_server.scraper import scrape_url
 
+from testing._gates import requires_searxng
 
+
+@requires_searxng
 async def test_cache_miss_then_hit():
   cache = Session_Cache()
   cache.clear()

@@ -287,6 +287,10 @@ async def main():
         f"sec={POLL_SEC}s, macro={POLL_MACRO}s", file=sys.stderr, flush=True)
 
   classifier = Materiality_Classifier()
+  # Eager check at boot. The client is built lazily now, so without this a
+  # missing GROQ_API_KEY would first surface on the initial classification --
+  # minutes into a long-lived daemon rather than at startup.
+  classifier.validate_credentials()
 
   await asyncio.gather(
     watch_finnhub_company_news(classifier),

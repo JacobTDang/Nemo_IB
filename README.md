@@ -153,6 +153,29 @@ LangGraph architecture details.
 
 ## Tests
 
+### The two suite runs
+
+```bash
+# Offline. No credentials, no containers, no network. Nothing here should fail.
+SKIP_NETWORK_TESTS=1 .venv/bin/python -m pytest testing/ -q
+
+# Strict. Everything gated must actually run and pass -- a gate that cannot
+# fail is not a gate, and "skipped" otherwise decays into "deleted".
+# Needs GROQ_API_KEY, OPENROUTER_API_KEY and SearXNG up (docker compose up -d searxng).
+NEMO_REQUIRE_SERVICES=1 .venv/bin/python -m pytest testing/ -q
+```
+
+Tests that reach a live service carry a gate from `testing/_gates.py`
+(`requires_groq`, `requires_openrouter`, `requires_searxng`, `requires_playbook`,
+`requires_sec`). Offline they skip with a reason naming exactly what is missing.
+Under `NEMO_REQUIRE_SERVICES=1` the same tests fail instead, so a
+fully-credentialled run proves they still work rather than merely still exist.
+Do not set both variables at once: an offline run cannot satisfy a strict one,
+and the gate says so rather than guessing.
+
+Each test module gets its own SQLite database (`testing/conftest.py`). Modules
+used to share `db_cache/session.db` and read each other's rows.
+
 ```bash
 # Phase D smoke tests for the 7 v2 skills (12 invocations, real ticker data)
 .\.venv\Scripts\python.exe testing\skill_smoke_2026_05_22.py

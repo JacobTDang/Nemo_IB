@@ -314,30 +314,50 @@ def mega_cap_tickers():
     return ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "JPM", "JNJ", "V", "WMT"]
 
 
+def fake_xbrl(rows):
+    """An XBRL stand-in in the shape edgartools actually produces.
+
+    Every column the selection path reads has to be here. The frames these
+    tests used to build carried `concept`, `numeric_value`, `period_start`,
+    `period_end` and `unit` -- no `period_key`, no `context_ref`, no
+    `unit_ref`, and no contexts at all -- so a fact could not be dimensioned
+    even in principle and the two defects the audits found were unreachable
+    from this file. Each row is (concept, value, period_start, period_end,
+    context_ref, dimensions).
+    """
+    frame = pd.DataFrame([{
+        'concept': concept,
+        'numeric_value': value,
+        'period_key': f'duration_{start}_{end}' if start else f'instant_{end}',
+        'period_start': start,
+        'period_end': end,
+        'context_ref': context,
+        'unit_ref': 'usd',
+    } for concept, value, start, end, context, _ in rows])
+
+    class _Context:
+        def __init__(self, dimensions):
+            self.dimensions = dict(dimensions)
+
+    query = MagicMock()
+    query.to_dataframe.return_value = frame
+    query.by_concept.return_value = query
+    facts = MagicMock()
+    facts.query.return_value = query
+
+    mock = MagicMock()
+    mock.facts = facts
+    mock.contexts = {row[4]: _Context(row[5]) for row in rows}
+    return mock
+
+
 @pytest.fixture
 def mock_xbrl_data():
     """Create mock XBRL data for unit testing."""
-    mock = MagicMock()
-
-    # Create mock facts
-    mock_facts = MagicMock()
-    mock_query = MagicMock()
-
-    # Sample DataFrame for revenue
-    sample_df = pd.DataFrame({
-        'concept': ['us-gaap:Revenues'],
-        'numeric_value': [100000000000.0],
-        'period_start': ['2023-01-01'],
-        'period_end': ['2023-12-31'],
-        'unit': ['USD']
-    })
-
-    mock_query.to_dataframe.return_value = sample_df
-    mock_query.by_concept.return_value = mock_query
-    mock_facts.query.return_value = mock_query
-    mock.facts = mock_facts
-
-    return mock
+    return fake_xbrl([
+        ('us-gaap:Revenues', 100000000000.0, '2023-01-01', '2023-12-31',
+         'c-1', {}),
+    ])
 
 
 @pytest.fixture
@@ -465,78 +485,53 @@ class TestFilterAnnualData:
 
     def test_filter_annual_data_quarterly_vs_annual(self):
         """Test that quarterly data is properly excluded."""
-        mock_xbrl = MagicMock()
-        mock_facts = MagicMock()
-        mock_query = MagicMock()
-
-        # Create DataFrame with both quarterly and annual data
-        df = pd.DataFrame({
-            'concept': ['us-gaap:Revenues'] * 4,
-            'numeric_value': [25000000000.0, 25000000000.0, 25000000000.0, 100000000000.0],
-            'period_start': ['2023-01-01', '2023-04-01', '2023-07-01', '2023-01-01'],
-            'period_end': ['2023-03-31', '2023-06-30', '2023-09-30', '2023-12-31'],
-            'unit': ['USD'] * 4
-        })
-
-        mock_query.to_dataframe.return_value = df
-        mock_query.by_concept.return_value = mock_query
-        mock_facts.query.return_value = mock_query
-        mock_xbrl.facts = mock_facts
+        mock_xbrl = fake_xbrl([
+            ('us-gaap:Revenues', 25000000000.0, '2023-01-01', '2023-03-31', 'c-2', {}),
+            ('us-gaap:Revenues', 25000000000.0, '2023-04-01', '2023-06-30', 'c-3', {}),
+            ('us-gaap:Revenues', 25000000000.0, '2023-07-01', '2023-09-30', 'c-4', {}),
+            ('us-gaap:Revenues', 100000000000.0, '2023-01-01', '2023-12-31', 'c-1', {}),
+        ])
 
         result = filter_annual_data(mock_xbrl, 'us-gaap:Revenues')
 
-        if result is not None:
-            # Should return the annual value (100B), not quarterly
-            assert result['duration_days'] >= 350 or result['value'] == 100000000000.0
+        assert result is not None
+        # Should return the annual value (100B), not quarterly
+        assert result['duration_days'] >= 350
+        assert result['value'] == 100000000000.0
 
-    def test_filter_annual_data_revenue_max_selection(self):
-        """Test that for revenue, the maximum value is selected."""
-        mock_xbrl = MagicMock()
-        mock_facts = MagicMock()
-        mock_query = MagicMock()
+    def test_filter_annual_data_ignores_the_segment_breakdown(self):
+        """The consolidated total is NOT "the largest fact for the period".
 
-        # Create DataFrame with multiple revenue values for same period
-        df = pd.DataFrame({
-            'concept': ['us-gaap:Revenues'] * 3,
-            'numeric_value': [50000000000.0, 100000000000.0, 75000000000.0],
-            'period_start': ['2023-01-01'] * 3,
-            'period_end': ['2023-12-31'] * 3,
-            'unit': ['USD'] * 3
-        })
-
-        mock_query.to_dataframe.return_value = df
-        mock_query.by_concept.return_value = mock_query
-        mock_facts.query.return_value = mock_query
-        mock_xbrl.facts = mock_facts
+        This test used to assert that it was, which is the assumption two audit
+        sweeps disproved: an operating-segment aggregate is struck before
+        intersegment eliminations and lands above the consolidated line, and a
+        joint-venture disclosure is not the filer's revenue at all. The fact to
+        return is the one carrying no dimensions, whatever its size.
+        """
+        mock_xbrl = fake_xbrl([
+            ('us-gaap:Revenues', 100000000000.0, '2023-01-01', '2023-12-31',
+             'c-9', {'srt:ConsolidationItemsAxis': 'us-gaap:OperatingSegmentsMember'}),
+            ('us-gaap:Revenues', 75000000000.0, '2023-01-01', '2023-12-31', 'c-1', {}),
+            ('us-gaap:Revenues', 50000000000.0, '2023-01-01', '2023-12-31',
+             'c-10', {'srt:StatementGeographicalAxis': 'country:US'}),
+        ])
 
         result = filter_annual_data(mock_xbrl, 'us-gaap:Revenues')
 
-        if result is not None:
-            # Should select the maximum revenue value
-            assert result['value'] == 100000000000.0
+        assert result is not None
+        assert result['value'] == 75000000000.0
 
     def test_filter_annual_data_handles_nan_values(self):
         """Test handling of NaN values in data."""
-        mock_xbrl = MagicMock()
-        mock_facts = MagicMock()
-        mock_query = MagicMock()
-
-        df = pd.DataFrame({
-            'concept': ['us-gaap:Revenues'] * 2,
-            'numeric_value': [np.nan, 100000000000.0],
-            'period_start': ['2023-01-01'] * 2,
-            'period_end': ['2023-12-31'] * 2,
-            'unit': ['USD'] * 2
-        })
-
-        mock_query.to_dataframe.return_value = df
-        mock_query.by_concept.return_value = mock_query
-        mock_facts.query.return_value = mock_query
-        mock_xbrl.facts = mock_facts
+        mock_xbrl = fake_xbrl([
+            ('us-gaap:Revenues', np.nan, '2023-01-01', '2023-12-31', 'c-2', {}),
+            ('us-gaap:Revenues', 100000000000.0, '2023-01-01', '2023-12-31', 'c-1', {}),
+        ])
 
         result = filter_annual_data(mock_xbrl, 'us-gaap:Revenues')
         # Should handle NaN gracefully
-        assert result is None or (result is not None and not np.isnan(result.get('value', np.nan)))
+        assert result is not None
+        assert result['value'] == 100000000000.0
 
 
 # =============================================================================
@@ -628,8 +623,11 @@ class TestGetRevenueBase:
             assert 'revenue_base' in result
             assert 'concept_used' in result
             assert result['revenue_base'] > 0
-            # Revenue should be in reasonable range (in millions)
-            assert 1 <= result['revenue_base'] <= 1000000  # $1M to $1T
+            # Raw units, not millions. get_revenue_base returns the XBRL fact
+            # as tagged -- `float(result['value'])  # raw units, not scaled` --
+            # and every caller in this project reads it that way. The bound was
+            # 1..1e6, which no filer with revenue has ever satisfied.
+            assert 1e6 <= result['revenue_base'] <= 1e13  # $1M to $10T
 
     def test_get_revenue_base_invalid_ticker(self, rate_limiter):
         """Test with invalid ticker."""
@@ -990,7 +988,21 @@ class TestIntegrationWorkflows:
         assert len(set(revenues)) >= 1
 
     def test_sector_comparison_workflow(self, rate_limiter):
-        """Test comparing metrics across sectors."""
+        """Comparing EBITDA margins across sectors, and refusing where it cannot.
+
+        EBITDA needs operating income, and JNJ, PFE, XOM and CVX tag no
+        `us-gaap:OperatingIncomeLoss` in their latest 10-K -- verified against
+        the filings, where the element is absent entirely rather than
+        dimensioned. This test used to require two of the three sectors to
+        produce a margin and got them: the chain's last entry,
+        `IncomeLossFromContinuingOperations`, prefix-matched
+        `IncomeLossFromContinuingOperationsBeforeIncomeTaxes...` and pre-tax
+        income was reported as operating income.
+
+        So the check is what the filings actually support: a ticker either
+        yields a margin or says which component is missing, never a margin
+        computed from the wrong line.
+        """
         sectors = {
             'tech': ["AAPL", "MSFT"],
             'healthcare': ["JNJ", "PFE"],
@@ -998,6 +1010,7 @@ class TestIntegrationWorkflows:
         }
 
         sector_metrics = {}
+        refusals = []
 
         for sector, tickers in sectors.items():
             sector_metrics[sector] = []
@@ -1006,10 +1019,17 @@ class TestIntegrationWorkflows:
                 result = get_ebitda_margin(ticker)
                 if result.get('success'):
                     sector_metrics[sector].append(result['ebitda_margin_percent'])
+                else:
+                    refusals.append((ticker, result.get('error')))
 
-        # Should have data for multiple sectors
-        sectors_with_data = sum(1 for v in sector_metrics.values() if len(v) > 0)
-        assert sectors_with_data >= 2
+        assert len(sector_metrics['tech']) == 2, sector_metrics
+
+        # Every filer that did not produce a margin must name the component it
+        # is missing, so a coverage gap can never be read as a data point.
+        for ticker, error in refusals:
+            assert error, ticker
+            assert ('Missing EBITDA components' in error
+                    or 'No revenue concept found' in error), (ticker, error)
 
 
 # =============================================================================
@@ -1660,28 +1680,16 @@ class TestRegression:
 
     def test_negative_value_handling(self):
         """Test handling of negative values in XBRL data."""
-        mock_xbrl = MagicMock()
-        mock_facts = MagicMock()
-        mock_query = MagicMock()
-
-        df = pd.DataFrame({
-            'concept': ['us-gaap:OperatingIncomeLoss'],
-            'numeric_value': [-1000000000.0],  # Negative operating income
-            'period_start': ['2023-01-01'],
-            'period_end': ['2023-12-31'],
-            'unit': ['USD']
-        })
-
-        mock_query.to_dataframe.return_value = df
-        mock_query.by_concept.return_value = mock_query
-        mock_facts.query.return_value = mock_query
-        mock_xbrl.facts = mock_facts
+        mock_xbrl = fake_xbrl([
+            ('us-gaap:OperatingIncomeLoss', -1000000000.0, '2023-01-01',
+             '2023-12-31', 'c-1', {}),
+        ])
 
         result = filter_annual_data(mock_xbrl, 'us-gaap:OperatingIncomeLoss')
 
-        if result is not None:
-            # Should preserve negative values
-            assert result['value'] == -1000000000.0
+        assert result is not None
+        # Should preserve negative values
+        assert result['value'] == -1000000000.0
 
 
 # =============================================================================
@@ -1759,7 +1767,7 @@ class TestSpecialCompanies:
         logger.info(f"Bank {ticker}: success={result.get('success')}")
         if result.get('success'):
             # Banks should have substantial revenue
-            assert result['revenue_base'] > 10000  # > $10B in millions
+            assert result['revenue_base'] > 10e9  # > $10B, in raw units
 
     @pytest.mark.parametrize("ticker", ["MET", "PRU", "AFL", "PGR"])
     def test_insurance_companies(self, ticker, rate_limiter):
@@ -1790,22 +1798,10 @@ class TestMockBased:
 
     def test_get_revenue_base_mock_success(self):
         """Test get_revenue_base with mocked successful response."""
-        mock_xbrl = MagicMock()
-        mock_facts = MagicMock()
-        mock_query = MagicMock()
-
-        df = pd.DataFrame({
-            'concept': ['us-gaap:Revenues'],
-            'numeric_value': [365000000000.0],  # Apple-like revenue
-            'period_start': ['2023-10-01'],
-            'period_end': ['2024-09-30'],
-            'unit': ['USD']
-        })
-
-        mock_query.to_dataframe.return_value = df
-        mock_query.by_concept.return_value = mock_query
-        mock_facts.query.return_value = mock_query
-        mock_xbrl.facts = mock_facts
+        mock_xbrl = fake_xbrl([
+            ('us-gaap:Revenues', 365000000000.0, '2023-10-01', '2024-09-30',
+             'c-1', {}),
+        ])
 
         with patch('tools.web_search_server.sec_utils.get_latest_filing') as mock_filing:
             mock_filing.return_value = {
@@ -1818,50 +1814,29 @@ class TestMockBased:
             result = get_revenue_base("AAPL")
 
             assert result['success'] == True
-            assert result['revenue_base'] == 365000.0  # In millions
+            assert result['revenue_base'] == 365000000000.0  # raw units
+            assert result['concept_used'] == 'us-gaap:Revenues'
 
     def test_get_ebitda_margin_mock_calculation(self):
-        """Test EBITDA margin calculation with mocked data."""
-        # This tests the calculation logic without API calls
-        mock_xbrl = MagicMock()
-        mock_facts = MagicMock()
-        mock_query = MagicMock()
+        """EBITDA = operating income + D&A, over revenue on the same scale.
 
-        def mock_by_concept(concept):
-            if 'OperatingIncome' in concept:
-                df = pd.DataFrame({
-                    'concept': [concept],
-                    'numeric_value': [100000000000.0],  # $100B
-                    'period_start': ['2023-01-01'],
-                    'period_end': ['2023-12-31'],
-                    'unit': ['USD']
-                })
-            elif 'Depreciation' in concept:
-                df = pd.DataFrame({
-                    'concept': [concept],
-                    'numeric_value': [10000000000.0],  # $10B
-                    'period_start': ['2023-01-01'],
-                    'period_end': ['2023-12-31'],
-                    'unit': ['USD']
-                })
-            elif 'Revenue' in concept:
-                df = pd.DataFrame({
-                    'concept': [concept],
-                    'numeric_value': [400000000000.0],  # $400B
-                    'period_start': ['2023-01-01'],
-                    'period_end': ['2023-12-31'],
-                    'unit': ['USD']
-                })
-            else:
-                df = pd.DataFrame()
-
-            mock_q = MagicMock()
-            mock_q.to_dataframe.return_value = df
-            return mock_q
-
-        mock_query.by_concept = mock_by_concept
-        mock_facts.query.return_value = mock_query
-        mock_xbrl.facts = mock_facts
+        The frames here used to carry no period_key and no contexts, and the
+        patched revenue was in millions while the tagged facts were in raw
+        units, so the margin came out four orders of magnitude wrong and the
+        assertion sat behind `if result.get('success')`. Both sides are raw
+        units now and the assertion runs unconditionally.
+        """
+        mock_xbrl = fake_xbrl([
+            ('us-gaap:OperatingIncomeLoss', 100000000000.0, '2023-01-01',
+             '2023-12-31', 'c-1', {}),
+            # The segment breakdown is larger than the consolidated line, which
+            # is the case "largest fact wins" got wrong on CVX and SPG.
+            ('us-gaap:OperatingIncomeLoss', 140000000000.0, '2023-01-01',
+             '2023-12-31', 'c-9',
+             {'srt:ConsolidationItemsAxis': 'us-gaap:OperatingSegmentsMember'}),
+            ('us-gaap:DepreciationDepletionAndAmortization', 10000000000.0,
+             '2023-01-01', '2023-12-31', 'c-1', {}),
+        ])
 
         with patch('tools.web_search_server.sec_utils.get_latest_filing') as mock_filing:
             mock_filing.return_value = {
@@ -1872,16 +1847,16 @@ class TestMockBased:
             with patch('tools.web_search_server.sec_utils.get_revenue_base') as mock_revenue:
                 mock_revenue.return_value = {
                     'success': True,
-                    'revenue_base': 400000.0  # $400B in millions
+                    'revenue_base': 400000000000.0,  # raw units, as the tool returns
                 }
 
                 result = get_ebitda_margin("TEST")
 
-                if result.get('success'):
-                    # EBITDA = 100B + 10B = 110B
-                    # EBITDA Margin = 110B / 400B * 100 = 27.5%
-                    expected_margin = 27.5
-                    assert abs(result['ebitda_margin_percent'] - expected_margin) < 0.1
+        assert result['success'] is True, result.get('error')
+        assert result['operating_income'] == 100000000000.0
+        assert result['d&a'] == 10000000000.0
+        # EBITDA = 100B + 10B = 110B; 110B / 400B = 27.5%
+        assert abs(result['ebitda_margin_percent'] - 27.5) < 0.1
 
 
 # =============================================================================

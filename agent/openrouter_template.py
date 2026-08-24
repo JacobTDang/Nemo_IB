@@ -1,4 +1,5 @@
 from openai import OpenAI, APIError, AuthenticationError, RateLimitError, APIConnectionError, APITimeoutError, NotFoundError
+from .groq_template import CredentialsMissing
 import httpx
 import os, sys, json, re, time
 from threading import Lock
@@ -162,8 +163,40 @@ def _demote_model(model: str, seconds: float = None) -> None:
 
 # Initialize pool at import; PRIMARY_REASONING_MODEL stays as a convenience alias
 # pointing at the first-preference alive model (used by existing constructor defaults).
-_MODEL_POOL = _build_reasoning_pool()
-PRIMARY_REASONING_MODEL = _MODEL_POOL[0]
+_MODEL_POOL: list = []
+_POOL_BUILT = False
+
+
+def _ensure_pool() -> list:
+  """Build the pool on first use.
+
+  This used to run at import, which meant importing the module for a type or a
+  helper cost five OpenRouter pings and ~0.7s -- and made an offline test run
+  not strictly offline. Resolving a model is what should cost, not importing.
+  """
+  global _MODEL_POOL, _POOL_BUILT
+  with _POOL_LOCK:
+    if not _POOL_BUILT:
+      _MODEL_POOL = _build_reasoning_pool()
+      _POOL_BUILT = True
+  return _MODEL_POOL
+
+
+def primary_reasoning_model() -> str:
+  """First-preference alive model, resolving the pool if needed."""
+  return _ensure_pool()[0]
+
+
+def __getattr__(name: str):
+  """PEP 562 module-level attribute access.
+
+  Keeps `PRIMARY_REASONING_MODEL` working as a module attribute and as a
+  from-import for the several consumers that read it, while deferring the
+  network work until something actually asks.
+  """
+  if name == "PRIMARY_REASONING_MODEL":
+    return primary_reasoning_model()
+  raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class OpenRouterModel:
@@ -188,29 +221,51 @@ class OpenRouterModel:
     load_dotenv()
     # Default to the verified primary reasoning model resolved at import time
     if model_name is None:
-      model_name = PRIMARY_REASONING_MODEL
+      model_name = primary_reasoning_model()
     # Try the requested env var first, then fall back to the main key.
     # This means a single OPENROUTER_API_KEY is always enough to run the system --
     # model-specific keys (OPENROUTER_NEMOTRON, OPENROUTER_GLM) are optional extras.
-    api_key = os.getenv(api_key_env) or os.getenv("OPENROUTER_API_KEY")
-    if not api_key:
-      raise ValueError(f"No API key found. Set OPENROUTER_API_KEY (or {api_key_env}) in your .env file.")
-    self.client = OpenAI(
-      api_key=api_key,
-      base_url="https://openrouter.ai/api/v1",
-      timeout=self.CLIENT_TIMEOUT
-    )
+    self._api_key_env = api_key_env
+    self._client = None
+    self._fallback_client = None
     self.model_name = model_name
     self.conversatoin_history = []
 
-    # Fallback client: prefer OPENROUTER_GLM, otherwise reuse the main key.
-    # Reusing the main key is fine -- fallback only triggers if primary model fails.
-    fallback_key = os.getenv("OPENROUTER_GLM") or api_key
-    self.fallback_client = OpenAI(
-      api_key=fallback_key,
-      base_url="https://openrouter.ai/api/v1",
-      timeout=self.CLIENT_TIMEOUT
-    )
+  def _resolve_api_key(self) -> str:
+    api_key = os.getenv(self._api_key_env) or os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+      raise CredentialsMissing(
+        f"No API key found. Set OPENROUTER_API_KEY (or {self._api_key_env}) in your .env file.")
+    return api_key
+
+  def validate_credentials(self) -> None:
+    """Fail fast at process start. See GroqModel.validate_credentials."""
+    self._resolve_api_key()
+
+  @property
+  def client(self) -> OpenAI:
+    if self._client is None:
+      self._client = OpenAI(
+        api_key=self._resolve_api_key(),
+        base_url="https://openrouter.ai/api/v1",
+        timeout=self.CLIENT_TIMEOUT
+      )
+    return self._client
+
+  @property
+  def fallback_client(self) -> OpenAI:
+    # Prefer OPENROUTER_GLM, otherwise reuse the main key. Reusing it is fine --
+    # the fallback only triggers when the primary model fails. _resolve_api_key
+    # is still called when OPENROUTER_GLM is absent so the fallback path cannot
+    # become a way to skip the credential check.
+    if self._fallback_client is None:
+      fallback_key = os.getenv("OPENROUTER_GLM") or self._resolve_api_key()
+      self._fallback_client = OpenAI(
+        api_key=fallback_key,
+        base_url="https://openrouter.ai/api/v1",
+        timeout=self.CLIENT_TIMEOUT
+      )
+    return self._fallback_client
 
   @staticmethod
   def _strip_thinking(text: str) -> str:

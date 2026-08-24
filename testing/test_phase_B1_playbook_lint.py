@@ -12,6 +12,10 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from testing._gates import requires_playbook
+
+pytestmark = requires_playbook
+
 CLAUDE_MD = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'CLAUDE.md')
 
 REQUIRED_TOP_HEADER = "## Investment Banking Agent Playbook (Claude Code Mode)"

@@ -17,9 +17,24 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Absolute, not CWD-relative: a relative path silently opens a different
 # database when a process starts from another directory, and the mismatch
 # surfaces as an empty result rather than an error.
-DB_PATH = os.environ.get(
-    "NEMO_DB_PATH", os.path.join(_REPO_ROOT, "db_cache", "session.db")
-)
+_DEFAULT_DB_PATH = os.path.join(_REPO_ROOT, "db_cache", "session.db")
+
+
+def current_db_path() -> str:
+    """Resolve the state database path on every call.
+
+    Read per call rather than bound at import so a test fixture or an
+    embedding process can redirect the database after this module loads.
+    A default argument is evaluated once, at function-definition time, so
+    `def get_connection(db_path=DB_PATH)` froze NEMO_DB_PATH at import and
+    silently ignored any later override.
+    """
+    return os.environ.get("NEMO_DB_PATH", _DEFAULT_DB_PATH)
+
+
+# Convenience alias for readers that want the path at import time. Callers that
+# need to honour a later override must call current_db_path() instead.
+DB_PATH = current_db_path()
 
 CREATE_SCHEMA = [
     # --- Phase 0: watchlist (tickers actively monitored) ---
@@ -382,14 +397,19 @@ _PREEARNINGS_EVALS_MIGRATIONS = [
 ]
 
 
-def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
+def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
     """Open a connection with row factory set for dict-like access.
+
+    `db_path=None` resolves through current_db_path() on every call so a
+    NEMO_DB_PATH set after import is honoured.
 
     Also loads the sqlite-vec extension on every connection so the
     `rag_chunk_embeddings` virtual table is usable. If sqlite-vec is not
     installed (e.g. in a minimal environment) the import is skipped silently
     so non-RAG code paths continue to work.
     """
+    if db_path is None:
+        db_path = current_db_path()
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -411,14 +431,19 @@ def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
     return conn
 
 
-def init_schema(db_path: str = DB_PATH) -> None:
+def init_schema(db_path: Optional[str] = None) -> None:
     """Create all autonomous-system tables if they don't exist, and run
     additive ALTER TABLE migrations for new columns on existing rows.
+
+    `db_path=None` resolves through current_db_path() on every call. See
+    get_connection for why this is not a bound default.
 
     Also creates the sqlite-vec virtual table `rag_chunk_embeddings` so
     chunk_id rows in `rag_chunks` can be paired with a 384-dim float
     embedding (rowid == chunk_id by convention).
     """
+    if db_path is None:
+        db_path = current_db_path()
     conn = get_connection(db_path)
     try:
         for stmt in CREATE_SCHEMA:

@@ -43,6 +43,16 @@ class WorkFlow:
     self.workflow = StateGraph(AgentState)
     self.mcp = mcp
 
+    # Eager check at the front-end entrypoint. Model clients are built lazily
+    # now, so without this a missing key would first surface several agents
+    # into a run that has already cost minutes and MCP calls.
+    for agent in (self.master_orchestrator, self.prober, self.orchestrator,
+                  self.search_summarizer, self.financial_analyst,
+                  self.modeling_agent, self.plan_verifier, self.news_agent,
+                  self.verification_agent, self.bull_agent, self.bear_agent,
+                  self.arbiter_agent):
+      agent.validate_credentials()
+
     self.app = self.setup_graph()
 
   def master_node(self, state: AgentState):

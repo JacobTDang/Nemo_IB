@@ -227,3 +227,46 @@ def test_env_example_primary_reasoning_model_is_empty():
           f"PRIMARY_REASONING_MODEL ships a non-empty default: {value!r}"
         return
   pytest.fail("PRIMARY_REASONING_MODEL not found in .env.example")
+
+
+# --------------------------------------------------------------------------
+# Import-time network access.
+#
+# _build_reasoning_pool() ran at module import, so merely importing
+# openrouter_template pinged OpenRouter five times and cost ~0.7s. That makes
+# an "offline" test run not strictly offline, and it charges a caller who only
+# wanted the module for a type or a helper.
+# --------------------------------------------------------------------------
+
+def test_importing_the_module_makes_no_network_call():
+    """Importing must be free. Resolving a model is what costs."""
+    import subprocess
+    import sys
+
+    probe = (
+        "import sys\n"
+        "class Boom:\n"
+        "    def __init__(self, *a, **k):\n"
+        "        raise AssertionError('network client built at import')\n"
+        "import openai\n"
+        "openai.OpenAI = Boom\n"
+        "import agent.openrouter_template\n"
+        "print('imported clean')\n"
+    )
+    out = subprocess.run([sys.executable, "-c", probe],
+                         capture_output=True, text=True, cwd=".")
+    assert "imported clean" in out.stdout, out.stderr[-600:]
+
+
+def test_the_constant_still_resolves_when_read():
+    """Consumers do `from openrouter_template import PRIMARY_REASONING_MODEL`.
+    Laziness must not break that -- reading it builds the pool on demand."""
+    import agent.openrouter_template as ort
+    value = ort.PRIMARY_REASONING_MODEL
+    assert isinstance(value, str) and "/" in value
+
+
+def test_unknown_attribute_still_raises():
+    import agent.openrouter_template as ort
+    with pytest.raises(AttributeError):
+        ort.NoSuchAttribute

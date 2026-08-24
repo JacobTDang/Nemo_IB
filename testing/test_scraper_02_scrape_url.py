@@ -4,6 +4,10 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tools.web_search_server.scraper import scrape_url, scrape_urls
 
+from testing._gates import requires_searxng
+
+pytestmark = requires_searxng
+
 
 async def test_trafilatura_static_page():
   url = "https://www.sec.gov/edgar/aboutedgar.htm"
