@@ -332,6 +332,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"[senate annual] FAILED: {exc}", file=sys.stderr)
             failures += 1
 
+    # Idempotent and cheap. The normalised key stops new duplicates forming,
+    # but a run that ingested filings written under an older spelling of a
+    # name would otherwise leave that person split in two.
+    merged = store.merge_duplicate_members()
+    if merged:
+        _log(f"[members] merged {merged} duplicate record(s)")
+
     return 1 if failures else 0
 
 

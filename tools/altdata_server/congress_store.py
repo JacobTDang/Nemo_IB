@@ -24,6 +24,7 @@ on every restart is not a pipeline. Point `NEMO_CONGRESS_DB` at a real volume.
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -168,10 +169,34 @@ def _now() -> str:
 
 # ------------------------------------------------------------------ members
 
+# Honorifics the House index sometimes folds into the first-name field.
+_HONORIFICS = {"mr", "mrs", "ms", "dr", "hon", "honorable", "rep", "sen"}
+
+
+def _given_name(first: str) -> str:
+    """The first given name, without middle initials or honorifics.
+
+    The House index writes the same person several ways across filings --
+    "Rudy C. Yakym" and "Rudy Yakym", "Thomas Suozzi" and "Thomas R. Suozzi",
+    "Laurel Lee" and "Laurel Mrs Lee". Keyed literally, each variant became
+    its own member and split that person's history.
+
+    Only the leading given name is kept, which is enough to separate Rick
+    Scott from Tim Scott and Adam Smith from Adrian Smith while collapsing
+    the punctuation variants of one person.
+    """
+    tokens = [t for t in re.split(r"[\s.]+", (first or "").strip().lower()) if t]
+    for token in tokens:
+        if token in _HONORIFICS or len(token) == 1:
+            continue
+        return token
+    return tokens[0] if tokens else ""
+
+
 def member_id(chamber: str, last: str, first: str, state: str = "") -> str:
     """A stable key. Names repeat across chambers and across states."""
     parts = [chamber.lower(), (last or "").strip().lower(),
-             (first or "").strip().lower(), (state or "").strip().upper()]
+             _given_name(first), (state or "").strip().upper()]
     return ":".join(p.replace(" ", "_") for p in parts)
 
 
@@ -359,3 +384,53 @@ def sync_state(source: str) -> Optional[Dict[str, Any]]:
         row = conn.execute("SELECT * FROM sync_state WHERE source = ?",
                            (source,)).fetchone()
     return dict(row) if row else None
+
+
+def merge_duplicate_members() -> int:
+    """Reunite members whose key was written before `_given_name` normalised it.
+
+    The House index writes one person several ways across filings, so the
+    store accumulated "Rudy C. Yakym" beside "Rudy Yakym" and
+    "Thomas Suozzi" beside "Thomas R. Suozzi". Normalising the key stops new
+    duplicates; this repairs the ones already recorded, which otherwise keep
+    that person's history split in two and invisible to any query.
+
+    Every dependent row is repointed rather than deleted -- the point is to
+    reunite a history, not halve it. Returns how many records were merged.
+    Safe to re-run.
+    """
+    merged = 0
+    with connect() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT member_id, chamber, last, first, full_name, state FROM members"
+        ).fetchall()
+
+        def key_of(row) -> str:
+            # The state is part of the key and must be carried through, or the
+            # recomputed key matches neither stored id and the merge keeps an
+            # arbitrary one.
+            return member_id(row["chamber"], row["last"] or "",
+                             row["first"] or "", row["state"] or "")
+
+        canonical: Dict[str, str] = {}
+        for row in rows:
+            key = key_of(row)
+            # Prefer the id that already equals the normalised key; failing
+            # that, keep the first seen so the choice is deterministic.
+            if key not in canonical or row["member_id"] == key:
+                canonical[key] = row["member_id"]
+
+        for row in rows:
+            keep = canonical[key_of(row)]
+            if row["member_id"] == keep:
+                continue
+            for table in ("transactions", "holdings", "filings"):
+                conn.execute(
+                    f"UPDATE {table} SET member_id = ? WHERE member_id = ?",
+                    (keep, row["member_id"]))
+            conn.execute("DELETE FROM members WHERE member_id = ?",
+                         (row["member_id"],))
+            merged += 1
+
+    return merged

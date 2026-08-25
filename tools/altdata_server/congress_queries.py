@@ -66,6 +66,49 @@ def _note(coverage: Dict[str, Any], extra: str = "") -> str:
     return " ".join(parts)
 
 
+def _match_members(conn: sqlite3.Connection, name: str) -> List[Dict[str, Any]]:
+    """Members matching `name`, without sweeping in other people's first names.
+
+    A single token is matched against the surname only. Matching it against
+    the full name too made "Scott" return Scott DesJarlais and C. Scott
+    Franklin alongside Rick and Tim Scott, and their holdings were then
+    attributed to a query nobody meant to include them in.
+
+    Two or more tokens are matched against the full name, so "Rick Scott"
+    still resolves to one person.
+    """
+    query = (name or "").strip().lower()
+    if not query:
+        return []
+    if len(query.split()) == 1:
+        return _rows(conn, """
+            SELECT member_id, full_name, chamber, state, district FROM members
+            WHERE LOWER(last) = ? OR LOWER(last) LIKE ?
+            ORDER BY full_name""", (query, f"%{query}%"))
+    return _rows(conn, """
+        SELECT member_id, full_name, chamber, state, district FROM members
+        WHERE LOWER(full_name) LIKE ? ORDER BY full_name""", (f"%{query}%",))
+
+
+def _per_member(matched: List[Dict[str, Any]], rows: List[Dict[str, Any]],
+                totals) -> List[Dict[str, Any]]:
+    """Break the numbers out by person.
+
+    One total covering several filers is not a fact about any of them. The
+    matched list named them, but the figure beside it was a merge.
+    """
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(row.get("member") or "unattributed", []).append(row)
+    out = []
+    for member in matched:
+        mine = grouped.get(member["full_name"], [])
+        out.append({"member": member["full_name"], "chamber": member["chamber"],
+                    "state": member["state"], "district": member["district"],
+                    "count": len(mine), "totals": totals(mine)})
+    return out
+
+
 # ------------------------------------------------------------------ by ticker
 
 def ticker_activity(ticker: str, since: Optional[str] = None,
@@ -119,13 +162,8 @@ def member_activity(name: str, since: Optional[str] = None,
     match that does not say who it hit produces numbers nobody can attribute,
     and two members share a surname often enough that it matters.
     """
-    pattern = f"%{(name or '').strip().lower()}%"
     with store.connect() as conn:
-        matched = _rows(conn, """
-            SELECT member_id, full_name, chamber, state, district
-            FROM members
-            WHERE LOWER(full_name) LIKE ? OR LOWER(last) LIKE ?
-            ORDER BY full_name""", (pattern, pattern))
+        matched = _match_members(conn, name)
 
         transactions: List[Dict[str, Any]] = []
         if matched:
@@ -151,14 +189,22 @@ def member_activity(name: str, since: Optional[str] = None,
     top = sorted(by_ticker.items(), key=lambda kv: -kv[1])[:10]
 
     coverage = store.coverage()
+    ambiguous = len(matched) > 1
     extra = "" if matched else (
         f"'{name}' matched no member in the store. Either the name is spelled "
         f"differently in the filings or that member's filings have not been "
         f"ingested.")
+    if ambiguous:
+        extra = (f"'{name}' matched more than one member "
+                 f"({', '.join(m['full_name'] for m in matched)}). The totals "
+                 f"below cover all of them together; per_member breaks them "
+                 f"apart. " + extra)
     return {
         "success": True,
         "query": {"name": name, "since": since},
         "matched_members": matched,
+        "ambiguous": ambiguous,
+        "per_member": _per_member(matched, transactions, _totals),
         "transaction_count": len(transactions),
         "totals": _totals(transactions),
         "most_traded": [{"ticker": t, "transaction_count": c} for t, c in top],
@@ -297,12 +343,8 @@ def ticker_holdings(ticker: str, limit: int = 500) -> Dict[str, Any]:
 
 def member_holdings(name: str, limit: int = 1000) -> Dict[str, Any]:
     """One member's disclosed holdings, matched loosely on name."""
-    pattern = f"%{(name or '').strip().lower()}%"
     with store.connect() as conn:
-        matched = _rows(conn, """
-            SELECT member_id, full_name, chamber, state, district FROM members
-            WHERE LOWER(full_name) LIKE ? OR LOWER(last) LIKE ?
-            ORDER BY full_name""", (pattern, pattern))
+        matched = _match_members(conn, name)
 
         holdings: List[Dict[str, Any]] = []
         if matched:
@@ -317,9 +359,17 @@ def member_holdings(name: str, limit: int = 1000) -> Dict[str, Any]:
                 LIMIT ?""", (*ids, limit))
 
     coverage = store.coverage()
+    ambiguous = len(matched) > 1
     extra = _HOLDING_NOTE if matched else (
         f"'{name}' matched no member in the store. {_HOLDING_NOTE}")
+    if ambiguous:
+        extra = (f"'{name}' matched more than one member "
+                 f"({', '.join(m['full_name'] for m in matched)}). The totals "
+                 f"below cover all of them together; per_member breaks them "
+                 f"apart. " + extra)
     return {"success": True, "query": {"name": name},
-            "matched_members": matched, "holding_count": len(holdings),
+            "matched_members": matched, "ambiguous": ambiguous,
+            "per_member": _per_member(matched, holdings, _holding_totals),
+            "holding_count": len(holdings),
             "totals": _holding_totals(holdings), "holdings": holdings,
             "coverage": coverage, "note": _note(coverage, extra)}
