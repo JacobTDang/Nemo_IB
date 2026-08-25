@@ -13,7 +13,13 @@ Two paths are written at runtime:
 | `/app/db_cache` | tool cache and session schema | slow, but unbounded |
 
 Both are mounted as size-capped tmpfs, so they live in RAM, cannot grow past
-their cap, and are freed when the container exits. Measured with the mounts in
+their cap, and are freed when the container exits.
+
+One path is deliberately **not** disposable. The congressional disclosure store
+at `/app/data/congress.db` sits on the named volume `congress-data`, because
+rebuilding it means re-fetching and re-parsing thousands of PDFs from the House
+Clerk -- slow, and rude to a public service. Putting it in the tmpfs above would
+make the pipeline unusable, since every restart would start from nothing. Measured with the mounts in
 place: the image layer stays untouched apart from the `/etc/resolv.conf` and
 `/etc/hosts` that Docker manages itself.
 
@@ -67,7 +73,6 @@ the actual gate is `testing/test_http_transport.py`, which completes a real
 handshake and one live tool call against each server.
 
 ## Building
-## Building
 
 ```bash
 docker build -t nemo-data:local .                                  # native, local testing
@@ -94,8 +99,47 @@ unset, verified.
 `get_policy_signals`, `get_government_contracts`, and
 `get_taiwan_monthly_revenue` will degrade.
 
+## Blockers hit while building this, and how they present
+
+Each of these failed *after* a green test suite, so none of them is caught by
+running the tests.
+
+**`uv.lock` drifting from `pyproject.toml`.** The Dockerfile installs with
+`uv sync --frozen`, which refuses a lockfile that disagrees with the project
+file, so the build dies at the dependency step. It happens whenever a package
+moves between dependency groups -- `pdfplumber` joining the `server` group for
+the House PTR parser did it. `uv lock --check` says so in one line; run it
+before building.
+
+**A lazily-imported package missing from the `server` group.** The build-time
+import check imports each server, so it only sees module-level imports. A
+package imported inside a function -- `pdfplumber` in `fetch_house_ptr`,
+`bs4` in `parse_senate_ptr` -- is invisible to it, the image builds clean, and
+the ImportError arrives on the first real tool call in production.
+`testing/test_server_dependencies_are_declared.py` walks every shipped file and
+requires each third-party import to be declared, which is what closes this.
+
+**A new top-level module under `tools/` not added to the `COPY` line.** Covered
+in Building above; it is silently absent at runtime rather than a build error.
+
+**The congressional store ships empty.** The volume persists but the image
+contains no data, and the tools answer "no trades" for everything until it is
+filled. They say so explicitly -- `store_empty: true` and the command to run --
+rather than presenting an empty store as an empty record. After first boot:
+
+```bash
+docker compose run --rm congress-sync --house 2024 2025 2026 --senate --senate-annual
+```
+
+Roughly 40 minutes of throttled requests for a full backfill. Safe to re-run and
+safe to cron; nothing already parsed is fetched twice.
+
 ## Known gaps in this image
 
+- Congressional **holdings are Senate-only**. House annual reports are PDFs whose
+  columns must be read geometrically from the header rectangles rather than from
+  the extracted text, and that parser is not built. The tool description states
+  the limit, so the gap is visible to a caller rather than silent.
 - `analyze_exposures` and `get_thesis_evolution` read book state. The entrypoint
   creates the schema so they return an empty result rather than failing, but a
   data-source host holds no positions, so empty is the truthful answer.
