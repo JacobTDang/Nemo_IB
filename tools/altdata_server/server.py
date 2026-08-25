@@ -1752,46 +1752,67 @@ class AltDataServer:
                 Tool(
                     name="get_congress_trades",
                     description=(
-                        "Congressional stock trades from the official STOCK Act "
-                        "disclosures: the House Clerk's Periodic Transaction Reports "
-                        "and the Senate eFD. These are TRANSACTIONS, NOT HOLDINGS — "
-                        "Congress does not publish current positions, and no position "
-                        "can be derived from this. Amounts are BRACKETS, not figures: "
-                        "every row carries amount_min and amount_max and there is no "
-                        "midpoint to report. Members file up to 45 days after trading, "
-                        "so transaction_date and filed_date differ. Always read "
-                        "'coverage': it reports filings_available against filings_read, "
-                        "plus filings skipped as scanned paper. When coverage_complete "
-                        "is false an absent ticker does NOT mean it was not traded."
+                        "Congressional stock trades from official STOCK Act "
+                        "disclosures (House Clerk PTRs + Senate eFD), served from "
+                        "a local store. These are TRANSACTIONS, NOT HOLDINGS: "
+                        "Congress does not publish current positions. Amounts are "
+                        "BRACKETS — every row carries amount_min and amount_max and "
+                        "there is no midpoint. Members file up to 45 days after "
+                        "trading, so transaction_date and filed_date differ. ALWAYS "
+                        "read 'coverage': when coverage.complete is false the answer "
+                        "is drawn from an incomplete record and an absent ticker does "
+                        "NOT mean it was not traded. Populate the store with "
+                        "`python -m tools.altdata_server.congress_sync --house 2026 "
+                        "--senate`."
                     ),
                     inputSchema={
                         "type": "object",
                         "properties": {
-                            "ticker": {
-                                "type": "string",
-                                "description": "Filter to one ticker, e.g. 'NVDA'. Bonds and funds have no ticker and are excluded by any filter.",
-                            },
-                            "member": {
-                                "type": "string",
-                                "description": "Filter by member name, matched loosely, e.g. 'Pelosi'.",
-                            },
-                            "chamber": {
-                                "type": "string",
-                                "enum": ["both", "house", "senate"],
-                                "default": "both",
-                            },
-                            "days": {
-                                "type": "integer",
-                                "default": 45,
-                                "description": "Window of FILING dates to search. Trades inside are older.",
-                            },
-                            "max_filings": {
-                                "type": "integer",
-                                "default": 20,
-                                "description": "Cap on filings opened per chamber. Anything beyond it is reported in coverage.capped_unread, never dropped silently.",
-                            },
+                            "ticker": {"type": "string",
+                                       "description": "Filter to one ticker. Bonds and funds have no ticker."},
+                            "member": {"type": "string",
+                                       "description": "Filter by member name, matched loosely. The members matched are returned."},
+                            "chamber": {"type": "string", "enum": ["house", "senate"]},
+                            "since": {"type": "string",
+                                      "description": "Earliest transaction date, YYYY-MM-DD."},
+                            "until": {"type": "string",
+                                      "description": "Latest transaction date, YYYY-MM-DD."},
+                            "limit": {"type": "integer", "default": 200},
                         },
                     },
+                ),
+                Tool(
+                    name="get_congress_leaderboard",
+                    description=(
+                        "Aggregate congressional trading activity from the local "
+                        "store: most-traded tickers or most-active members. Totals "
+                        "are bracketed sums (sum of lower bounds, sum of upper "
+                        "bounds), never midpoints. Rows with no ticker are excluded "
+                        "from the ticker leaderboard rather than grouped, since "
+                        "bonds and private funds have no symbol. Read 'coverage'."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "kind": {"type": "string", "enum": ["tickers", "members"],
+                                     "default": "tickers"},
+                            "since": {"type": "string",
+                                      "description": "Earliest transaction date, YYYY-MM-DD."},
+                            "chamber": {"type": "string", "enum": ["house", "senate"]},
+                            "limit": {"type": "integer", "default": 25},
+                        },
+                    },
+                ),
+                Tool(
+                    name="get_congress_coverage",
+                    description=(
+                        "What the congressional disclosure store actually holds: "
+                        "filings ingested, how many parsed, and how many could not "
+                        "be read because they were filed on paper and scanned. Call "
+                        "this before treating any empty congressional result as an "
+                        "absence rather than a gap."
+                    ),
+                    inputSchema={"type": "object", "properties": {}},
                 ),
             ]
 
@@ -1809,6 +1830,10 @@ class AltDataServer:
                 return await parent.capex_announcements(args)
             if name == "get_congress_trades":
                 return await parent.congress_trades(args)
+            if name == "get_congress_leaderboard":
+                return await parent.congress_leaderboard(args)
+            if name == "get_congress_coverage":
+                return await parent.congress_coverage(args)
             return _err(name, f"unknown tool: {name}")
 
     # -----------------------------------------------------------------------
@@ -1816,29 +1841,90 @@ class AltDataServer:
     # -----------------------------------------------------------------------
 
 
+    # ------------------------------------------------------------------
+    # Congressional disclosures, served from the local store.
+    #
+    # These read rather than fetch. Parsing a House PTR is an HTTP round trip
+    # plus a PDF parse, which on demand bought about twenty filings per call
+    # and made every answer partial. Ingestion belongs to congress_sync.
+    # ------------------------------------------------------------------
+
+    _EMPTY_STORE = (
+        "The congressional disclosure store is empty, so this is not a "
+        "statement about what was traded. Populate it with: "
+        "python -m tools.altdata_server.congress_sync --house 2026 --senate"
+    )
+
+    @staticmethod
+    def _mark_empty(result: Dict[str, Any]) -> Dict[str, Any]:
+        """An empty store must never read as an empty record."""
+        if not result.get("coverage", {}).get("total"):
+            result["store_empty"] = True
+            result["note"] = f"{AltDataServer._EMPTY_STORE} {result.get('note', '')}"
+        return result
+
     async def congress_trades(self, args: Dict[str, Any]) -> List[TextContent]:
-        from .congress_trades import get_congress_trades
+        from . import congress_queries as queries
 
         try:
-            result = await asyncio.wait_for(
-                asyncio.to_thread(
-                    get_congress_trades,
-                    ticker=args.get("ticker"),
-                    member=args.get("member"),
-                    chamber=args.get("chamber", "both"),
-                    days=int(args.get("days", 45)),
-                    max_filings=int(args.get("max_filings", 20)),
-                ),
-                timeout=180.0,
-            )
-        except asyncio.TimeoutError:
-            return _err("get_congress_trades",
-                        "the disclosure sites did not answer within 180s; lower "
-                        "max_filings or narrow the window")
-        except Exception as exc:
+            if args.get("member"):
+                result = await asyncio.to_thread(
+                    queries.member_activity, args["member"],
+                    since=args.get("since"), limit=int(args.get("limit", 200)))
+                if args.get("ticker"):
+                    wanted = args["ticker"].upper().strip()
+                    result["transactions"] = [
+                        t for t in result["transactions"] if t.get("ticker") == wanted]
+                    result["transaction_count"] = len(result["transactions"])
+            else:
+                result = await asyncio.to_thread(
+                    queries.ticker_activity, args.get("ticker", ""),
+                    since=args.get("since"), until=args.get("until"),
+                    chamber=args.get("chamber"), limit=int(args.get("limit", 200)))
+        except Exception as exc:  # noqa: BLE001 - surfaced, never masked
             return _err("get_congress_trades",
                         f"{type(exc).__name__}: {str(exc)[:200]}")
-        return _dispatch("get_congress_trades", result)
+        return _dispatch("get_congress_trades", self._mark_empty(result))
+
+    async def congress_leaderboard(self, args: Dict[str, Any]) -> List[TextContent]:
+        from . import congress_queries as queries
+
+        kind = args.get("kind", "tickers")
+        try:
+            if kind == "members":
+                result = await asyncio.to_thread(
+                    queries.most_active_members, since=args.get("since"),
+                    limit=int(args.get("limit", 25)))
+            else:
+                result = await asyncio.to_thread(
+                    queries.most_traded_tickers, since=args.get("since"),
+                    chamber=args.get("chamber"), limit=int(args.get("limit", 25)))
+        except Exception as exc:  # noqa: BLE001 - surfaced, never masked
+            return _err("get_congress_leaderboard",
+                        f"{type(exc).__name__}: {str(exc)[:200]}")
+        return _dispatch("get_congress_leaderboard", self._mark_empty(result))
+
+    async def congress_coverage(self, args: Dict[str, Any]) -> List[TextContent]:
+        from . import congress_store as cstore
+
+        try:
+            overall = await asyncio.to_thread(cstore.coverage)
+            per_chamber = {c: await asyncio.to_thread(cstore.coverage, c)
+                           for c in ("house", "senate")}
+        except Exception as exc:  # noqa: BLE001 - surfaced, never masked
+            return _err("get_congress_coverage",
+                        f"{type(exc).__name__}: {str(exc)[:200]}")
+
+        note = ("filings_parsed against total is the only basis for reading an "
+                "empty congressional result as an absence rather than a gap. "
+                "'scanned' filings were filed on paper and carry no extractable "
+                "text; they will not become readable on a retry.")
+        if not overall["total"]:
+            note = f"{self._EMPTY_STORE} {note}"
+        overall["by_chamber"] = per_chamber
+        overall["note"] = note
+        overall["database"] = cstore.current_db_path()
+        return _dispatch("get_congress_coverage", overall)
 
     async def taiwan_monthly_revenue(self, args: Dict[str, Any]) -> List[TextContent]:
         codes = args.get("company_codes", [])
