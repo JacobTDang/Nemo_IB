@@ -3,6 +3,7 @@ integration."""
 import sys
 import os
 
+import pytest
 from dotenv import load_dotenv
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -19,6 +20,19 @@ from daemons.edgar_firehose import (
     FORM_CATEGORIES, tick,
 )
 from state.schema import init_schema, get_connection
+
+
+SKIP_NETWORK = os.environ.get("SKIP_NETWORK_TESTS") == "1"
+
+
+def network(func):
+  """Apply the real `network` marker plus the offline skip.
+
+  Same helper as testing/test_sec_series.py. A bare skipif is not a registered
+  marker, so `-m network` would not select these.
+  """
+  func = pytest.mark.network(func)
+  return pytest.mark.skipif(SKIP_NETWORK, reason="live EDGAR test")(func)
 
 
 _results = {'pass': 0, 'fail': 0, 'failures': []}
@@ -150,6 +164,7 @@ def test_store_filing_dedupe():
     conn.close()
 
 
+@network
 def test_tick_with_injected_feed():
   _section("4. Tick() with synthetic feed override")
   entries = _parse_feed(SYNTHETIC_ATOM)
