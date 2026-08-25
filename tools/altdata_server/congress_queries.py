@@ -42,11 +42,27 @@ def _rows(conn: sqlite3.Connection, sql: str, params: tuple) -> List[Dict[str, A
     return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
 
+def _open_ended(rows: List[Dict[str, Any]], low: str, high: str) -> bool:
+    """Whether any row has a floor but no disclosed ceiling.
+
+    "Over $50,000,000" and the EIGA spouse cap have no upper bound. Summing
+    them as though the ceiling were zero produced a maximum below its own
+    minimum -- live, three NVDA holdings totalled 1,600,002 to 1,250,000.
+    Once such a row is in the sum the total has no ceiling either.
+    """
+    return any(r.get(low) is not None and r.get(high) is None for r in rows)
+
+
 def _totals(transactions: List[Dict[str, Any]]) -> Dict[str, Any]:
     """A bracketed total, plus the direction counts that give it meaning."""
+    unbounded = _open_ended(transactions, "amount_min", "amount_max")
     return {
         "amount_min_total": sum(t.get("amount_min") or 0 for t in transactions),
-        "amount_max_total": sum(t.get("amount_max") or 0 for t in transactions),
+        "amount_max_total": None if unbounded else sum(
+            t.get("amount_max") or 0 for t in transactions),
+        "open_ended_count": sum(1 for t in transactions
+                                if t.get("amount_min") is not None
+                                and t.get("amount_max") is None),
         "purchase_count": sum(1 for t in transactions
                               if (t.get("transaction_type") or "").startswith("purchase")),
         "sale_count": sum(1 for t in transactions
@@ -110,6 +126,18 @@ def _per_member(matched: List[Dict[str, Any]], rows: List[Dict[str, Any]],
 
 
 # ------------------------------------------------------------------ by ticker
+
+def _uncap_open_ended(rows: List[Dict[str, Any]], key: str) -> List[Dict[str, Any]]:
+    """SQL SUM cannot express "no ceiling"; COALESCE(max, 0) closes it at zero.
+
+    An aggregate containing an open-ended bracket has no upper bound, so the
+    ceiling is dropped rather than reported as a figure below its own floor.
+    """
+    for row in rows:
+        if row.get("open_ended_count"):
+            row[key] = None
+    return rows
+
 
 def ticker_activity(ticker: str, since: Optional[str] = None,
                     until: Optional[str] = None,
@@ -240,6 +268,9 @@ def most_traded_tickers(since: Optional[str] = None, chamber: Optional[str] = No
                    COUNT(DISTINCT t.member_id)     AS member_count,
                    SUM(COALESCE(t.amount_min, 0))  AS amount_min_total,
                    SUM(COALESCE(t.amount_max, 0))  AS amount_max_total,
+                   SUM(CASE WHEN t.amount_min IS NOT NULL
+                             AND t.amount_max IS NULL
+                            THEN 1 ELSE 0 END)     AS open_ended_count,
                    SUM(CASE WHEN t.transaction_type LIKE 'purchase%'
                             THEN 1 ELSE 0 END)     AS purchase_count,
                    SUM(CASE WHEN t.transaction_type LIKE 'sale%'
@@ -250,6 +281,7 @@ def most_traded_tickers(since: Optional[str] = None, chamber: Optional[str] = No
             GROUP BY t.ticker
             ORDER BY transaction_count DESC, member_count DESC
             LIMIT ?""", (*params, limit))
+    _uncap_open_ended(tickers, "amount_max_total")
 
     coverage = store.coverage()
     return {
@@ -275,7 +307,10 @@ def most_active_members(since: Optional[str] = None, limit: int = 25
                    COUNT(*)                       AS transaction_count,
                    COUNT(DISTINCT t.ticker)       AS distinct_tickers,
                    SUM(COALESCE(t.amount_min, 0)) AS amount_min_total,
-                   SUM(COALESCE(t.amount_max, 0)) AS amount_max_total
+                   SUM(COALESCE(t.amount_max, 0)) AS amount_max_total,
+                   SUM(CASE WHEN t.amount_min IS NOT NULL
+                             AND t.amount_max IS NULL
+                            THEN 1 ELSE 0 END)    AS open_ended_count
             FROM transactions t
             JOIN filings f ON f.filing_id = t.filing_id
             JOIN members m ON m.member_id = t.member_id
@@ -283,6 +318,7 @@ def most_active_members(since: Optional[str] = None, limit: int = 25
             GROUP BY t.member_id
             ORDER BY transaction_count DESC
             LIMIT ?""", (*params, limit))
+    _uncap_open_ended(members, "amount_max_total")
 
     coverage = store.coverage()
     return {"success": True, "query": {"since": since, "limit": limit},
@@ -310,9 +346,13 @@ _HOLDING_COLUMNS = """h.ticker, h.cusip, h.asset_name, h.asset_type_code, h.owne
 
 def _holding_totals(holdings: List[Dict[str, Any]]) -> Dict[str, Any]:
     priced = [h for h in holdings if h.get("value_min") is not None]
+    unbounded = _open_ended(priced, "value_min", "value_max")
     return {
         "value_min_total": sum(h["value_min"] or 0 for h in priced),
-        "value_max_total": sum(h["value_max"] or 0 for h in priced),
+        # None, not a smaller number: with an open-ended row in the sum the
+        # disclosure states no ceiling, and closing it at one inverts the range.
+        "value_max_total": None if unbounded else sum(
+            h["value_max"] or 0 for h in priced),
         "priced_count": len(priced),
         # Never folded into the totals: a holding nobody could price and a
         # holding worth nothing are different disclosures.
