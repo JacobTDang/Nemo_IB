@@ -334,7 +334,12 @@ def get_latest_filing(ticker: str, form_type: str = '10-K') -> Optional[Dict[str
     result = None
     try:
       company = Company(ticker)
-      filings = company.get_filings(form=form_type)
+      # An amendment carries whatever the filer is correcting, which is often
+      # Part III proxy information and no financial statements. Altria's most
+      # recent 10-K is such a 10-K/A, and it made get_revenue_base report that
+      # Altria does not tag revenue. fetch_concept_series already excludes
+      # them; this is the other path into EDGAR, and it feeds ten tools.
+      filings = company.get_filings(form=form_type, amendments=False)
 
       if filings:
         latest_filing = filings[0]
