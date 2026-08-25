@@ -284,3 +284,19 @@ def test_no_holding_is_ever_stored_without_an_as_of(db, senate_annuals, monkeypa
     assert as_of is not None, (
         "the parser gave no as-of and the sync stored the holding anyway; "
         "it must fall back to the filing date rather than leave it empty")
+
+
+@pytest.mark.parametrize("doc_id,is_paper", [
+    ("8221263", True),    # McCaul 2025 -- a real scan beginning with 8
+    ("9116162", True),    # Bilirakis -- a real scan beginning with 9
+    ("20026537", False),  # Allen PTR -- electronic
+    ("10077643", False),  # Adams annual -- electronic
+])
+def test_paper_filings_are_recognised_by_length_not_prefix(doc_id, is_paper):
+    """Every 7-digit id in the store was a scan; every 8-digit one parsed.
+
+    Requiring the id to begin with 9, as the published descriptions put it,
+    matched 51 of 166 scans and downloaded the other 115 to learn the same
+    thing from several megabytes of page images.
+    """
+    assert sync._house_docid_is_paper(doc_id) is is_paper

@@ -68,17 +68,22 @@ def _is_scan(exc: Exception) -> bool:
 
 
 def _house_docid_is_paper(doc_id: str) -> bool:
-    """A 7-digit House DocID beginning with 9 is a scan of a paper filing.
+    """A 7-digit House DocID is a scan of a paper filing.
 
-    Electronic filings carry an 8-digit id beginning with 1. Recognising a
-    scan from the index costs nothing; downloading it to discover the same
-    thing costs a request and several megabytes -- Khanna's runs to 353 pages
-    of images -- and the answer is identical either way. Paper was 6.8% of
-    2025 annual filings and 30.3% of 2014's, so this matters more the further
-    back a backfill reaches.
+    Length is the discriminator, not the leading digit. Measured over 1,330
+    House filings in the store: every one of the 166 seven-digit ids was a
+    scan and every one of the 1,164 eight-digit ids parsed, with no
+    exceptions either way. An earlier version of this also required the id to
+    begin with 9, which is how the published descriptions put it -- that
+    caught 51 of the 166 and quietly downloaded the other 115 to discover the
+    same thing the slow way.
+
+    Recognising a scan from the index costs nothing; fetching it costs a
+    request and several megabytes -- one runs to 353 pages of images -- for an
+    identical answer. Paper was 6.8% of 2025 annual filings and 30.3% of
+    2014's, so this matters more the further back a backfill reaches.
     """
-    doc_id = (doc_id or "").strip()
-    return len(doc_id) == 7 and doc_id.startswith("9")
+    return len((doc_id or "").strip()) == 7
 
 
 def _iso_from_us(text: str) -> Optional[str]:
