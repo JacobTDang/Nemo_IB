@@ -154,3 +154,61 @@ def test_a_date_filter_bounds_the_window(seeded):
 
     assert result["transaction_count"] == 1
     assert result["transactions"][0]["chamber"] == "senate"
+
+
+# ---------------------------------------------------------------- holdings
+
+@pytest.fixture
+def with_holdings(seeded):
+    """Annual-report holdings alongside the trades already seeded."""
+    store.upsert_filing({"filing_id": "senate:annual:u1", "chamber": "senate",
+                         "doc_id": "u1", "member_id": seeded["tuberville"],
+                         "filing_type": "annual", "filed_date": "2026-05-15",
+                         "year": 2025, "parse_status": "parsed"})
+    store.replace_holdings("senate:annual:u1", seeded["tuberville"], [
+        {"ticker": "NVDA", "asset_name": "Nvidia Corp", "owner": "self",
+         "value_min": 15001, "value_max": 50000, "as_of": "2025-12-31"},
+        {"ticker": "QQQ", "asset_name": "Invesco QQQ", "owner": "joint",
+         "value_min": 100001, "value_max": 250000, "as_of": "2025-12-31"},
+        # Unascertainable: bounds unknown, which is not a value of zero.
+        {"ticker": None, "asset_name": "State Pension", "owner": "self",
+         "value_min": None, "value_max": None, "as_of": "2025-12-31"},
+    ])
+    return seeded
+
+
+def test_holdings_are_reported_with_their_snapshot_date(with_holdings):
+    result = q.ticker_holdings("NVDA")
+
+    assert result["holding_count"] == 1
+    assert result["holdings"][0]["as_of"] == "2025-12-31"
+    assert result["holdings"][0]["value_min"] == 15001
+
+
+def test_holdings_say_they_are_not_current_positions(with_holdings):
+    """The single most important caveat on this dataset."""
+    result = q.ticker_holdings("NVDA")
+    note = result["note"].lower()
+
+    assert "not a current position" in note or "during" in note, (
+        "an annual disclosure presented without its staleness reads as a "
+        "live portfolio")
+
+
+def test_a_holding_with_unknown_bounds_is_not_summed_as_zero(with_holdings):
+    result = q.member_holdings("Tuberville")
+
+    assert result["holding_count"] == 3
+    assert result["totals"]["unpriced_count"] == 1, (
+        "an unascertainable holding was folded into the totals as zero")
+    assert result["totals"]["value_min_total"] == 115_002
+
+
+def test_member_holdings_and_trades_are_kept_apart(with_holdings):
+    """A disclosed holding and a disclosed trade are different claims."""
+    holdings = q.member_holdings("Tuberville")
+    trades = q.member_activity("Tuberville")
+
+    assert holdings["holding_count"] == 3
+    assert trades["transaction_count"] == 1
+    assert "holdings" in holdings and "transactions" not in holdings

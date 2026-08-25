@@ -20,6 +20,7 @@ Usage:
     python -m tools.altdata_server.congress_sync --house 2026
     python -m tools.altdata_server.congress_sync --house 2024 2025 2026
     python -m tools.altdata_server.congress_sync --senate --days 90
+    python -m tools.altdata_server.congress_sync --senate-annual
     python -m tools.altdata_server.congress_sync --status
 """
 from __future__ import annotations
@@ -41,6 +42,11 @@ from .congress_trades import (
     search_senate_ptrs,
     senate_session,
 )
+from .senate_annual import (
+    fetch_senate_annual,
+    latest_amendments,
+    search_senate_annuals,
+)
 
 # The House Clerk and the Senate publish no rate limit. This is deliberate
 # politeness rather than a measured ceiling: the whole backfill is a few
@@ -59,6 +65,20 @@ def _throttle() -> None:
 
 def _is_scan(exc: Exception) -> bool:
     return "no extractable text" in str(exc)
+
+
+def _house_docid_is_paper(doc_id: str) -> bool:
+    """A 7-digit House DocID beginning with 9 is a scan of a paper filing.
+
+    Electronic filings carry an 8-digit id beginning with 1. Recognising a
+    scan from the index costs nothing; downloading it to discover the same
+    thing costs a request and several megabytes -- Khanna's runs to 353 pages
+    of images -- and the answer is identical either way. Paper was 6.8% of
+    2025 annual filings and 30.3% of 2014's, so this matters more the further
+    back a backfill reaches.
+    """
+    doc_id = (doc_id or "").strip()
+    return len(doc_id) == 7 and doc_id.startswith("9")
 
 
 def _iso_from_us(text: str) -> Optional[str]:
@@ -121,6 +141,15 @@ def sync_house_ptrs(year: int, max_filings: Optional[int] = None,
             "source_url": (f"https://disclosures-clerk.house.gov/public_disc/"
                            f"ptr-pdfs/{year}/{filing['doc_id']}.pdf"),
         }
+        if _house_docid_is_paper(filing["doc_id"]):
+            record["parse_status"] = "scanned"
+            record["parse_error"] = (
+                "filed on paper; the PDF is page images with no extractable "
+                "text (identified from the DocID, not downloaded)")
+            store.upsert_filing(record)
+            scanned += 1
+            continue
+
         _throttle()
         try:
             parsed_filing = fetch_house_ptr(filing["doc_id"], year)
@@ -245,7 +274,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--house", nargs="*", type=int, metavar="YEAR",
                         help="House PTR years to ingest, e.g. --house 2025 2026")
     parser.add_argument("--senate", action="store_true",
-                        help="Ingest recent Senate PTRs")
+                        help="Ingest recent Senate PTRs (trades)")
+    parser.add_argument("--senate-annual", action="store_true",
+                        help="Ingest Senate annual reports (holdings)")
+    parser.add_argument("--since", default="01/01/2026", metavar="MM/DD/YYYY",
+                        help="Earliest submission date for annual reports")
     parser.add_argument("--days", type=int, default=90,
                         help="Senate window in days (default 90)")
     parser.add_argument("--max-filings", type=int, default=None,
@@ -271,8 +304,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print(f"{table+':':10} {count}")
         return 0
 
-    if not args.house and not args.senate:
-        parser.error("nothing to do: pass --house YEAR..., --senate, or --status")
+    if not args.house and not args.senate and not args.senate_annual:
+        parser.error("nothing to do: pass --house YEAR..., --senate, "
+                     "--senate-annual, or --status")
 
     failures = 0
     for year in args.house or []:
@@ -289,7 +323,116 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"[senate] FAILED: {exc}", file=sys.stderr)
             failures += 1
 
+    if args.senate_annual:
+        try:
+            sync_senate_annuals(since=args.since, max_filings=args.max_filings)
+        except DisclosureUnavailable as exc:
+            print(f"[senate annual] FAILED: {exc}", file=sys.stderr)
+            failures += 1
+
     return 1 if failures else 0
+
+
+
+
+# ------------------------------------------------- Senate annual (holdings)
+
+def sync_senate_annuals(since: str = "01/01/2026",
+                        max_filings: Optional[int] = None,
+                        quiet: bool = False) -> Dict[str, Any]:
+    """Ingest Senate annual reports -- the holdings, not the trades.
+
+    Only the highest amendment per (senator, calendar year) is fetched.
+    Amendments are full restatements rather than deltas, so ingesting a base
+    report alongside the amendment that replaced it would double every
+    unchanged holding and keep figures the filer has since corrected.
+
+    Paper filings are recorded as scans without being fetched: they are
+    galleries of GIF page images, and no parser reads them.
+    """
+    store.init_schema()
+    session = senate_session()               # raises DisclosureUnavailable
+    found = search_senate_annuals(session, since,
+                                  limit=max(max_filings or 0, 400))
+
+    electronic = [f for f in found if f.get("kind") == "annual" and f.get("uuid")]
+    paper = [f for f in found if f.get("kind") != "annual" and f.get("uuid")]
+    wanted = latest_amendments(electronic)
+
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for filing in wanted + paper:
+        member = store.member_id("senate", filing["last"], filing["first"])
+        store.upsert_member({
+            "member_id": member, "chamber": "senate",
+            "first": filing["first"], "last": filing["last"],
+            "full_name": f"{filing['first']} {filing['last']}".strip(),
+            "state": None, "district": None, "office": filing.get("office"),
+            "first_seen": _iso_from_us(filing.get("filed_date", "")),
+            "last_seen": _iso_from_us(filing.get("filed_date", "")),
+        })
+        by_id[f"senate:annual:{filing['uuid']}"] = {**filing, "member_id": member}
+
+    pending = store.unparsed_filing_ids(list(by_id))
+    already_held = len(by_id) - len(pending)
+    budget = pending if max_filings is None else pending[:max_filings]
+    remaining = len(pending) - len(budget)
+
+    parsed = failed = scanned = 0
+    for filing_id in budget:
+        filing = by_id[filing_id]
+        year = filing.get("calendar_year")
+        record = {
+            "filing_id": filing_id, "chamber": "senate",
+            "doc_id": filing["uuid"], "member_id": filing["member_id"],
+            "filing_type": "annual", "raw_filing_type": filing.get("kind"),
+            "filed_date": _iso_from_us(filing.get("filed_date", "")),
+            "year": year,
+            "source_url": (f"https://efdsearch.senate.gov/search/view/"
+                           f"{filing.get('kind')}/{filing['uuid']}/"),
+        }
+        if filing.get("kind") != "annual":
+            record["parse_status"] = "scanned"
+            record["parse_error"] = "filed on paper; the report is page images"
+            store.upsert_filing(record)
+            scanned += 1
+            continue
+
+        _throttle()
+        try:
+            report = fetch_senate_annual(session, filing["uuid"])
+        except DisclosureUnavailable as exc:
+            record["parse_status"] = "error"
+            record["parse_error"] = str(exc)[:400]
+            store.upsert_filing(record)
+            failed += 1
+            continue
+
+        record["parse_status"] = store.PARSED
+        record["parsed_at"] = datetime.now(timezone.utc).isoformat(
+            timespec="seconds")
+        store.upsert_filing(record)
+
+        # A CY2025 report describes assets held during 2025, so its snapshot
+        # date is that year end. Without it a holding cannot be aged against
+        # the trades that came after.
+        as_of = f"{year}-12-31" if year else None
+        for row in report["holdings"]:
+            row.setdefault("as_of", as_of)
+            row["as_of"] = row.get("as_of") or as_of
+        store.replace_holdings(filing_id, filing["member_id"], report["holdings"])
+        parsed += 1
+
+    store.record_sync("senate_annual", filings_seen=len(by_id),
+                      filings_parsed=parsed, filings_failed=failed + scanned,
+                      cursor=since)
+    _log(f"[senate annual] seen={len(by_id)} held={already_held} "
+         f"parsed={parsed} scans={scanned} errors={failed} "
+         f"remaining={remaining}", quiet)
+
+    return {"chamber": "senate", "kind": "annual", "filings_seen": len(by_id),
+            "already_held": already_held, "filings_parsed": parsed,
+            "scans": scanned, "errors": failed, "remaining": remaining,
+            "complete": remaining == 0}
 
 
 if __name__ == "__main__":

@@ -1804,6 +1804,35 @@ class AltDataServer:
                     },
                 ),
                 Tool(
+                    name="get_congress_holdings",
+                    description=(
+                        "Congressional ASSET HOLDINGS from annual financial "
+                        "disclosures — the closest thing to positions that exists, "
+                        "and the only place holdings are published at all. READ THIS "
+                        "BEFORE USING: an annual report covers assets held at some "
+                        "point DURING the calendar year it names, valued in brackets, "
+                        "and is filed months after that year ends. A row is NOT a "
+                        "current position — the member may have exited before filing, "
+                        "and trades disclosed since are not reflected in it. Values "
+                        "are brackets with no midpoint. Holdings the filer could not "
+                        "price (state pensions, family trusts) carry no bounds and are "
+                        "counted in unpriced_count rather than summed as zero. Roughly "
+                        "a third of rows are Excepted Investment Funds whose underlying "
+                        "holdings are legally not itemised. Senate only at present; "
+                        "House annual reports are PDFs and are not yet ingested."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "ticker": {"type": "string",
+                                       "description": "Who disclosed holding this ticker."},
+                            "member": {"type": "string",
+                                       "description": "One member's disclosed holdings, matched loosely."},
+                            "limit": {"type": "integer", "default": 200},
+                        },
+                    },
+                ),
+                Tool(
                     name="get_congress_coverage",
                     description=(
                         "What the congressional disclosure store actually holds: "
@@ -1832,6 +1861,8 @@ class AltDataServer:
                 return await parent.congress_trades(args)
             if name == "get_congress_leaderboard":
                 return await parent.congress_leaderboard(args)
+            if name == "get_congress_holdings":
+                return await parent.congress_holdings(args)
             if name == "get_congress_coverage":
                 return await parent.congress_coverage(args)
             return _err(name, f"unknown tool: {name}")
@@ -1903,6 +1934,27 @@ class AltDataServer:
             return _err("get_congress_leaderboard",
                         f"{type(exc).__name__}: {str(exc)[:200]}")
         return _dispatch("get_congress_leaderboard", self._mark_empty(result))
+
+    async def congress_holdings(self, args: Dict[str, Any]) -> List[TextContent]:
+        from . import congress_queries as queries
+
+        if not args.get("ticker") and not args.get("member"):
+            return _err("get_congress_holdings",
+                        "pass a ticker or a member; holdings are only meaningful "
+                        "scoped to one or the other")
+        try:
+            if args.get("member"):
+                result = await asyncio.to_thread(
+                    queries.member_holdings, args["member"],
+                    limit=int(args.get("limit", 200)))
+            else:
+                result = await asyncio.to_thread(
+                    queries.ticker_holdings, args["ticker"],
+                    limit=int(args.get("limit", 200)))
+        except Exception as exc:  # noqa: BLE001 - surfaced, never masked
+            return _err("get_congress_holdings",
+                        f"{type(exc).__name__}: {str(exc)[:200]}")
+        return _dispatch("get_congress_holdings", self._mark_empty(result))
 
     async def congress_coverage(self, args: Dict[str, Any]) -> List[TextContent]:
         from . import congress_store as cstore

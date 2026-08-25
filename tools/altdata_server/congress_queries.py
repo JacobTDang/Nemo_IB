@@ -241,3 +241,85 @@ def most_active_members(since: Optional[str] = None, limit: int = 25
     coverage = store.coverage()
     return {"success": True, "query": {"since": since, "limit": limit},
             "members": members, "coverage": coverage, "note": _note(coverage)}
+
+
+# ---------------------------------------------------------------- holdings
+
+_HOLDING_NOTE = (
+    "An annual report discloses assets held at some point DURING the calendar "
+    "year it covers, valued in brackets, and is filed months after that year "
+    "ends. A row here is not a current position: the member may have exited it "
+    "before filing, and any trade disclosed since is not reflected in it. "
+    "Values are brackets; totals sum the lower and upper bounds separately and "
+    "there is no midpoint. Holdings the filer could not price "
+    "(state pensions, family trusts) carry no bounds at all and are counted in "
+    "unpriced_count rather than summed as zero."
+)
+
+_HOLDING_COLUMNS = """h.ticker, h.cusip, h.asset_name, h.asset_type_code, h.owner,
+                      h.value_min, h.value_max, h.income_min, h.income_max,
+                      h.income_type, h.as_of, f.chamber, f.filed_date,
+                      f.source_url, m.full_name AS member, m.state"""
+
+
+def _holding_totals(holdings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    priced = [h for h in holdings if h.get("value_min") is not None]
+    return {
+        "value_min_total": sum(h["value_min"] or 0 for h in priced),
+        "value_max_total": sum(h["value_max"] or 0 for h in priced),
+        "priced_count": len(priced),
+        # Never folded into the totals: a holding nobody could price and a
+        # holding worth nothing are different disclosures.
+        "unpriced_count": len(holdings) - len(priced),
+        "open_ended_count": sum(1 for h in priced if h.get("value_max") is None),
+    }
+
+
+def ticker_holdings(ticker: str, limit: int = 500) -> Dict[str, Any]:
+    """Who disclosed holding one ticker, from the annual reports."""
+    wanted = (ticker or "").upper().strip()
+    with store.connect() as conn:
+        holdings = _rows(conn, f"""
+            SELECT {_HOLDING_COLUMNS} FROM holdings h
+            JOIN filings f ON f.filing_id = h.filing_id
+            LEFT JOIN members m ON m.member_id = h.member_id
+            WHERE h.ticker = ?
+            ORDER BY h.as_of DESC, h.value_min DESC
+            LIMIT ?""", (wanted, limit))
+
+    coverage = store.coverage()
+    return {"success": True, "ticker": wanted,
+            "holding_count": len(holdings),
+            "member_count": len({h["member"] for h in holdings if h["member"]}),
+            "totals": _holding_totals(holdings), "holdings": holdings,
+            "coverage": coverage, "note": _note(coverage, _HOLDING_NOTE)}
+
+
+def member_holdings(name: str, limit: int = 1000) -> Dict[str, Any]:
+    """One member's disclosed holdings, matched loosely on name."""
+    pattern = f"%{(name or '').strip().lower()}%"
+    with store.connect() as conn:
+        matched = _rows(conn, """
+            SELECT member_id, full_name, chamber, state, district FROM members
+            WHERE LOWER(full_name) LIKE ? OR LOWER(last) LIKE ?
+            ORDER BY full_name""", (pattern, pattern))
+
+        holdings: List[Dict[str, Any]] = []
+        if matched:
+            ids = [m["member_id"] for m in matched]
+            placeholders = ",".join("?" * len(ids))
+            holdings = _rows(conn, f"""
+                SELECT {_HOLDING_COLUMNS} FROM holdings h
+                JOIN filings f ON f.filing_id = h.filing_id
+                LEFT JOIN members m ON m.member_id = h.member_id
+                WHERE h.member_id IN ({placeholders})
+                ORDER BY h.as_of DESC, h.value_min DESC
+                LIMIT ?""", (*ids, limit))
+
+    coverage = store.coverage()
+    extra = _HOLDING_NOTE if matched else (
+        f"'{name}' matched no member in the store. {_HOLDING_NOTE}")
+    return {"success": True, "query": {"name": name},
+            "matched_members": matched, "holding_count": len(holdings),
+            "totals": _holding_totals(holdings), "holdings": holdings,
+            "coverage": coverage, "note": _note(coverage, extra)}

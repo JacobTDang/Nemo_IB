@@ -150,3 +150,88 @@ def test_an_index_failure_is_raised_not_swallowed(db, monkeypatch):
     monkeypatch.setattr(sync, "fetch_house_index", boom)
     with pytest.raises(DisclosureUnavailable):
         sync.sync_house_ptrs(2026)
+
+
+# --------------------------------------------------- annual reports/holdings
+
+@pytest.fixture
+def senate_annuals(monkeypatch):
+    """Senate annual reports, with amendments and paper filings mixed in."""
+    state = {"fetched": []}
+
+    def install(filings, holdings=2):
+        state["filings"] = filings
+        state["holdings"] = holdings
+
+    monkeypatch.setattr(sync, "senate_session", lambda: object())
+    monkeypatch.setattr(sync, "search_senate_annuals",
+                        lambda session, since, limit=200: state["filings"])
+    monkeypatch.setattr(sync, "_throttle", lambda: None)
+
+    def fetch(session, uuid):
+        state["fetched"].append(uuid)
+        return {"member": "A B", "calendar_year": 2025, "amendment": 0,
+                "filed_date": "2026-05-15", "has_assets_table": True,
+                "source_url": f"https://example.invalid/{uuid}",
+                "rows": [], "holdings": [
+                    {"ticker": "MSFT", "asset_name": "Microsoft Corp",
+                     "owner": "self", "value_min": 15001, "value_max": 50000,
+                     "income_min": 201, "income_max": 1000,
+                     "income_type": "Dividends", "asset_type": "Corporate Securities"}
+                ] * state["holdings"]}
+
+    monkeypatch.setattr(sync, "fetch_senate_annual", fetch)
+    install.state = state
+    return install
+
+
+def _annual(uuid, last, amendment=0, kind="annual", year=2025):
+    return {"first": "A", "last": last, "office": f"{last} (Senator)",
+            "filed_date": "05/15/2026", "label": f"Annual Report for CY {year}",
+            "kind": kind, "uuid": uuid, "calendar_year": year,
+            "amendment": amendment}
+
+
+def test_only_the_highest_amendment_is_ingested(db, senate_annuals):
+    """Amendments restate in full; ingesting both doubles every holding."""
+    senate_annuals([_annual("u1", "Boozman", amendment=0),
+                    _annual("u2", "Boozman", amendment=2)])
+    sync.sync_senate_annuals()
+
+    assert senate_annuals.state["fetched"] == ["u2"], (
+        f"fetched {senate_annuals.state['fetched']}; a superseded base report "
+        f"was ingested alongside the amendment that replaced it")
+
+
+def test_paper_annual_reports_are_recorded_as_scans(db, senate_annuals):
+    senate_annuals([_annual("u3", "Durbin", kind="paper")])
+    result = sync.sync_senate_annuals()
+
+    assert result["scans"] == 1
+    assert store.coverage()["by_status"]["scanned"] == 1
+    assert "u3" not in senate_annuals.state["fetched"]
+
+
+def test_holdings_are_stored_against_the_filing(db, senate_annuals):
+    senate_annuals([_annual("u4", "Britt")], holdings=3)
+    sync.sync_senate_annuals()
+
+    with store.connect() as conn:
+        rows = conn.execute(
+            "SELECT ticker, value_min, value_max, as_of FROM holdings").fetchall()
+    assert len(rows) == 3
+    assert rows[0][0] == "MSFT" and rows[0][1] == 15001
+    assert rows[0][3] == "2025-12-31", (
+        "a holding without its as-of date cannot be aged, and CY2025 assets "
+        "are reported as of the end of that year")
+
+
+def test_an_annual_filing_is_typed_as_annual(db, senate_annuals):
+    senate_annuals([_annual("u5", "Cruz")])
+    sync.sync_senate_annuals()
+
+    with store.connect() as conn:
+        row = conn.execute(
+            "SELECT filing_type, holding_count FROM filings").fetchone()
+    assert row[0] == "annual"
+    assert row[1] == 2
