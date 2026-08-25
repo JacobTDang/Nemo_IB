@@ -487,10 +487,22 @@ def get_annual_revenue(ticker: str, limit: int = 3,
             try:
                 points = fetch_concept_series(ticker, concept, form=form,
                                               limit=limit)
+            # Only NotCovered is swallowed, and only to try the next concept.
+            # A network failure or an unknown ticker propagates: reporting an
+            # outage as "this filer does not disclose it" is the one answer
+            # worse than an error.
             except NotCovered:
                 continue
-            except Exception:  # noqa: BLE001 - try the next concept
-                continue
+            except Exception as exc:  # noqa: BLE001 - surface it, never mask it
+                return {
+                    "ticker": ticker,
+                    "success": False,
+                    "form": form,
+                    "annual_filing_date": index.get(form),
+                    "error": f"fetching revenue concepts failed: {exc}",
+                    "latest_revenue": None, "currency": None, "series": [],
+                    "concept_used": None, "concepts_tried": tried,
+                }
 
             series: List[Dict[str, Any]] = []
             covers_latest_filing = False

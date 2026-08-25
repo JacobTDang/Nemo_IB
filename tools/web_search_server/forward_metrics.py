@@ -90,13 +90,27 @@ def _region_label(member: str) -> str:
 
 
 def _series_for(ticker: str, concepts: tuple, form: str, limit: int):
-    """First covered concept's consolidated values, newest first."""
+    """The chain element reaching the most recent filing, newest first.
+
+    Every concept in the chain is evaluated rather than stopping at the first
+    that returns anything, because filers change elements between filings and
+    the abandoned element still answers from the older filing. NVDA tags
+    `us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax` only in its
+    FY2022 10-K and `us-gaap:Revenues` since; stopping at the first hit
+    resolved revenue for 2022 alone. Freshness decides, and ties keep chain
+    order so the more specific element still wins when a filer tags both.
+    """
+    best_rows: List[Dict[str, Any]] = []
+    best_concept: Optional[str] = None
+    best_end = ""
     for concept in concepts:
         try:
             points = fetch_concept_series(ticker, concept, form=form, limit=limit)
+        # Only NotCovered is swallowed, and only to try the next concept.
+        # A network failure or an unknown ticker propagates: reporting an
+        # outage as "this filer does not disclose it" is the one answer
+        # worse than an error.
         except NotCovered:
-            continue
-        except Exception:  # noqa: BLE001 - try the next concept
             continue
         rows = []
         for point in points:
@@ -104,9 +118,12 @@ def _series_for(ticker: str, concepts: tuple, form: str, limit: int):
             if fact is not None:
                 rows.append({"filing_date": point.filing_date,
                              "period": fact.period, "value": fact.value})
-        if rows:
-            return rows, concept
-    return [], None
+        if not rows:
+            continue
+        newest = max(r["filing_date"] for r in rows)
+        if newest > best_end:
+            best_rows, best_concept, best_end = rows, concept, newest
+    return best_rows, best_concept
 
 
 def get_contracted_revenue(ticker: str, limit: int = 3,
@@ -120,8 +137,17 @@ def get_contracted_revenue(ticker: str, limit: int = 3,
     A filer reporting only deferred revenue is a partial answer, not a failure;
     most non-enterprise filers never disclose RPO.
     """
-    rpo, rpo_concept = _series_for(ticker, RPO_CONCEPTS, form, limit)
-    deferred, deferred_concept = _series_for(ticker, DEFERRED_CONCEPTS, form, limit)
+    try:
+        rpo, rpo_concept = _series_for(ticker, RPO_CONCEPTS, form, limit)
+        deferred, deferred_concept = _series_for(
+            ticker, DEFERRED_CONCEPTS, form, limit)
+    except Exception as exc:  # noqa: BLE001 - surface the failure, never mask it
+        return {
+            "ticker": ticker, "success": False, "wrong_form": False,
+            "error": f"fetching contracted-revenue concepts failed: {exc}",
+            "rpo": [], "deferred_revenue": [],
+            "rpo_concept_used": None, "deferred_concept_used": None,
+        }
 
     if not rpo and not deferred:
         mismatch = form_mismatch_note(ticker, form)
@@ -159,10 +185,18 @@ def get_geographic_revenue(ticker: str, limit: int = 1,
     for concept in REVENUE_CONCEPTS:
         try:
             points = fetch_concept_series(ticker, concept, form=form, limit=limit)
+        # Only NotCovered is swallowed, and only to try the next concept.
+        # A network failure or an unknown ticker propagates: reporting an
+        # outage as "this filer does not disclose it" is the one answer
+        # worse than an error.
         except NotCovered:
             continue
-        except Exception:  # noqa: BLE001
-            continue
+        except Exception as exc:  # noqa: BLE001 - surface it, never mask it
+            return {
+                "ticker": ticker, "success": False, "wrong_form": False,
+                "error": f"fetching geographic-revenue concepts failed: {exc}",
+                "by_region": [], "regions_found": [],
+            }
 
         by_region: Dict[str, List[Dict[str, Any]]] = {}
         consolidated: Optional[float] = None
@@ -251,7 +285,14 @@ def get_public_float(ticker: str, form: str = "10-K") -> Dict[str, Any]:
     Reported on the cover page as of the filer's second-quarter close, so it
     lags -- the filing date is returned alongside it rather than implied.
     """
-    rows, _ = _series_for(ticker, (FLOAT_CONCEPT,), form, 1)
+    try:
+        rows, _ = _series_for(ticker, (FLOAT_CONCEPT,), form, 1)
+    except Exception as exc:  # noqa: BLE001 - surface the failure, never mask it
+        return {
+            "ticker": ticker, "success": False, "wrong_form": False,
+            "error": f"fetching {FLOAT_CONCEPT} failed: {exc}",
+            "public_float": None, "filing_date": None,
+        }
     if not rows:
         mismatch = form_mismatch_note(ticker, form)
         return {

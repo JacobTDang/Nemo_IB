@@ -43,9 +43,11 @@ def _bucket_value(ticker: str, concepts: tuple, form: str) -> Optional[float]:
     for concept in concepts:
         try:
             points = fetch_concept_series(ticker, concept, form=form, limit=1)
+        # Only NotCovered is swallowed, and only to try the next concept.
+        # A network failure or an unknown ticker propagates: reporting an
+        # outage as "this filer does not disclose it" is the one answer
+        # worse than an error.
         except NotCovered:
-            continue
-        except Exception:  # noqa: BLE001 - try the next concept
             continue
         for point in points:
             fact = point.latest_undimensioned()
@@ -70,7 +72,21 @@ def get_debt_maturity_schedule(ticker: str,
 
     for bucket, concepts in MATURITY_CONCEPTS.items():
         tried.extend(concepts)
-        by_year[bucket] = _bucket_value(ticker, concepts, form)
+        try:
+            by_year[bucket] = _bucket_value(ticker, concepts, form)
+        except Exception as exc:  # noqa: BLE001 - surface it, never mask it
+            return {
+                "ticker": ticker,
+                "success": False,
+                "wrong_form": False,
+                "coverage": "unknown",
+                "error": f"fetching debt-maturity concepts failed: {exc}",
+                "by_year": {},
+                "total": None,
+                "buckets_found": 0,
+                "concepts_tried": tried,
+                "pct_due_within_one_year": None,
+            }
 
     found = [v for v in by_year.values() if v is not None]
     buckets_found = len(found)

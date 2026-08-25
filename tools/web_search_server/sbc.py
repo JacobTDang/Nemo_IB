@@ -40,18 +40,32 @@ OCF_CONCEPTS = (
 
 def _consolidated_by_filing(ticker: str, concepts: tuple, form: str,
                             limit: int) -> tuple:
-    """Try each concept in turn; return ({filing_date: value}, concept_used).
+    """The chain element reaching the most recent filing, as {filing_date: value}.
 
     Returns ({}, None) when no concept in the chain is covered. The caller
     decides whether that is fatal — it is for SBC itself, and merely means "no
     ratio" for a denominator.
+
+    Every concept is evaluated rather than stopping at the first that returns
+    anything, because filers change elements between filings and the abandoned
+    element still answers from the older filing. NVDA tags
+    `us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax` only in its
+    FY2022 10-K and `us-gaap:Revenues` since; stopping at the first hit
+    resolved revenue for 2022 alone and left `pct_of_revenue` None for every
+    year after it. Freshness decides, and ties keep chain order so the more
+    specific element still wins when a filer tags both.
     """
+    best_values: Dict[str, float] = {}
+    best_concept: Optional[str] = None
+    best_end = ""
     for concept in concepts:
         try:
             points = fetch_concept_series(ticker, concept, form=form, limit=limit)
+        # Only NotCovered is swallowed, and only to try the next concept.
+        # A network failure or an unknown ticker propagates: reporting an
+        # outage as "this filer does not disclose it" is the one answer
+        # worse than an error.
         except NotCovered:
-            continue
-        except Exception:  # noqa: BLE001 - try the next concept
             continue
 
         values: Dict[str, float] = {}
@@ -59,9 +73,12 @@ def _consolidated_by_filing(ticker: str, concepts: tuple, form: str,
             fact = point.latest_undimensioned()
             if fact is not None:
                 values[point.filing_date] = fact.value
-        if values:
-            return values, concept
-    return {}, None
+        if not values:
+            continue
+        newest = max(values)
+        if newest > best_end:
+            best_values, best_concept, best_end = values, concept, newest
+    return best_values, best_concept
 
 
 def get_sbc_series(ticker: str, limit: int = 5,
@@ -72,8 +89,18 @@ def get_sbc_series(ticker: str, limit: int = 5,
     cash flow. Ratios are None when the denominator could not be resolved —
     never zero, which would read as "no SBC burden".
     """
-    sbc_values, concept_used = _consolidated_by_filing(
-        ticker, SBC_CONCEPTS, form, limit)
+    try:
+        sbc_values, concept_used = _consolidated_by_filing(
+            ticker, SBC_CONCEPTS, form, limit)
+    except Exception as exc:  # noqa: BLE001 - surface the failure, never mask it
+        return {
+            "ticker": ticker,
+            "success": False,
+            "wrong_form": False,
+            "error": f"fetching stock-based compensation concepts failed: {exc}",
+            "series": [],
+            "concept_used": None,
+        }
 
     if not sbc_values:
         mismatch = form_mismatch_note(ticker, form)
