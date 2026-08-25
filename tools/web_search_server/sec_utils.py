@@ -3,6 +3,7 @@ from edgar import Company
 from edgar.xbrl import XBRL
 from collections import OrderedDict
 import pandas as pd
+import logging
 import os
 import re
 import sys
@@ -20,6 +21,8 @@ from tools.web_search_server.sec_series import _require_identity
 # triggers rate limiting on heavy 10-Ks (AMD, MSFT). Now a per-key lock
 # serializes concurrent callers — only one thread fetches, the rest block and
 # return the cached result. OrderedDict bounds growth across long sessions.
+logger = logging.getLogger(__name__)
+
 _FILING_CACHE_MAX = 32
 _filing_cache_lru: "OrderedDict[tuple, Any]" = OrderedDict()
 _filing_key_locks: Dict[tuple, threading.Lock] = {}
@@ -311,8 +314,13 @@ def get_latest_filing(ticker: str, form_type: str = '10-K') -> Optional[Dict[str
   (ticker, form_type), only one thread performs the SEC download; the rest
   block on a per-key lock and return the cached result. Cache is bounded to
   _FILING_CACHE_MAX entries (LRU eviction) so long deep-research sessions
-  don't grow memory indefinitely. Failures are also cached to avoid retry
-  storms within one process lifetime.
+  don't grow memory indefinitely.
+
+  An absence is cached -- a company that files no 10-K will not start doing
+  so mid-session, and re-asking on every call is the retry storm this cache
+  exists to prevent. A *failure* is not: a 503 or a dropped connection says
+  nothing about the filer, and caching it told every later caller the filing
+  did not exist until the process restarted.
   """
   cache_key = (ticker.upper(), form_type)
 
@@ -332,6 +340,7 @@ def get_latest_filing(ticker: str, form_type: str = '10-K') -> Optional[Dict[str
     _require_identity()
 
     result = None
+    cacheable = True
     try:
       company = Company(ticker)
       # An amendment carries whatever the filer is correcting, which is often
@@ -345,8 +354,14 @@ def get_latest_filing(ticker: str, form_type: str = '10-K') -> Optional[Dict[str
         latest_filing = filings[0]
         try:
           xbrl_data = latest_filing.xbrl()
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - reason is logged, not swallowed
+          # Cached, this is worse than a failed fetch: the filing looks
+          # present and every caller reads xbrl_data as None, i.e. "this
+          # company tags nothing". Retry instead.
+          logger.warning("XBRL fetch failed for %s %s (%s): %s",
+                         ticker, form_type, latest_filing.accession_number, exc)
           xbrl_data = None
+          cacheable = False
 
         url = None
         for attr in ['filing_url', 'url', 'filing_details_url', 'document_url']:
@@ -361,15 +376,23 @@ def get_latest_filing(ticker: str, form_type: str = '10-K') -> Optional[Dict[str
           'filing_object': latest_filing,
           'xbrl_data': xbrl_data,
         }
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - reason is logged, not swallowed
+      logger.warning("SEC filing fetch failed for %s %s: %s",
+                     ticker, form_type, exc)
       result = None
+      cacheable = False
 
-    _filing_cache_lru[cache_key] = result
-    # LRU eviction: drop oldest entries (and their per-key locks) above cap.
-    while len(_filing_cache_lru) > _FILING_CACHE_MAX:
-      evicted_key, _ = _filing_cache_lru.popitem(last=False)
-      with _filing_locks_master:
-        _filing_key_locks.pop(evicted_key, None)
+    # A company that files no 10-K is a fact and is worth caching; a 503 is
+    # not. Caching the 503 answered every later caller with "no such filing"
+    # for the life of the process, which for a long-running server means
+    # until someone restarts it.
+    if cacheable:
+      _filing_cache_lru[cache_key] = result
+      # LRU eviction: drop oldest entries (and their per-key locks) above cap.
+      while len(_filing_cache_lru) > _FILING_CACHE_MAX:
+        evicted_key, _ = _filing_cache_lru.popitem(last=False)
+        with _filing_locks_master:
+          _filing_key_locks.pop(evicted_key, None)
 
     return result
 
