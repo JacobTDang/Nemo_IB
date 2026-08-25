@@ -103,7 +103,12 @@ def get_share_count_series(ticker: str, limit: int = 8,
     total_series: List[Dict[str, Any]] = []
 
     for point in points:
-        for fact in point.facts:
+        # deduplicated(), not facts: Biogen emits one share-count fact twice,
+        # and total() below already discounts the repeat. Walking the raw list
+        # here listed every Biogen period twice and, for anyone adding the
+        # classes up, handed back the doubled count the total was fixed to
+        # avoid. Distinct classes carry distinct contexts and survive.
+        for fact in point.deduplicated():
             label = _class_label(fact.dimension_member(CLASS_AXIS))
             by_class.setdefault(label, []).append({
                 "filing_date": point.filing_date,
