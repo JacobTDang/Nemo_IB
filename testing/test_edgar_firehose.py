@@ -3,7 +3,16 @@ integration."""
 import sys
 import os
 
+from dotenv import load_dotenv
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# tick() resolves watchlist tickers through edgartools, which now requires a
+# real SEC_EMAIL rather than a placeholder. pytest does not read .env, so this
+# module does -- the same thing testing/test_sec_series.py does for the same
+# reason. Module level rather than a fixture so the file still runs as a
+# script.
+load_dotenv()
 
 from daemons.edgar_firehose import (
     _parse_feed, filter_relevant, store_filing_as_event,

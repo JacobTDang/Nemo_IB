@@ -308,8 +308,11 @@ async def tick(
   limiter = _RateLimiter()
   semaphore = asyncio.Semaphore(CONCURRENT_QUERIES)
 
+  # Only the real fetch path uses the client -- watch_ticker ignores it when
+  # fetch_fn is injected. Building one anyway meant a tick that makes no HTTP
+  # request still demanded a contact address for the User-Agent.
   close_client = False
-  if client is None:
+  if client is None and fetch_fn is None:
     client = httpx.AsyncClient(headers={'User-Agent': _user_agent()})
     close_client = True
   try:

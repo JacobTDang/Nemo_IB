@@ -2,6 +2,14 @@
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+
+from dotenv import load_dotenv
+
+# These reach live EDGAR, which now requires a real SEC_EMAIL rather than a
+# placeholder. pytest does not read .env, so this module does -- the same
+# thing testing/test_sec_series.py does for the same reason.
+load_dotenv()
+
 from tools.web_search_server.sec_utils import get_margin_breakdown
 
 

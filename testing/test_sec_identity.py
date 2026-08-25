@@ -196,6 +196,27 @@ def test_gdelt_user_agent_refuses_without_sec_email(monkeypatch):
         gdelt_poller._user_agent()
 
 
+def test_gdelt_tick_without_network_needs_no_identity(monkeypatch):
+    """A tick with an injected fetch_fn makes no HTTP request, so it must not
+    demand a contact address. `tick` used to build an httpx client it never
+    handed to anything -- harmless while the User-Agent was invented, a
+    spurious credential requirement once it stopped being."""
+    import asyncio
+
+    from daemons import gdelt_poller
+    monkeypatch.delenv("SEC_EMAIL", raising=False)
+
+    async def fetch_fn(ticker, timespan):
+        return []
+
+    counts = asyncio.run(gdelt_poller.tick(
+        classifier=object(),
+        watchlist_override=["AAPL"],
+        fetch_fn=fetch_fn,
+    ))
+    assert counts["tickers_polled"] == 1
+
+
 @pytest.mark.parametrize("module_name", [
     "daemons.rss_aggregator",
     "daemons.edgar_firehose",
