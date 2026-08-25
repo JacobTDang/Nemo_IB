@@ -258,3 +258,19 @@ def test_annotating_does_not_share_mutable_state_with_the_payload():
 
     assert payload["data"]["revenue"] == 1, "the payload's data was rewritten"
     assert payload["rows"][0]["n"] == 1, "the payload's rows were rewritten"
+
+
+def test_a_payload_that_already_states_success_wins_over_the_caller():
+    """Deliberate, and worth stating because the spec was ambiguous here.
+
+    Rule 1 says never overwrite; the caller-supplied `success=` argument
+    looked like an exception to it. It is not. The tool that built the payload
+    knows whether its own call succeeded; an annotating wrapper further out
+    does not, and letting the outer layer override would let a dispatch
+    boundary mark a genuine failure as a success. `success=` therefore fills a
+    gap and never contradicts.
+    """
+    assert annotate({"success": True}, provider="P", success=False)["success"] is True
+    assert annotate({"success": False}, provider="P", success=True)["success"] is False
+    # It still fills the gap when the payload says nothing.
+    assert annotate({}, provider="P", success=False)["success"] is False
