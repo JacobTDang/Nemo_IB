@@ -74,6 +74,13 @@ if not os.path.isfile(_VENV_PYTHON):
 
 _SUBPROCESS_TIMEOUT_S = 40.0
 
+# Greenhouse is tried twice -- ?content=true for departments, then the plain
+# listing -- and both run inside the stage-1 pool. The pool must outwait their
+# sum, or a board that is merely slow is reported as no provider at all.
+_GREENHOUSE_CONTENT_TIMEOUT_S = 10
+_GREENHOUSE_LISTING_TIMEOUT_S = 8
+_ATS_POOL_TIMEOUT_S = 20
+
 
 # ---------------------------------------------------------------------------
 # Subprocess dispatch helper
@@ -469,7 +476,8 @@ def _try_greenhouse_norm(slug: str, dept_filter: Optional[str]) -> Optional[Dict
     # departments; the plain listing omits the key entirely. The plain listing
     # is the fallback so a slow/oversized content response still yields a count
     # (with department_coverage saying the breakdown is missing).
-    for url, timeout in ((f"{base}?content=true", 10), (base, 8)):
+    for url, timeout in ((f"{base}?content=true", _GREENHOUSE_CONTENT_TIMEOUT_S),
+                         (base, _GREENHOUSE_LISTING_TIMEOUT_S)):
         try:
             resp = requests.get(url, timeout=timeout,
                                 headers={"User-Agent": "Mozilla/5.0"})
@@ -702,7 +710,8 @@ def _fetch_job_postings(slug: str, ats: str,
             # attempt and its plain-listing fallback (10s + 8s worst case).
             # A tighter bound here would report "no provider answered" for a
             # board that was merely slow.
-            for future in as_completed([gh_f, lv_f], timeout=20):
+            for future in as_completed([gh_f, lv_f],
+                                       timeout=_ATS_POOL_TIMEOUT_S):
                 try:
                     result = future.result()
                     if result:
