@@ -191,7 +191,9 @@ def sync_senate_ptrs(days: int = 90, max_filings: Optional[int] = None,
     since = (datetime.now() - timedelta(days=days)).strftime("%m/%d/%Y")
 
     session = senate_session()               # raises DisclosureUnavailable
-    found = search_senate_ptrs(session, since, limit=max(max_filings or 0, 400))
+    # No limit: the search pages at 100 a time and the walk must reach
+    # recordsTotal, or the ingest silently sees only the newest page.
+    found = search_senate_ptrs(session, since)
 
     by_id: Dict[str, Dict[str, Any]] = {}
     for filing in found:
@@ -352,8 +354,7 @@ def sync_senate_annuals(since: str = "01/01/2026",
     """
     store.init_schema()
     session = senate_session()               # raises DisclosureUnavailable
-    found = search_senate_annuals(session, since,
-                                  limit=max(max_filings or 0, 400))
+    found = search_senate_annuals(session, since)
 
     electronic = [f for f in found if f.get("kind") == "annual" and f.get("uuid")]
     paper = [f for f in found if f.get("kind") != "annual" and f.get("uuid")]
@@ -407,17 +408,23 @@ def sync_senate_annuals(since: str = "01/01/2026",
             failed += 1
             continue
 
+        # The parser decides both, because only it has seen the heading.
+        # `report_types=[7]` is an umbrella and New Filer, Candidate and
+        # Termination reports arrive through it: they carry real holdings but
+        # no calendar year, and dating them to a year end would invent a
+        # period they never covered.
+        record["filing_type"] = report.get("report_kind") or "annual"
+        record["year"] = report.get("calendar_year") or year
         record["parse_status"] = store.PARSED
         record["parsed_at"] = datetime.now(timezone.utc).isoformat(
             timespec="seconds")
         store.upsert_filing(record)
 
-        # A CY2025 report describes assets held during 2025, so its snapshot
-        # date is that year end. Without it a holding cannot be aged against
-        # the trades that came after.
-        as_of = f"{year}-12-31" if year else None
+        # Last resort: the date it was filed. A holding with no as-of at all
+        # cannot be aged against the trades that came after it, and an
+        # approximate date carries that caveat where an empty one does not.
+        as_of = report.get("as_of") or record["filed_date"]
         for row in report["holdings"]:
-            row.setdefault("as_of", as_of)
             row["as_of"] = row.get("as_of") or as_of
         store.replace_holdings(filing_id, filing["member_id"], report["holdings"])
         parsed += 1

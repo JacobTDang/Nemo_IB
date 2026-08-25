@@ -157,16 +157,23 @@ def parse_senate_annual(html: str) -> Dict[str, Any]:
 
     soup = BeautifulSoup(html, "html.parser")
 
+    # These pages break headings and names across tabs and newlines, and the
+    # honorific differs by report kind, so collapse whitespace before reading
+    # anything out of them.
+    def _flat(node) -> str:
+        return re.sub(r"\s+", " ", node.get_text(" ", strip=True)).strip() \
+            if node else ""
+
     heading = soup.find("h1")
-    heading_text = heading.get_text(" ", strip=True) if heading else ""
+    heading_text = _flat(heading)
     year = re.search(r"\bCY\s*(\d{4})", heading_text)
     amendment = re.search(r"Amendment\s+(\d+)", heading_text, re.I)
 
     filer = soup.find(class_="filedReport")
     member = None
     if filer:
-        text = filer.get_text(" ", strip=True)
-        text = re.sub(r"^The Honorable\s+", "", text)
+        text = _flat(filer)
+        text = re.sub(r"^(The Honorable|Mr\.|Mrs\.|Ms\.|Dr\.)\s+", "", text)
         member = re.sub(r"\s*\(.*\)\s*$", "", text).strip()
 
     filed = None
@@ -176,9 +183,35 @@ def parse_senate_annual(html: str) -> Dict[str, Any]:
             filed = datetime.strptime(match.group(1), "%m/%d/%Y").date().isoformat()
             break
 
+    # `report_types=[7]` is an umbrella: Candidate, New Filer and Termination
+    # reports arrive through it alongside true annual reports. They carry real
+    # holdings but no calendar year, and dating them to a year end would
+    # invent a period they never covered.
+    kind = "annual"
+    lowered = heading_text.lower()
+    if lowered.startswith("new filer"):
+        kind = "new_filer"
+    elif lowered.startswith("candidate"):
+        kind = "candidate"
+    elif lowered.startswith("termination"):
+        kind = "termination"
+
+    calendar_year = int(year.group(1)) if year else None
+    if calendar_year is not None:
+        as_of = f"{calendar_year}-12-31"
+    else:
+        # The report date in the heading, else the date it was filed. A
+        # holding with no as-of cannot be aged against the trades that
+        # followed it, so this never resolves to nothing.
+        stamped = re.search(r"(\d{2}/\d{2}/\d{4})", heading_text)
+        as_of = (datetime.strptime(stamped.group(1), "%m/%d/%Y").date().isoformat()
+                 if stamped else filed)
+
     result: Dict[str, Any] = {
         "member": member,
-        "calendar_year": int(year.group(1)) if year else None,
+        "report_kind": kind,
+        "calendar_year": calendar_year,
+        "as_of": as_of,
         "amendment": int(amendment.group(1)) if amendment else 0,
         "filed_date": filed,
         "has_assets_table": False,
@@ -271,36 +304,23 @@ SENATE_ANNUAL_REPORT_TYPE = 7
 SENATE_SENATOR_FILER_TYPE = 1
 
 
-def search_senate_annuals(session, since: str, limit: int = 200) -> List[Dict[str, Any]]:
+def search_senate_annuals(session, since: str,
+                          limit: Optional[int] = None) -> List[Dict[str, Any]]:
     """Senate annual reports submitted on or after `since` (MM/DD/YYYY).
 
     Empty date bounds make the search endpoint answer 503 rather than an
     error, so `since` is required rather than defaulted away.
     """
-    from .congress_trades import SENATE_SEARCH, DisclosureUnavailable
+    from .congress_trades import DisclosureUnavailable, senate_search_pages
 
     if not since:
         raise DisclosureUnavailable(
             "a start date is required: the Senate search answers 503 to an "
             "unbounded query rather than returning an error")
-    try:
-        response = session.post(
-            SENATE_SEARCH, timeout=30,
-            headers={"Referer": "https://efdsearch.senate.gov/search/",
-                     "X-CSRFToken": session.cookies.get("csrftoken", ""),
-                     "X-Requested-With": "XMLHttpRequest"},
-            data={"start": 0, "length": limit,
-                  "report_types": f"[{SENATE_ANNUAL_REPORT_TYPE}]",
-                  "filer_types": f"[{SENATE_SENATOR_FILER_TYPE}]",
-                  "submitted_start_date": f"{since} 00:00:00",
-                  "submitted_end_date": "", "candidate_state": "",
-                  "senator_state": "", "office_id": "", "first_name": "",
-                  "last_name": ""})
-        response.raise_for_status()
-        rows = response.json().get("data", [])
-    except Exception as exc:  # noqa: BLE001 - surfaced, never masked
-        raise DisclosureUnavailable(
-            f"the Senate annual-report search failed: {exc}") from exc
+    rows = senate_search_pages(
+        session, since,
+        report_types=f"[{SENATE_ANNUAL_REPORT_TYPE}]",
+        filer_types=f"[{SENATE_SENATOR_FILER_TYPE}]", limit=limit)
 
     filings = []
     for row in rows:

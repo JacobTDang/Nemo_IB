@@ -170,7 +170,10 @@ def senate_annuals(monkeypatch):
 
     def fetch(session, uuid):
         state["fetched"].append(uuid)
+        # Mirrors the real parser: it resolves report_kind and as_of itself,
+        # because only it has seen the heading.
         return {"member": "A B", "calendar_year": 2025, "amendment": 0,
+                "report_kind": "annual", "as_of": "2025-12-31",
                 "filed_date": "2026-05-15", "has_assets_table": True,
                 "source_url": f"https://example.invalid/{uuid}",
                 "rows": [], "holdings": [
@@ -235,3 +238,49 @@ def test_an_annual_filing_is_typed_as_annual(db, senate_annuals):
             "SELECT filing_type, holding_count FROM filings").fetchone()
     assert row[0] == "annual"
     assert row[1] == 2
+
+
+def test_a_new_filer_report_keeps_its_own_kind_and_date(db, senate_annuals, monkeypatch):
+    """The umbrella search returns these; they must not be filed as annual."""
+    senate_annuals([_annual("u9", "Armstrong")])
+
+    def fetch(session, uuid):
+        return {"member": "Alan Armstrong", "calendar_year": None,
+                "amendment": 0, "report_kind": "new_filer",
+                "as_of": "2026-03-24", "filed_date": "2026-07-21",
+                "has_assets_table": True, "source_url": "https://example.invalid",
+                "rows": [], "holdings": [
+                    {"ticker": "MSFT", "asset_name": "Microsoft Corp",
+                     "owner": "self", "value_min": 15001, "value_max": 50000}]}
+
+    monkeypatch.setattr(sync, "fetch_senate_annual", fetch)
+    sync.sync_senate_annuals()
+
+    with store.connect() as conn:
+        kind = conn.execute("SELECT filing_type FROM filings").fetchone()[0]
+        as_of = conn.execute("SELECT as_of FROM holdings").fetchone()[0]
+    assert kind == "new_filer", f"filed as {kind!r}"
+    assert as_of == "2026-03-24", (
+        "a New Filer snapshot was dated to a calendar year end it never covered")
+
+
+def test_no_holding_is_ever_stored_without_an_as_of(db, senate_annuals, monkeypatch):
+    """A holding with no date cannot be aged against later trades."""
+    senate_annuals([_annual("u10", "Nodate")])
+
+    def fetch(session, uuid):
+        return {"member": "No Date", "calendar_year": None, "amendment": 0,
+                "report_kind": "annual", "as_of": None,
+                "filed_date": "2026-05-15", "has_assets_table": True,
+                "source_url": "https://example.invalid", "rows": [],
+                "holdings": [{"ticker": "X", "asset_name": "X Corp",
+                              "owner": "self", "value_min": 1, "value_max": 2}]}
+
+    monkeypatch.setattr(sync, "fetch_senate_annual", fetch)
+    sync.sync_senate_annuals()
+
+    with store.connect() as conn:
+        as_of = conn.execute("SELECT as_of FROM holdings").fetchone()[0]
+    assert as_of is not None, (
+        "the parser gave no as-of and the sync stored the holding anyway; "
+        "it must fall back to the filing date rather than leave it empty")

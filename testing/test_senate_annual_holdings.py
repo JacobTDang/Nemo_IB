@@ -160,3 +160,66 @@ def test_a_report_without_the_assets_table_is_empty_not_an_error():
         "<h2 class='filedReport'>The Honorable A B (B, A)</h2></body></html>")
     assert result["holdings"] == []
     assert result["has_assets_table"] is False
+
+
+# ------------------------------------------------- report kinds beyond annual
+
+NEW_FILER = '''
+<html><body>
+<h1>New Filer
+\t\t\tReport for
+\t\t03/24/2026</h1>
+<h2 class="filedReport">Mr.
+\t\t\tAlan
+\t\t\tArmstrong
+\t\t\t\t(Armstrong, Alan)</h2>
+<p class="muted">Filed 07/21/2026 @ 09:02 AM</p>
+<table id="grid_items" class="table dataTable">
+<thead><tr><th></th><th>Asset</th><th>Asset Type</th><th>Owner</th>
+<th>Value</th><th>Income Type</th><th>Income</th></tr></thead>
+<tbody>
+<tr><td>1</td><td class="span4"><strong><a href="http://finance.yahoo.com/q?s=MSFT">MSFT</a> - Microsoft Corp</strong><div class="muted"></div></td><td>Corporate Securities<div class="muted">Stock</div></td><td>Self</td><td>$15,001 - $50,000</td><td>Dividends</td><td>$201 - $1,000</td></tr>
+</tbody></table></body></html>
+'''
+
+
+def test_a_new_filer_report_is_not_labelled_annual():
+    """report_types=[7] is an umbrella; New Filer reports arrive through it.
+
+    They carry real holdings but no calendar year, so treating them as annual
+    reports left the snapshot date empty and the positions unageable.
+    """
+    result = sa.parse_senate_annual(NEW_FILER)
+
+    assert result["report_kind"] == "new_filer"
+    assert result["calendar_year"] is None
+    assert len(result["holdings"]) == 1
+
+
+def test_a_new_filer_snapshot_is_dated_from_the_report():
+    """Its as-of is the report date, not a year end it never had."""
+    result = sa.parse_senate_annual(NEW_FILER)
+
+    assert result["as_of"] == "2026-03-24", (
+        "a New Filer report is a snapshot at appointment; dating it to a "
+        "calendar year end invents a period it does not cover")
+
+
+def test_an_annual_report_is_dated_to_its_year_end(parsed):
+    assert parsed["report_kind"] == "annual"
+    assert parsed["as_of"] == "2025-12-31"
+
+
+def test_a_snapshot_date_is_never_absent():
+    """A holding with no date cannot be aged against later trades."""
+    for html in (REPORT, NEW_FILER):
+        assert sa.parse_senate_annual(html)["as_of"], (
+            "a report produced holdings with no as-of date at all")
+
+
+def test_the_filer_name_survives_the_page_whitespace():
+    """These pages break the name across tabs and newlines."""
+    result = sa.parse_senate_annual(NEW_FILER)
+    assert result["member"] == "Alan Armstrong", (
+        f"got {result['member']!r}; the raw markup splits the name across "
+        f"lines and the honorific differs from the annual template")

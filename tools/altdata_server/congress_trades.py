@@ -43,6 +43,13 @@ SENATE_PTR_REPORT_TYPE = 11
 
 HTTP_TIMEOUT = 30
 
+# The search endpoint caps a page at 100 rows no matter what `length` asks
+# for: length=400 returns 100 and reports recordsTotal=234. A single request
+# therefore sees part of the record and says nothing about the rest, so the
+# walk follows every page rather than trusting one.
+SENATE_PAGE_SIZE = 100
+
+
 # House PTRs mark who holds the asset; an unmarked row is the filer's own.
 _HOUSE_OWNER = {"SP": "spouse", "JT": "joint", "DC": "dependent_child"}
 _SENATE_OWNER = {"self": "self", "spouse": "spouse", "joint": "joint",
@@ -391,27 +398,64 @@ def senate_session() -> requests.Session:
     return session
 
 
+def senate_search_pages(session: requests.Session, since: str,
+                        report_types: str, filer_types: str = "[]",
+                        limit: Optional[int] = None) -> List[List[Any]]:
+    """Every result row for a search, following the server's 100-row pages.
+
+    `limit` caps the walk for a caller that genuinely wants only the newest
+    few; left unset, the walk continues to `recordsTotal` so a partial read
+    can never be mistaken for the whole record.
+    """
+    rows: List[List[Any]] = []
+    start = 0
+    total = None
+    while True:
+        page_size = SENATE_PAGE_SIZE if limit is None else min(
+            SENATE_PAGE_SIZE, limit - len(rows))
+        if page_size <= 0:
+            break
+        try:
+            response = session.post(
+                SENATE_SEARCH, timeout=HTTP_TIMEOUT,
+                headers={"Referer": "https://efdsearch.senate.gov/search/",
+                         "X-CSRFToken": session.cookies.get("csrftoken", ""),
+                         "X-Requested-With": "XMLHttpRequest"},
+                data={"start": start, "length": page_size,
+                      "report_types": report_types,
+                      "filer_types": filer_types,
+                      "submitted_start_date": f"{since} 00:00:00",
+                      "submitted_end_date": "",
+                      "candidate_state": "", "senator_state": "",
+                      "office_id": "", "first_name": "", "last_name": ""})
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as exc:  # noqa: BLE001 - surfaced, never masked
+            raise DisclosureUnavailable(
+                f"the Senate search failed at row {start}: {exc}") from exc
+
+        page = payload.get("data") or []
+        if total is None:
+            total = payload.get("recordsTotal")
+        rows.extend(page)
+        # An empty page ends the walk. Without this a server that stops
+        # returning rows while still reporting a larger total spins forever.
+        if not page:
+            break
+        start += len(page)
+        if total is not None and start >= total:
+            break
+        if limit is not None and len(rows) >= limit:
+            break
+    return rows if limit is None else rows[:limit]
+
+
 def search_senate_ptrs(session: requests.Session, since: str,
-                       limit: int = 100) -> List[Dict[str, str]]:
+                       limit: Optional[int] = None) -> List[Dict[str, str]]:
     """Senate PTRs submitted on or after `since` (MM/DD/YYYY)."""
-    try:
-        response = session.post(
-            SENATE_SEARCH, timeout=HTTP_TIMEOUT,
-            headers={"Referer": "https://efdsearch.senate.gov/search/",
-                     "X-CSRFToken": session.cookies.get("csrftoken", ""),
-                     "X-Requested-With": "XMLHttpRequest"},
-            data={"start": 0, "length": limit,
-                  "report_types": f"[{SENATE_PTR_REPORT_TYPE}]",
-                  "filer_types": "[]",
-                  "submitted_start_date": f"{since} 00:00:00",
-                  "submitted_end_date": "",
-                  "candidate_state": "", "senator_state": "",
-                  "office_id": "", "first_name": "", "last_name": ""})
-        response.raise_for_status()
-        rows = response.json().get("data", [])
-    except Exception as exc:  # noqa: BLE001 - surfaced, never masked
-        raise DisclosureUnavailable(
-            f"the Senate PTR search failed: {exc}") from exc
+    rows = senate_search_pages(session, since,
+                               report_types=f"[{SENATE_PTR_REPORT_TYPE}]",
+                               filer_types="[]", limit=limit)
 
     filings = []
     for row in rows:
