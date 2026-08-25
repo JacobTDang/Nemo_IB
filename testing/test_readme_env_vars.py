@@ -25,6 +25,10 @@ _README_ENV_RE = re.compile(r"`([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)`")
 _GETENV_RE = re.compile(r"""(?:getenv|environ\.get)\(\s*["']([A-Z0-9_]+)["']""")
 _ENVIRON_ITEM_RE = re.compile(r"""environ\[\s*["']([A-Z0-9_]+)["']""")
 _DOTENV_RE = re.compile(r"^([A-Z0-9_]+)=", re.MULTILINE)
+# Compose reads variables too, and a Python-only scan cannot see them.
+# NEMO_BIND_ADDR is read by docker-compose.yml and by nothing else; without
+# this the check calls a live, load-bearing variable undocumented-and-unread.
+_COMPOSE_ENV_RE = re.compile(r"\$\{([A-Z0-9_]+)[:?}-]")
 
 
 def _readme_env_names() -> set:
@@ -48,6 +52,19 @@ def _names_the_code_reads() -> set:
     return names
 
 
+def _names_the_deploy_config_reads() -> set:
+    names = set()
+    deploy = os.path.join(_REPO, "deploy")
+    for directory, _subdirs, files in os.walk(deploy):
+        for filename in files:
+            if not filename.endswith((".yml", ".yaml")):
+                continue
+            with open(os.path.join(directory, filename), encoding="utf-8",
+                      errors="ignore") as handle:
+                names |= set(_COMPOSE_ENV_RE.findall(handle.read()))
+    return names
+
+
 def _names_in_env_example() -> set:
     with open(os.path.join(_REPO, ".env.example"), encoding="utf-8") as handle:
         return set(_DOTENV_RE.findall(handle.read()))
@@ -57,7 +74,8 @@ def test_readme_documents_env_vars_the_code_actually_reads():
     documented = _readme_env_names()
     assert documented, "README env-var scan found nothing -- the regex has drifted"
 
-    known = _names_the_code_reads() | _names_in_env_example()
+    known = (_names_the_code_reads() | _names_in_env_example()
+             | _names_the_deploy_config_reads())
     unread = sorted(name for name in documented if name not in known)
 
     assert not unread, (
@@ -65,8 +83,19 @@ def test_readme_documents_env_vars_the_code_actually_reads():
         f"{', '.join(unread)}")
 
 
-def test_paper_broker_credentials_are_documented():
-    """The names AsyncBroker prefers must be the names the setup section gives."""
-    documented = _readme_env_names()
+def test_paper_broker_credentials_are_declared():
+    """The names AsyncBroker prefers must be the names .env.example gives.
+
+    This used to check README.md. The README now documents only the five MCP
+    servers the image ships, and the paper broker is deliberately not one of
+    them -- it places orders, and a data-source host should not be able to
+    trade. The guarantee still matters, though: the bug that prompted this file
+    was a documented credential name nothing read. So the check follows the
+    broker to the file that does describe it.
+    """
+    declared = _names_in_env_example()
     for name in ("ALPACA_PAPER_KEY", "ALPACA_PAPER_SECRET"):
-        assert name in documented, f"README no longer documents {name}"
+        assert name in declared, (
+            f".env.example no longer declares {name}; a filled-in .env would "
+            f"leave the broker unable to authenticate with the credential "
+            f"apparently right there in the file")
