@@ -38,7 +38,7 @@ if not logger.handlers:
 # SEC identity is resolved on use by sec_series._require_identity rather than
 # defaulted here: a placeholder contact address misrepresents the caller to
 # the SEC on every request, and does it silently. Absolute import because
-# testing/test_multi_company_verification.py loads this file by path (the
+# testing/run_multi_company_verification.py loads this file by path (the
 # module name starts with a digit), which leaves it without a parent package.
 from tools.web_search_server.sec_series import _require_identity
 

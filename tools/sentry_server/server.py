@@ -431,8 +431,7 @@ class SentryServer:
           name='sentry_active_falsifier_alerts',
           description=(
             'Recent falsifier_alerts rows (last 7 days), newest first. '
-            'Joins against theses so each alert carries the ticker. '
-            'Returns [] gracefully if the table does not exist yet.'
+            'Joins against theses so each alert carries the ticker.'
           ),
           inputSchema={
             'type': 'object',
