@@ -189,3 +189,29 @@ def test_openrouter_gate_sees_a_dotenv_key(monkeypatch):
     importlib.reload(gates)
     assert gates.service_missing("openrouter") is None, (
         "gate reports OpenRouter unavailable while .env configures it")
+
+
+def test_finnhub_gate_reports_missing_key(monkeypatch):
+    from testing import _gates
+    _online(monkeypatch)
+    monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
+    assert "FINNHUB_API_KEY" in _gates.service_missing("finnhub")
+
+
+def test_fred_gate_reports_missing_key(monkeypatch):
+    from testing import _gates
+    _online(monkeypatch)
+    monkeypatch.delenv("FRED_API_KEY", raising=False)
+    assert "FRED_API_KEY" in _gates.service_missing("fred")
+
+
+def test_finnhub_and_fred_gates_respect_the_offline_flag(monkeypatch):
+    """Both reach a live HTTP API, so an offline run must gate them even when
+    the credential is configured."""
+    from testing import _gates
+    monkeypatch.setenv("SKIP_NETWORK_TESTS", "1")
+    monkeypatch.setenv("FINNHUB_API_KEY", "test-key-not-real")
+    monkeypatch.setenv("FRED_API_KEY", "test-key-not-real")
+    for service in ("finnhub", "fred"):
+        reason = _gates.service_missing(service)
+        assert reason is not None and "SKIP_NETWORK_TESTS" in reason, service

@@ -103,6 +103,16 @@ def service_missing(name: str) -> str | None:
     if name == "sec":
         return None if _env_key("SEC_EMAIL") else (
             "SEC_EMAIL is unset; SEC fair access requires a real contact identity")
+    if name == "finnhub":
+        if _offline():
+            return _OFFLINE_REASON.format(service="the Finnhub API")
+        return None if _env_key("FINNHUB_API_KEY") else (
+            "FINNHUB_API_KEY is unset or empty; set it in .env to run this test")
+    if name == "fred":
+        if _offline():
+            return _OFFLINE_REASON.format(service="the FRED API")
+        return None if _env_key("FRED_API_KEY") else (
+            "FRED_API_KEY is unset or empty; set it in .env to run this test")
     raise ValueError(f"unknown service gate: {name!r}")
 
 
@@ -123,3 +133,5 @@ requires_openrouter = _gate("openrouter")
 requires_searxng = _gate("searxng")
 requires_playbook = _gate("playbook")
 requires_sec = _gate("sec")
+requires_finnhub = _gate("finnhub")
+requires_fred = _gate("fred")

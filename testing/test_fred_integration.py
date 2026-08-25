@@ -9,6 +9,13 @@ Tests:
   3. Mixed macro + news query -- verifies both macro and market intel tools
      fire in the same pipeline run.
 
+These were script functions taking an `mcp` argument, so pytest tried to
+resolve `mcp` as a fixture and errored at collection -- the FRED macro
+pipeline had no real coverage. `mcp` is now an actual fixture and the three
+are real tests, gated on FRED_API_KEY + OPENROUTER_API_KEY and skipped on
+SKIP_NETWORK_TESTS=1: each drives the full agent workflow, which spawns MCP
+subprocesses and makes live LLM and FRED calls.
+
 Usage: python -m testing.test_fred_integration [1|2|3]
   No arg = run test 1 only (fastest)
   Pass test number to run a specific test
@@ -19,12 +26,34 @@ import sys
 import os
 import time
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from typing import cast
 from agent.workflows.analysis_workflow import WorkFlow
 from agent.workflows.agent_state import AgentState
 from agent.MCP_manager import MCPConnectionManager
+from testing._gates import requires_fred, requires_openrouter
+
+
+# The whole module drives the live agent workflow: MCP subprocesses, live FRED
+# calls and live LLM completions. Both gates apply to every test, and both
+# report SKIP_NETWORK_TESTS=1 as unavailable.
+pytestmark = [pytest.mark.network, pytest.mark.slow,
+              requires_fred, requires_openrouter]
+
+
+@pytest.fixture
+async def mcp():
+  """One connected MCPConnectionManager per test.
+
+  Function-scoped: the manager clears its session cache on enter and exit, so
+  sharing it across tests would let one test's cached tool results decide
+  another's assertions.
+  """
+  async with MCPConnectionManager() as manager:
+    yield manager
 
 
 def print_banner(text: str):
@@ -118,7 +147,7 @@ def analyze_result(result: dict, test_name: str):
   }
 
 
-async def test_1_macro_outlook(mcp: MCPConnectionManager):
+async def test_1_macro_outlook(mcp):
   """Test 1: Pure macro query -- should use get_macro_snapshot and/or get_treasury_yields."""
   print_banner("TEST 1: Pure Macro Query")
   print("Query: 'What is the current macro environment and interest rate outlook?'")
@@ -150,10 +179,10 @@ async def test_1_macro_outlook(mcp: MCPConnectionManager):
     passed = False
 
   print(f"\n{'PASS' if passed else 'FAIL'}: Test 1 - Macro Outlook")
-  return passed
+  assert passed, "macro pipeline did not populate macro vars / risk_free_rate / report"
 
 
-async def test_2_dcf_risk_free_rate(mcp: MCPConnectionManager):
+async def test_2_dcf_risk_free_rate(mcp):
   """Test 2: DCF query -- should auto-resolve risk_free_rate from macro tools into calculate_wacc."""
   print_banner("TEST 2: DCF with Auto Risk-Free Rate Resolution")
   print("Query: 'Run a DCF analysis on MSFT'")
@@ -199,10 +228,10 @@ async def test_2_dcf_risk_free_rate(mcp: MCPConnectionManager):
     print(f"INFO: WACC not found in variables (orchestrator may not have planned calculate_wacc)")
 
   print(f"\n{'PASS' if passed else 'FAIL'}: Test 2 - DCF Risk-Free Rate")
-  return passed
+  assert passed, "risk_free_rate did not auto-resolve into the DCF path"
 
 
-async def test_3_mixed_macro_news(mcp: MCPConnectionManager):
+async def test_3_mixed_macro_news(mcp):
   """Test 3: Mixed query -- both macro and market intel tools should fire."""
   print_banner("TEST 3: Mixed Macro + News Query")
   print("Query: 'What is the macro outlook and current news sentiment for AAPL?'")
@@ -257,7 +286,7 @@ async def test_3_mixed_macro_news(mcp: MCPConnectionManager):
       print(f"  {k}: {variables[k]}")
 
   print(f"\n{'PASS' if passed else 'FAIL'}: Test 3 - Mixed Macro + News")
-  return passed
+  assert passed, "mixed macro+news query did not produce macro output and a report"
 
 
 async def main():
@@ -275,9 +304,13 @@ async def main():
 
   print_banner(f"FRED INTEGRATION TEST SUITE -- Test {test_num}")
 
-  async with MCPConnectionManager() as mcp:
-    test_fn = tests[test_num]
-    passed = await test_fn(mcp)
+  passed = True
+  async with MCPConnectionManager() as manager:
+    try:
+      await tests[test_num](manager)
+    except AssertionError as exc:
+      print(f"\nASSERTION FAILED: {exc}")
+      passed = False
 
   print_banner("RESULTS")
   print(f"  Test {test_num}: {'PASS' if passed else 'FAIL'}")
