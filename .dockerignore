@@ -1,0 +1,9 @@
+
+
+# Secrets must never enter the build context. The image reads them at runtime
+# through compose's env_file, so nothing here needs them, and a future
+# `COPY . .` would otherwise bake real API keys into a layer that survives
+# deletion of the file.
+.env
+.env.*
+!.env.example

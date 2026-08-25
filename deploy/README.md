@@ -99,6 +99,53 @@ unset, verified.
 `get_policy_signals`, `get_government_contracts`, and
 `get_taiwan_monthly_revenue` will degrade.
 
+## Getting secrets onto the host
+
+Nothing secret is in the image, and that is verifiable rather than assumed:
+`env_file` is read by compose on the host at **run** time, the Dockerfile has no
+`ARG` and never references `.env`, and `.dockerignore` excludes it so a careless
+`COPY . .` cannot bake one into a layer. To check a specific key:
+
+```bash
+docker run --rm -e SEEK="$(grep '^FINNHUB_API_KEY=' .env | cut -d= -f2- | head -c 16)" \
+  --entrypoint sh nemo-data:local -c 'grep -rlF "$SEEK" /app /etc /root /usr/local || echo CLEAN'
+```
+
+Search `/app /etc /root /usr/local`, never `/`: grepping `/` matches the
+process's own `/proc/self/cmdline` and reports a leak that is not there. Check
+the needle is non-empty first, too -- `grep -rl ""` matches every file in the
+image.
+
+So the secrets have to reach the host separately. Over the tailnet:
+
+```bash
+scp .env you@100.x.y.z:/srv/nemo/.env          # never over the public internet
+ssh you@100.x.y.z 'chmod 600 /srv/nemo/.env'
+```
+
+**The bearer token is generated, not chosen.** 32 random bytes, once, on the
+host that will run the stack:
+
+```bash
+openssl rand -hex 32
+```
+
+Where it lives is a real trade-off:
+
+- **In the shell** (`NEMO_MCP_TOKEN=... docker compose up -d`) keeps it out of
+  every file on disk. Interpolation happens at `up`, so containers keep their
+  copy across a reboot -- but any later `docker compose up` or `restart` needs
+  the variable present again, and forgetting it stops the stack rather than
+  publishing it unauthenticated.
+- **In `.env`** alongside the API keys survives unattended restarts and is one
+  fewer thing to remember. It is also one more secret in a file, though that
+  file already holds every API key, so the marginal exposure is small.
+
+For a homelab that should come back up on its own, `.env` with `chmod 600` is
+the pragmatic choice. The client end is not free either: `claude mcp add
+--header "Authorization: Bearer ..."` writes the token to `~/.claude.json` in
+plaintext, so that file is a secret on every machine you register from.
+
 ## Blockers hit while building this, and how they present
 
 Each of these failed *after* a green test suite, so none of them is caught by

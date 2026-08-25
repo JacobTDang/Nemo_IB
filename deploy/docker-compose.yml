@@ -6,10 +6,16 @@
 #
 # Every service shares one image and differs only in its command and port.
 #
-# Bind to the tailnet address rather than every interface once Tailscale is in
-# place: replace "8810:8080" with "<tailnet-ip>:8810:8080" so nothing is exposed
-# to the untrusted LAN. The bearer token is defence in depth behind that, not a
-# substitute for it.
+# NEMO_BIND_ADDR is the address the ports publish on. It defaults to 127.0.0.1,
+# so a missing variable fails closed -- reachable only from the host itself --
+# rather than publishing five servers to an untrusted LAN. On the homelab set it
+# to the machine's Tailscale address:
+#
+#   NEMO_BIND_ADDR=100.x.y.z docker compose up -d
+#
+# Never set it to 0.0.0.0. The bearer token is defence in depth behind the
+# network boundary, not a substitute for one: on a flat home network that is
+# every phone, TV and IoT device.
 #
 # Build for the target architecture before deploying. Proxmox VE is x86-64
 # only, so an image built on Apple Silicon without --platform will not run:
@@ -72,31 +78,31 @@ services:
     <<: *server
     container_name: nemo-sec
     command: python -m tools.web_search_server.web_search http
-    ports: ["8810:8080"]
+    ports: ["${NEMO_BIND_ADDR:-127.0.0.1}:8810:8080"]
 
   financial:
     <<: *server
     container_name: nemo-financial
     command: python -m tools.financial_modeling_engine.analysis_tools http
-    ports: ["8811:8080"]
+    ports: ["${NEMO_BIND_ADDR:-127.0.0.1}:8811:8080"]
 
   finnhub:
     <<: *server
     container_name: nemo-finnhub
     command: python -m tools.news_agregator.finnhub_server http
-    ports: ["8812:8080"]
+    ports: ["${NEMO_BIND_ADDR:-127.0.0.1}:8812:8080"]
 
   fred:
     <<: *server
     container_name: nemo-fred
     command: python -m tools.news_agregator.fred_server http
-    ports: ["8813:8080"]
+    ports: ["${NEMO_BIND_ADDR:-127.0.0.1}:8813:8080"]
 
   altdata:
     <<: *server
     container_name: nemo-altdata
     command: python -m tools.altdata_server.server http
-    ports: ["8814:8080"]
+    ports: ["${NEMO_BIND_ADDR:-127.0.0.1}:8814:8080"]
 
   # Ingestion, not a server. Under a profile so `docker compose up` never
   # starts it: it is a batch job that finishes, and a restart:unless-stopped
