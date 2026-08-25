@@ -171,6 +171,13 @@ def annotating(provider, *, per_tool=None, warnings_per_tool=None):
                 ), default=str)
             return contents
 
+        # Exposed so a manifest can read what responses actually report rather
+        # than restating it. Two lists of providers drift; one does not.
+        wrapper.annotation_config = {
+            "provider": provider,
+            "per_tool": dict(per_tool),
+            "warnings_per_tool": {k: list(v) for k, v in warnings_per_tool.items()},
+        }
         return wrapper
 
     return decorate

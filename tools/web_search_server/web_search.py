@@ -1,4 +1,4 @@
-from tools.response_meta import annotating
+from tools.response_meta import annotating, warning
 from typing import Any, Dict, List
 import asyncio
 import json
@@ -1151,6 +1151,45 @@ class WebSearchServer:
         "rag_search": "Nemo RAG index",
         "rag_ingest": "Nemo RAG index",
         "search": "SearXNG",
+      },
+warnings_per_tool={
+        # Every entry here is a limitation already recorded in the repository
+        # (README.md, docs/audits/2026-08-25-codex-audit.md, or a tool's own
+        # docstring). A caveat that cannot be sourced is not added: an invented
+        # limitation is worse than a missing one, because it will be believed.
+        "get_debt_maturity_schedule": [
+          warning("incomplete_coverage",
+                  "Coverage is materially incomplete. `not_covered` means the "
+                  "split was not disclosed in tagged form, NEVER that no debt "
+                  "matures."),
+        ],
+        "get_earnings_transcripts": [
+          warning("may_not_be_a_transcript",
+                  "May return an earnings release rather than a call "
+                  "transcript. Check the document before quoting management."),
+        ],
+        "extract_litigation": [
+          warning("may_be_a_cross_reference",
+                  "Some filers answer this item with a pointer to a "
+                  "financial-statement note, so the extract can be a "
+                  "cross-reference rather than the matter itself."),
+        ],
+        "extract_forward_signals": [
+          warning("boilerplate_risk",
+                  "Can surface safe-harbor or risk-factor boilerplate rather "
+                  "than informative guidance."),
+        ],
+        "get_ebitda_margin": [
+          warning("refuses_by_design",
+                  "Refuses filers that tag no undimensioned operating income, "
+                  "banks among them. A refusal names the element it looked "
+                  "for and is not a failure."),
+        ],
+        "extract_mda": [
+          warning("layout_sensitive",
+                  "Section extraction depends on filing layout; some "
+                  "nonstandard 10-K layouts defeat it."),
+        ],
       })
     async def call_tool(name: str, args: Dict[str, Any]) -> List[TextContent]:
       try:

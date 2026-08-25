@@ -40,7 +40,7 @@ Optional env vars:
   CONGRESS_API_KEY   -- congress.gov API key (free; enhances get_policy_signals)
 """
 from __future__ import annotations
-from tools.response_meta import annotating
+from tools.response_meta import annotating, warning
 
 import asyncio
 import json
@@ -1859,6 +1859,24 @@ class AltDataServer:
                 "get_congress_holdings": "US Senate eFD",
                 "get_congress_leaderboard": "US House Clerk / Senate eFD",
                 "get_congress_coverage": "Nemo congressional store",
+            },
+warnings_per_tool={
+                "get_congress_holdings": [
+                    warning("not_current_positions",
+                            "Annual disclosures cover assets held at some "
+                            "point DURING the year they name and are filed "
+                            "months after it ends. A row is not a current "
+                            "position."),
+                    warning("senate_only",
+                            "Holdings are Senate-only. House annual reports "
+                            "are PDFs that are not yet ingested, so absence "
+                            "here is not absence of a holding."),
+                ],
+                "get_congress_trades": [
+                    warning("disclosure_lag",
+                            "Members file up to 45 days after trading, so "
+                            "transaction_date and filed_date differ."),
+                ],
             })
         async def call_tool(name: str, args: Dict[str, Any]):
             if name == "get_taiwan_monthly_revenue":

@@ -6,7 +6,7 @@ earnings calendars, peer companies, and key financial metrics.
 
 Entry point: python -m tools.news_agregator.finnhub_server server
 """
-from tools.response_meta import annotating
+from tools.response_meta import annotating, warning
 from typing import Any, Dict, List
 import asyncio
 import json
@@ -1123,7 +1123,15 @@ class FinnhubServer:
       ]
 
     @self.server.call_tool()
-    @annotating("Finnhub")
+    @annotating(
+      "Finnhub",
+warnings_per_tool={
+        "get_earnings_calendar": [
+          warning("dates_can_be_wrong",
+                  "Finnhub earnings dates can be stale or incorrect. Confirm "
+                  "against the filer before relying on a date."),
+        ],
+      })
     async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
       match name:
         case "get_company_news":

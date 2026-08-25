@@ -1,4 +1,4 @@
-from tools.response_meta import annotating
+from tools.response_meta import annotating, warning
 from typing import Any, Dict, List, Optional
 import asyncio
 from tools.financial_modeling_engine.corporate_actions import get_corporate_actions
@@ -1476,6 +1476,33 @@ class Financial_Analysis:
         "analyze_exposures": "Nemo book state",
         "record_thesis_evolution": "Nemo book state",
         "get_thesis_evolution": "Nemo book state",
+      },
+warnings_per_tool={
+        # Sourced from the repository's own documentation. See the sec server
+        # for why nothing unsourced is added here.
+        "get_short_interest": [
+          warning("stale_by_design",
+                  "Exchange short interest is published on a lag and is "
+                  "normally 2-3 weeks old. There is no live alternative "
+                  "configured."),
+        ],
+        "get_options_metrics": [
+          warning("stale_after_hours",
+                  "Options quotes can be stale outside market hours, and "
+                  "illiquid strikes can yield invalid implied-volatility "
+                  "values."),
+        ],
+        "get_market_data": [
+          warning("not_execution_grade",
+                  "yfinance is convenient for research and is not a "
+                  "consolidated execution-grade market-data feed. Do not use "
+                  "it to price a trade."),
+        ],
+        "get_price_history": [
+          warning("not_execution_grade",
+                  "yfinance is convenient for research and is not a "
+                  "consolidated execution-grade market-data feed."),
+        ],
       })
     async def call_tool(name: str, args: Dict[str, Any]) -> List[TextContent]:
       try:
