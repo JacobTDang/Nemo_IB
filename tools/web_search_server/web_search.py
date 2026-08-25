@@ -1,3 +1,4 @@
+from tools.response_meta import annotating
 from typing import Any, Dict, List
 import asyncio
 import json
@@ -1138,6 +1139,19 @@ class WebSearchServer:
       return [t for t in _ALL_TOOLS if _tool_is_available(t.name)]
 
     @self.server.call_tool()
+    @annotating(
+      "SEC EDGAR",
+      per_tool={
+        # Not every tool here reads EDGAR, and naming the wrong upstream is
+        # worse than naming none.
+        "get_urls_content": "web fetch (caller-supplied URLs)",
+        "get_patent_filings": "Google Patents",
+        "get_earnings_transcripts": "Finnhub",
+        "extract_call_sentiment": "Finnhub",
+        "rag_search": "Nemo RAG index",
+        "rag_ingest": "Nemo RAG index",
+        "search": "SearXNG",
+      })
     async def call_tool(name: str, args: Dict[str, Any]) -> List[TextContent]:
       try:
         if name == 'search':

@@ -39,7 +39,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # sentry, excel and slack as well -- excluded from running but present on disk,
 # which on a LAN-reachable host is the difference between "no trading tools"
 # and "trading tools nobody happens to start".
-COPY tools/__init__.py tools/mcp_http.py ./tools/
+COPY tools/__init__.py tools/mcp_http.py tools/response_meta.py ./tools/
 COPY tools/news_agregator/ ./tools/news_agregator/
 COPY tools/web_search_server/ ./tools/web_search_server/
 COPY tools/financial_modeling_engine/ ./tools/financial_modeling_engine/

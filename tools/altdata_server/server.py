@@ -40,6 +40,7 @@ Optional env vars:
   CONGRESS_API_KEY   -- congress.gov API key (free; enhances get_policy_signals)
 """
 from __future__ import annotations
+from tools.response_meta import annotating
 
 import asyncio
 import json
@@ -1846,6 +1847,19 @@ class AltDataServer:
             ]
 
         @self.server.call_tool()
+        @annotating(
+            "altdata",
+            per_tool={
+                "get_taiwan_monthly_revenue": "FinMind (TWSE)",
+                "get_job_postings_count": "Greenhouse / Lever / Workday boards",
+                "get_government_contracts": "USAspending.gov",
+                "get_policy_signals": "GovTrack / Congress.gov",
+                "get_capex_announcements": "company newsroom / press releases",
+                "get_congress_trades": "US House Clerk / Senate eFD",
+                "get_congress_holdings": "US Senate eFD",
+                "get_congress_leaderboard": "US House Clerk / Senate eFD",
+                "get_congress_coverage": "Nemo congressional store",
+            })
         async def call_tool(name: str, args: Dict[str, Any]):
             if name == "get_taiwan_monthly_revenue":
                 return await parent.taiwan_monthly_revenue(args)

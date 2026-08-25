@@ -6,6 +6,7 @@ GDP growth, yield curve, and access to 800k+ FRED series.
 
 Entry point: python -m tools.news_agregator.fred_server server
 """
+from tools.response_meta import annotating
 from typing import Any, Dict, List, Optional
 import asyncio
 import json
@@ -373,6 +374,7 @@ class FredServer:
       ]
 
     @self.server.call_tool()
+    @annotating("FRED")
     async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
       match name:
         case "get_macro_snapshot":

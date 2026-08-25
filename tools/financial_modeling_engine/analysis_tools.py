@@ -1,3 +1,4 @@
+from tools.response_meta import annotating
 from typing import Any, Dict, List, Optional
 import asyncio
 from tools.financial_modeling_engine.corporate_actions import get_corporate_actions
@@ -1456,6 +1457,26 @@ class Financial_Analysis:
       ]
 
     @self.server.call_tool()
+    @annotating(
+      "Yahoo Finance (yfinance)",
+      per_tool={
+        # These compute from inputs the caller supplies rather than reading an
+        # upstream, so naming a data provider would misattribute the number.
+        "calculate_dcf": "Nemo (computed)",
+        "calculate_scenario_dcf": "Nemo (computed)",
+        "calculate_wacc": "Nemo (computed)",
+        "calculate_lbo": "Nemo (computed)",
+        "calculate_credit_profile": "Nemo (computed)",
+        "calculate_capital_returns": "Nemo (computed)",
+        "comparable_company_analysis": "Nemo (computed)",
+        "backtest_signal": "Nemo (computed)",
+        "get_historical_analogue": "Nemo (curated)",
+        "extract_13f_holdings": "SEC EDGAR",
+        "get_corporate_actions": "SEC EDGAR",
+        "analyze_exposures": "Nemo book state",
+        "record_thesis_evolution": "Nemo book state",
+        "get_thesis_evolution": "Nemo book state",
+      })
     async def call_tool(name: str, args: Dict[str, Any]) -> List[TextContent]:
       try:
         if name == "get_corporate_actions":

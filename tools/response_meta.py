@@ -96,3 +96,81 @@ def annotate(
         result.setdefault("warnings", [])
 
     return result
+
+
+# --------------------------------------------------------------- the seam
+
+# Keys that unambiguously name the period the DATA describes. Deliberately
+# short. `timestamp` is when we asked, `filing_date` is when a document was
+# filed, `date` could be either -- promoting any of them would hand a caller
+# confident provenance that is wrong, and a caller comparing two observations
+# on a bad `data_as_of` compares different periods believing they match.
+_PERIOD_KEYS = ("data_as_of", "period_end", "as_of")
+
+_SOURCE_URL_KEYS = ("source_url", "filing_url", "url")
+
+
+def _first_present(payload: dict, keys) -> "object | None":
+    for key in keys:
+        value = payload.get(key)
+        if value:
+            return value
+    return None
+
+
+def annotating(provider, *, per_tool=None, warnings_per_tool=None):
+    """Wrap an MCP `call_tool(name, args)` so every response carries provenance.
+
+    Applied at the dispatcher rather than in each tool. `web_search` alone
+    returns TextContent from fifty places; editing each is fifty chances to
+    differ and one to be forgotten, and a tool added later would ship without
+    provenance and nothing would say so.
+
+    `per_tool` overrides the provider where a server reads more than one
+    upstream -- altdata answers from the House Clerk, the Senate eFD,
+    USAspending, GovTrack, FinMind and public ATS boards, and calling all of
+    that "altdata" would name the aggregator instead of the source.
+
+    Anything that is not a JSON object is passed through untouched: a list has
+    no place to put provenance without changing its shape, and inventing one
+    here would be the guess this module exists to avoid.
+    """
+    import functools
+    import json
+
+    per_tool = per_tool or {}
+    warnings_per_tool = warnings_per_tool or {}
+
+    def decorate(handler):
+        @functools.wraps(handler)
+        async def wrapper(name, args, *rest, **kwargs):
+            contents = await handler(name, args, *rest, **kwargs)
+            if not contents:
+                return contents
+
+            resolved = per_tool.get(name, provider)
+            extra = warnings_per_tool.get(name)
+
+            for item in contents:
+                text = getattr(item, "text", None)
+                if not text:
+                    continue
+                try:
+                    payload = json.loads(text)
+                except (ValueError, TypeError):
+                    continue                      # prose, not a response body
+                if not isinstance(payload, dict):
+                    continue                      # a list has nowhere to put it
+
+                item.text = json.dumps(annotate(
+                    payload,
+                    provider=resolved,
+                    source_url=_first_present(payload, _SOURCE_URL_KEYS),
+                    data_as_of=_first_present(payload, _PERIOD_KEYS),
+                    warnings=list(extra) if extra else None,
+                ), default=str)
+            return contents
+
+        return wrapper
+
+    return decorate
