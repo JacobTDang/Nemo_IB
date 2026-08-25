@@ -1,27 +1,31 @@
 """Phase B3b: governance extractor handles SEC's XML declaration.
 
 The B3 pilot found that `extract_governance_data` was returning
-`success=False, board_members=[]` for MSFT. Root cause was an unhandled
-combination on Python >=3.10:
+`success=False, board_members=[]` for MSFT. Root cause: SEC HTML files begin
+with an `<?xml ... encoding="..."?>` processing instruction, and lxml's string
+parser rejects those outright ("Unicode strings with encoding declaration are
+not supported").
 
-  - `pd.read_html(StringIO(html))` defaults to the lxml flavor, which
-    rejects unicode strings that begin with an `<?xml ... ?>` processing
-    instruction (which SEC's HTML files all do).
-  - The pre-existing fallback to `flavor='html5lib'` cannot execute
-    because the latest released `html5lib` (1.1) does
-    `from collections import Mapping`, which was removed in Python 3.10.
+Fix in `tools/web_search_server/8K_and_DEF14A_utils.py`: strip the XML
+declaration before invoking pd.read_html so lxml accepts the input.
 
-Fix in `tools/web_search_server/8K_and_DEF14A_utils.py:_extract_board_from_tables`:
-strip the XML declaration before invoking pd.read_html so lxml accepts the
-input, and fall back to the `bs4` flavor (works without html5lib) instead
-of the broken `html5lib` flavor when lxml still fails.
+An earlier version of this file asserted that a plain
+`pd.read_html(StringIO(sec_html))` *raises*, to prove the strip was needed.
+That premise was wrong -- and wrong in a way worth pinning, because it made
+the workaround look dead. `pd.read_html`'s default `flavor` is the pair
+("lxml", "bs4") tried in order, with ValueError caught between them. So the
+default call succeeds on declared HTML by silently downgrading to bs4; it is
+only `flavor="lxml"` that still raises. The strip is therefore live and
+load-bearing: it is the difference between SEC tables being parsed by lxml
+and being parsed by the weaker fallback parser.
 
-This test is intentionally narrow: it pins the parsing-level fix without
-making an HTTP call to EDGAR. A captured-fixture run is more honest than
-hitting the network in CI.
+These tests are intentionally narrow: they pin the parsing-level behaviour
+without making an HTTP call to EDGAR.
 """
 import os
 import sys
+
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -48,26 +52,45 @@ _SEC_STYLE_HTML = '''<?xml version="1.0" encoding="UTF-8"?>
 </html>'''
 
 
-def test_xml_declaration_strip_keeps_lxml_path_alive():
-  """Direct sanity check that the helper's strip logic produces a string
-  lxml can parse via pd.read_html."""
+def test_lxml_flavor_still_rejects_the_xml_declaration():
+  """The limitation the strip exists for is still real.
+
+  If this ever starts passing without raising, lxml has changed and the strip
+  can be reconsidered -- but not before.
+  """
   import pandas as pd
   from io import StringIO
-  # Pre-fix behavior: this raises on Py>=3.10
-  raised = False
-  try:
-    pd.read_html(StringIO(_SEC_STYLE_HTML))
-  except (ValueError, ImportError):
-    raised = True
-  assert raised, "test premise wrong: raw lxml string parse already works"
-  # Post-fix behavior: stripping the declaration unblocks lxml
+  with pytest.raises(ValueError, match="encoding declaration"):
+    pd.read_html(StringIO(_SEC_STYLE_HTML), flavor='lxml')
+  print("PASS: flavor='lxml' still rejects an encoding declaration")
+
+
+def test_default_flavor_masks_the_failure_by_downgrading_to_bs4():
+  """Why the old premise looked right and was wrong.
+
+  The default flavor is ("lxml", "bs4"); pandas catches the lxml ValueError
+  and retries with bs4, so the declared HTML parses -- via the fallback
+  parser, not via lxml. That silent downgrade is exactly what the strip
+  avoids, so this behaviour is pinned rather than relied upon.
+  """
+  import pandas as pd
+  from io import StringIO
+  dfs = pd.read_html(StringIO(_SEC_STYLE_HTML))
+  assert len(dfs) == 1 and len(dfs[0]) == 4
+  print("PASS: default flavor parses declared HTML by falling back to bs4")
+
+
+def test_stripping_the_declaration_unblocks_lxml():
+  """Post-fix behavior: after the strip, the lxml flavor itself succeeds."""
+  import pandas as pd
+  from io import StringIO
   clean = _SEC_STYLE_HTML
   if clean.lstrip().startswith('<?xml') and '?>' in clean:
     clean = clean.split('?>', 1)[1].lstrip()
-  dfs = pd.read_html(StringIO(clean))
+  dfs = pd.read_html(StringIO(clean), flavor='lxml')
   assert dfs and len(dfs) == 1
   assert len(dfs[0]) == 4
-  print("PASS: stripping XML declaration unblocks pd.read_html (lxml)")
+  print("PASS: stripping the XML declaration unblocks the lxml flavor")
 
 
 def test_extract_board_from_tables_no_longer_silent_fails_on_xml_decl():
@@ -130,7 +153,9 @@ def test_no_xml_declaration_passes_through_unchanged():
 
 
 if __name__ == "__main__":
-  test_xml_declaration_strip_keeps_lxml_path_alive()
+  test_lxml_flavor_still_rejects_the_xml_declaration()
+  test_default_flavor_masks_the_failure_by_downgrading_to_bs4()
+  test_stripping_the_declaration_unblocks_lxml()
   test_extract_board_from_tables_no_longer_silent_fails_on_xml_decl()
   test_no_xml_declaration_passes_through_unchanged()
   print("\nAll Phase B3b governance XML-strip tests passed.")

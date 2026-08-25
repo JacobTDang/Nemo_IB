@@ -1242,7 +1242,7 @@ class SECFilingParser:
             # Strip SEC's `<?xml ... ?>` processing instruction so lxml's
             # string parser accepts the input. Same fix as in
             # _extract_board_from_tables — see that method's comment for
-            # the full rationale (html5lib 1.1 is broken on Py>=3.10).
+            # why the strip is load-bearing rather than cosmetic.
             clean_html = html
             if clean_html.lstrip().startswith('<?xml') and '?>' in clean_html:
                 clean_html = clean_html.split('?>', 1)[1].lstrip()
@@ -2005,18 +2005,26 @@ class SECFilingParser:
         if not html: return best_members, None
         try:
             # SEC HTML often starts with `<?xml version="1.0" encoding="..."?>`
-            # which makes lxml's string parser raise "Unicode strings with
-            # encoding declaration are not supported." The html5lib fallback
-            # is unusable on Python >=3.10 (its 1.1 release imports the
-            # removed `collections.Mapping`). Strip the declaration so the
-            # default lxml path works on a clean string.
+            # and lxml's string parser still refuses that: "Unicode strings
+            # with encoding declaration are not supported."
+            #
+            # pd.read_html's default flavor is the pair ("lxml", "bs4"), tried
+            # in order, so without this strip the lxml attempt raises, pandas
+            # silently falls back to bs4, and every SEC table is parsed by the
+            # weaker parser. Stripping the declaration keeps the lxml path
+            # usable. It is not cosmetic -- the two parsers disagree on the
+            # malformed tables SEC filings are full of.
             clean_html = html
             if clean_html.lstrip().startswith('<?xml') and '?>' in clean_html:
                 clean_html = clean_html.split('?>', 1)[1].lstrip()
             try:
                 dfs = pd.read_html(StringIO(clean_html))
             except Exception:
-                # bs4 flavor works without lxml or html5lib if either is missing
+                # Reachable when lxml is not installed: pandas raises
+                # ImportError out of _parser_dispatch before its internal
+                # per-flavor loop (which only catches ValueError) can fall
+                # back. Asking for bs4 explicitly still works -- that flavor
+                # needs bs4 + html5lib, not lxml.
                 dfs = pd.read_html(StringIO(clean_html), flavor='bs4')
 
             for table_idx, df in enumerate(dfs):
