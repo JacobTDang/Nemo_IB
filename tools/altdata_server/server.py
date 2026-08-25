@@ -1749,6 +1749,50 @@ class AltDataServer:
                         },
                     },
                 ),
+                Tool(
+                    name="get_congress_trades",
+                    description=(
+                        "Congressional stock trades from the official STOCK Act "
+                        "disclosures: the House Clerk's Periodic Transaction Reports "
+                        "and the Senate eFD. These are TRANSACTIONS, NOT HOLDINGS — "
+                        "Congress does not publish current positions, and no position "
+                        "can be derived from this. Amounts are BRACKETS, not figures: "
+                        "every row carries amount_min and amount_max and there is no "
+                        "midpoint to report. Members file up to 45 days after trading, "
+                        "so transaction_date and filed_date differ. Always read "
+                        "'coverage': it reports filings_available against filings_read, "
+                        "plus filings skipped as scanned paper. When coverage_complete "
+                        "is false an absent ticker does NOT mean it was not traded."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "ticker": {
+                                "type": "string",
+                                "description": "Filter to one ticker, e.g. 'NVDA'. Bonds and funds have no ticker and are excluded by any filter.",
+                            },
+                            "member": {
+                                "type": "string",
+                                "description": "Filter by member name, matched loosely, e.g. 'Pelosi'.",
+                            },
+                            "chamber": {
+                                "type": "string",
+                                "enum": ["both", "house", "senate"],
+                                "default": "both",
+                            },
+                            "days": {
+                                "type": "integer",
+                                "default": 45,
+                                "description": "Window of FILING dates to search. Trades inside are older.",
+                            },
+                            "max_filings": {
+                                "type": "integer",
+                                "default": 20,
+                                "description": "Cap on filings opened per chamber. Anything beyond it is reported in coverage.capped_unread, never dropped silently.",
+                            },
+                        },
+                    },
+                ),
             ]
 
         @self.server.call_tool()
@@ -1763,12 +1807,38 @@ class AltDataServer:
                 return await parent.policy_signals(args)
             if name == "get_capex_announcements":
                 return await parent.capex_announcements(args)
+            if name == "get_congress_trades":
+                return await parent.congress_trades(args)
             return _err(name, f"unknown tool: {name}")
 
     # -----------------------------------------------------------------------
     # Existing tool handlers
     # -----------------------------------------------------------------------
 
+
+    async def congress_trades(self, args: Dict[str, Any]) -> List[TextContent]:
+        from .congress_trades import get_congress_trades
+
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    get_congress_trades,
+                    ticker=args.get("ticker"),
+                    member=args.get("member"),
+                    chamber=args.get("chamber", "both"),
+                    days=int(args.get("days", 45)),
+                    max_filings=int(args.get("max_filings", 20)),
+                ),
+                timeout=180.0,
+            )
+        except asyncio.TimeoutError:
+            return _err("get_congress_trades",
+                        "the disclosure sites did not answer within 180s; lower "
+                        "max_filings or narrow the window")
+        except Exception as exc:
+            return _err("get_congress_trades",
+                        f"{type(exc).__name__}: {str(exc)[:200]}")
+        return _dispatch("get_congress_trades", result)
 
     async def taiwan_monthly_revenue(self, args: Dict[str, Any]) -> List[TextContent]:
         codes = args.get("company_codes", [])
