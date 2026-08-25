@@ -42,6 +42,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from state.schema import init_schema, get_watchlist
 from state.events_store import store_event, seen
 from agent.Materiality_Classifier import Materiality_Classifier
+from tools.web_search_server.sec_series import _require_identity
 
 
 # -- Tuning -----------------------------------------------------------------
@@ -54,10 +55,19 @@ GDELT_MAXRECORDS = 50              # per-ticker query cap
 HOURLY_INSERT_CAP = 500            # circuit breaker
 CONCURRENT_QUERIES = 4             # semaphore-bounded concurrency
 MATERIALITY_RPM = 25               # share-of-budget ceiling from this daemon
-USER_AGENT = (
-  f"Nemo Sentry GDELT poller "
-  f"({os.getenv('SEC_EMAIL', 'analyst@example.com')})"
-)
+
+
+def _user_agent() -> str:
+  """GDELT User-Agent carrying a real contact address, resolved on use.
+
+  Built here rather than at module level so this daemon imports without
+  credentials: a module-level resolution turns a missing SEC_EMAIL into an
+  import traceback in whatever imported the daemon, before its entrypoint can
+  report which variable is unset. `_main_loop` resolves it eagerly at boot for
+  the same reason the Groq credential is checked there.
+  """
+  return f"Nemo Sentry GDELT poller ({_require_identity()})"
+
 
 _running = True
 
@@ -300,7 +310,7 @@ async def tick(
 
   close_client = False
   if client is None:
-    client = httpx.AsyncClient(headers={'User-Agent': USER_AGENT})
+    client = httpx.AsyncClient(headers={'User-Agent': _user_agent()})
     close_client = True
   try:
     await asyncio.gather(
@@ -341,9 +351,12 @@ def _format_counts(counts: Dict[str, int]) -> str:
 
 async def _main_loop(args) -> None:
   init_schema()
-  # Eager check at boot. tick() builds the classifier itself, and the client is
-  # built lazily now, so without this a missing GROQ_API_KEY would first surface
-  # inside a tick rather than at startup.
+  # Eager checks at boot. Every tick is wrapped in `except Exception`, so a
+  # missing variable would otherwise be a traceback printed once per interval
+  # forever while the daemon reported itself as running.
+  _user_agent()
+  # tick() builds the classifier itself, and the client is built lazily now, so
+  # without this a missing GROQ_API_KEY would first surface inside a tick.
   Materiality_Classifier().validate_credentials()
   _install_signal_handlers()
   print(f"[gdelt_poller] starting | interval={args.interval}s | "

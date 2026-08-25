@@ -39,6 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from state.schema import init_schema, get_watchlist
 from state.events_store import store_event, seen
 from agent.Materiality_Classifier import Materiality_Classifier
+from tools.web_search_server.sec_series import _require_identity
 
 
 DEFAULT_INTERVAL_S = 1800       # 30 min between full poll cycles
@@ -54,8 +55,19 @@ CLASSIFY_SLEEP_S = 2.5
 MAX_ITEMS_PER_FEED = 30
 MAX_BODY_CHARS = 4000
 
+
 # SEC requires a UA header that identifies the requester
-SEC_UA = f"{os.getenv('NAME', 'analyst')} {os.getenv('SEC_EMAIL', 'analyst@example.com')} (Nemo Sentry RSS)"
+def _sec_user_agent() -> str:
+  """SEC User-Agent, resolved on use.
+
+  Built here rather than at module level so this daemon imports without
+  credentials: a module-level resolution turns a missing SEC_EMAIL into an
+  import traceback in whatever imported the daemon, before its entrypoint can
+  report which variable is unset. `main` resolves it eagerly at boot when a
+  SEC feed is configured, for the same reason the Groq credential is checked
+  there.
+  """
+  return f"{_require_identity()} (Nemo Sentry RSS)"
 
 
 _running = True
@@ -116,7 +128,7 @@ def _parse_feed(feed_cfg: Dict[str, Any]) -> Any:
   exposes errors via .bozo."""
   headers = None
   if feed_cfg.get('is_sec'):
-    headers = {'User-Agent': SEC_UA}
+    headers = {'User-Agent': _sec_user_agent()}
   return feedparser.parse(feed_cfg['url'], request_headers=headers)
 
 
@@ -312,6 +324,13 @@ def main() -> None:
     print(f"[rss_aggregator] no feeds in {feeds_path}; nothing to do",
           file=sys.stderr, flush=True)
     sys.exit(1)
+
+  # Eager check at boot, but only when a SEC feed is configured. Every tick is
+  # wrapped in `except Exception`, so a missing SEC_EMAIL would otherwise be a
+  # traceback printed once per interval forever while the daemon reported
+  # itself as running.
+  if any(f.get('is_sec') for f in feeds):
+    _sec_user_agent()
 
   # Eager check at boot, but only when a feed actually needs classification --
   # tick() builds the classifier under the same condition. The client is built

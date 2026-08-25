@@ -19,16 +19,15 @@ Capability:
 """
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, List, Optional, Tuple
 
-from edgar import Company, set_identity
+from edgar import Company
 
 
-# Default identity for SEC requests (sec_utils handles this too, but we
-# call set_identity defensively here so the tool works standalone)
-NAME = os.getenv('NAME', 'Investment Analyst')
-SEC_EMAIL = os.getenv('SEC_EMAIL', 'analyst@example.com')
+# SEC identity is resolved on use by sec_series._require_identity (called
+# below), so this tool still works standalone without inventing a contact
+# address when SEC_EMAIL is unset.
+from tools.web_search_server.sec_series import _require_identity
 
 
 # Curated registry of major institutional 13F filers. Names normalized
@@ -107,8 +106,9 @@ def get_fund_holdings(fund_name_or_cik: str, n_filings: int = 2) -> Dict[str, An
             'error': f'Unknown fund {fund_name_or_cik!r}. Use list_known_funds() to see available.',
             'available': [f['fund'] for f in list_known_funds()]}
 
+  _require_identity()
+
   try:
-    set_identity(f"{NAME} {SEC_EMAIL}")
     company = Company(resolved['cik'])
     filings = list(company.get_filings(form='13F-HR').head(n_filings))
   except Exception as e:

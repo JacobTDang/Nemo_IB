@@ -1,5 +1,5 @@
 from typing import Any, Dict, Optional
-from edgar import Company, set_identity
+from edgar import Company
 from edgar.xbrl import XBRL
 from collections import OrderedDict
 import pandas as pd
@@ -9,9 +9,10 @@ import sys
 import threading
 # useful documentation for edgartools xbrl: https://edgartools.readthedocs.io/en/latest/getting-xbrl/
 
-# set identity first
-NAME = os.getenv('NAME', 'Investment Analyst')
-SEC_EMAIL = os.getenv('SEC_EMAIL', 'analyst@example.com')
+# SEC identity is resolved on use by sec_series._require_identity, which
+# refuses to invent a contact address. Defaulting it here misrepresented the
+# caller to the SEC on every request.
+from tools.web_search_server.sec_series import _require_identity
 
 # Single-flight LRU cache for SEC filing fetches. The previous plain-dict cache
 # had a check-then-fill race: N concurrent threads asking for the same
@@ -279,9 +280,10 @@ def get_latest_filing(ticker: str, form_type: str = '10-K') -> Optional[Dict[str
       _filing_cache_lru.move_to_end(cache_key)
       return _filing_cache_lru[cache_key]
 
+    _require_identity()
+
     result = None
     try:
-      set_identity(f"{NAME} {SEC_EMAIL}")
       company = Company(ticker)
       filings = company.get_filings(form=form_type)
 
@@ -1356,8 +1358,9 @@ def get_schedule_13d_filings(ticker: str, limit: int = 15,
   scan; surfaces as `stake_pct` when found. Falls back to filer name +
   date + URL when stake parse fails.
   """
+  _require_identity()
+
   try:
-    set_identity(f"{NAME} {SEC_EMAIL}")
     company = Company(ticker)
   except Exception as e:
     return {'ticker': ticker, 'success': False,
@@ -1512,8 +1515,9 @@ def diff_10k(ticker: str, item: str = '1A',
   Default behavior: diff latest 10-K vs prior 10-K. Override with
   current_year/prior_year for specific comparisons.
   """
+  _require_identity()
+
   try:
-    set_identity(f"{NAME} {SEC_EMAIL}")
     company = Company(ticker)
     filings = list(company.get_filings(form='10-K').head(10))
   except Exception as e:
@@ -1736,8 +1740,9 @@ def get_company_filings_history(ticker: str, form_type: str = '10-K',
   download or parse XBRL/text. Use the other extractors with specific
   accession numbers for content.
   """
+  _require_identity()
+
   try:
-    set_identity(f"{NAME} {SEC_EMAIL}")
     company = Company(ticker)
     filings = company.get_filings(form=form_type)
   except Exception as e:
@@ -2040,8 +2045,9 @@ def get_earnings_releases(ticker: str, max_quarters: int = 4,
   (Motley Fool, Seeking Alpha). This tool returns the prepared remarks
   + the key-metrics table that always opens the release.
   """
+  _require_identity()
+
   try:
-    set_identity(f"{NAME} {SEC_EMAIL}")
     company = Company(ticker)
   except Exception as e:
     return {'ticker': ticker, 'success': False,

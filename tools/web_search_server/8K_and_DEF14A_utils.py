@@ -19,7 +19,6 @@ from io import StringIO
 import pandas as pd
 import logging
 import re
-import os
 import numpy as np
 
 try:
@@ -36,8 +35,12 @@ if not logger.handlers:
     logger.setLevel(logging.WARNING)
 
 # Configuration
-NAME = os.getenv('NAME', 'Investment Analyst')
-SEC_EMAIL = os.getenv('SEC_EMAIL', 'analyst@example.com')
+# SEC identity is resolved on use by sec_series._require_identity rather than
+# defaulted here: a placeholder contact address misrepresents the caller to
+# the SEC on every request, and does it silently. Absolute import because
+# testing/test_multi_company_verification.py loads this file by path (the
+# module name starts with a digit), which leaves it without a parent package.
+from tools.web_search_server.sec_series import _require_identity
 
 # Regex constants
 _ITEM_NUM_RE = re.compile(r'(\d+\.\d+)')
@@ -930,13 +933,18 @@ def run_truth_tests(executives: List[Dict[str, Any]], board_members: List[Dict[s
 
 class SECFilingParser:
     def __init__(self, name: Optional[str] = None, email: Optional[str] = None) -> None:
-        self.name, self.email = name or NAME, email or SEC_EMAIL
+        self.name, self.email = name, email
         self.event_classifier = DynamicEventClassifier()
         self.name_extractor = DynamicNameExtractor()
         self.validator = FilingGroundedValidator()
 
     def _set_identity(self) -> None:
-        set_identity(f"{self.name} {self.email}")
+        # An explicit name/email pair passed to the constructor wins; anything
+        # else has to come from the environment, which refuses to guess.
+        if self.name and self.email:
+            set_identity(f"{self.name} {self.email}")
+        else:
+            _require_identity()
 
     def _generate_quality_report(self, results: List[Dict[str, Any]], truth_tests_passed: bool, truth_alerts: List[str]) -> Dict[str, Any]:
         if not results:
@@ -1106,8 +1114,9 @@ class SECFilingParser:
         return actions
 
     def extract_8k_events(self, ticker: str, limit: int = 10) -> Dict[str, Any]:
+        self._set_identity()
+
         try:
-            self._set_identity()
             company = Company(ticker)
             filings = company.get_filings(form='8-K')
             if not filings: return {'ticker': ticker, 'success': False, 'error': 'No 8-K found'}
@@ -1163,8 +1172,9 @@ class SECFilingParser:
         except Exception as e: return {'ticker': ticker, 'success': False, 'error': str(e)}
 
     def extract_proxy_compensation(self, ticker: str) -> Dict[str, Any]:
+        self._set_identity()
+
         try:
-            self._set_identity()
             filings = Company(ticker).get_filings(form='DEF 14A')
             if not filings: return {'ticker': ticker, 'executives': [], 'candidates': [], 'success': False, 'error': 'No DEF 14A found'}
             latest = filings[0]
@@ -1597,8 +1607,9 @@ class SECFilingParser:
         return out
 
     def extract_governance_data(self, ticker: str, debug: bool = False) -> Dict[str, Any]:
+        self._set_identity()
+
         try:
-            self._set_identity()
             filings = Company(ticker).get_filings(form='DEF 14A')
             if not filings: return {'ticker': ticker, 'board_members': [], 'candidates': [], 'success': False}
             latest = filings[0]
