@@ -50,7 +50,9 @@ Copy `.env.example` to `.env` and fill in:
 
 - `FINNHUB_API_KEY` — market intel (free tier is sufficient)
 - `FRED_API_KEY` — macro data
-- `ALPACA_PAPER_API_KEY` + `ALPACA_PAPER_SECRET_KEY` — paper broker
+- `ALPACA_PAPER_KEY` + `ALPACA_PAPER_SECRET` — paper broker
+  (`ALPACA_LIVE_KEY` + `ALPACA_LIVE_SECRET` for live trading, which the
+  broker never falls back to)
 - `OPENROUTER_API_KEY` — only needed for the LangGraph fallback mode
 - `SEC_EMAIL` — real contact address sent as the User-Agent for SEC EDGAR.
   Required: SEC fair access asks for one, so anything reaching EDGAR refuses
