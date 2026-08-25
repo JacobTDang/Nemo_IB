@@ -8,8 +8,18 @@ still answers it -- the port is bound by uvicorn either way. Only a real
 handshake proves the thing works.
 
 Requires the compose stack:
-    docker compose -f deploy/docker-compose.yml up -d
+    NEMO_MCP_TOKEN=... docker compose -f deploy/docker-compose.yml up -d
 Skipped when it is not up, so the offline suite is unaffected.
+
+The token matters. The servers refuse an unauthenticated request, and this
+gate predates that: it connected to `/mcp` with no Authorization header, so
+once bearer auth shipped it failed every case against a running stack and
+skipped every case against a stopped one. It was green precisely when there
+was nothing to check, which is the worst state a gate can be in. Set
+NEMO_MCP_TOKEN (or MCP_AUTH_TOKEN) to the value the stack was started with.
+
+The trailing slash matters too. `/mcp` answers 307 to `/mcp/`, and some
+clients drop the Authorization header across a redirect.
 """
 import asyncio
 import os
@@ -38,15 +48,35 @@ def _up(port: int) -> bool:
         return False
 
 
+def _token() -> str:
+    return (os.environ.get("NEMO_MCP_TOKEN")
+            or os.environ.get("MCP_AUTH_TOKEN") or "")
+
+
 def _require(port: int):
     if not _up(port):
         pytest.skip(f"nothing listening on {port}; bring up the compose stack")
+    if not _token():
+        # Skip rather than fail: a stack is up but we have no way to talk to
+        # it, which is a missing test credential and not a broken server. The
+        # message says which, because "401" alone sent someone hunting an auth
+        # bug when the real answer was an unset variable.
+        pytest.skip(
+            "the stack is up but NEMO_MCP_TOKEN/MCP_AUTH_TOKEN is unset, so "
+            "every request would be refused; export the token the stack was "
+            "started with")
+
+
+def _headers() -> dict:
+    return {"Authorization": f"Bearer {_token()}"}
 
 
 async def _session(port: int):
     from mcp import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
-    return streamablehttp_client(f"http://localhost:{port}/mcp"), ClientSession
+    return (streamablehttp_client(f"http://localhost:{port}/mcp/",
+                                  headers=_headers()),
+            ClientSession)
 
 
 def _run(coro):
@@ -61,7 +91,7 @@ def test_server_completes_a_handshake_and_a_real_call(name):
     async def go():
         from mcp import ClientSession
         from mcp.client.streamable_http import streamablehttp_client
-        async with streamablehttp_client(f"http://localhost:{port}/mcp") as (r, w, _):
+        async with streamablehttp_client(f"http://localhost:{port}/mcp/", headers=_headers()) as (r, w, _):
             async with ClientSession(r, w) as s:
                 init = await s.initialize()
                 tools = await s.list_tools()
@@ -85,7 +115,7 @@ def test_sec_server_gates_capabilities_over_http_too():
     async def go():
         from mcp import ClientSession
         from mcp.client.streamable_http import streamablehttp_client
-        async with streamablehttp_client(f"http://localhost:{port}/mcp") as (r, w, _):
+        async with streamablehttp_client(f"http://localhost:{port}/mcp/", headers=_headers()) as (r, w, _):
             async with ClientSession(r, w) as s:
                 await s.initialize()
                 return {t.name for t in (await s.list_tools()).tools}
@@ -122,7 +152,7 @@ def test_repeated_requests_leave_no_residue():
     async def call_once():
         from mcp import ClientSession
         from mcp.client.streamable_http import streamablehttp_client
-        async with streamablehttp_client(f"http://localhost:{port}/mcp") as (r, w, _):
+        async with streamablehttp_client(f"http://localhost:{port}/mcp/", headers=_headers()) as (r, w, _):
             async with ClientSession(r, w) as s:
                 await s.initialize()
                 await s.call_tool("get_treasury_yields", {})
