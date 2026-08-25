@@ -52,7 +52,9 @@ Copy `.env.example` to `.env` and fill in:
 - `FRED_API_KEY` — macro data
 - `ALPACA_PAPER_API_KEY` + `ALPACA_PAPER_SECRET_KEY` — paper broker
 - `OPENROUTER_API_KEY` — only needed for the LangGraph fallback mode
-- `SEC_EMAIL` — used as User-Agent for SEC EDGAR (rate-limit friendly)
+- `SEC_EMAIL` — real contact address sent as the User-Agent for SEC EDGAR.
+  Required: SEC fair access asks for one, so anything reaching EDGAR refuses
+  to start without it rather than substitute a placeholder.
 
 ### 3. SearxNG (web search backend)
 
