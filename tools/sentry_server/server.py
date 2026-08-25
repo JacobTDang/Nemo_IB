@@ -22,7 +22,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import sqlite3
 import sys
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -702,22 +701,16 @@ class SentryServer:
     cutoff = (datetime.now(timezone.utc) - _td(days=7)).isoformat()
     conn = get_connection()
     try:
-      try:
-        rows = conn.execute(
-          """SELECT a.*, t.ticker
-             FROM falsifier_alerts a
-             LEFT JOIN theses t ON t.thesis_id = a.thesis_id
-             WHERE a.fired_at >= ?
-             ORDER BY a.fired_at DESC LIMIT ?""",
-          (cutoff, limit),
-        ).fetchall()
-        return _ok('sentry_active_falsifier_alerts',
-                   {'alerts': [dict(r) for r in rows], 'count': len(rows)})
-      except sqlite3.OperationalError:
-        # Table not yet created by falsifier_watcher; return empty gracefully
-        return _ok('sentry_active_falsifier_alerts',
-                   {'alerts': [], 'count': 0,
-                    'note': 'falsifier_alerts table does not exist yet'})
+      rows = conn.execute(
+        """SELECT a.*, t.ticker
+           FROM falsifier_alerts a
+           LEFT JOIN theses t ON t.thesis_id = a.thesis_id
+           WHERE a.fired_at >= ?
+           ORDER BY a.fired_at DESC LIMIT ?""",
+        (cutoff, limit),
+      ).fetchall()
+      return _ok('sentry_active_falsifier_alerts',
+                 {'alerts': [dict(r) for r in rows], 'count': len(rows)})
     finally:
       conn.close()
 

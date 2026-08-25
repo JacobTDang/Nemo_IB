@@ -31,7 +31,7 @@ from state.theses import (
 )
 from state.events_store import store_event
 from daemons.falsifier_watcher import (
-    evaluate_thesis, tick, _ensure_alerts_table, _already_alerted,
+    evaluate_thesis, tick, _already_alerted,
     _falsifier_hash,
 )
 
@@ -361,7 +361,6 @@ def test_alert_table_persistence():
 def main():
   print("\nFalsifier Watcher — end-to-end stress tests\n")
   init_schema()
-  _ensure_alerts_table()
 
   # Always clean any leftover test data BEFORE running so prior failed
   # runs don't pollute results

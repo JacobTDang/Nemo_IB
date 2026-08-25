@@ -288,8 +288,10 @@ def should_skip(
 def _has_recent_falsifier_alert(ticker: str, hours: int = 24) -> bool:
   """Check whether falsifier_watcher has fired on this ticker recently.
 
-  The falsifier_alerts table is created on demand by daemons/falsifier_watcher.py
-  (_ensure_alerts_table). If it doesn't exist yet, return False without crashing.
+  falsifier_alerts is part of CREATE_SCHEMA, so init_schema() guarantees it.
+  A missing table here means the DB was never initialised -- that must surface,
+  not be swallowed into "no recent alert", which would silently disable the
+  falsifier bypass.
   """
   cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
   conn = get_connection()
@@ -306,8 +308,5 @@ def _has_recent_falsifier_alert(ticker: str, hours: int = 24) -> bool:
     )
     row = cur.fetchone()
     return row is not None
-  except Exception:
-    # falsifier_alerts table may not exist yet — that's OK
-    return False
   finally:
     conn.close()
