@@ -778,12 +778,40 @@ degraded sweep can never be read as coverage.
   not a rule: the frame carries a `decimals` column that would settle it and
   `ConceptFact` does not keep it. Same class as the AMT `NetIncomeLoss` case
   under the reconciliation sweep's defect 5.
-- **`get_ebitda_margin` cannot serve a filer that tags no operating income.**
-  Eleven of the 32 — every bank, both REITs in the basket, XOM, CVX, GE, BIIB,
-  FOXA and LEN — return a "missing EBITDA components" error where they used to
-  return an EBITDA built on pre-tax income reached by prefix match (JPM:
-  72,595,000,000; GS: a fact worth $1). The error is correct and the coverage
-  gap is real: there is no consolidated operating income in those filings.
+- **`get_ebitda_margin` cannot serve a filer that tags no operating income,
+  and the gap cannot be closed.** Eleven of the 32 — JPM, BAC, WFC, GS, O,
+  BIIB, XOM, CVX, GE, FOXA, LEN — tag no `us-gaap:OperatingIncomeLoss`, where
+  they used to return an EBITDA built on pre-tax income reached by prefix match
+  (JPM: 72,595,000,000; XOM: 45,969,000,000; GS:
+  `gs:GeographicReportingInformationPercentageOfOperatingIncomeLoss`, a
+  geographic percentage worth 1.00 reported as dollars). Every alternative was
+  measured against the live filings on 2026-08-24 and each was rejected:
+  - `us-gaap:OperatingIncomeLossIncludingEquityMethodInvestments` and
+    `us-gaap:GrossProfit` are tagged by none of the eleven, and none of them
+    presents an operating income subtotal on the face of the statement.
+  - `...BeforeIncomeTaxes...` is pre-tax income. It is the defect, not the fix.
+  - Revenue less `us-gaap:CostsAndExpenses` is not operating income either, and
+    the filings disagree about why, so no single rule survives all of them. O
+    tags its financing interest as `us-gaap:InterestExpenseOperating`
+    (1,134,879,000) inside its expense total. BIIB nests
+    `us-gaap:NonoperatingIncomeExpense` (-305,600,000) inside its, where the
+    sign the presentation applies is not recoverable from the fact value. XOM's
+    non-operating income sits inside `us-gaap:Revenues` with no element of its
+    own to remove it by. GE settles it: 45,855 - 37,342 + 1,487 reconciles to
+    GE's tagged pre-tax income of 10,000,000,000 exactly, and the 8,513,000,000
+    in the middle is still struck after `ge:InterestAndOtherFinancialCharges`
+    (843,000,000) and a non-operating pension credit (-788,000,000). A
+    build-up that reconciles is not a build-up that is right.
+  - O tags no FFO or AFFO concept anywhere in its 10-K — 672 distinct concepts,
+    none of them NAREIT. The REIT measure lives in the earnings release.
+  - For the four banks the measure itself does not apply: interest is a bank's
+    raw material, revenue is struck as `us-gaap:RevenuesNetOfInterestExpense`
+    (already net of the interest EBITDA exists to add back), and adding it back
+    would report funding cost as profit.
+  Coverage is 21/32 before and after. What changed is the refusal: each of the
+  eleven now returns `coverage: "not_covered"` with `concepts_tried` and a
+  reason naming either the bank case or the missing element, and the tool
+  description says which filer types are not served.
 - **`get_margin_breakdown` gross profit is unavailable for AMT, GE, HON and
   RIOT.** Each tags `us-gaap:GrossProfit` only on a dimension, or not for an
   annual period. The tool used to report the dimensioned segment figure as

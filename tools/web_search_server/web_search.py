@@ -156,7 +156,19 @@ def _build_all_tools() -> List[Tool]:
         ),
         Tool(
           name="get_ebitda_margin",
-          description="Calculate EBITDA margin from SEC filings",
+          description=(
+            "EBITDA margin from the latest SEC filing: operating income "
+            "(us-gaap:OperatingIncomeLoss) plus D&A, over revenue. Coverage is "
+            "partial and the gaps are structural, not transient. Banks and "
+            "broker-dealers (JPM, BAC, WFC, GS) have no operating income line "
+            "and EBITDA is meaningless for one -- interest is a bank's raw "
+            "material, not a financing cost; ask for net interest margin or "
+            "the efficiency ratio instead. Filers that present no operating "
+            "income subtotal (XOM, CVX, O, BIIB, GE, FOXA, LEN) are also not "
+            "covered: their only subtotal is pre-tax income, which is not "
+            "operating income. Those return success=false, "
+            "coverage='not_covered' and a reason; no substitute figure is "
+            "invented. 21 of the 32 filers in the audit basket are covered."),
           inputSchema={
             "type": "object",
             "properties": {

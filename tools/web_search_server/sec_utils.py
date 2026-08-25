@@ -85,6 +85,55 @@ DA_CONCEPTS = (
   'us-gaap:Depreciation',
 )
 
+# Operating income, for EBITDA. One element, and it stays one element.
+#
+# A bare `OperatingIncomeLoss` and a bare `IncomeLossFromContinuingOperations`
+# used to trail this chain, and the prefix match answered both with whatever
+# longer element a filer happened to tag: pre-tax income for JPM
+# (72,595,000,000) and XOM (45,969,000,000), and for GS
+# `gs:GeographicReportingInformationPercentageOfOperatingIncomeLoss` -- four
+# facts of 0.69, 0.23, 0.08 and 1.00, of which `idxmax` took the 1.00 and
+# reported it as Goldman's operating income in dollars.
+#
+# Eleven of the 32 filers in the audit basket tag nothing here: JPM, BAC, WFC,
+# GS, O, BIIB, XOM, CVX, GE, FOXA, LEN. Every alternative was measured against
+# their live filings on 2026-08-24 and none is operating income:
+#
+#   * `us-gaap:OperatingIncomeLossIncludingEquityMethodInvestments` and
+#     `us-gaap:GrossProfit` are tagged by none of the eleven.
+#   * `...BeforeIncomeTaxes...` is pre-tax income. It is what the prefix match
+#     used to return, and it is the defect, not the fix.
+#   * Revenue less `us-gaap:CostsAndExpenses` is not operating income either,
+#     and the filings disagree about why. O's expense total carries its
+#     financing interest, tagged `us-gaap:InterestExpenseOperating`
+#     (1,134,879,000). BIIB nests `us-gaap:NonoperatingIncomeExpense`
+#     (-305,600,000) inside it, where the sign the presentation applies is not
+#     recoverable from the fact. XOM's non-operating income is inside
+#     `us-gaap:Revenues` with no element of its own to remove it by. GE is the
+#     case that settles it: 45,855 - 37,342 + 1,487 reconciles to GE's tagged
+#     pre-tax income of 10,000,000,000 exactly, and the 8,513,000,000 in the
+#     middle is still struck after `ge:InterestAndOtherFinancialCharges`
+#     (843,000,000) and a non-operating pension credit (-788,000,000). A
+#     reconciling build-up is not a correct one.
+#   * O tags no FFO or AFFO concept anywhere in its 10-K -- 672 distinct
+#     concepts, none of them NAREIT. The REIT measure is in the earnings
+#     release, not the filing's XBRL.
+#
+# So the eleven are refused by name of what was tried. See
+# `_ebitda_not_covered`.
+OPERATING_INCOME_CONCEPTS = (
+  'us-gaap:OperatingIncomeLoss',
+)
+
+# Elements that appear on a bank's or broker-dealer's income statement and
+# essentially nowhere else. Used only to pick which refusal to write, never to
+# choose or alter a number, so a false positive costs wording rather than
+# accuracy. All four banks in the basket tag both.
+BANK_INCOME_STATEMENT_CONCEPTS = (
+  'us-gaap:InterestIncomeExpenseNet',
+  'us-gaap:NoninterestExpense',
+)
+
 TAX_EXPENSE_CONCEPTS = (
   'us-gaap:IncomeTaxExpenseBenefit',
   'us-gaap:ProvisionForIncomeTaxes',
@@ -598,125 +647,178 @@ def get_revenue_base(ticker: str, form_type: str= "10-K") -> Dict[str, Any]:
       'success': False
     }
 
+def _ebitda_result(ticker: str, coverage: str, error: Optional[str],
+                   operating_income=None, operating_income_concept=None,
+                   d_and_a=None, d_and_a_concept=None, revenue=None,
+                   currency=None, period_end=None) -> Dict[str, Any]:
+  """One shape for every outcome, served or refused.
+
+  A caller reading `coverage` must not have to branch on whether the key is
+  there, and the halves that were read are handed back either way -- knowing
+  a filer's D&A and revenue is useful even when its operating income is
+  missing, and `get_historical_fcf` already answers that way for capex.
+  """
+  served = coverage == 'full'
+  ebitda_amount = (float(operating_income) + float(d_and_a)) if served else None
+  margin = (ebitda_amount / float(revenue) * 100.0) if served and revenue else None
+  return {
+    'ticker': ticker,
+    'success': served,
+    'coverage': coverage,
+    'error': error,
+    'concepts_tried': list(OPERATING_INCOME_CONCEPTS),
+    'ebitda_margin_percent': margin,
+    'ebitda_amount': ebitda_amount,
+    'operating_income': None if operating_income is None else float(operating_income),
+    'd&a': None if d_and_a is None else float(d_and_a),
+    'revenue': None if revenue is None else float(revenue),
+    'currency': currency,
+    'operating_income_concept_used': operating_income_concept,
+    'd&a_concept_used': d_and_a_concept,
+    'period_end': period_end,
+  }
+
+
+def _is_bank_income_statement(xbrl, form_type: str) -> bool:
+  """Whether this filing's income statement is a bank's.
+
+  A bank reports net interest income and non-interest expense and has no
+  operating income line at all. Read from the filing rather than from a list
+  of tickers, so a filer this project has never seen gets the same answer.
+  """
+  return all(filter_annual_data(xbrl, concept, form_type) is not None
+             for concept in BANK_INCOME_STATEMENT_CONCEPTS)
+
+
+def _ebitda_not_covered(ticker: str, form_type: str, xbrl) -> str:
+  """Why this filer cannot be given an EBITDA, in its own terms.
+
+  Two reasons, and the difference matters to whoever reads it. A bank will
+  never have an operating income line and EBITDA would be meaningless if it
+  did, so pointing at a missing element invites someone to go find another
+  one. Everybody else here simply presents no operating income subtotal, and
+  the answer is that no substitute is honest.
+  """
+  tried = ', '.join(OPERATING_INCOME_CONCEPTS)
+  if _is_bank_income_statement(xbrl, form_type):
+    return (
+      f"{ticker} files a bank income statement and EBITDA is not a meaningful "
+      f"measure for a bank. Interest is a bank's raw material, not a financing "
+      f"cost: the revenue line is struck net of interest expense "
+      f"(us-gaap:RevenuesNetOfInterestExpense), already net of the very charge "
+      f"EBITDA exists to add back, and the statement carries no operating "
+      f"income line ({tried} is not tagged). "
+      f"Adding interest back would report funding cost as profit. Use net "
+      f"interest margin, the efficiency ratio (us-gaap:NoninterestExpense over "
+      f"revenue), or return on tangible common equity instead.")
+  return (
+    f"{ticker} tags no operating income in its {form_type} ({tried}), so EBITDA "
+    f"cannot be computed from this filing. No substitute is used: the only "
+    f"subtotal above net income this filer tags is pre-tax income "
+    f"(us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxes...), which "
+    f"carries interest and every other non-operating item, and revenue less "
+    f"us-gaap:CostsAndExpenses is not operating income either -- filers put "
+    f"financing interest and non-operating pension inside that total. Either "
+    f"would be plausible and wrong. This is a coverage gap, not a zero margin.")
+
+
 def get_ebitda_margin(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
-  # Ignores interst, taxes, and non-cash expenses, so it allows you to compare the underlying profit generation of a company from there core operations
-  # how to ususally calculate it
-  # 1. Find the operating income from income statement
-  # 2. Find the depreciation & amorization on the cash flow statement
-  # 3. Calcualte ebitda = operating income + depreication & amorization, and then divide the sum by revenue
+  """EBITDA margin: operating income plus D&A, over revenue.
+
+  Operating income comes from `us-gaap:OperatingIncomeLoss` and from nothing
+  else -- see `OPERATING_INCOME_CONCEPTS` for the eleven filers that tag it
+  nowhere and why none of the alternatives is defensible. They are refused
+  with a named reason rather than given a number built on pre-tax income.
+  """
   try:
-    ebitda = {} # use to store operating income and depreciation & amorization
     filing = get_latest_filing(ticker, form_type)
-    if filing and filing['xbrl_data']:
-      xbrl = filing['xbrl_data']
+    if not filing or not filing['xbrl_data']:
+      return _ebitda_result(
+        ticker, 'not_covered',
+        _filing_miss(ticker, form_type,
+                     f'Unable to get latest filing for {ticker}'))
 
-      # Operating income. `IncomeLossFromContinuingOperations` used to trail
-      # this list and reached, by prefix,
-      # `IncomeLossFromContinuingOperationsBeforeIncomeTaxes...` -- pre-tax
-      # income, reported as operating income. JPM's EBITDA was built on
-      # 72,595,000,000 of pre-tax income that way, XOM's on 45,969,000,000,
-      # and GS's on a fact worth $1. A bank, a REIT and an oil major do not
-      # tag operating income at all, and the honest answer for them is that
-      # EBITDA cannot be computed from this filing.
-      operating_income_concepts = [
-      'us-gaap:OperatingIncomeLoss',        # 95% of companies
-      ]
+    xbrl = filing['xbrl_data']
 
-      for concept in operating_income_concepts:
+    operating_income = operating_income_concept = period_end = None
+    for concept in OPERATING_INCOME_CONCEPTS:
+      result = filter_annual_data(xbrl, concept, form_type)
+      if result:
+        operating_income = result['value']
+        operating_income_concept = result['concept_used']
+        period_end = result['period_end']
+        break
+
+    # D&A off the cash flow statement. Combined totals only; the bare
+    # `us-gaap:Depreciation` that ends DA_CONCEPTS is depreciation without
+    # amortisation and would understate EBITDA rather than fail to find it.
+    d_and_a = d_and_a_concept = None
+    for concept in DA_CONCEPTS[:-1]:
+      result = filter_annual_data(xbrl, concept, form_type)
+      if result:
+        d_and_a = result['value']
+        d_and_a_concept = result['concept_used']
+        break
+
+    if d_and_a is None:
+      # Some filers tag depreciation and amortisation separately and no total.
+      depreciation = amortization = 0
+      concepts_used = []
+      for concept in ('us-gaap:Depreciation',
+                      'us-gaap:AmortizationOfIntangibleAssets'):
         result = filter_annual_data(xbrl, concept, form_type)
         if result:
-          ebitda['operating_income'] = result['value']
-          ebitda['operating_income_concept_used'] = result['concept_used']
-          ebitda['operating_income_period_end'] = result['period_end']
-          break
+          if 'Depreciation' in concept:
+            depreciation = result['value']
+          else:
+            amortization = result['value']
+          concepts_used.append(result['concept_used'])
+      if concepts_used:
+        d_and_a = depreciation + amortization
+        d_and_a_concept = ' + '.join(concepts_used)
 
+    revenue_data = get_revenue_base(ticker, form_type)
+    revenue = revenue_data['revenue_base'] if revenue_data['success'] else None
+    currency = revenue_data.get('currency') if revenue_data['success'] else None
 
-      # get the depreciation & amorization from the cash flow statement
-      cashflow_statement_concepts = DA_CONCEPTS[:-1]  # combined totals only
+    if operating_income is None:
+      return _ebitda_result(
+        ticker, 'not_covered', _ebitda_not_covered(ticker, form_type, xbrl),
+        d_and_a=d_and_a, d_and_a_concept=d_and_a_concept, revenue=revenue,
+        currency=currency)
 
+    if d_and_a is None:
+      tried = ', '.join(DA_CONCEPTS[:-1])
+      return _ebitda_result(
+        ticker, 'not_covered',
+        f"{ticker} tags no depreciation and amortisation total in its "
+        f"{form_type} ({tried}), nor us-gaap:Depreciation beside "
+        f"us-gaap:AmortizationOfIntangibleAssets. Operating income alone is "
+        f"EBIT, not EBITDA, and returning it as EBITDA would understate the "
+        f"margin by the whole of D&A.",
+        operating_income=operating_income,
+        operating_income_concept=operating_income_concept,
+        revenue=revenue, currency=currency, period_end=period_end)
 
-      for concept in cashflow_statement_concepts:
-        result = filter_annual_data(xbrl, concept, form_type)
-        if result:
-          ebitda['d&a'] = result['value']
-          ebitda['d&a_concept_used'] = result['concept_used']
-          ebitda['d&a_period_end'] = result['period_end']
-          break
+    if not revenue:
+      return _ebitda_result(
+        ticker, 'not_covered', revenue_data.get('error'),
+        operating_income=operating_income,
+        operating_income_concept=operating_income_concept,
+        d_and_a=d_and_a, d_and_a_concept=d_and_a_concept,
+        period_end=period_end)
 
-      if 'd&a' not in ebitda or not ebitda['d&a']:
-        # Try to get individual components and add them together
-        individual_concepts = [
-          'us-gaap:Depreciation',
-          'us-gaap:AmortizationOfIntangibleAssets'
-        ]
+    return _ebitda_result(
+      ticker, 'full', None,
+      operating_income=operating_income,
+      operating_income_concept=operating_income_concept,
+      d_and_a=d_and_a, d_and_a_concept=d_and_a_concept,
+      revenue=revenue, currency=currency, period_end=period_end)
 
-        depreciation_value = 0
-        amortization_value = 0
-        concepts_used = []
-        period_end = None
-
-        for concept in individual_concepts:
-          result = filter_annual_data(xbrl, concept, form_type)
-          if result:
-            if 'Depreciation' in concept:
-              depreciation_value = result['value']
-            elif 'Amortization' in concept:
-              amortization_value = result['value']
-            concepts_used.append(result['concept_used'])
-            if not period_end:
-              period_end = result['period_end']
-
-        # Only set D&A if we found at least one component
-        if depreciation_value > 0 or amortization_value > 0:
-          ebitda['d&a'] = depreciation_value + amortization_value
-          ebitda['d&a_concept_used'] = ' + '.join(concepts_used)
-          ebitda['d&a_period_end'] = period_end
-
-      # Get revenue for margin calculation
-      revenue_data = get_revenue_base(ticker, form_type)
-      if not revenue_data['success']:
-        return revenue_data  # Return the error from revenue function
-
-      revenue = revenue_data['revenue_base']  # already in raw dollars
-
-      # Calculate EBITDA and EBITDA margin
-      if 'operating_income' not in ebitda or 'd&a' not in ebitda:
-        missing = []
-        if 'operating_income' not in ebitda: missing.append('operating_income')
-        if 'd&a' not in ebitda: missing.append('d&a')
-        return {
-          'error': f"Missing EBITDA components for {ticker}: {', '.join(missing)}",
-          'success': False
-        }
-      ebitda_amount = ebitda['operating_income'] + ebitda['d&a']
-      ebitda_margin_percent = (ebitda_amount / revenue) * 100
-
-      return {
-        'error': None,
-        'success': True,
-        'ticker': ticker,
-        'ebitda_margin_percent': float(ebitda_margin_percent),
-        'ebitda_amount': float(ebitda_amount),
-        'operating_income': float(ebitda['operating_income']),
-        'd&a': float(ebitda['d&a']),
-        'revenue': float(revenue),
-        'operating_income_concept_used': ebitda.get('operating_income_concept_used'),
-        'd&a_concept_used': ebitda.get('d&a_concept_used'),
-        'period_end': ebitda.get('operating_income_period_end')
-      }
-    else:
-      return {
-        'error': _filing_miss(ticker, form_type,
-                              f'Unable to get latest filing for {ticker}'),
-        'success': False
-      }
-
-
-  except Exception as e:
-    return {
-      'error': f'Failed to get latest file for {ticker}',
-      'success': False
-    }
+  except Exception as e:  # noqa: BLE001 - reported, never swallowed
+    return _ebitda_result(
+      ticker, 'not_covered',
+      f'Unable to get EBITDA margin for {ticker}: {type(e).__name__}: {e}')
 
 def get_capex_pct_revenue(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
   # function to get capital expenditures: Capex is the money that the company spends to buy, maintain, or upgrade physical assets

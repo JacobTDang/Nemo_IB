@@ -56,7 +56,10 @@ SKIP_KEYS = {
   'success', 'error', 'concept_used', 'concept', 'period_end', 'filing_date',
   'tax_concept_used', 'pretax_concept_used', 'operating_income_concept_used',
   'd&a_concept_used', 'capex_concept_used', 'data_type', 'data_shape',
-  'columns', 'sample_data'
+  'columns', 'sample_data',
+  # How well a tool was able to answer, not a fact about the company. Bare
+  # 'coverage' would be shared by every tool that reports it.
+  'coverage', 'concepts_tried',
 }
 
 # Variable keys that are percentages (e.g. 15.61 for 15.61%) and need /100 for tool args
