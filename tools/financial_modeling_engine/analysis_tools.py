@@ -22,7 +22,8 @@ from mcp.types import Tool, TextContent
 
 market_data_description = """Retrieves real-time market data for a company from Yahoo Finance including market cap, enterprise value, revenue, EBITDA, cash, debt, shares outstanding, beta, interest expense, and valuation multiples (P/E, P/B, EV/Revenue, EV/EBITDA, EV/EBIT).
 Should use: When you need current financial data for a company to perform valuation analysis, equity bridge calculations, or to get inputs for WACC calculation (beta, market cap, debt, interest expense).
-Should NOT use: When you need historical time-series data or SEC filing data (use SEC tools instead)."""
+Should NOT use: When you need historical time-series data or SEC filing data (use SEC tools instead).
+Share basis: marketCap is stated across every share class and the provider's sharesOutstanding is stated for one of them, so the two do not multiply together for a multi-class filer -- GOOGL is 2.0845x apart and BRK-B 1.5204x. shares_outstanding_basis says which case this response is; use shares_outstanding_all_classes for anything divided by a share count (value per share, book per share, ownership percentages) and read the share_count_basis_mismatch warning when it is present. pe_ratio and pb_ratio divide marketCap and are unaffected."""
 
 extract_13f_holdings_description = """Returns the top institutional holders and mutual fund holders of a stock, plus aggregate institutional ownership statistics. Data sourced from Yahoo's aggregation of SEC 13F-HR filings (institutional holders, filed quarterly) and NPORT-P filings (mutual funds). Each holder row includes shares held, market value in USD, percent of shares outstanding, and quarter-over-quarter percent change in position size.
 Should use: When researching who owns the stock, to detect institutional buying/selling pressure (pct_change_qoq), to size up the 'smart money' bull/bear setup, or to find catalysts in institutional positioning. Critical for the Layer-5 capital-allocation read in the IB analyst playbook.
@@ -34,11 +35,13 @@ Should NOT use: As a primary valuation input — options are sentiment, not fund
 
 short_interest_description = """Short interest snapshot: shares short, days to cover (short ratio), percent of float, and month-over-month change. Source: yfinance (underlying FINRA biweekly disclosures). Includes a signal classifier (low/moderate/elevated/crowded short).
 Should use: For positioning context — crowded shorts on a stock with bull momentum signal squeeze risk; rising shorts on a name with deteriorating fundamentals confirm the bear case. Pair with get_insider_transactions to triangulate sentiment.
-Should NOT use: For intraday positioning — short interest reports lag 2 weeks. Days-to-cover is an estimate based on average volume, not a hard ceiling."""
+Should NOT use: For intraday positioning — short interest reports lag 2 weeks. Days-to-cover is an estimate based on average volume, not a hard ceiling.
+Share basis: float_shares and shares_outstanding come from the provider on different share bases for a multi-class filer -- GOOGL's float exceeds its shares outstanding, so 1 - float/shares gives -85% insider ownership. shares_outstanding_basis says which case this is, shares_outstanding_all_classes is the count the float is comparable with, and float_exceeds_shares_outstanding / short_interest_exceeds_float appear in warnings when the two cannot be combined."""
 
 price_history_description = """Historical price summary: returns over 1M/3M/6M/YTD/1Y/3Y windows, realized volatility (annualized) over 30d/90d/180d/1Y, 52-week high/low with dates, max drawdown from trailing-12-month peak, and a configurable number of recent OHLCV bars. Source: yfinance auto-adjusted daily history.
 Should use: For drawdown framing ('stock down N% from peak'), volatility regime read (vol spike before earnings = expected surprise), and return decomposition over multiple windows.
-Should NOT use: For minute-level technical analysis (this returns daily bars). For intraday spot price use get_market_data."""
+Should NOT use: For minute-level technical analysis (this returns daily bars). For intraday spot price use get_market_data.
+Price basis: every close is back-adjusted onto the newest session's basis for splits AND dividends, which the response now states in price_basis and quantifies in price_adjustment. A close from before a split is stated in post-split shares, so it pairs with get_share_count_series.total_split_adjusted and NOT with total -- NVDA's 2024-05-24 bar against the as-filed count is out by exactly 10.0x. prices_split_adjusted and prices_dividend_adjusted appear in warnings when the window contains either."""
 
 trading_metrics_description = """Execution and position-sizing inputs from daily bars: relative volume (RVOL, the latest session's volume against its own trailing 20-session average), average dollar volume (ADV over 20 and 60 sessions, in USD and in shares), and average true range (ATR, Wilder-smoothed over 14 sessions, plus ATR as a percent of price). Source: the same yfinance daily bars as get_price_history.
 Should use: When deciding HOW to trade a name you have already researched -- how large a position the tape can absorb, how many days it takes to exit, how wide a stop has to be to survive ordinary daily noise, and whether today's volume is unusual enough to signal that something happened.
@@ -82,7 +85,10 @@ THIS IS THE LAST TOOL TO RUN. All of the following must have already executed be
 3. get_capex_pct_revenue(ticker)   -> capex_pct_revenue
 4. get_depreciation(ticker)        -> depreciation
 5. get_tax_rate(ticker)            -> tax_rate
-6. get_market_data(ticker)         -> cash, debt, shares_outstanding
+6. get_market_data(ticker)         -> cash, debt, shares_outstanding_all_classes
+   (per-share output divides the share count, so it needs the all-class figure;
+   the provider's sharesOutstanding covers one class and is 2.0845x short for
+   GOOGL, 1.5204x for BRK-B. Single-class filers are the same number.)
 7. get_basic_financials(ticker)    -> revenue_growth, terminal_multiple
 8. get_macro_snapshot()            -> risk_free_rate, terminal_growth
 9. calculate_wacc()                -> wacc"""
@@ -103,7 +109,9 @@ Data that must be in the variable store before modeling:
 - capex_pct_revenue     <- get_capex_pct_revenue
 - depreciation          <- get_depreciation
 - tax_rate              <- get_tax_rate
-- cash, debt, shares_outstanding, beta  <- get_market_data
+- cash, debt, shares_outstanding_all_classes, beta  <- get_market_data
+  (all-class, not the provider's single-class sharesOutstanding -- every price
+   in this model is a per-share figure)
 - risk_free_rate        <- get_macro_snapshot
 - revenueGrowthTTMYoy, evEbitdaTTM      <- get_basic_financials
 - forward estimate low/high revenue     <- get_forward_estimates (for bear/bull anchors)
@@ -117,7 +125,7 @@ MODELING PHASE ONLY -- called by the Financial Modeling Agent, not the execution
 ONLY run when the user query involves M&A, private equity, buyout potential, or takeout analysis.
 
 Data that must be in the variable store before modeling:
-- market_cap, totalDebt, totalCash, shares_outstanding  <- get_market_data
+- market_cap, totalDebt, totalCash, shares_outstanding_all_classes  <- get_market_data
 - revenue_base          <- get_revenue_base
 - ebitda_margin         <- get_ebitda_margin
 - capex_pct_revenue     <- get_capex_pct_revenue
@@ -145,7 +153,9 @@ capital_returns_description = """Calculates shareholder return profile: FCF yiel
 MODELING PHASE ONLY -- called by the Financial Modeling Agent, not the execution engine.
 
 Data that must be in the variable store before modeling:
-- market_cap, shares_outstanding          <- get_market_data
+- market_cap, shares_outstanding_all_classes  <- get_market_data
+  (dividend and buyback per share divide the share count; the provider's
+   sharesOutstanding is one class where market_cap is all of them)
 - revenue_base, ebitda_margin             <- get_revenue_base, get_ebitda_margin
 - capex_pct_revenue, depreciation         <- get_capex_pct_revenue, get_depreciation
 - tax_rate                                <- get_tax_rate
@@ -1793,7 +1803,15 @@ class Financial_Analysis:
             "adjusting produces an answer wrong by an order of magnitude, and "
             "nothing in the raw data signals the error.\n\n"
             "'latest_split_ratio' is null when no split falls in the window -- "
-            "never 1.0, which would imply a split occurred that changed nothing."
+            "never 1.0, which would imply a split occurred that changed nothing.\n\n"
+            "Dividend basis: the provider restates every historical dividend into "
+            "today's share units, so AAPL's 2020-08-07 payment reads 0.205 against "
+            "an as-declared $0.82. 'amount' is that restated figure and pairs with "
+            "a split-adjusted share count; 'amount_as_declared' is what the company "
+            "declared and pairs with the as-filed cover-page count from the same "
+            "quarter. Mixing them is out by the split ratio, and in the opposite "
+            "direction to get_price_history, whose closes are back-adjusted the "
+            "other way."
           ),
           inputSchema={
             "type": "object",
@@ -1821,8 +1839,20 @@ class Financial_Analysis:
         "comparable_company_analysis": "Nemo (computed)",
         "backtest_signal": "Nemo (computed)",
         "get_historical_analogue": "Nemo (curated)",
-        "extract_13f_holdings": "SEC EDGAR",
-        "get_corporate_actions": "SEC EDGAR",
+        # Both said "SEC EDGAR" and both read yfinance. corporate_actions.py
+        # calls yf.Ticker(symbol); get_institutional_holdings reads
+        # yf.Ticker(ticker).major_holders. The response shapes agree
+        # independently -- tz-aware timestamps and split-adjusted dividends,
+        # neither of which EDGAR publishes.
+        #
+        # Stated explicitly rather than left to the module default so
+        # re-adding EDGAR is a deliberate act. The harm was never only
+        # attribution: get_share_count_series.split_adjustment.source says
+        # "yfinance", so a caller cross-checking a split ratio between the two
+        # believed two independent providers agreed. They had one source read
+        # twice, and the EDGAR label is what sold it.
+        "extract_13f_holdings": "Yahoo Finance (yfinance)",
+        "get_corporate_actions": "Yahoo Finance (yfinance)",
         "analyze_exposures": "Nemo book state",
         "record_thesis_evolution": "Nemo book state",
         "get_thesis_evolution": "Nemo book state",
@@ -1841,6 +1871,25 @@ warnings_per_tool={
                   "Options quotes can be stale outside market hours, and "
                   "illiquid strikes can yield invalid implied-volatility "
                   "values."),
+        ],
+        "get_corporate_actions": [
+          warning("not_an_independent_source",
+                  "Dividends and splits here are yfinance's, not EDGAR's. "
+                  "get_share_count_series.split_adjustment reads the same "
+                  "upstream -- its own `source` field says \"yfinance\" -- so "
+                  "a split ratio agreeing across the two is one source read "
+                  "twice, not two providers corroborating. For independent "
+                  "confirmation read the filing (get_latest_filing, "
+                  "extract_8k_events)."),
+        ],
+        "extract_13f_holdings": [
+          warning("aggregator_not_the_filing",
+                  "Holdings come from Yahoo's aggregation of SEC 13F-HR and "
+                  "NPORT-P filings, not from EDGAR. Yahoo decides the "
+                  "as-of quarter, which managers it carries and how it "
+                  "reconciles amendments, and none of that is stated in the "
+                  "response. For the filings themselves use the SEC tools "
+                  "(get_fund_holdings, compare_fund_holdings)."),
         ],
         "get_market_data": [
           warning("not_execution_grade",

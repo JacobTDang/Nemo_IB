@@ -68,8 +68,22 @@ def test_single_class_total_is_the_single_fact(monkeypatch):
     assert result["classes_found"] == ["Common"]
 
 
+def _no_quote_provider(ticker):
+    """The market cross-check, unreachable.
+
+    A multi-class total is now weighed against a market capitalisation, since
+    summing classes at 1:1 is a third short for a filer whose Class A converts
+    into 1,500 Class B. These tests are about enumerating the classes, so the
+    check is left unreachable rather than answered -- and an unreachable source
+    is reported, never taken for agreement.
+    """
+    raise dilution.MarketShareCountUnavailable(
+        f"no quote provider is reachable from the offline suite ({ticker})")
+
+
 def test_multi_class_total_sums_every_class(monkeypatch):
     """The regression test for the 52% understatement."""
+    monkeypatch.setattr(dilution, "fetch_market_share_count", _no_quote_provider)
     monkeypatch.setattr(dilution, "fetch_concept_series", lambda *a, **k: [
         _point("2026-07-23", [
             _fact(5868000000.0, "us-gaap:CommonClassAMember", ref="c-28"),
@@ -84,6 +98,7 @@ def test_multi_class_total_sums_every_class(monkeypatch):
 def test_per_class_breakdown_is_always_reported(monkeypatch):
     """A bare total hides a missing class. The caller must be able to see the
     classes that were found."""
+    monkeypatch.setattr(dilution, "fetch_market_share_count", _no_quote_provider)
     monkeypatch.setattr(dilution, "fetch_concept_series", lambda *a, **k: [
         _point("2026-07-23", [
             _fact(5868000000.0, "us-gaap:CommonClassAMember", ref="c-28"),

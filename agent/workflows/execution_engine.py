@@ -103,7 +103,10 @@ ARGUMENT_ALIASES = {
   'total_debt': 'totalDebt',
   'cash': 'totalCash',
   'debt': 'totalDebt',
-  'shares_outstanding': 'sharesOutstanding',
+  # All classes, not the provider's single-class figure: GOOGL's
+  # sharesOutstanding is Class A alone and would inflate every
+  # per-share model output by 2.08x (BRK-B 1.52x).
+  'shares_outstanding': 'shares_outstanding_all_classes',
 }
 
 

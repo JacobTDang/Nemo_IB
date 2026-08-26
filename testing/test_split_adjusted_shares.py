@@ -101,10 +101,25 @@ def _msft_series():
 
 @pytest.fixture
 def series(monkeypatch):
+    """The filings, offline -- and the quote provider with them.
+
+    A multi-class filer now has its class weights checked against a market
+    capitalisation, because summing classes at 1:1 is wrong by a third for a
+    filer whose Class A converts into 1,500 Class B. These tests are about
+    split adjustment, so the check is left unreachable rather than answered:
+    an unreachable source is reported, never taken for agreement.
+    """
     def install(points):
         monkeypatch.setattr(dilution, "fetch_concept_series",
                             lambda *a, **k: list(points))
+        monkeypatch.setattr(dilution, "fetch_market_share_count",
+                            _no_quote_provider)
     return install
+
+
+def _no_quote_provider(ticker):
+    raise dilution.MarketShareCountUnavailable(
+        f"no quote provider is reachable from the offline suite ({ticker})")
 
 
 @pytest.fixture

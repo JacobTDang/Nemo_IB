@@ -121,6 +121,9 @@ class Financial_Modeling_Agent(OpenRouterModel):
     'beta':                  'get_market_data',
     'totalDebt':             'get_market_data',
     'totalCash':             'get_market_data',
+    # See execution_engine: the single-class count inflates per-share
+    # output on multi-class filers.
+    'shares_outstanding_all_classes': 'get_market_data',
     'sharesOutstanding':     'get_market_data',
     'interestExpense':       'get_market_data',
     'dividendsPaid':         'get_financial_statements',

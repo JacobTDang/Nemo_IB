@@ -583,7 +583,20 @@ def _build_all_tools() -> List[Tool]:
             "'total' sums them and 'by_class' shows the split. Check 'classes_found' "
             "-- if a company you know has multiple classes reports only one, the "
             "total is understated. 'direction' is dilution / buyback / flat / "
-            "insufficient_history."
+            "insufficient_history.\n\n"
+            "That sum adds the classes at 1:1, which is only right when they are "
+            "worth 1:1. Berkshire's Class A converts into 1,500 Class B, so the sum "
+            "is 34% short of the company -- and Yahoo's sharesOutstanding agrees "
+            "with it to 0.03%, because one source dropped Class A and the other "
+            "under-weighted it. 'latest_total_basis' says single_class or "
+            "sum_of_classes_unweighted; 'share_basis' carries the check against the "
+            "market's own count, the quote_equivalent_total that pairs with a share "
+            "price, and any conversion ratio that could be established. A "
+            "multi_class_unweighted_total or multi_class_basis_unverified warning "
+            "means do not multiply latest_total by a price.\n\n"
+            "Prices to pair with this: every close from get_price_history is "
+            "back-adjusted for splits, so it pairs with 'total_split_adjusted', "
+            "never with 'total'."
           ),
           inputSchema={
             "type": "object",

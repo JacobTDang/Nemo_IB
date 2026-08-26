@@ -12,6 +12,16 @@ Three things make this harder than reading one number:
    Every result therefore reports its per-class breakdown alongside the total,
    so a caller can see which classes were found rather than trusting a bare sum.
 
+   Summing them is only right when the classes are worth the same. Berkshire's
+   Class A converts into 1,500 Class B, so 488,450 + 1,408,035,161 = 1.4085bn
+   is 34% short of the company, and the obvious cross-check hides it: Yahoo's
+   `sharesOutstanding` agrees with that sum to 0.03%, because one source
+   dropped Class A and the other under-weighted it. The sum is therefore
+   weighed against a market capitalisation, which cannot make either mistake,
+   and where the two disagree the total is labelled rather than quietly used.
+   The ratio is a per-filer fact: 1,500 is derived here, never assumed, and
+   where it cannot be derived the tool says so instead of assuming 1:1.
+
 2. **Company-specific member tags.** Alphabet's Class C is
    `goog:CapitalClassCMember`, not `us-gaap:CommonClassCMember`. Labels are
    derived from whatever the filer used; a whitelist of standard members would
@@ -90,6 +100,22 @@ _FRACTIONAL_SPLITS = tuple(sorted({
     if gcd(p, q) == 1 and p / q >= _SPLIT_MIN_RATIO
 }))
 
+# How far the SEC cover-page sum and the market's own share count may differ
+# before they are measuring different things. A cover page is up to a quarter
+# old, so ordinary buybacks and option exercises move it a percent or two;
+# GOOGL's three classes agree to 0.0005% and Berkshire's two are 51.98% apart.
+# Nothing real has been measured in between.
+_MARKET_BASIS_TOLERANCE_PCT = 5.0
+
+# A share class converts into another at a ratio written into a charter: 1,500
+# for Berkshire, 10 for a typical dual-class founder share. Charters use round
+# numbers, and with a class as small as Berkshire's 488,450 Class A shares
+# almost any residual divides into something near a whole number -- 433.96 for
+# a gap that is really an equity raise. Requiring two significant figures is
+# what separates a conversion ratio from a coincidence.
+_CONVERSION_RATIO_TOLERANCE = 0.005
+_MIN_CONVERSION_RATIO = 2.0
+
 _DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 UNDETERMINED = "split_suspected_undetermined"
@@ -113,6 +139,54 @@ def _class_label(member: Optional[str]) -> str:
     if len(words) > 1 and words[0] == "Common" and words[1] == "Class":
         words = words[1:]
     return " ".join(words)
+
+
+class MarketShareCountUnavailable(RuntimeError):
+    """The market's own share count could not be read.
+
+    Distinct from a filer whose classes are equivalent. Raised rather than
+    returned so that "we could not check" can never come back as "we checked
+    and they agree" -- which is precisely how a 1,500:1 filer would pass.
+    """
+
+
+def fetch_market_share_count(ticker: str) -> float:
+    """Shares outstanding across every class, in quoted-share equivalents.
+
+    The SEC cover page states each class in its own units and nothing in the
+    filing says what those units are worth relative to each other. The market
+    does: a quote and a market capitalisation are both denominated in the
+    listed class, so their quotient is the whole company measured in the units
+    the listed class trades in. For Berkshire that is 2,140,709,794 against a
+    cover-page sum of 1,408,523,611; for Alphabet the two agree to 0.0005%.
+
+    yfinance is the source -- already a dependency, and `fetch_split_history`
+    in this module reads the same provider. Its own `impliedSharesOutstanding`
+    is preferred where it agrees with market cap over price; the quotient is
+    the fallback because it is consistent with the market cap by construction.
+    """
+    import yfinance as yf  # imported here so this module loads without it
+
+    return _market_share_count_from_info(yf.Ticker(ticker).info or {}, ticker)
+
+
+def _market_share_count_from_info(info: Dict[str, Any], ticker: str) -> float:
+    """The quoted-basis count inside a yfinance info dict. Split out for tests."""
+    price = info.get("currentPrice") or info.get("regularMarketPrice")
+    market_cap = info.get("marketCap")
+    quotient = market_cap / price if market_cap and price else None
+    provider = info.get("impliedSharesOutstanding") or None
+
+    if quotient is None and provider is None:
+        raise MarketShareCountUnavailable(
+            f"the quote provider returned neither a market capitalisation nor "
+            f"an implied share count for {ticker!r}, so the share basis its "
+            f"classes are stated on could not be established.")
+    if quotient is None:
+        return float(provider)
+    if provider is not None and abs(provider - quotient) / quotient <= 0.005:
+        return float(provider)
+    return float(quotient)
 
 
 class SplitCalendarUnavailable(RuntimeError):
@@ -309,6 +383,173 @@ def _pct_change(oldest: Optional[float],
     return (latest - oldest) / oldest * 100.0
 
 
+def _round_conversion_ratio(ratio: float) -> Optional[float]:
+    """The round conversion ratio `ratio` sits on, or None if it sits on none.
+
+    Two significant figures, because that is what a charter contains. 1,500 and
+    10 and 200 pass; 434 -- what a 15% equity raise implies against Berkshire's
+    Class A count -- does not, and that is the case this check exists to reject.
+    """
+    from math import floor, log10
+
+    try:
+        ratio = float(ratio)
+    except (TypeError, ValueError):
+        return None
+    if ratio != ratio or ratio < _MIN_CONVERSION_RATIO:
+        return None
+    magnitude = 10 ** (floor(log10(ratio)) - 1)
+    candidate = round(ratio / magnitude) * magnitude
+    if candidate < _MIN_CONVERSION_RATIO:
+        return None
+    if abs(ratio - candidate) / candidate > _CONVERSION_RATIO_TOLERANCE:
+        return None
+    return float(candidate)
+
+
+def _implied_class_weights(latest_by_class: Dict[str, float],
+                           quote_equivalent_total: float
+                           ) -> Optional[Dict[str, float]]:
+    """What each class is worth in quoted-share units, or None.
+
+    Solvable only for two classes: the listed one carries a weight of one and
+    the residual falls entirely on the other. With three the residual has more
+    than one way to be split and any answer would be a choice dressed as a
+    measurement.
+
+    The listed class is taken to be the larger count, which is what makes a
+    class liquid enough to quote. The result is published only when it lands on
+    a round ratio *and* rebuilds the market's own total, so the arithmetic has
+    to agree with itself twice before a number this load-bearing is stated.
+    """
+    if len(latest_by_class) != 2:
+        return None
+    ordered = sorted(latest_by_class.items(), key=lambda kv: kv[1], reverse=True)
+    (listed_label, listed_count), (other_label, other_count) = ordered
+    if not other_count or not listed_count:
+        return None
+
+    weight = (quote_equivalent_total - listed_count) / other_count
+    rounded = _round_conversion_ratio(weight)
+    if rounded is None:
+        return None
+    rebuilt = rounded * other_count + listed_count
+    if abs(rebuilt - quote_equivalent_total) / quote_equivalent_total > 0.001:
+        return None
+    return {other_label: rounded, listed_label: 1.0}
+
+
+def _empty_share_basis() -> Dict[str, Any]:
+    return {
+        "total_basis": None,
+        "classes_found": [],
+        "economically_equivalent": None,
+        "quote_equivalent_total": None,
+        "quote_equivalent_source": None,
+        "implied_class_weights": None,
+        "gap_pct": None,
+        "source_error": None,
+    }
+
+
+def _share_basis(ticker: str, latest_by_class: Dict[str, float],
+                 latest_total: Optional[float]
+                 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """(basis, warnings) for the units `latest_total` is stated in.
+
+    `latest_total` adds the classes at one to one. For Alphabet that is right;
+    for Berkshire it is wrong by a third, because a Class A share converts into
+    1,500 Class B and the sum counts it as one. The two mistakes cancel into
+    something that looks reassuring: Berkshire's cover-page sum 1,408,523,611
+    and Yahoo's `sharesOutstanding` 1,408,035,161 agree to 0.03%, so the
+    obvious cross-check between two independent sources passes while both are
+    a third short -- one dropped Class A, the other under-weighted it.
+
+    So the check is made against a source that cannot make the same mistake: a
+    market capitalisation is the whole company, whatever its classes are worth
+    to each other. A single-class filer has nothing to check and pays nothing
+    for the check -- no lookup is made at all.
+    """
+    basis = _empty_share_basis()
+    classes = sorted(latest_by_class)
+    basis["classes_found"] = classes
+
+    if len(classes) <= 1:
+        basis.update({
+            "total_basis": "single_class",
+            "economically_equivalent": True,
+            "quote_equivalent_total": latest_total,
+            "quote_equivalent_source": "sec_cover_page",
+        })
+        return basis, []
+
+    basis["total_basis"] = "sum_of_classes_unweighted"
+    try:
+        market_total = fetch_market_share_count(ticker)
+    except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+        basis["source_error"] = f"{type(exc).__name__}: {exc}"
+        market_total = None
+
+    if not market_total or not latest_total:
+        return basis, [{
+            "code": "multi_class_basis_unverified",
+            "message": (
+                f"{ticker}: latest_total adds {len(classes)} share classes "
+                f"({', '.join(classes)}) at 1:1, and whether they are worth "
+                f"1:1 is a fact about this filer that the filings do not "
+                f"state. It could not be established here "
+                f"({basis['source_error'] or 'no market share count available'}). "
+                f"A Berkshire Class A share converts into 1,500 Class B, "
+                f"which makes the same sum 34% short. Do not multiply "
+                f"latest_total by a share price until the basis is known."),
+            "classes_found": classes,
+        }]
+
+    gap_pct = (market_total - latest_total) / latest_total * 100.0
+    basis.update({
+        "quote_equivalent_total": market_total,
+        "quote_equivalent_source": "market_capitalisation_over_price",
+        "gap_pct": gap_pct,
+    })
+
+    if abs(gap_pct) <= _MARKET_BASIS_TOLERANCE_PCT:
+        basis["economically_equivalent"] = True
+        return basis, []
+
+    basis["economically_equivalent"] = False
+    weights = _implied_class_weights(latest_by_class, market_total)
+    basis["implied_class_weights"] = weights
+
+    if weights:
+        named = ", ".join(
+            f"one {label} carries {weight:,.0f} quoted shares"
+            for label, weight in sorted(weights.items(),
+                                        key=lambda kv: kv[1], reverse=True)
+            if weight != 1.0)
+        cause = (f" The gap is explained exactly by a conversion ratio: "
+                 f"{named}, which rebuilds the market's total to within "
+                 f"0.1%.")
+    else:
+        cause = (" The classes may convert at a ratio other than 1:1, or the "
+                 "cover page may simply predate an issuance; neither can be "
+                 "settled from these filings.")
+
+    return basis, [{
+        "code": "multi_class_unweighted_total",
+        "message": (
+            f"{ticker}: latest_total ({latest_total:,.0f}) adds "
+            f"{', '.join(classes)} at 1:1, and the market prices the company "
+            f"as {market_total:,.0f} shares of the listed class -- "
+            f"{gap_pct:+.2f}% away.{cause} Multiplying latest_total by a share "
+            f"price understates the market capitalisation by "
+            f"{(1 - latest_total / market_total) * 100:.2f}%; "
+            f"quote_equivalent_total is the count that pairs with a quote."),
+        "classes_found": classes,
+        "quote_equivalent_total": market_total,
+        "implied_class_weights": weights,
+    }]
+
+
 def _empty_adjustment() -> Dict[str, Any]:
     return {
         "adjusted": False,
@@ -340,6 +581,8 @@ def _failure(ticker: str, message: str,
         "wrong_form": bool(mismatch),
         "error": not_covered_reason(ticker, form, message) if form else message,
         "latest_total": None,
+        "latest_total_basis": None,
+        "share_basis": _empty_share_basis(),
         "by_class": {},
         "classes_found": [],
         "total_series": [],
@@ -442,6 +685,18 @@ def get_share_count_series(ticker: str, limit: int = 8,
 
     latest_total = total_series[0]["total"] if total_series else None
 
+    # The classes as of the newest filing, which is the filing latest_total
+    # speaks for. Read from that observation rather than from by_class, because
+    # a class the newest cover page does not carry must not be weighed into a
+    # total the newest cover page produced.
+    latest_by_class: Dict[str, float] = {}
+    if observations:
+        for fact in observations[0]["facts"]:
+            label = _class_label(fact.dimension_member(CLASS_AXIS))
+            latest_by_class[label] = latest_by_class.get(label, 0.0) + fact.value
+    share_basis, basis_warnings = _share_basis(ticker, latest_by_class,
+                                               latest_total)
+
     # The safety net, and the reason the calendar is not trusted blindly. A
     # discontinuity that survives the adjustment is a split the calendar got
     # wrong, missed, or dated differently from the filings -- and a ratio that
@@ -493,6 +748,8 @@ def get_share_count_series(ticker: str, limit: int = 8,
         "ticker": ticker,
         "success": True,
         "latest_total": latest_total,
+        "latest_total_basis": share_basis["total_basis"],
+        "share_basis": share_basis,
         "by_class": by_class,
         "classes_found": sorted(by_class.keys()),
         "by_class_change": _class_changes(by_class, undetermined=bool(unexplained)),
@@ -503,7 +760,8 @@ def get_share_count_series(ticker: str, limit: int = 8,
         "periods_examined": len(total_series),
         "split_adjusted": bool(applied),
         "split_adjustment": adjustment,
-        "warnings": _split_warnings(ticker, adjustment, unexplained, source_error),
+        "warnings": _split_warnings(ticker, adjustment, unexplained,
+                                    source_error) + basis_warnings,
     }
 
 

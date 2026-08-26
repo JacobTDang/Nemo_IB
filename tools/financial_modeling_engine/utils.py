@@ -127,6 +127,133 @@ def _absent(value) -> bool:
     return isinstance(value, float) and value != value
 
 
+# Two share counts in one response are on the same basis or they are not. Below
+# this the difference is the provider rounding its own figures -- NVDA, AAPL and
+# MSFT all reconcile to within 1e-7% -- and above it the two numbers are
+# measuring different things. Nothing real sits between: the smallest genuine
+# basis gap measured is BRK-B's 52%.
+_SHARE_BASIS_TOLERANCE_PCT = 0.5
+
+
+def market_cap_implied_shares(market_cap, price) -> Optional[float]:
+    """The share count `marketCap` was built on, or None.
+
+    The only count in the payload guaranteed to be consistent with the payload:
+    it is derived from two of its own fields. An absent market cap or an absent
+    or zero price yields None rather than a division that would either raise or
+    invent a count.
+    """
+    if _absent(market_cap) or _absent(price) or not price:
+        return None
+    return market_cap / price
+
+
+def _within(value: float, reference: float, tolerance_pct: float) -> bool:
+    """Whether two figures of the same thing agree to within `tolerance_pct`."""
+    if not reference:
+        return False
+    return abs(value - reference) / abs(reference) * 100.0 <= tolerance_pct
+
+
+def share_count_basis(market_cap, price, shares_outstanding,
+                      provider_implied=None) -> Dict[str, Any]:
+    """How `sharesOutstanding` relates to the `marketCap` sitting beside it.
+
+    yfinance reports `marketCap` across every share class and
+    `sharesOutstanding` for one of them, with nothing distinguishing the two.
+    Side by side that is a 2.0845x error for GOOGL and a 1.5204x error for
+    BRK-B in any figure divided by the share count -- a DCF value per share, a
+    book value per share, an insider ownership percentage -- while `pe_ratio`
+    and `pb_ratio`, which divide `marketCap`, stay correct. One field in the
+    response disagrees with the rest of it.
+
+    `basis` is what was observed, not what caused it. A gap is usually a
+    multi-class filer, but a cover page a quarter stale makes the same shape,
+    and asserting the cause would be a guess where the observation is a fact.
+
+    `shares_outstanding_all_classes` is the count that reproduces `marketCap`,
+    so a caller has something with a valid counterpart to divide by. It prefers
+    the provider's own `impliedSharesOutstanding` where that agrees with
+    market cap over price, and falls back to the quotient -- which is
+    internally consistent by construction -- where it does not.
+    """
+    implied = market_cap_implied_shares(market_cap, price)
+    reported = None if _absent(shares_outstanding) else float(shares_outstanding)
+    provider = None if _absent(provider_implied) or not provider_implied \
+        else float(provider_implied)
+
+    all_classes, source = None, None
+    if implied is not None:
+        if provider is not None and _within(provider, implied,
+                                            _SHARE_BASIS_TOLERANCE_PCT):
+            all_classes, source = provider, 'provider_implied'
+        else:
+            all_classes, source = implied, 'market_cap_over_price'
+        # A share count is a whole number. `market_cap_implied_shares` keeps
+        # the fraction, because it is a quotient and saying so is the point.
+        all_classes = int(round(all_classes))
+
+    gap_pct = None
+    basis = 'unverified'
+    if implied is not None and reported:
+        gap_pct = (implied - reported) / reported * 100.0
+        if abs(gap_pct) <= _SHARE_BASIS_TOLERANCE_PCT:
+            basis = 'matches_market_cap'
+        elif gap_pct > 0:
+            basis = 'narrower_than_market_cap'
+        else:
+            basis = 'wider_than_market_cap'
+
+    return {
+        'basis': basis,
+        'shares_outstanding': reported,
+        'market_cap_implied_shares': implied,
+        'provider_implied_shares_outstanding': provider,
+        'shares_outstanding_all_classes': all_classes,
+        'all_classes_source': source,
+        'gap_pct': gap_pct,
+    }
+
+
+def share_basis_warning(ticker: str, basis: Dict[str, Any]
+                        ) -> Optional[Dict[str, Any]]:
+    """The warning for a share count that does not match its own market cap.
+
+    None when the two reconcile, which is every single-class filer. A caveat
+    that fires on the responses it has nothing to say about is a caveat
+    attached to the tool rather than to the answer, and a reader learns to skip
+    the array.
+
+    The message states the multiple, not only the percentage gap. "52% apart"
+    does not tell an analyst that their value per share is 2.0845x too high,
+    and the multiple is the entire reason this class of defect matters.
+    """
+    if basis['basis'] not in ('narrower_than_market_cap',
+                             'wider_than_market_cap'):
+        return None
+    reported = basis['shares_outstanding']
+    implied = basis['market_cap_implied_shares']
+    multiple = implied / reported
+    return {
+        'code': 'share_count_basis_mismatch',
+        'message': (
+            f"{ticker}: sharesOutstanding ({reported:,.0f}) and marketCap "
+            f"are on different share bases. marketCap divided by the price "
+            f"in this same response implies {implied:,.0f} shares, "
+            f"{basis['gap_pct']:+.2f}% away. The usual cause is a multi-class "
+            f"filer: the provider counts one class in sharesOutstanding and "
+            f"every class in marketCap. Any per-share figure divided by "
+            f"sharesOutstanding is therefore {multiple:.4g}x too high. Use "
+            f"shares_outstanding_all_classes for per-share arithmetic; "
+            f"pe_ratio and pb_ratio are computed from marketCap and are "
+            f"unaffected."),
+        'shares_outstanding': reported,
+        'shares_outstanding_all_classes': basis['shares_outstanding_all_classes'],
+        'gap_pct': basis['gap_pct'],
+        'multiple': multiple,
+    }
+
+
 # The two inputs each multiple divides. Ordered so the report reads the way an
 # analyst would list them.
 _MULTIPLE_INPUTS = ('pe_ratio', 'pb_ratio', 'ev_revenue', 'ev_ebitda', 'ev_ebit')
@@ -234,6 +361,22 @@ def get_data(ticker: str) -> Dict[str, Any]:
   data['totalDebt'] = _balance_or_none(info, 'totalDebt')
   data['sharesOutstanding'] = info.get('sharesOutstanding')
   data['beta'] = info.get('beta')
+
+  # `sharesOutstanding` is left exactly as the provider sent it -- callers
+  # already read it and silently redefining it would move the error rather than
+  # remove it. What is added is the basis it is on and the count that does
+  # reproduce the marketCap beside it, so the two can no longer be multiplied
+  # together into a 2.08x error with nothing in the payload objecting.
+  share_basis = share_count_basis(
+      data['marketCap'], data['currentPrice'], data['sharesOutstanding'],
+      provider_implied=info.get('impliedSharesOutstanding'))
+  data['shares_outstanding_basis'] = share_basis['basis']
+  data['shares_outstanding_all_classes'] = share_basis['shares_outstanding_all_classes']
+  data['shares_outstanding_all_classes_source'] = share_basis['all_classes_source']
+  data['market_cap_implied_shares'] = share_basis['market_cap_implied_shares']
+  data['shares_outstanding_gap_pct'] = share_basis['gap_pct']
+  basis_mismatch = share_basis_warning(ticker.upper(), share_basis)
+  data['warnings'] = [basis_mismatch] if basis_mismatch else []
 
   # safely get interest expense from income statement
   INTEREST_EXPENSE_KEYS: List[str] = ['Interest Expense', 'Interest Expense Non Operating', 'Net Interest Income']
@@ -768,6 +911,126 @@ def fetch_daily_bars(ticker: str, period: str = '2y') -> "pd.DataFrame":
   return yf.Ticker(ticker).history(period=period, auto_adjust=True)
 
 
+# Below this the dividends stripped out of the price path are smaller than the
+# rounding on the closes themselves. Above it they are a real understatement of
+# any historical market cap built from these bars -- AAPL's dividends after
+# 2020-08-28 are 4.75% of that bar.
+_DIVIDEND_ADJUSTMENT_MATERIAL_PCT = 1.0
+
+PRICE_BASIS = 'split_and_dividend_adjusted'
+
+
+def price_adjustment(df: "pd.DataFrame") -> Dict[str, Any]:
+  """What `auto_adjust=True` did to the closes in `df`.
+
+  The bars come back back-adjusted for splits and dividends onto the newest
+  session's basis, and until now the response said so nowhere -- the basis
+  appeared only in a tool description. Paired with a cover-page share count
+  that is stated as filed, that is an exact-multiple error:
+
+      NVDA 2024-05-24  close 106.29 x total 2,460,000,000        = $261bn
+                       close 106.29 x total_split_adjusted 24.6bn = $2,615bn
+
+  10.0x, which is the split ratio. AAPL on 2020-08-28 is 4.0x.
+
+  Read off the frame rather than fetched: yfinance returns the `Dividends` and
+  `Stock Splits` columns from the same request as the prices, so naming the
+  adjustment costs nothing and cannot disagree with the bars it describes.
+  """
+  splits: List[Dict[str, Any]] = []
+  factor = 1.0
+  if 'Stock Splits' in df:
+    for stamp, value in df['Stock Splits'].items():
+      try:
+        ratio = float(value)
+      except (TypeError, ValueError):
+        continue
+      # A ratio of zero is "no split on this bar"; a ratio of one is a split
+      # that changed nothing, which is a different claim and not one this
+      # toolset makes anywhere else.
+      if ratio != ratio or ratio <= 0 or ratio == 1.0:
+        continue
+      splits.append({'date': pd.Timestamp(stamp).strftime('%Y-%m-%d'),
+                     'ratio': ratio})
+      factor *= ratio
+
+  dividends: List[float] = []
+  if 'Dividends' in df:
+    for value in df['Dividends']:
+      try:
+        amount = float(value)
+      except (TypeError, ValueError):
+        continue
+      if amount == amount and amount > 0:
+        dividends.append(amount)
+
+  oldest_close = None
+  if 'Close' in df and len(df):
+    try:
+      oldest_close = float(df['Close'].iloc[0])
+    except (TypeError, ValueError):
+      oldest_close = None
+
+  removed = float(sum(dividends))
+  pct = (removed / oldest_close * 100.0
+         if oldest_close and removed else (0.0 if oldest_close else None))
+
+  return {
+    'auto_adjust': True,
+    'basis': PRICE_BASIS,
+    'splits_in_window': splits,
+    'cumulative_split_factor': factor,
+    'dividends_in_window': len(dividends),
+    'dividends_per_share_removed': removed,
+    'dividends_pct_of_oldest_close': pct,
+  }
+
+
+def price_adjustment_warnings(ticker: str,
+                              adjustment: Dict[str, Any]) -> List[Dict[str, Any]]:
+  """Warnings for an adjustment a caller could pair something wrong with.
+
+  Only when there is something to say. `price_basis` is a field on every
+  response because it is true of every bar; a warning that fired on every
+  response would be a property of the tool wearing a warning's clothes.
+  """
+  entries: List[Dict[str, Any]] = []
+  splits = adjustment['splits_in_window']
+  if splits:
+    described = ", ".join(
+        (f"{s['ratio']:g}-for-1" if s['ratio'] >= 1.0
+         else f"1-for-{1.0 / s['ratio']:g}") + f" on {s['date']}"
+        for s in splits)
+    factor = adjustment['cumulative_split_factor']
+    entries.append({
+      'code': 'prices_split_adjusted',
+      'message': (
+        f"{ticker}: every close here is back-adjusted onto the newest "
+        f"session's basis for {described}, so a close from before the "
+        f"earliest of those dates is stated in {factor:g}x as many shares as "
+        f"the company had at the time. Do not multiply it by a cover-page "
+        f"share count: get_share_count_series reports `total` as filed and "
+        f"`total_split_adjusted` on this basis, and only the second one "
+        f"pairs with these prices."),
+      'splits_in_window': splits,
+      'cumulative_split_factor': factor,
+    })
+  pct = adjustment['dividends_pct_of_oldest_close']
+  if pct is not None and pct >= _DIVIDEND_ADJUSTMENT_MATERIAL_PCT:
+    entries.append({
+      'code': 'prices_dividend_adjusted',
+      'message': (
+        f"{ticker}: {adjustment['dividends_in_window']} dividends totalling "
+        f"{adjustment['dividends_per_share_removed']:.4g} per share have also "
+        f"been taken out of the price path, {pct:.2f}% of the oldest close in "
+        f"this window. A historical market capitalisation built from these "
+        f"closes understates the price actually quoted at the time by that "
+        f"much; get_corporate_actions carries the payments themselves."),
+      'dividends_pct_of_oldest_close': pct,
+    })
+  return entries
+
+
 def get_price_history(ticker: str, period: str = '2y',
                       include_recent_bars: int = 20) -> Dict[str, Any]:
   """Historical OHLCV summary from yfinance.
@@ -803,6 +1066,10 @@ def get_price_history(ticker: str, period: str = '2y',
     sub = returns.iloc[-days:]
     return round(float(sub.std() * (252 ** 0.5) * 100), 2)
 
+  # Fields whose window the request could not support. Named rather than
+  # silently substituted or silently dropped.
+  window_short_fields: List[str] = []
+
   # YTD return: from first trading day of this calendar year
   today = datetime.now()
   jan1 = datetime(today.year, 1, 1)
@@ -810,21 +1077,54 @@ def get_price_history(ticker: str, period: str = '2y',
             df.index[df.index >= jan1]
   ytd_ret = None
   if len(ytd_idx) > 0:
-    ytd_start = close.loc[ytd_idx[0]]
-    if ytd_start:
-      ytd_ret = round(((close.iloc[-1] / ytd_start) - 1) * 100, 2)
+    # Only meaningful when the frame actually reaches back into this year.
+    # On a six-month window the first bar on/after 1 January is late February,
+    # so "YTD" measured five months and reported 140.21% for AMD against a
+    # true 115.21%. A listing younger than the year is a different case and
+    # keeps its YTD.
+    # Did the REQUEST reach back before 1 January? Comparing the frame start
+    # to the first in-frame January bar is trivially true and was the bug: on
+    # a six-month window both are late February.
+    #
+    # A listing younger than the year is the other case and keeps its YTD --
+    # the frame starts after 1 January because the stock did, not because the
+    # window was short.
+    _PERIOD_DAYS = {'1mo': 31, '3mo': 92, '6mo': 183, 'ytd': 366, '1y': 366,
+                    '2y': 731, '5y': 1827, '10y': 3653, 'max': 10 ** 5}
+    requested_days = _PERIOD_DAYS.get(str(period).lower(), 0)
+    days_since_jan1 = (df.index[-1] - pd.Timestamp(jan1, tz=df.index.tz)).days \
+        if df.index.tz else (df.index[-1] - jan1).days
+    covers_year_start = requested_days >= days_since_jan1
+    if covers_year_start:
+      ytd_start = close.loc[ytd_idx[0]]
+      if ytd_start:
+        ytd_ret = round(((close.iloc[-1] / ytd_start) - 1) * 100, 2)
+    else:
+      window_short_fields.append('returns_pct.ytd')
 
-  # 52w stats (last 252 trading days)
-  win52 = df.iloc[-252:] if len(df) >= 252 else df
-  high_idx = win52['High'].idxmax()
-  low_idx = win52['Low'].idxmin()
-
-  # Max drawdown over trailing 12 months
-  running_max = win52['Close'].expanding().max()
-  drawdown = (win52['Close'] / running_max - 1) * 100
-  max_dd = float(drawdown.min())
-  max_dd_date = drawdown.idxmin()
-  max_dd_peak_close = float(running_max.loc[max_dd_date])
+  # 52w stats. Checked as a DATE SPAN, not a row count: period="1y" returns
+  # 251 bars, so a 252-row test would null the field on the most natural
+  # request for it.
+  #
+  # The old `df.iloc[-252:] if len(df) >= 252 else df` silently substituted
+  # whatever the request fetched and kept the field name, so period="6mo"
+  # reported a "52-week low" of 188.22 for AMD against a true 149.22 -- 26%
+  # too high, no warning. The same frame carries max_drawdown_12m.
+  window_days = (df.index[-1] - df.index[0]).days
+  has_52w = window_days >= 350
+  win52 = df.iloc[-252:] if has_52w else None
+  high_idx = low_idx = None
+  max_dd = max_dd_date = max_dd_peak_close = None
+  if win52 is not None:
+    high_idx = win52['High'].idxmax()
+    low_idx = win52['Low'].idxmin()
+    running_max = win52['Close'].expanding().max()
+    drawdown = (win52['Close'] / running_max - 1) * 100
+    max_dd = float(drawdown.min())
+    max_dd_date = drawdown.idxmin()
+    max_dd_peak_close = float(running_max.loc[max_dd_date])
+  else:
+    window_short_fields.extend(['fifty_two_week', 'max_drawdown_12m'])
 
   # Recent bars
   recent = df.tail(include_recent_bars).copy()
@@ -839,12 +1139,28 @@ def get_price_history(ticker: str, period: str = '2y',
       'volume': int(row['Volume']),
     })
 
+  adjustment = price_adjustment(df)
+
   return {
     'ticker':            ticker.upper(),
     'success':           True,
     'error':             None,
     'period_requested':  period,
     'bars_returned':     len(df),
+    'price_basis':       adjustment['basis'],
+    'price_adjustment':  adjustment,
+    'warnings':          price_adjustment_warnings(ticker.upper(), adjustment)
+                         + ([{
+                             'code': 'window_too_short_for_field',
+                             'message': (
+                               f"{', '.join(window_short_fields)} "
+                               f"{'are' if len(window_short_fields) > 1 else 'is'} "
+                               f"not reported: period={period!r} covers "
+                               f"{window_days} days, which cannot answer a "
+                               f"52-week or year-to-date question. Request a "
+                               f"longer period for {'them' if len(window_short_fields) > 1 else 'it'}."),
+                             'fields': window_short_fields,
+                           }] if window_short_fields else []),
     'date_range': {
       'start': df.index[0].strftime('%Y-%m-%d'),
       'end':   df.index[-1].strftime('%Y-%m-%d'),
@@ -864,13 +1180,13 @@ def get_price_history(ticker: str, period: str = '2y',
       '180d': _vol_over(180),
       '1y':   _vol_over(252),
     },
-    'fifty_two_week': {
+    'fifty_two_week': None if win52 is None else {
       'high':     round(float(win52['High'].max()), 2),
       'high_date': high_idx.strftime('%Y-%m-%d'),
       'low':      round(float(win52['Low'].min()), 2),
       'low_date': low_idx.strftime('%Y-%m-%d'),
     },
-    'max_drawdown_12m': {
+    'max_drawdown_12m': None if win52 is None else {
       'drawdown_pct':       round(max_dd, 2),
       'trough_date':        max_dd_date.strftime('%Y-%m-%d'),
       'peak_close_before':  round(max_dd_peak_close, 2),
@@ -916,6 +1232,50 @@ def get_short_interest(ticker: str) -> Dict[str, Any]:
   short_pct_float = info.get('shortPercentOfFloat')
   short_ratio = info.get('shortRatio')
 
+  # The same provider field on the same footing as in get_market_data, plus the
+  # two impossibilities it produces here. GOOGL's float_shares (10.88bn) comes
+  # back larger than its shares_outstanding (5.87bn) because the float covers
+  # every class and the share count covers one; insider ownership taken as
+  # 1 - float/shares computes to -85%. BRK-B's shares_short (11.9m) exceeds its
+  # float_shares (1.23m) for the mirror-image reason. Neither is a state a
+  # company can be in, and both were reported without comment.
+  float_shares = info.get('floatShares') or None
+  shares_out = info.get('sharesOutstanding') or None
+  basis = share_count_basis(info.get('marketCap'),
+                            info.get('currentPrice')
+                            or info.get('regularMarketPrice'),
+                            shares_out,
+                            provider_implied=info.get('impliedSharesOutstanding'))
+  warnings: List[Dict[str, Any]] = []
+  mismatch = share_basis_warning(ticker.upper(), basis)
+  if mismatch is not None:
+    warnings.append(mismatch)
+  if float_shares and shares_out and float_shares > shares_out:
+    all_classes = basis['shares_outstanding_all_classes']
+    remedy = (f" Compare the float against shares_outstanding_all_classes "
+              f"({all_classes:,.0f}), which is counted the same way."
+              if all_classes else "")
+    warnings.append({
+      'code': 'float_exceeds_shares_outstanding',
+      'message': (
+        f"{ticker.upper()}: float_shares ({float_shares:,.0f}) exceeds "
+        f"shares_outstanding ({shares_out:,.0f}), which no company can do. "
+        f"The float is counted across every share class and the share count "
+        f"covers one of them, so the two do not subtract: insider ownership "
+        f"taken as 1 - float_shares / shares_outstanding comes out at "
+        f"{(1 - float_shares / shares_out) * 100:.0f}%." + remedy),
+    })
+  if shares_short and float_shares and shares_short > float_shares:
+    warnings.append({
+      'code': 'short_interest_exceeds_float',
+      'message': (
+        f"{ticker.upper()}: shares_short ({shares_short:,.0f}) exceeds "
+        f"float_shares ({float_shares:,.0f}), so the two are not counted on "
+        f"the same share class. short_pct_of_float is the provider's own "
+        f"figure and is not shares_short / float_shares -- dividing them here "
+        f"gives {shares_short / float_shares * 100:,.0f}%."),
+    })
+
   # Sentiment label based on % of float
   signal = 'unknown'
   if short_pct_float is not None:
@@ -937,12 +1297,15 @@ def get_short_interest(ticker: str) -> Dict[str, Any]:
     'mom_change_pct':            mom_change_pct,
     'short_ratio_days_to_cover': float(short_ratio) if short_ratio else None,
     'short_pct_of_float':        round(float(short_pct_float) * 100, 3) if short_pct_float else None,
-    'float_shares':              int(info.get('floatShares', 0)) or None,
-    'shares_outstanding':        int(info.get('sharesOutstanding', 0)) or None,
+    'float_shares':              int(float_shares) if float_shares else None,
+    'shares_outstanding':        int(shares_out) if shares_out else None,
+    'shares_outstanding_basis':  basis['basis'],
+    'shares_outstanding_all_classes': basis['shares_outstanding_all_classes'],
     'as_of_date':                _epoch_to_iso(info.get('dateShortInterest')),
     'prior_month_date':          _epoch_to_iso(info.get('sharesShortPreviousMonthDate')),
     'signal':                    signal,
     'source':                    'yfinance (underlying: FINRA biweekly short interest)',
+    'warnings':                  warnings,
   }
 
 

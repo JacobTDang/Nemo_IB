@@ -42,10 +42,26 @@ def _alphabet_point():
 
 @pytest.fixture
 def _stub(monkeypatch):
+    """The filings, offline.
+
+    The quote provider goes with them: a multi-class filer now has its class
+    weights checked against a market capitalisation, and these tests are about
+    which facts survive deduplication rather than what the classes are worth
+    to each other. Raising is what the offline suite actually is -- a source
+    that cannot be reached -- and `_share_basis` reports that rather than
+    assuming the classes are equivalent.
+    """
     def install(point):
         monkeypatch.setattr(dilution, "fetch_concept_series",
                             lambda *a, **k: [point])
+        monkeypatch.setattr(dilution, "fetch_market_share_count",
+                            _no_quote_provider)
     return install
+
+
+def _no_quote_provider(ticker):
+    raise dilution.MarketShareCountUnavailable(
+        f"no quote provider is reachable from the offline suite ({ticker})")
 
 
 def test_a_duplicated_fact_appears_once_per_class(_stub):
