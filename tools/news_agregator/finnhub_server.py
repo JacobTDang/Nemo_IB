@@ -101,15 +101,23 @@ def _condense_insider_data(raw: Dict[str, Any]) -> Dict[str, Any]:
   """
   transactions = raw.get("data", [])
   if not transactions:
-    return {"total_bought": 0, "total_sold": 0, "net_shares": 0,
-            "buy_count": 0, "sell_count": 0, "top_insiders": [],
-            "recent_30d": {"bought": 0, "sold": 0, "net": 0},
-            "recent_90d": {"bought": 0, "sold": 0, "net": 0},
-            "prior_90d": {"bought": 0, "sold": 0, "net": 0},
+    # Every field below is derived from these rows, so with no rows there is
+    # no total, no count and no signal. `signal: "neutral"` here occupied the
+    # same field that reads "net_selling" for a real window, so nothing
+    # downstream could separate "insiders were balanced" from "we got nothing
+    # back", and a screen filtering on `signal != "net_selling"` admitted
+    # every ticker the plan cannot see. The empty `top_insiders` is left as
+    # the only shape in the payload, which is what lets `build_envelope`
+    # recognise the emptiness and label the coverage.
+    return {"total_bought": None, "total_sold": None, "net_shares": None,
+            "buy_count": None, "sell_count": None, "top_insiders": [],
+            "recent_30d": None,
+            "recent_90d": None,
+            "prior_90d": None,
             "prior_period_avg_per_90d_sold": None,
             "current_vs_baseline_ratio": None,
             "period_start": None, "period_end": None,
-            "signal": "neutral"}
+            "signal": None}
 
   total_bought = 0
   total_sold = 0
@@ -457,7 +465,11 @@ def _condense_earnings_surprises(raw: List[Dict[str, Any]], limit: int = 12) -> 
   Returns: per-quarter table, beat_count, miss_count, avg_surprise_pct, beat_rate_pct
   """
   if not isinstance(raw, list) or not raw:
-    return {"quarters": [], "beat_count": 0, "miss_count": 0, "avg_surprise_pct": None}
+    # `beat_count: 0` beside `quarters: []` reads as "this company has never
+    # beaten" -- a fact about the filer, asserted from an empty hand. The
+    # counts below are only reported once there are quarters to count.
+    return {"quarters": [], "beat_count": None, "miss_count": None,
+            "avg_surprise_pct": None}
 
   quarters = []
   beat_count = 0
@@ -813,7 +825,19 @@ def _condense_financial_statements(raw: Dict[str, Any], statement: str, freq: st
   - Format B: {"data": [{"endDate": ..., "report": {"ic": [{concept, value}, ...]}}]}
 
   Returns last 5 annual or 8 quarterly periods with key fields only.
+
+  When Finnhub declines the request, its own words are kept -- the same rule
+  `_condense_forward_estimates` follows. `/stock/financials` answers HTTP 403
+  "You don't have access to this resource" on this plan for every symbol, NVDA
+  included, and calling that "Unrecognized response format" was a false
+  diagnosis: the format was a perfectly recognizable entitlement refusal. It
+  sent a reader to fix a parser and lost the one sentence naming the fixable
+  problem.
   """
+  if isinstance(raw, dict) and raw.get("error"):
+    return {"statement": statement, "freq": freq,
+            "error": f"Finnhub: {raw['error']}"}
+
   # Fields to keep for each statement type (Finnhub standardized camelCase)
   KEEP = {
     "ic": {"revenue", "costOfRevenue", "grossProfit", "operatingExpense",
@@ -881,7 +905,9 @@ def _condense_insider_sentiment(raw: Dict[str, Any]) -> Dict[str, Any]:
   """
   data = raw.get("data", []) if isinstance(raw, dict) else []
   if not data:
-    return {"months": [], "signal": "neutral", "avg_mspr": None}
+    # No monthly readings, so no average and no verdict over them. The empty
+    # `months` is what `build_envelope` reads to label the coverage.
+    return {"months": [], "signal": None, "avg_mspr": None}
 
   # Sort by year desc, month desc and take last 6
   sorted_data = sorted(data, key=lambda x: (x.get("year", 0), x.get("month", 0)), reverse=True)[:6]
@@ -909,7 +935,9 @@ def _condense_insider_sentiment(raw: Dict[str, Any]) -> Dict[str, Any]:
     else:
       signal = "neutral"
   else:
-    signal = "neutral"
+    # Months arrived but every MSPR was null. The same rule one level in:
+    # there is no average to classify, so there is no classification.
+    signal = None
 
   return {"months": months, "signal": signal, "avg_mspr": avg_mspr}
 
@@ -933,6 +961,33 @@ def _slim_articles(articles: List[Dict[str, Any]], cap: int = 20) -> List[Dict[s
       "url": article.get("url", "")
     })
   return slimmed
+
+
+def _news_page(articles: List[Dict[str, Any]], from_date: str, to_date: str,
+               cap: int = 20) -> Dict[str, Any]:
+  """A capped slice of a news window, plus what the cap cost.
+
+  NVDA over an eight-day window returned 20 articles all stamped the final
+  day; Finnhub had 246 and the preceding seven days vanished. As a bare list
+  that reads as "here is the news for your window" when it is "here are the
+  20 most recent" -- for a catalyst workflow, the difference between
+  "nothing happened last week" and "we did not look".
+
+  So the page names both windows: the one asked for and the one the returned
+  articles actually span.
+  """
+  returned = _slim_articles(articles, cap=cap)
+  stamps = sorted(a["datetime"] for a in returned if a["datetime"])
+  covered = (f"{stamps[0][:10]} -> {stamps[-1][:10]}") if stamps else None
+
+  return {
+    "window_requested": f"{from_date} -> {to_date}",
+    "window_returned": covered,
+    "total_articles": len(articles),
+    "returned": len(returned),
+    "truncated": len(returned) < len(articles),
+    "articles": returned,
+  }
 
 
 def _warm_yfinance_session() -> None:
@@ -1259,7 +1314,7 @@ warnings_per_tool={
       "symbol": ticker, "from": from_date, "to": to_date
     })
     if isinstance(result, list):
-      result = _slim_articles(result, cap=20)
+      result = _news_page(result, from_date, to_date, cap=20)
     envelope = build_envelope(result, ticker, "get_company_news")
     return [TextContent(type="text", text=safe_json_dumps(envelope))]
 
@@ -1311,8 +1366,25 @@ warnings_per_tool={
     Lets the consumer detect upgrade/downgrade momentum that's invisible
     in a single-period snapshot."""
     result = await self.client.get("/stock/recommendation", {"symbol": ticker})
+
+    # Two different nothings, told apart. Finnhub declining the request is an
+    # error with a reason worth reporting; an empty list is a coverage fact
+    # `build_envelope` already knows how to label. `{"error": "no
+    # recommendation data"}` collapsed both into a sentence with no code, no
+    # coverage label and nothing in metadata.errors.
+    if isinstance(result, dict) and result.get("error"):
+      envelope = build_envelope({"periods": [],
+                                 "error": f"Finnhub: {result['error']}"},
+                                ticker, "get_analyst_revisions_history",
+                                errors=[f"Finnhub: {result['error']}"])
+      envelope["warnings"] = [warning(
+        "primary_source_unavailable",
+        "Finnhub did not answer the recommendation request, so no revision "
+        "history is reported. See metadata.errors for what it said; this is "
+        "not evidence that the company has no analyst coverage.")]
+      return [TextContent(type="text", text=safe_json_dumps(envelope))]
     if not isinstance(result, list) or not result:
-      envelope = build_envelope({"error": "no recommendation data"}, ticker,
+      envelope = build_envelope({"periods": []}, ticker,
                                 "get_analyst_revisions_history")
       return [TextContent(type="text", text=safe_json_dumps(envelope))]
 
@@ -1362,10 +1434,13 @@ warnings_per_tool={
       m6 = periods[6]
       momentum["6mo_net_bullish_delta"] = latest["net_bullish"] - m6["net_bullish"]
 
-    # Signal classifier
-    signal = "neutral"
+    # Signal classifier. It reads one input, the 3-month delta, and fewer
+    # than four periods means that input does not exist -- "neutral" there
+    # reported no revision momentum when no momentum had been measured.
+    signal = None
     if momentum.get("3mo_net_bullish_delta") is not None:
       d3 = momentum["3mo_net_bullish_delta"]
+      signal = "neutral"       # measured and flat, which is a reading
       if d3 >= 5:
         signal = "upgrading_strong"
       elif d3 >= 2:
@@ -1480,6 +1555,15 @@ warnings_per_tool={
     })
     condensed = _condense_financial_statements(result, statement, freq) if isinstance(result, dict) else result
 
+    # What the primary path said, kept before the fallback overwrites it --
+    # the same bookkeeping get_forward_estimates does. `/stock/financials`
+    # answers 403 on this plan for every symbol, and the response reported
+    # `errors: []` while yfinance served NVDA's income statement, so nothing
+    # recorded a fixable entitlement problem.
+    primary_errors = []
+    if isinstance(condensed, dict) and condensed.get("error"):
+      primary_errors.append(f"{statement}/{freq}: {condensed['error']}")
+
     # yfinance fallback when Finnhub returns 403 / empty / unrecognized format
     # (free-tier `/stock/financials` is paywalled). Same pattern as
     # get_forward_estimates — single fallback call, 30s timeout to absorb
@@ -1501,7 +1585,29 @@ warnings_per_tool={
         if isinstance(condensed, dict):
           condensed["error"] = (condensed.get("error") or "no data") + " + yfinance_timeout"
 
-    envelope = build_envelope(condensed, ticker, "get_financial_statements")
+    has_periods = isinstance(condensed, dict) and bool(condensed.get("periods"))
+    source = condensed.get("_source") if isinstance(condensed, dict) else None
+
+    envelope = build_envelope(condensed, ticker, "get_financial_statements",
+                              errors=primary_errors)
+    # Set on the body deliberately: @annotating fills provider and warnings
+    # with setdefault, so a value already here survives, which is the only way
+    # to correct a per-response provider without editing the decorator's one
+    # static "Finnhub" for the whole server. A response with no periods was
+    # answered by nobody, and naming a provider there would credit a source
+    # for a figure it did not supply.
+    envelope["provider"] = (
+      _SOURCE_PROVIDERS.get(source, source or "Finnhub") if has_periods
+      else "none (no financial statements retrieved)")
+    if primary_errors:
+      envelope["warnings"] = list(envelope.get("warnings") or []) + [warning(
+        "primary_source_unavailable",
+        "Finnhub declined the financial-statements request. Any periods below "
+        "come from the fallback named in `provider` and in `_source`; if "
+        "there are none, nothing was retrieved, which is not evidence that "
+        "the company files no statements. See metadata.errors for what "
+        "Finnhub said.",
+        finnhub_errors=primary_errors)]
     return [TextContent(type="text", text=safe_json_dumps(envelope))]
 
   async def get_company_profile(self, ticker: str) -> List[TextContent]:

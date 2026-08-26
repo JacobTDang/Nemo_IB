@@ -113,8 +113,13 @@ def _flatten_market_intel(variables: Dict[str, Any], tool_name: str, data: Dict[
     return
 
   if tool_name == 'get_insider_transactions':
+    # `is not None` because the tool now reports null rather than a fabricated
+    # zero or "neutral" when Finnhub returned no transactions. A null in the
+    # variable store would render as "None" in a prompt and read as a value;
+    # an absent key reads as absent, which is what it is. Matches the guard
+    # the earnings-surprises and insider-sentiment branches already use.
     for key in ('total_bought', 'total_sold', 'net_shares', 'buy_count', 'sell_count', 'signal'):
-      if key in data:
+      if data.get(key) is not None:
         variables[f"insider.{key}"] = data[key]
         variables[f"insider_{key}"] = data[key]
     top = data.get('top_insiders', [])
@@ -733,6 +738,27 @@ def _process_market_intel(tool_name: str, tool_result: Dict) -> Dict[str, Any]:
   return {"type": "market_intel", "tool": tool_name, "data": inner}
 
 
+def _extract_articles(tool_result: Dict) -> List[Dict[str, Any]]:
+  """The article list out of a news envelope, whichever shape it arrives in.
+
+  `get_company_news` now returns a page object -- counts, both windows, and
+  `articles` -- because a bare list could not say that 226 of 246 articles
+  had been cut. Reading `data` as a list would have turned that into "no
+  articles to analyze": the same silence, one layer down.
+
+  `get_market_news` still returns a bare list; both are accepted here rather
+  than leaving the caller to guess which tool produced which.
+  """
+  data = tool_result.get("data")
+  if isinstance(data, list):
+    return data
+  if isinstance(data, dict):
+    articles = data.get("articles")
+    if isinstance(articles, list):
+      return articles
+  return []
+
+
 def _process_news(
   tool_name: str,
   tool_result: Dict,
@@ -744,8 +770,8 @@ def _process_news(
   arguments: Dict[str, Any] = None
 ):
   """Route news tool results through per-article sentiment analysis."""
-  articles = tool_result.get("data", [])
-  if not articles or not isinstance(articles, list):
+  articles = _extract_articles(tool_result)
+  if not articles:
     print(f"  [Pass-through] {tool_name}: no articles to analyze", flush=True)
     results.append({"type": "market_intel", "tool": tool_name, "data": tool_result})
     return

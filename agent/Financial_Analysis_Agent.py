@@ -364,7 +364,15 @@ COMMON MISTAKES TO AVOID:
         if tool_name == 'get_insider_transactions':
             if not isinstance(data, dict):
                 return f"[INSIDER ACTIVITY] {data}\n\n"
-            signal = data.get('signal', 'unknown').replace('_', ' ').upper()
+            if data.get('signal') is None:
+                # Finnhub returned no transactions, so every figure below
+                # would be a zero nobody measured. Say that instead of
+                # printing "Net shares: 0" into the analysis prompt.
+                return ("[INSIDER ACTIVITY] Finnhub returned no insider "
+                        "transactions for this symbol. No totals, no window "
+                        "and no signal -- this is not a reading of balanced "
+                        "insider activity.\n\n")
+            signal = data['signal'].replace('_', ' ').upper()
             lines = [
                 f"[INSIDER ACTIVITY] Signal: {signal}",
                 f"  Net shares: {data.get('net_shares', 0):,} (bought: {data.get('total_bought', 0):,}, sold: {data.get('total_sold', 0):,})",
@@ -570,7 +578,11 @@ COMMON MISTAKES TO AVOID:
         elif tool_name == 'get_insider_sentiment':
             if not isinstance(data, dict):
                 return f"[INSIDER SENTIMENT (MSPR)] {data}\n\n"
-            signal = data.get('signal', 'neutral').upper()
+            if data.get('signal') is None:
+                return ("[INSIDER SENTIMENT (MSPR)] Finnhub returned no "
+                        "monthly MSPR readings for this symbol. No average "
+                        "and no signal -- this is not a neutral reading.\n\n")
+            signal = data['signal'].upper()
             avg_mspr = data.get('avg_mspr')
             months = data.get('months', [])
             lines = [f"[INSIDER SENTIMENT (MSPR)] Signal: {signal} | Avg MSPR (6M): {avg_mspr}"]

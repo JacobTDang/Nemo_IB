@@ -116,17 +116,32 @@ class FinnhubClient:
       self._session = None
 
 
+# Keys that restate the request or describe the lookup rather than answer it.
+# `symbol` and `metricType` are Finnhub echoing the arguments back. The news
+# page's window and counts are ours, and are the same kind of thing: a payload
+# holding only "you asked about these eight days and we returned 0 of 0
+# articles" is still a payload with nothing in it. Without this the counts
+# added to close the silent-cap defect would have permanently satisfied
+# `_has_content`, and the not_covered label would never fire for news again.
+_LOOKUP_ECHO_KEYS = frozenset({
+  "symbol", "metricType",
+  "window_requested", "window_returned", "total_articles", "returned",
+  "truncated",
+})
+
+
 def _has_content(node: Any) -> bool:
   """Does this payload contain anything a caller could act on?
 
   Nested because Finnhub answers an unknown symbol with structure but no
   content -- `{"metric": {}, "series": {}, "symbol": "ZZZZ"}` is shaped like a
   result and holds none. A zero counts as content: a metric that is genuinely
-  zero is an answer.
+  zero is an answer, unless it is a count of what we did rather than a
+  measurement of the company.
   """
   if isinstance(node, dict):
     return any(_has_content(value) for key, value in node.items()
-               if key not in ("symbol", "metricType"))
+               if key not in _LOOKUP_ECHO_KEYS)
   if isinstance(node, (list, tuple)):
     return any(_has_content(value) for value in node)
   if isinstance(node, str):
@@ -151,10 +166,18 @@ def build_envelope(
   and a successful response with no content reads as "this company has no
   profile" -- a claim about the company, made from our own empty hand.
 
-  The label stops short of saying why. Finnhub returns an empty body both for
-  an unknown symbol and for one outside the plan's entitlement, and the server
-  already reasons this way for forward estimates, where a 403 is kept in the
-  provider's own words rather than flattened to "no data".
+  The label stops short of saying why. Finnhub returns the same empty body for
+  an unknown symbol, for one outside the plan's entitlement, and for a covered
+  company with nothing to report in the window asked for -- verified:
+  `/stock/insider-transactions` answers `{"data": [], "symbol": X}` for SHOP,
+  NVO and SAP exactly as it does for ZZZZNOTREAL. The server already reasons
+  this way for forward estimates, where a 403 is kept in the provider's own
+  words rather than flattened to "no data".
+
+  This only fires on a payload with nothing in it, which is why a tool that
+  summarises its rows has to hand over the empty rows rather than a summary
+  computed over them: `{"quarters": [], "beat_count": 0}` has content, and the
+  content is a claim nothing measured.
 
   `success` is untouched: a news window with no articles is a real empty.
   """
@@ -175,9 +198,10 @@ def build_envelope(
     envelope["warnings"] = [{
       "code": "finnhub_returned_nothing",
       "message": (
-        f"Finnhub returned no content for {ticker!r}. That happens both for a "
-        f"symbol it does not carry and for one outside this plan's "
-        f"entitlement, and the response does not distinguish them, so this is "
+        f"Finnhub returned no content for {ticker!r}. That happens for a "
+        f"symbol it does not carry, for one outside this plan's entitlement, "
+        f"and for a covered company with nothing to report in the window "
+        f"asked for, and the response does not distinguish them, so this is "
         f"not evidence about what the company discloses."),
     }]
 

@@ -56,11 +56,21 @@ def test_existing_aggregation_unchanged():
 
 
 def test_empty_input_returns_empty_window():
+  """No rows means no window and no totals.
+
+  This asserted `total_bought == 0 and total_sold == 0` until the empty
+  response was audited: a zero there says insiders moved no stock, when the
+  truth is that nothing was measured. Finnhub returns the same empty body for
+  a symbol it does not carry, for one outside the plan, and for a covered
+  company with no Form 4s, so the totals -- like the window -- are only
+  reported once there are transactions to total. See
+  test_no_data_is_not_a_verdict.py for the rule.
+  """
   out = _condense_insider_data({"data": []})
   assert out['period_start'] is None
   assert out['period_end'] is None
-  assert out['total_bought'] == 0 and out['total_sold'] == 0
-  print("PASS: empty input -> period_start/end = None")
+  assert out['total_bought'] is None and out['total_sold'] is None
+  print("PASS: empty input -> period_start/end and totals = None")
 
 
 def test_malformed_dates_dont_break_window():
