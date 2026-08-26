@@ -117,9 +117,18 @@ def test_curated_caveats_are_structured(label, module, cls):
 
 
 def test_the_caveats_that_prompted_this_are_actually_attached():
-    """Named explicitly so removing one is a deliberate act, not an omission."""
+    """Named explicitly so removing one is a deliberate act, not an omission.
+
+    get_debt_maturity_schedule is deliberately NOT in this list. Its caveat is
+    about coverage, which is a property of each answer rather than of the
+    tool: attached statically it fired on responses whose six buckets were
+    verified against SEC and whose own `coverage` field said "full". The
+    tool-level version of that fact lives in tools/manifest.py, and the
+    per-response one is raised by the tool only when the answer really is
+    incomplete. `testing/test_conditional_warnings.py` holds both halves.
+    """
     expected = {
-        "sec": {"get_debt_maturity_schedule", "get_earnings_transcripts"},
+        "sec": {"get_earnings_transcripts"},
         "altdata": {"get_congress_holdings"},
     }
     for label, module, cls in SERVERS:
