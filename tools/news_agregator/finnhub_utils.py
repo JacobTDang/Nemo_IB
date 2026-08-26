@@ -116,6 +116,24 @@ class FinnhubClient:
       self._session = None
 
 
+def _has_content(node: Any) -> bool:
+  """Does this payload contain anything a caller could act on?
+
+  Nested because Finnhub answers an unknown symbol with structure but no
+  content -- `{"metric": {}, "series": {}, "symbol": "ZZZZ"}` is shaped like a
+  result and holds none. A zero counts as content: a metric that is genuinely
+  zero is an answer.
+  """
+  if isinstance(node, dict):
+    return any(_has_content(value) for key, value in node.items()
+               if key not in ("symbol", "metricType"))
+  if isinstance(node, (list, tuple)):
+    return any(_has_content(value) for value in node)
+  if isinstance(node, str):
+    return bool(node.strip())
+  return node is not None
+
+
 def build_envelope(
   data: Any,
   ticker: str,
@@ -127,8 +145,20 @@ def build_envelope(
 
   Every tool result goes through this so downstream consumers
   (execution engine, analysis agent) see a consistent shape.
+
+  An empty payload is labelled rather than left to be inferred. Asked about a
+  symbol that does not exist, these tools answered `success: true, data: {}`,
+  and a successful response with no content reads as "this company has no
+  profile" -- a claim about the company, made from our own empty hand.
+
+  The label stops short of saying why. Finnhub returns an empty body both for
+  an unknown symbol and for one outside the plan's entitlement, and the server
+  already reasons this way for forward estimates, where a 403 is kept in the
+  provider's own words rather than flattened to "no data".
+
+  `success` is untouched: a news window with no articles is a real empty.
   """
-  return {
+  envelope = {
     "domain": "market_intel",
     "ticker": ticker,
     "tool": tool_name,
@@ -139,3 +169,16 @@ def build_envelope(
       "errors": errors or [],
     }
   }
+
+  if not _has_content(data):
+    envelope["coverage"] = "not_covered"
+    envelope["warnings"] = [{
+      "code": "finnhub_returned_nothing",
+      "message": (
+        f"Finnhub returned no content for {ticker!r}. That happens both for a "
+        f"symbol it does not carry and for one outside this plan's "
+        f"entitlement, and the response does not distinguish them, so this is "
+        f"not evidence about what the company discloses."),
+    }]
+
+  return envelope
