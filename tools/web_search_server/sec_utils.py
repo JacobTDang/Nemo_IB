@@ -3875,6 +3875,30 @@ _GEOGRAPHIC_ATTRIBUTION_RE = re.compile(
   r'(?:customers?|clients?)\s+(?:headquartered|located|domiciled|based|residing)\b',
   re.IGNORECASE)
 
+# A share of receivables is not a share of revenue. AVGO discloses both one
+# paragraph apart -- one customer at 32% of net revenue and 44% of net accounts
+# receivable -- and both landed in pct_of_revenue, so the tool reported 44%
+# when the filing says 32%. The larger, wronger number sorts first.
+#
+# The row is kept rather than dropped: a receivables concentration is a real
+# credit-risk disclosure, and the gap between the two says that customer pays
+# slower than the rest.
+# "Top five end customers accounted for 40%" and "one customer accounted for
+# 32%" are both true and cannot be added. Summed, AVGO's fiscal 2025 rows came
+# to 144% of revenue. The aggregate is worth keeping -- concentration across a
+# handful of buyers is the point of the disclosure -- but a caller iterating
+# rows reads an unlabelled 40% as a single buyer.
+_AGGREGATE_SCOPE_RE = re.compile(
+  r'\b(?:aggregate|combined|together|collectively)\b|'
+  r'\b(?:top|largest|five|four|three|ten)\s+'
+  r'(?:\w+\s+){0,2}?(?:customers|clients|end\s+customers)\b|'
+  r'\bcustomers\s+(?:accounted|represented|comprised)\b',
+  re.IGNORECASE)
+
+_RECEIVABLES_BASIS_RE = re.compile(
+  r'\b(?:accounts?\s+receivable|receivables?\s+balance|trade\s+receivables?)\b',
+  re.IGNORECASE)
+
 # The fiscal year the disclosure describes. Anchored on "fiscal ... <year>" or
 # "year(s) ended <month> <day>, <year>" so a year that merely appears in the
 # sentence -- an acquisition date, a contract term -- is not mistaken for the
@@ -4013,9 +4037,16 @@ def _scan_customer_concentration(text: str) -> Dict[str, Any]:
       continue
     prior.append((sentence, len(customers)))
 
+    measures_receivables = bool(_RECEIVABLES_BASIS_RE.search(sentence))
+    is_aggregate = bool(_AGGREGATE_SCOPE_RE.search(sentence))
     customers.append({
       "name": name,
-      "pct_of_revenue": pct,
+      # None on a receivables row: the field names revenue, so a number in it
+      # is a claim about revenue.
+      "pct_of_revenue": None if measures_receivables else pct,
+      "pct_of_receivables": pct if measures_receivables else None,
+      "basis": "accounts_receivable" if measures_receivables else "revenue",
+      "scope": "aggregate" if is_aggregate else "single_customer",
       "fiscal_year": fiscal_year,
       "occurrences": 1,
       "excerpt": window.strip(),
@@ -4027,12 +4058,43 @@ def _scan_customer_concentration(text: str) -> Dict[str, Any]:
   for year in sorted({row['fiscal_year'] for row in customers},
                      key=lambda y: (y is None, -(y or 0))):
     rows = [r for r in customers if r['fiscal_year'] == year]
-    total = round(sum(r['pct_of_revenue'] for r in rows), 4)
+    # total_pct exists to warn when disclosed shares exceed 100% of revenue,
+    # so only revenue rows belong in it.
+    revenue_rows = [r for r in rows
+                    if r['pct_of_revenue'] is not None
+                    and r['scope'] == 'single_customer']
+    total = round(sum(r['pct_of_revenue'] for r in revenue_rows), 4)
     periods.append({
       'fiscal_year': year,
       'total_pct': total,
       'disclosure_count': len(rows),
+      'revenue_disclosure_count': len(revenue_rows),
     })
+    # Two unnamed single-customer rows disclosing the same share in the same
+    # year are usually one customer stated twice, in Risk Factors and again in
+    # MD&A. Usually is not always: NVDA's 10-K reports two different direct
+    # customers at the same percentage, so merging them would erase a real
+    # one. The tool cannot tell which case this is and says so instead of
+    # choosing. Before aggregates were excluded from this total, AVGO's
+    # double-count showed up as an impossible 144%; at 64% nothing else would
+    # mention it.
+    shares = {}
+    for row in revenue_rows:
+      if row.get('name') is None:
+        shares.setdefault(row['pct_of_revenue'], []).append(row)
+    repeated = {pct: rows_ for pct, rows_ in shares.items() if len(rows_) > 1}
+    for pct, rows_ in sorted(repeated.items()):
+      label = f"fiscal year {year}" if year is not None else "an unstated period"
+      warnings.append(warning(
+        'possible_duplicate_disclosure',
+        f"{len(rows_)} unnamed customer disclosures for {label} each report "
+        f"{pct}% of revenue. Filings often state one customer's share twice, "
+        f"in Risk Factors and again in MD&A, and these may be one customer "
+        f"rather than {len(rows_)}. They are also genuinely two in some "
+        f"filings, so they are counted separately and total_pct may "
+        f"double-count. Read the `disclosure` text on each row to decide.",
+        fiscal_year=year, pct_of_revenue=pct, rows=len(rows_)))
+
     if total > 100:
       label = f"fiscal year {year}" if year is not None else "an unstated period"
       warnings.append(warning(
