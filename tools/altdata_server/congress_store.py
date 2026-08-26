@@ -285,6 +285,37 @@ def unparsed_filing_ids(candidates: Sequence[str]) -> List[str]:
 
 # ------------------------------------------------------- rows within filings
 
+def _sane_transaction(row: Dict[str, Any],
+                      filed_date: Optional[str]) -> Dict[str, Any]:
+    """Drop the fields of a row that cannot be true, keeping the rest.
+
+    The last place a false figure can be stopped. Parsers get better and
+    parsers get replaced, but every one of them writes through here, so a row
+    that cannot be true should not depend on which produced it.
+
+    Both shapes below were found in the live store. Neither is repaired, only
+    refused: a trade dated 2026-12-26 and disclosed on 2026-02-09 is almost
+    certainly December 2025, and "almost certainly" is how a parsing bug
+    becomes a fact in a database.
+    """
+    row = dict(row)
+
+    # An amount bracket whose floor is above its ceiling. Found 24 times, and
+    # every one had amount_max = 200 -- the PTR's own "Cap. Gains > $200?"
+    # header, read as a figure when the entry spanned a page break. The floor
+    # was right in every case, so the floor stays.
+    low, high = row.get("amount_min"), row.get("amount_max")
+    if low is not None and high is not None and low > high:
+        row["amount_max"] = None
+
+    # A trade disclosed before it happened. Found 7 times, one by ten months.
+    txn, filed = row.get("transaction_date"), filed_date
+    if txn and filed and txn > filed:
+        row["transaction_date"] = None
+
+    return row
+
+
 def replace_transactions(filing_id: str, member: Optional[str],
                          rows: Iterable[Dict[str, Any]]) -> int:
     """Write a filing's transactions, replacing anything held for it.
@@ -295,6 +326,12 @@ def replace_transactions(filing_id: str, member: Optional[str],
     """
     rows = list(rows)
     with connect() as conn:
+        filed_row = conn.execute(
+            "SELECT filed_date FROM filings WHERE filing_id = ?",
+            (filing_id,)).fetchone()
+        # Absence of a filing date is not evidence a trade date is wrong.
+        filed_date = filed_row[0] if filed_row else None
+        rows = [_sane_transaction(r, filed_date) for r in rows]
         conn.execute("DELETE FROM transactions WHERE filing_id = ?", (filing_id,))
         conn.executemany(
             """INSERT INTO transactions(txn_id, filing_id, member_id, row_index,
@@ -336,6 +373,30 @@ def replace_holdings(filing_id: str, member: Optional[str],
 
 
 # ----------------------------------------------------------------- coverage
+
+def repair_impossible_rows() -> Dict[str, int]:
+    """Apply the write-time sanity rules to rows already stored.
+
+    `replace_transactions` refuses these on the way in, but rows written before
+    it did are still held. Idempotent, so it is safe to run on every sync.
+    Returns what it changed rather than logging it, because a repair that
+    reports nothing is indistinguishable from one that did nothing.
+    """
+    with connect() as conn:
+        inverted = conn.execute(
+            """UPDATE transactions SET amount_max = NULL
+               WHERE amount_min IS NOT NULL AND amount_max IS NOT NULL
+                 AND amount_min > amount_max""").rowcount
+        undated = conn.execute(
+            """UPDATE transactions SET transaction_date = NULL
+               WHERE transaction_date IS NOT NULL
+                 AND filing_id IN (SELECT filing_id FROM filings
+                                   WHERE filed_date IS NOT NULL)
+                 AND transaction_date > (SELECT filed_date FROM filings
+                                         WHERE filings.filing_id =
+                                               transactions.filing_id)""").rowcount
+    return {"amounts_cleared": inverted, "dates_cleared": undated}
+
 
 def coverage(chamber: Optional[str] = None) -> Dict[str, Any]:
     """What the store holds, split by whether it could be read.

@@ -344,6 +344,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     if merged:
         _log(f"[members] merged {merged} duplicate record(s)")
 
+    # Also idempotent and cheap. replace_transactions refuses impossible rows
+    # on the way in, but rows ingested before it did are still held, and a
+    # parser fixed later does not go back and correct what it already wrote.
+    repaired = store.repair_impossible_rows()
+    if repaired["amounts_cleared"] or repaired["dates_cleared"]:
+        _log(f"[repair] cleared {repaired['amounts_cleared']} impossible "
+             f"amount range(s) and {repaired['dates_cleared']} trade date(s) "
+             f"that fell after their own filing")
+
     return 1 if failures else 0
 
 

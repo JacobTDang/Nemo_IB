@@ -104,6 +104,25 @@ def _user_agent(contact: Optional[str] = None) -> str:
 
 # ------------------------------------------------------------------ amounts
 
+# The bands the Ethics in Government Act defines. Trade sizes are reported as
+# these and only these, so a pair that is not one of them was not read off the
+# filing correctly -- it was assembled from something else on the page.
+AMOUNT_BRACKETS: Tuple[Tuple[int, Optional[int]], ...] = (
+    (1, 1000),
+    (1001, 15000),
+    (15001, 50000),
+    (50001, 100000),
+    (100001, 250000),
+    (250001, 500000),
+    (500001, 1000000),
+    (1000001, 5000000),
+    (5000001, 25000000),
+    (25000001, 50000000),
+    (50000000, None),          # "$50,000,000 +"
+)
+_BRACKET_FLOORS = {low: high for low, high in AMOUNT_BRACKETS}
+
+
 def parse_amount_range(text: str) -> Tuple[Optional[int], Optional[int]]:
     """`"$1,001 - $15,000"` to `(1001, 15000)`.
 
@@ -111,17 +130,41 @@ def parse_amount_range(text: str) -> Tuple[Optional[int], Optional[int]]:
     bracket reads as a costless trade, which is a claim the filing never made.
     An open-ended top bracket ("$50,000,000 +") has no upper bound, so the
     upper bound is None rather than a repeat of the lower one.
+
+    The pair is checked against the statutory brackets. 24 rows in the store
+    held `amount_min > amount_max` with `amount_max = 200` -- "$200" is the
+    PTR's own "Cap. Gains > $200?" column header, which bleeds into the row
+    when an entry spans a page break and the amount cell loses its ceiling.
+    An inverted range is not a smaller range: summing it under-counts by
+    orders of magnitude, and "$50,001 to $200" is a fact no filing contains.
+
+    Where the floor is a real bracket bound it is kept and the ceiling
+    refused, because "at least $50,001" is true and "at most $200" is not.
     """
     if not text:
         return (None, None)
     numbers = [int(n.replace(",", "")) for n in re.findall(r"\$([\d,]+)", text)]
     if not numbers:
         return (None, None)
+
+    low = numbers[0]
+    if low not in _BRACKET_FLOORS:
+        # Not a disclosure band at all. Reporting it as one would dress up a
+        # misread as a filing figure.
+        return (None, None)
+
+    official_high = _BRACKET_FLOORS[low]
     if len(numbers) == 1:
-        # "$50,000,000 +" is open-ended; a lone bracket without a "+" is a
-        # single disclosed figure and bounds itself on both sides.
-        return (numbers[0], None if "+" in text else numbers[0])
-    return (numbers[0], numbers[1])
+        # "$50,000,000 +" is open-ended. A lone floor without a "+" lost its
+        # ceiling on the page; the floor still stands.
+        return (low, None if "+" in text else official_high)
+
+    high = numbers[1]
+    if high == official_high:
+        return (low, high)
+    # The ceiling disagrees with the band the floor belongs to, so it came
+    # from somewhere else on the page.
+    return (low, None)
 
 
 def _iso(date_text: str) -> Optional[str]:
