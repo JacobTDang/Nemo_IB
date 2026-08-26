@@ -230,6 +230,27 @@ def get_data(ticker: str) -> Dict[str, Any]:
     for key in ('pe_ratio', 'pb_ratio', 'ev_revenue', 'ev_ebitda', 'ev_ebit'):
       data[key] = None
 
+  # An enterprise value at or below zero cannot carry a multiple. The provider
+  # reports -233.9bn for BRK-B while its own market cap plus debt less cash is
+  # +842.7bn, because it counts Berkshire's insurance investments as cash. Left
+  # alone, that produced ev_revenue -0.61 and ev_ebitda -1.79 -- not cheap
+  # valuations but non-valuations, which sort below zero and read as the
+  # cheapest name in any comp table they land in. The provider's own figure is
+  # kept; only the ratios built on it go.
+  ev_usable = (data['enterpriseValue'] is not None
+               and data['enterpriseValue'] > 0)
+  if comparable and not ev_usable and data['enterpriseValue'] is not None:
+    reason = (
+        f"EV multiples are not reported: the provider's enterprise value for "
+        f"{ticker} is {data['enterpriseValue']:,.0f}, which is not positive. "
+        f"A multiple over a non-positive numerator has no ordering and sorts "
+        f"below every real one. Market cap plus debt less cash is "
+        f"{(data['marketCap'] or 0) + (data['totalDebt'] or 0) - (data['cash'] or 0):,.0f} "
+        f"if you need a substitute.")
+    existing = data.get('multiples_suppressed_reason')
+    data['multiples_suppressed_reason'] = (
+        f"{existing} {reason}" if existing else reason)
+
   # calculate multiples -- each wrapped independently so one failure doesn't skip all
   try:
     if comparable and data['marketCap'] is not None and data['netIncomeToCommon'] is not None:
@@ -244,13 +265,13 @@ def get_data(ticker: str) -> Dict[str, Any]:
     print(f'Error calculating P/B ratio for {ticker}: {str(e)}', file=sys.stderr)
 
   try:
-    if comparable and data['enterpriseValue'] is not None and data['revenue'] is not None:
+    if comparable and ev_usable and data['revenue'] is not None:
       data['ev_revenue'] = data['enterpriseValue'] / data['revenue']
   except Exception as e:
     print(f'Error calculating EV/Revenue for {ticker}: {str(e)}', file=sys.stderr)
 
   try:
-    if comparable and data['enterpriseValue'] is not None and data['EBITDA'] is not None:
+    if comparable and ev_usable and data['EBITDA'] is not None:
       data['ev_ebitda'] = data['enterpriseValue'] / data['EBITDA']
   except Exception as e:
     print(f'Error calculating EV/EBITDA for {ticker}: {str(e)}', file=sys.stderr)
@@ -264,7 +285,7 @@ def get_data(ticker: str) -> Dict[str, Any]:
         f"ev_ebit as a current enterprise value over a fiscal-year EBIT.")
 
   try:
-    if comparable and data['EBIT'] is not None and data['enterpriseValue'] is not None:
+    if comparable and ev_usable and data['EBIT'] is not None:
       data['ev_ebit'] = data['enterpriseValue'] / data['EBIT']
       data['ev_ebit_basis'] = (
           f"current enterprise value / {data.get('ebit_basis','fiscal_year')} "
