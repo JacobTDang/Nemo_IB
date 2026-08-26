@@ -3975,6 +3975,46 @@ _FISCAL_YEAR_RE = re.compile(
   re.IGNORECASE)
 
 
+# "in 2023, 2024 and 2025 accounted for 25%, 22% and 19%" -- one sentence, one
+# customer, three years. Taking the first percentage reported the OLDEST figure,
+# which for TSMC's second-largest customer (11 -> 12 -> 17) inverted the trend
+# and reported a rising customer at its smallest.
+# Not \b: filing text extracted from PDF loses spaces, so "in2023,2024"
+# has no word boundary before the year. Digit lookarounds instead.
+_YEAR_TOKEN_RE = re.compile(r'(?<!\d)(20\d{2})(?!\d)')
+_PCT_TOKEN_RE = re.compile(r'(\d{1,3}(?:\.\d+)?)\s*%')
+
+# "Major customers representing at least 10% of net revenue" -- the rule for
+# which customers must be named, not anybody's share.
+# Scoped to the words immediately before a percentage, not the whole sentence.
+# "No single customer accounted for more than 10% of revenue, except one which
+# represented 12%" carries a threshold AND a real disclosure; matching anywhere
+# in the sentence discarded the 12% along with the 10%.
+_DISCLOSURE_THRESHOLD_RE = re.compile(
+  r'(?:at\s+least|or\s+more|exceed(?:ing|s|ed)?|greater\s+than|more\s+than|'
+  r'in\s+excess\s+of|representing)\s*$', re.IGNORECASE)
+
+
+def _multi_year_series(sentence: str) -> Optional[Dict[int, float]]:
+  """{year: percent} when a sentence pairs a run of years with a run of
+  percentages, else None.
+
+  Requires equal counts and at least two of each: that is what makes the
+  pairing positional rather than a guess. A sentence naming one year and one
+  percentage is the ordinary case and is left to the existing path.
+  """
+  years = [int(y) for y in _YEAR_TOKEN_RE.findall(sentence)]
+  pcts = [float(v) for v in _PCT_TOKEN_RE.findall(sentence)]
+  # A year may be repeated by a column header; keep first appearances in order.
+  seen: List[int] = []
+  for year in years:
+    if year not in seen:
+      seen.append(year)
+  if len(seen) < 2 or len(seen) != len(pcts):
+    return None
+  return dict(zip(seen, pcts))
+
+
 def _sentence_around(text: str, index: int) -> str:
   """The sentence containing `index`, whitespace-normalised.
 
@@ -4087,11 +4127,35 @@ def _scan_customer_concentration(text: str) -> Dict[str, Any]:
       continue
 
     sentence = _sentence_around(text, match.start())
+
+    # A naming threshold is a rule about which customers must be disclosed,
+    # not a share anybody holds. Judged on the words leading into THIS
+    # percentage, since one sentence can carry both.
+    lead_in = text[max(0, match.start()):match.end()]
+    lead_in = lead_in[:lead_in.rfind('%')] if '%' in lead_in else lead_in
+    if _DISCLOSURE_THRESHOLD_RE.search(_normalize_excerpt(lead_in).rstrip('0123456789. ')):
+      continue
+
     window = text[max(0, match.start() - 120):match.end() + 40]
     name_match = _CUSTOMER_NAME_RE.search(window)
     name = _clean_customer_name(name_match.group(1)) if name_match else None
-    fiscal_year = _fiscal_year_in(sentence,
-                                 sentence.find(_normalize_excerpt(match.group(0))))
+
+    # One sentence covering several years is one customer, and the figure that
+    # matters is the most recent. Reporting the first printed percentage gave
+    # the oldest year and, for a customer rising 11 -> 12 -> 17, inverted the
+    # trend the caller came for.
+    by_year = _multi_year_series(sentence)
+    if by_year:
+      # The context pattern only anchors on the first percentage in the
+      # sentence, so `pct` is whichever year is printed first -- the oldest.
+      # Take the latest instead. Repeats collapse through the dedupe below,
+      # which now sees identical (pct, year, name) for the same sentence.
+      latest = max(by_year)
+      pct = by_year[latest]
+      fiscal_year = latest
+    else:
+      fiscal_year = _fiscal_year_in(
+        sentence, sentence.find(_normalize_excerpt(match.group(0))))
 
     # Group by the claim, not by the sentence alone: two different sentences
     # each disclosing 15% for the same year are two customers.
@@ -4112,6 +4176,9 @@ def _scan_customer_concentration(text: str) -> Dict[str, Any]:
       "pct_of_revenue": None if measures_receivables else pct,
       "pct_of_receivables": pct if measures_receivables else None,
       "basis": "accounts_receivable" if measures_receivables else "revenue",
+      # The whole series when the filing gave one -- the trend is the point,
+      # and losing it is what made the stale figure dangerous.
+      "by_year": by_year,
       "scope": "aggregate" if is_aggregate else "single_customer",
       "fiscal_year": fiscal_year,
       "occurrences": 1,
