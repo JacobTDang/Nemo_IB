@@ -141,7 +141,8 @@ CURATED_LIMITS: dict[str, dict[str, Any]] = {
         "expected_freshness": None,
         "known_limits": [
             "Reads book state, which the shipped data-source image does not "
-            "have; there it returns an empty result rather than failing.",
+            "have; there it holds no theses, so a request for a named thesis "
+            "is refused rather than answered with a null row.",
         ],
     },
 
@@ -157,6 +158,25 @@ CURATED_LIMITS: dict[str, dict[str, Any]] = {
     },
 
     # --- finnhub -----------------------------------------------------------
+    # docs/known_issues.md item 11. The endpoint entitlement was verified
+    # against the live key rather than assumed, because the alternative to
+    # this caveat is a workflow reading recommendation counts as estimate
+    # revisions -- which is exactly what happened before the rename.
+    "get_analyst_rating_trend": {
+        "expected_freshness": "monthly; Finnhub typically serves only the "
+                              "last ~4 monthly snapshots whatever "
+                              "lookback_months asks for",
+        "known_limits": [
+            "Rating buckets, not estimate revisions. There is no EPS, revenue "
+            "or price-target figure in the response, and Finnhub's estimate, "
+            "upgrade/downgrade and price-target endpoints all answer 403 on "
+            "this plan, so none can be added.",
+            "A lookback_months longer than the history Finnhub returns is "
+            "answered with what exists plus a `history_shorter_than_requested` "
+            "warning; deltas the history cannot support are named in "
+            "`momentum_unavailable` rather than left absent.",
+        ],
+    },
     # Audit s7: "There is no KPI-level consensus source."
     "get_forward_estimates": {
         "expected_freshness": None,
@@ -166,7 +186,38 @@ CURATED_LIMITS: dict[str, dict[str, Any]] = {
         ],
     },
 
+    # --- sec ---------------------------------------------------------------
+    # docs/known_issues.md item 13. The name-table limit is stated in the
+    # tool's own note; the inference caveat is the one a caller has to know
+    # before treating `relationship` as disclosure rather than a reading of it.
+    "get_supply_chain": {
+        "expected_freshness": "annual; from Item 1 of the most recent 10-K",
+        "known_limits": [
+            "Name matching covers ~150 mega-caps, so smaller suppliers and "
+            "customers are invisible to it. Software and services filers "
+            "usually name no competitor at all and surface only in "
+            "`trigger_sentences`.",
+            "`relationship` is inferred from the nearest cue phrase in the "
+            "filing prose, not tagged by the filer. `relationship_basis` "
+            "names the cue so the call can be audited, and \"unknown\" means "
+            "no cue was near the mention rather than no relationship.",
+        ],
+    },
+
     # --- altdata -----------------------------------------------------------
+    # docs/known_issues.md item 12.
+    "get_policy_signals": {
+        "expected_freshness": None,
+        "known_limits": [
+            "Bills are found by keyword search over full text, so a bill can "
+            "match on a keyword its title never uses. Each row names the "
+            "keyword that surfaced it in `matched_keyword`.",
+            "`signal` is title-word polarity weighted by enactment "
+            "probability, summed over the matched set. It describes the "
+            "legislative docket a sector sits in, not a forecast for the "
+            "company.",
+        ],
+    },
     # README, `altdata` section: "these are transactions and year-covering
     # snapshots, not live positions. Congress publishes no current holdings.
     # Members file up to 45 days after trading ... Filings that arrive as scans

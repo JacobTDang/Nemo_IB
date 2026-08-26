@@ -194,8 +194,10 @@ safe to cron; nothing already parsed is fetched twice.
   the extracted text, and that parser is not built. The tool description states
   the limit, so the gap is visible to a caller rather than silent.
 - `analyze_exposures` and `get_thesis_evolution` read book state. The entrypoint
-  creates the schema so they return an empty result rather than failing, but a
-  data-source host holds no positions, so empty is the truthful answer.
+  creates the schema so the queries run rather than failing on a missing table.
+  A data-source host holds no positions, so `analyze_exposures` answering with
+  an empty book is the truthful answer. `get_thesis_evolution` names one thesis,
+  and a book that does not hold it refuses rather than returning a null row.
 - Employee count is not available from XBRL: no filer examined tags it, so it
   would need cover-page text extraction.
 

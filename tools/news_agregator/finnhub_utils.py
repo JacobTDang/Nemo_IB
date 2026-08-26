@@ -291,3 +291,241 @@ def build_envelope(
     }]
 
   return envelope
+
+
+# ------------------------------------------------------- earnings integrity
+#
+# A count is a fact about the rows Finnhub returned. A rate and an average are
+# claims about the company, and they are only defined when the rows they run
+# over form one continuous series on one share basis.
+#
+# CREG, live 2026-08-26: four rows spanning 2011-06-30 to 2026-03-31, with
+# actual_eps of 1600 and 700 (pre-reverse-split) beside -0.03 and -0.02, and
+# two rows Finnhub never priced. It reported avg_surprise_pct 49.53 -- both
+# 2011 rows and nothing since -- and beat_rate_pct 50.0, which is 2 beats over
+# 4 rows when only 2 of those rows could beat or miss at all.
+#
+# The rows are left exactly as Finnhub sent them, following the fix already
+# landed for TGT's duplicate fiscal periods: which row is wrong is Finnhub's
+# to say, and dropping one would silently change counts other callers read.
+# What is withheld is the derived statistics, because a hole and a share-basis
+# break leave them with no referent.
+
+# A per-share figure 1000x another in the same array is a corporate action,
+# not a business result. Deliberately far above any organic swing -- a company
+# going from a $0.01 quarter to a $3.00 quarter is 300x and real -- and far
+# below CREG's 80,000x.
+_SHARE_BASIS_BREAK_RATIO = 1000.0
+
+# A quarterly filer's newest bucket sits at or just behind the current
+# calendar quarter. `period` is a bucket that can lead the fiscal close by
+# weeks, so one quarter of slack is normal and two is tolerable; three or more
+# means the provider has not published prints the company has already made.
+_STALE_CALENDAR_QUARTERS = 3
+
+
+def _quarter_index(year, quarter):
+  """A single ordinal for a fiscal (year, quarter), or None."""
+  if not isinstance(year, int) or not isinstance(quarter, int):
+    return None
+  if not 1 <= quarter <= 4:
+    return None
+  return year * 4 + (quarter - 1)
+
+
+def _indexed(quarters):
+  """(index, entry) for every row carrying a usable fiscal identity, newest first."""
+  rows = []
+  for entry in quarters or []:
+    if not isinstance(entry, dict):
+      continue
+    index = _quarter_index(entry.get("year"), entry.get("quarter"))
+    if index is not None:
+      rows.append((index, entry))
+  return sorted(rows, key=lambda pair: pair[0], reverse=True)
+
+
+def fiscal_period_gaps(quarters):
+  """Quarters missing between consecutive rows of the returned series.
+
+  A repeat is not a gap: TGT files fiscal 2027 Q2 under two different `period`
+  buckets, and `_duplicate_fiscal_periods` already declares that. A hole is a
+  step of more than one quarter between adjacent rows.
+  """
+  rows = _indexed(quarters)
+  gaps = []
+  for (newer_index, newer), (older_index, older) in zip(rows, rows[1:]):
+    step = newer_index - older_index
+    if step > 1:
+      gaps.append({
+        "between": [[older.get("year"), older.get("quarter")],
+                    [newer.get("year"), newer.get("quarter")]],
+        "period_buckets": [older.get("period"), newer.get("period")],
+        "quarters_missing": step - 1,
+      })
+  return gaps
+
+
+def share_basis_discontinuity(quarters):
+  """Is this array's actual_eps on more than one share basis?
+
+  Returns the measurement, or None. A reverse split between two rows makes
+  every cross-row statistic undefined, and Finnhub restates neither side.
+  """
+  values = []
+  for entry in quarters or []:
+    if not isinstance(entry, dict):
+      continue
+    actual = entry.get("actual_eps")
+    if isinstance(actual, bool) or not isinstance(actual, (int, float)):
+      continue
+    if abs(float(actual)) > 0:
+      values.append((abs(float(actual)), entry))
+  if len(values) < 2:
+    return None
+  smallest, small_row = min(values, key=lambda pair: pair[0])
+  largest, large_row = max(values, key=lambda pair: pair[0])
+  ratio = largest / smallest
+  if ratio < _SHARE_BASIS_BREAK_RATIO:
+    return None
+  return {
+    "max_abs_actual_eps": large_row.get("actual_eps"),
+    "min_abs_actual_eps": small_row.get("actual_eps"),
+    "ratio": round(ratio, 1),
+    "fiscal": [[large_row.get("year"), large_row.get("quarter")],
+               [small_row.get("year"), small_row.get("quarter")]],
+    "threshold": _SHARE_BASIS_BREAK_RATIO,
+  }
+
+
+def _calendar_quarter_index(iso_date):
+  """The quarter ordinal of a YYYY-MM-DD string, or None."""
+  if not isinstance(iso_date, str) or len(iso_date) < 7:
+    return None
+  try:
+    year = int(iso_date[0:4])
+    month = int(iso_date[5:7])
+  except ValueError:
+    return None
+  if not 1 <= month <= 12:
+    return None
+  return year * 4 + (month - 1) // 3
+
+
+def summarize_earnings_surprises(quarters, today=None):
+  """Counts, rates and averages over a condensed surprise table.
+
+  Counts are always reported: they describe the rows in hand. Rates and
+  averages are reported only when the series is continuous and on one share
+  basis, and each carries the population it was computed over -- the defect
+  behind `beat_rate_pct: 50.0` was a denominator (`total_periods`) that
+  counted two rows Finnhub never priced and which therefore could neither
+  beat nor miss.
+
+  `avg_surprise_pct` averages the `surprise_pct` values as published in
+  data.quarters, which are rounded to 2dp. The figure it replaces averaged
+  Finnhub's unrounded `surprisePercent`, so a response can move by 0.01 --
+  TSM went 7.14 -> 7.13. Deliberate: the average now reconciles against the
+  column a reader can add up, and an average that disagrees with its own
+  table by a cent is a question nobody can answer from the response.
+  """
+  rows = [entry for entry in (quarters or []) if isinstance(entry, dict)]
+  empty = {
+    "beat_count": None, "miss_count": None, "inline_count": None,
+    "total_periods": None, "graded_periods": None, "ungraded_periods": None,
+    "beat_rate_pct": None, "beat_rate_basis": None,
+    "beat_rate_pct_unavailable": None,
+    "avg_surprise_pct": None, "avg_surprise_pct_basis": None,
+    "avg_surprise_pct_unavailable": None,
+    "fiscal_period_gaps": [], "share_basis_discontinuity": None,
+    "latest_fiscal_period": None, "calendar_quarters_behind": None,
+    "history_is_stale": None,
+  }
+  if not rows:
+    # test_no_data_is_not_a_verdict: `beat_count: 0` beside `quarters: []`
+    # reads as a fact about the filer, asserted from an empty hand.
+    return empty
+
+  graded = [entry for entry in rows if entry.get("surprise_pct") is not None]
+  beat_count = sum(1 for entry in graded if entry["surprise_pct"] > 0)
+  miss_count = sum(1 for entry in graded if entry["surprise_pct"] < 0)
+  inline_count = len(graded) - beat_count - miss_count
+
+  gaps = fiscal_period_gaps(rows)
+  basis_break = share_basis_discontinuity(rows)
+
+  blockers = []
+  if gaps:
+    worst = max(gaps, key=lambda gap: gap["quarters_missing"])
+    blockers.append(
+      f"the series is not continuous -- {worst['quarters_missing']} fiscal "
+      f"quarters are missing between {worst['between'][0]} and "
+      f"{worst['between'][1]}, so a figure averaged across these rows "
+      f"describes no period a reader could name")
+  if basis_break:
+    blockers.append(
+      f"actual_eps runs from {basis_break['min_abs_actual_eps']} to "
+      f"{basis_break['max_abs_actual_eps']} ({basis_break['ratio']:g}x), which "
+      f"is a corporate action rather than a business result -- these rows are "
+      f"not on one share basis and Finnhub restates neither side")
+  if not graded:
+    blockers.append(
+      "no row carries an estimate, so nothing in this response was graded "
+      "against one")
+
+  reason = None
+  if blockers:
+    reason = ("Withheld: " + "; and ".join(blockers) +
+              ". The per-quarter rows are unchanged and are in data.quarters.")
+
+  indexed = _indexed(rows)
+  latest = None
+  behind = None
+  if indexed:
+    _, newest = indexed[0]
+    latest = {"year": newest.get("year"), "quarter": newest.get("quarter"),
+              "period_bucket": newest.get("period")}
+    newest_bucket = _calendar_quarter_index(newest.get("period"))
+    now = _calendar_quarter_index(
+      today or datetime.now(timezone.utc).date().isoformat())
+    if newest_bucket is not None and now is not None:
+      behind = max(0, now - newest_bucket)
+
+  summary = dict(empty)
+  summary.update({
+    "beat_count": beat_count,
+    "miss_count": miss_count,
+    "inline_count": inline_count,
+    "total_periods": len(rows),
+    "graded_periods": len(graded),
+    "ungraded_periods": len(rows) - len(graded),
+    "fiscal_period_gaps": gaps,
+    "share_basis_discontinuity": basis_break,
+    "latest_fiscal_period": latest,
+    "calendar_quarters_behind": behind,
+    "history_is_stale": (None if behind is None
+                         else behind >= _STALE_CALENDAR_QUARTERS),
+  })
+
+  if reason is not None:
+    summary["avg_surprise_pct_unavailable"] = reason
+    summary["beat_rate_pct_unavailable"] = reason
+    return summary
+
+  summary["beat_rate_pct"] = round(beat_count / len(graded) * 100, 1)
+  summary["beat_rate_basis"] = (
+    f"{beat_count} beats of {len(graded)} graded quarters. Rows with no "
+    f"estimate are excluded from the denominator: they could neither beat "
+    f"nor miss.")
+  summary["avg_surprise_pct"] = round(
+    sum(entry["surprise_pct"] for entry in graded) / len(graded), 2)
+  graded_indexed = _indexed(graded)
+  summary["avg_surprise_pct_basis"] = {
+    "rows": len(graded),
+    "of_total_periods": len(rows),
+    "fiscal_first": [graded_indexed[-1][1].get("year"),
+                     graded_indexed[-1][1].get("quarter")],
+    "fiscal_last": [graded_indexed[0][1].get("year"),
+                    graded_indexed[0][1].get("quarter")],
+  }
+  return summary

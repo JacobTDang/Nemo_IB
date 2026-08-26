@@ -12,6 +12,39 @@ from typing import Optional, List, Dict, Any
 from state.schema import get_connection
 
 
+class ThesisNotFound(LookupError):
+  """The book holds no thesis under this id.
+
+  Raised rather than returned so the read and write paths cannot disagree
+  about it, and carried as prose rather than as a bare id so the tool layer
+  has nothing left to invent. The message says what the condition is NOT,
+  because the response it replaces -- ticker null, conviction null,
+  evolution_count 0 -- is exactly what a real thesis awaiting its first
+  check-in returns, and a caller who cannot tell those apart reads a thesis
+  the book has never held as one that has simply not moved.
+  """
+
+  def __init__(self, thesis_id: int):
+    self.thesis_id = thesis_id
+    super().__init__(
+      f"No thesis {thesis_id} exists in this book. This is a lookup that "
+      f"found nothing, not a thesis whose evolution log is empty -- a thesis "
+      f"that exists but has had no check-in yet answers with its ticker and "
+      f"current conviction beside an empty log. Call analyze_exposures for "
+      f"the theses this book does hold.")
+
+
+def thesis_exists(thesis_id: int) -> bool:
+  """Is there a thesis under this id? Cheaper than loading the report body."""
+  conn = get_connection()
+  try:
+    row = conn.execute("SELECT 1 FROM theses WHERE thesis_id = ?",
+                       (thesis_id,)).fetchone()
+    return row is not None
+  finally:
+    conn.close()
+
+
 def insert_thesis(
   ticker: str,
   recommendation: str,
@@ -77,7 +110,7 @@ def record_thesis_evolution(
     row = conn.execute("SELECT ticker, confidence FROM theses WHERE thesis_id = ?",
                        (thesis_id,)).fetchone()
     if not row:
-      raise ValueError(f"thesis {thesis_id} not found")
+      raise ThesisNotFound(thesis_id)
     ticker = row['ticker']
     prev_conviction = float(row['confidence'] or 0)
     # Compute new conviction (clamped 0-1)

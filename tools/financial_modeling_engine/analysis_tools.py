@@ -8,6 +8,7 @@ import sys
 import traceback
 
 from .utils import get_data, calculate_percentiles, get_institutional_holdings, get_options_metrics, get_short_interest, get_price_history, get_industry_etfs, get_historical_analogue
+from .options_quality import audit_options_metrics
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
@@ -1979,8 +1980,21 @@ warnings_per_tool={
     return [TextContent(type="text", text=json.dumps(_to_native(result), default=str))]
 
   async def get_options_metrics(self, ticker: str) -> List[TextContent]:
+    """Options-market signals, audited before they are served.
+
+    yfinance answers an illiquid chain with numbers shaped like answers.
+    DLNG, live 2026-08-26: an atm_put_iv of 4.0391 beside an atm_call_iv of
+    0.875 on the same strike, and an implied_move that was a bare
+    `{"error": ...}` where every other ticker has a numeric dict -- all under
+    `success: true` and `data_quality: {"iv_status": "ok", "notes": []}`.
+
+    The audit is a pure function of the payload (options_quality) so it can
+    be calibrated against captured responses rather than a live chain.
+    """
     result = await asyncio.to_thread(get_options_metrics, ticker)
-    return [TextContent(type="text", text=json.dumps(_to_native(result), default=str))]
+    return [TextContent(type="text",
+                        text=json.dumps(_to_native(audit_options_metrics(result)),
+                                        default=str))]
 
   async def get_short_interest(self, ticker: str) -> List[TextContent]:
     result = await asyncio.to_thread(get_short_interest, ticker)
@@ -2064,7 +2078,8 @@ warnings_per_tool={
     return [TextContent(type="text", text=json.dumps(_to_native(result), default=str))]
 
   async def record_thesis_evolution(self, thesis_id: int, observation: str, conviction_delta: float, tag = None) -> List[TextContent]:
-    from state.theses import record_thesis_evolution as _rec, get_thesis
+    from state.theses import (record_thesis_evolution as _rec, get_thesis,
+                              ThesisNotFound)
     try:
       eid = await asyncio.to_thread(_rec, thesis_id, observation, float(conviction_delta), tag)
       th = await asyncio.to_thread(get_thesis, thesis_id)
@@ -2074,27 +2089,57 @@ warnings_per_tool={
         "thesis_id": thesis_id,
         "new_conviction": th['confidence'] if th else None,
       }
+    except ThesisNotFound as missing:
+      # A known condition, so it reads as a decision rather than as a crash.
+      # The exception class stays out of the response: it names the process
+      # that failed, not the request that could not be answered.
+      result = {"success": False, "thesis_id": thesis_id, "error": str(missing)}
     except Exception as e:
-      result = {"success": False, "error": f"{type(e).__name__}: {e}"}
+      # Anything unrecognised keeps its class. This is not a condition we
+      # modelled, and hiding what it was behind prose would cost the only
+      # diagnostic there is.
+      result = {"success": False, "thesis_id": thesis_id,
+                "error": f"record_thesis_evolution failed: {type(e).__name__}: {e}"}
     return [TextContent(type="text", text=json.dumps(_to_native(result), default=str))]
 
   async def get_thesis_evolution(self, thesis_id: int) -> List[TextContent]:
-    from state.theses import get_thesis_evolution as _get, get_thesis
+    """The reflexivity trace for one thesis, or a refusal naming what is missing.
+
+    `ticker: null, current_conviction: null, evolution_count: 0` used to be
+    the answer for a thesis the book has never held -- and it is exactly the
+    answer for a real thesis awaiting its first check-in, so no caller could
+    tell a missing thesis from an untouched one. The write path already knew
+    the difference and raised; the read path reported the null row.
+
+    An empty book is still an empty book: a data-source host holds no theses
+    and `analyze_exposures` there answers empty and successful, which stays
+    true. Asking for one *named* thesis it does not hold is a different
+    question, and the honest answer to that is the same on either host.
+    """
+    from state.theses import (get_thesis_evolution as _get, get_thesis,
+                              ThesisNotFound)
     try:
-      log = await asyncio.to_thread(_get, thesis_id)
       th = await asyncio.to_thread(get_thesis, thesis_id)
+      if th is None:
+        raise ThesisNotFound(thesis_id)
+      log = await asyncio.to_thread(_get, thesis_id)
       result = {
         "success": True,
         "thesis_id": thesis_id,
-        "ticker": th['ticker'] if th else None,
-        "current_conviction": th['confidence'] if th else None,
-        "falsifiers": th.get('falsifiers') if th else None,
-        "variant_perception": th.get('variant_perception') if th else None,
+        "ticker": th['ticker'],
+        "current_conviction": th['confidence'],
+        "falsifiers": th.get('falsifiers'),
+        "variant_perception": th.get('variant_perception'),
         "evolution_count": len(log),
         "evolution": log,
       }
+    except ThesisNotFound as missing:
+      # No evolution_count and no evolution list: both are measurements over
+      # rows, and there were no rows to measure because there is no thesis.
+      result = {"success": False, "thesis_id": thesis_id, "error": str(missing)}
     except Exception as e:
-      result = {"success": False, "error": f"{type(e).__name__}: {e}"}
+      result = {"success": False, "thesis_id": thesis_id,
+                "error": f"get_thesis_evolution failed: {type(e).__name__}: {e}"}
     return [TextContent(type="text", text=json.dumps(_to_native(result), default=str))]
 
   async def comparable_company_analysis(self, comparables: List[str]) -> List[TextContent]:

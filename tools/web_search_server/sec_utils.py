@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from edgar import Company
 from edgar.xbrl import XBRL
 from collections import OrderedDict
@@ -2021,17 +2021,136 @@ def diff_10k(ticker: str, item: str = '1A',
   }
 
 
+# Cue phrases that say which way a named company sits relative to the filer.
+# The direction is what a read-through needs and what `related_companies`
+# never carried: TSM (NVDA's foundry) and AMD (its rival) arrived in one flat
+# list with identical schema, and the only thing telling them apart was prose
+# in `sample_context`.
+#
+# Two tiers, because "nearest cue wins" gets NVDA's own sentence backwards.
+# The filing reads "Our competitors include suppliers of discrete and
+# integrated computing solutions ... such as Advanced Micro Devices": the
+# nearest cue to AMD is the bare noun "suppliers", which is the OBJECT of the
+# sentence, while "competitors include" is the predicate that actually governs
+# the list. Predicates are searched first and a bare noun is only consulted
+# when no predicate is in range.
+_RELATIONSHIP_PREDICATES: List[Tuple[str, Tuple[str, ...]]] = [
+    ('supplier', (
+        'suppliers include', 'our suppliers', 'we utilize foundries',
+        'we utilize', 'we purchase', 'we buy', 'we source', 'we procure',
+        'we engage with', 'purchase from', 'purchased from', 'sourced from',
+        'we depend on', 'we rely on', 'rely on', 'relies on', 'depend on',
+        'manufactured by', 'produced by', 'supplied by',
+        'contract manufacturers', 'subcontractors',
+    )),
+    ('customer', (
+        'customers include', 'our customers', 'largest customers',
+        'significant customers', 'sales to', 'sell to', 'resell our',
+    )),
+    ('competitor', (
+        'competitors include', 'our competitors', 'competitors are',
+        'competition from', 'compete with', 'competes with',
+        'competing with', 'we compete',
+    )),
+    ('partner', (
+        'partners include', 'in partnership with', 'partner with',
+        'partners with', 'collaborate with', 'collaboration with',
+        'joint venture with', 'strategic alliance',
+    )),
+]
+# Bare "suppliers"/"supplier" are deliberately NOT here. NVDA's competitor
+# section is a bulleted list under "Our competitors include:" whose bullets
+# each read "suppliers of <category> ... such as A, B, C" -- the filer is
+# describing rivals who supply the same market, not its own vendors. Reading
+# that noun as a cue put Broadcom, Qualcomm, Cisco, Arm and Tesla on NVDA's
+# supplier list. A noun that flips meaning with the sentence it sits in is not
+# a cue; the predicate above it is.
+_RELATIONSHIP_NOUNS: List[Tuple[str, Tuple[str, ...]]] = [
+    ('supplier',   ('foundries', 'foundry', 'subcontractor',
+                    'contract manufacturer')),
+    ('customer',   ('customers', 'customer')),
+    ('competitor', ('competitors', 'competitor', 'competition')),
+    ('partner',    ('partners', 'partner')),
+]
+
+# How far back from a mention to look for the cue that governs it. 10-K prose
+# puts the cue at the head of a list ("Our competitors include: • suppliers of
+# X ... such as A, B and C; • suppliers of Y ... such as D and E"), and those
+# lists run long -- NVDA's reaches ~600 characters past the predicate before
+# the last name in it. The predicate window is the wider of the two because
+# the nearest predicate still wins, so a closer "we purchase" is not
+# outvoted by a distant "competitors include".
+_RELATIONSHIP_PREDICATE_LOOKBACK = 1500
+_RELATIONSHIP_NOUN_LOOKBACK = 600
+_RELATIONSHIP_LOOKAHEAD = 160
+
+# A company name sitting next to a URL is a link, not a business relationship.
+# NVDA's Item 1 ends with a follow-us block -- "NVIDIA Facebook (facebook.
+# com/nvidia)" -- and META was reported as a related company with
+# mention_count 2 off the back of it.
+_URL_NEAR_MENTION = re.compile(r'\b[a-z0-9-]+\.\s?(?:com|net|org|io|co)\b/',
+                               re.IGNORECASE)
+_URL_PROXIMITY = 60
+
+
+def _nearest_cue(window: str, tiers) -> Tuple[Optional[str], Optional[str], int]:
+    """(relationship, cue, position) for the cue closest to the window's end."""
+    best_rel = best_cue = None
+    best_pos = -1
+    for rel, cues in tiers:
+        for cue in cues:
+            pos = window.rfind(cue)
+            if pos > best_pos:
+                best_rel, best_cue, best_pos = rel, cue, pos
+    return best_rel, best_cue, best_pos
+
+
+def _classify_relationship(text: str, start: int, end: int) -> Tuple[str, str]:
+    """(relationship, basis) for the mention at [start, end) in `text`.
+
+    Predicates before bare nouns, and within a tier the cue closest to the
+    mention wins -- the prose introduces a list and the names follow it. A cue
+    after the mention is accepted only when nothing precedes it.
+    """
+    after = text[end:end + _RELATIONSHIP_LOOKAHEAD].lower()
+
+    for tiers, tier_name, lookback in (
+            (_RELATIONSHIP_PREDICATES, 'predicate', _RELATIONSHIP_PREDICATE_LOOKBACK),
+            (_RELATIONSHIP_NOUNS, 'noun', _RELATIONSHIP_NOUN_LOOKBACK)):
+        before = text[max(0, start - lookback):start].lower()
+        rel, cue, pos = _nearest_cue(before, tiers)
+        if rel is not None:
+            distance = len(before) - pos
+            return rel, f'{tier_name} {cue!r} {distance} chars before the mention'
+
+    for tiers, tier_name in ((_RELATIONSHIP_PREDICATES, 'predicate'),
+                             (_RELATIONSHIP_NOUNS, 'noun')):
+        for rel, cues in tiers:
+            for cue in cues:
+                pos = after.find(cue)
+                if pos >= 0:
+                    return rel, f'{tier_name} {cue!r} {pos} chars after the mention'
+    return 'unknown', 'no supply-chain or competition cue near the mention'
+
+
 def get_supply_chain(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
   """Extract supply-chain / competitor mentions from 10-K Item 1 (Business).
 
   Two extraction layers:
     1. Curated-name match — scans Item 1 body text for a list of well-known
        company names (~150 entries). Returns matched tickers with mention
-       counts and a sample context sentence each.
+       counts, a sample context sentence, and which side of the business the
+       filer put them on: supplier / customer / competitor / partner.
     2. Trigger-phrase extraction — returns sentences containing supply-
        chain language ('compete with', 'rely on', 'suppliers include',
        'customers include') so the analyst can see context even when no
        specific company names match.
+
+  The direction is the point. Without it `related_companies` is a flat list in
+  which the foundry a company buys wafers from and the rival taking its share
+  carry the same schema, and a read-through workflow chaining this tool has
+  nothing machine-readable to chain. `suppliers`, `customers`, `competitors`
+  and `partners` at the top level are that handoff.
 
   Note: software/services companies often describe competitors by category
   ('identity vendors', 'security solution vendors') rather than by name —
@@ -2064,6 +2183,8 @@ def get_supply_chain(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
     # Layer 1: curated name match
     self_name = ticker.upper()
     related_companies = []
+    excluded_mentions = []
+    by_ticker: Dict[str, Dict[str, Any]] = {}
     seen_tickers = set([self_name])
     for name_lower, mapped_ticker in _COMPANY_NAME_TO_TICKER.items():
       if mapped_ticker == self_name:
@@ -2073,24 +2194,54 @@ def get_supply_chain(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
       matches = list(pat.finditer(item1))
       if not matches:
         continue
+
+      # Drop link-footer occurrences before anything is counted, and say so.
+      # Silently dropping a match would trade one invisible error for another.
+      kept = []
+      for m in matches:
+        near = item1[max(0, m.start() - _URL_PROXIMITY):
+                     m.end() + _URL_PROXIMITY]
+        if _URL_NEAR_MENTION.search(near):
+          continue
+        kept.append(m)
+      if not kept:
+        excluded_mentions.append({
+          'name_matched':   name_lower,
+          'ticker':         mapped_ticker,
+          'mention_count':  len(matches),
+          'reason':         ('every mention sits next to a URL — a social-media '
+                             'or investor-relations link, not a business '
+                             'relationship'),
+        })
+        continue
+
+      m0 = kept[0]
+      relationship, basis = _classify_relationship(item1, m0.start(), m0.end())
       # Sample context: first 200 chars around first mention
-      m0 = matches[0]
       ctx_start = max(0, m0.start() - 100)
       ctx_end = min(len(item1), m0.end() + 200)
       context = re.sub(r'\s+', ' ', item1[ctx_start:ctx_end]).strip()
       if mapped_ticker in seen_tickers:
-        # Aggregate: bump count on existing entry
-        for r in related_companies:
-          if r['ticker'] == mapped_ticker:
-            r['mention_count'] += len(matches)
+        # Aggregate: bump count on existing entry. A later alias that lands a
+        # classification the first one could not is taken.
+        existing = by_ticker.get(mapped_ticker)
+        if existing is not None:
+          existing['mention_count'] += len(kept)
+          if existing['relationship'] == 'unknown' and relationship != 'unknown':
+            existing['relationship'] = relationship
+            existing['relationship_basis'] = basis
         continue
       seen_tickers.add(mapped_ticker)
-      related_companies.append({
+      entry = {
         'name_matched':   name_lower,
         'ticker':         mapped_ticker,
-        'mention_count':  len(matches),
+        'mention_count':  len(kept),
+        'relationship':   relationship,
+        'relationship_basis': basis,
         'sample_context': context[:400],
-      })
+      }
+      by_ticker[mapped_ticker] = entry
+      related_companies.append(entry)
     related_companies.sort(key=lambda r: r['mention_count'], reverse=True)
 
     # Layer 2: trigger-phrase sentences
@@ -2113,6 +2264,10 @@ def get_supply_chain(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
       if len(trigger_sentences) >= 25:
         break
 
+    def _side(name: str) -> List[str]:
+      return [r['ticker'] for r in related_companies
+              if r['relationship'] == name]
+
     return {
       'ticker':           ticker.upper(),
       'success':          True,
@@ -2120,10 +2275,25 @@ def get_supply_chain(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
       'item1_length_chars': len(item1),
       'related_companies':  related_companies,
       'related_count':      len(related_companies),
+      # The machine-readable handoff. A read-through consumer wants "who is
+      # upstream, who is downstream, who is a rival" without parsing prose.
+      'suppliers':          _side('supplier'),
+      'customers':          _side('customer'),
+      'competitors':        _side('competitor'),
+      'partners':           _side('partner'),
+      'unclassified':       _side('unknown'),
+      'excluded_mentions':  excluded_mentions,
       'trigger_sentences':  trigger_sentences,
       'trigger_count':      len(trigger_sentences),
       'filing_date':        filing_data.get('filing_date'),
-      'note':               'Curated name match covers ~150 mega-caps. Software/services 10-Ks often describe competitors by category, not by name — trigger_sentences captures that context.',
+      'note':               ('Curated name match covers ~150 mega-caps. '
+                             '`relationship` is inferred from the nearest cue '
+                             'phrase in the filing prose and `relationship_basis` '
+                             'names it, so a caller can audit the call; '
+                             '"unknown" means no cue was near the mention, not '
+                             'that no relationship exists. Software/services '
+                             '10-Ks often describe competitors by category, not '
+                             'by name — trigger_sentences captures that context.'),
     }
 
   except Exception as e:
@@ -2331,26 +2501,66 @@ _FUTURE_TERMS = (
 )
 
 
-def extract_call_sentiment(ticker: str, quarters: int = 4) -> Dict[str, Any]:
-  """Score sentiment over the last N quarterly earnings releases.
+# Tone-shift span labels, in days between the two releases compared. A
+# "year-over-year" field that spans one quarter is not a softer version of a
+# YoY reading -- for a retailer it compares a back-to-school quarter with a
+# spring one, which is the seasonality the YoY frame exists to cancel.
+_TONE_SPAN_LABELS = (
+    (150, 'quarter_over_quarter'),
+    (240, 'two_quarters'),
+    (300, 'three_quarters'),
+    (430, 'year_over_year'),
+)
 
-  Counts confident terms (record, strong, momentum) vs hedging terms
-  (uncertainty, softness, headwinds) per release. Computes a net score
-  (confident - hedging) per quarter and a YoY tonal shift signal.
 
-  Limitations: regex word-counting, not real NLP. Captures gross tone
-  shifts (e.g. CFO switching to "challenging environment" from "record
-  quarter") which is what's most actionable. Subtle sentiment is missed.
+def _tone_span_label(days: int) -> str:
+  for limit, label in _TONE_SPAN_LABELS:
+    if days <= limit:
+      return label
+  return 'multi_year'
+
+
+def extract_earnings_release_sentiment(ticker: str,
+                                       quarters: int = 4) -> Dict[str, Any]:
+  """Score tone over the last N quarterly earnings PRESS RELEASES.
+
+  Named for what it reads. It was `extract_call_sentiment`, and it has never
+  read a call: the text is the 8-K Item 2.02 EX-99.1 press release, company-
+  written prepared prose with no analyst Q&A in it. On CHWY that produced
+  pairs_found=0 downstream because the "transcripts" were releases
+  (docs/known_issues.md item 9), and the caveat attached to the tool did not
+  stop it.
+
+  Counts confident terms (record, strong, momentum) against hedging terms
+  (uncertainty, softness, headwinds) per release, normalised per 1000 words,
+  and reports the change between the newest release and the oldest one scored.
+
+  That comparison used to be called `yoy_shift` whatever it spanned. Live on
+  WMT it compared 2026-08-20 with 2026-05-21 -- one quarter -- and on AMAT it
+  spanned nine months. The span is now measured and labelled, and the signal
+  states which span it was measured over.
+
+  Limitations: regex word-counting, not real NLP. Captures gross tone shifts
+  (a CFO switching to "challenging environment" from "record quarter"), which
+  is what is most actionable. Subtle sentiment is missed.
   """
   releases_result = get_earnings_releases(ticker, max_quarters=quarters,
                                           max_chars_per_release=200000)
   if not releases_result.get('success'):
     return releases_result
 
+  releases = releases_result.get('releases', [])
   scores = []
-  for rel in releases_result.get('releases', []):
+  unscored = []
+  for rel in releases:
     text = rel.get('text') or ''
     if not text:
+      # A release whose EX-99.1 could not be read is not a quarter with no
+      # tone; it is a quarter that was not measured, and it used to leave
+      # `quarters_scored` lower with nothing saying why.
+      unscored.append({'filing_date': rel.get('filing_date'),
+                       'accession_number': rel.get('accession_number'),
+                       'reason': 'no EX-99.1 text could be read from the 8-K'})
       continue
     text_lower = text.lower()
     # Word-boundary count for each lexicon term
@@ -2390,46 +2600,100 @@ def extract_call_sentiment(ticker: str, quarters: int = 4) -> Dict[str, Any]:
       'top_confident_terms': dict(top_confs),
     })
 
-  if len(scores) < 2:
-    return {
-      'ticker': ticker, 'success': True, 'error': None,
-      'quarters_scored': len(scores), 'scores': scores,
-      'note': 'Need 2+ quarters to compute YoY tonal shift.',
-    }
+  # The window asked for and the window covered, side by side. WMT answered a
+  # request for 4 quarters with 2 and said only `quarters_scored: 2`.
+  warnings: List[Dict[str, Any]] = []
+  if len(scores) < quarters:
+    warnings.append(warning(
+      'fewer_quarters_than_requested',
+      f'{quarters} quarterly releases were requested and {len(scores)} were '
+      f'scored. {len(releases)} 8-K Item 2.02 releases were found in the '
+      f'last 30 8-K filings for {ticker.upper()}'
+      + (f'; {len(unscored)} of them carried no readable EX-99.1 text'
+         if unscored else '')
+      + '. Tone measured over fewer quarters is a different statistic from '
+        'tone measured over the requested window.',
+      quarters_requested=quarters,
+      quarters_scored=len(scores),
+      releases_found=len(releases)))
 
-  # YoY tonal shift: compare latest quarter to ~4 quarters ago
-  latest = scores[0]
-  yoy_ref = scores[3] if len(scores) >= 4 else scores[-1]
-  qoq_ref = scores[1]
-  net_yoy_delta = latest['net_score'] - yoy_ref['net_score']
-  hedging_yoy_delta = latest['hedging_per_1k_words'] - yoy_ref['hedging_per_1k_words']
-  confident_yoy_delta = latest['confident_per_1k_words'] - yoy_ref['confident_per_1k_words']
-
-  # Signal classifier
-  signal = 'stable'
-  if hedging_yoy_delta >= 1.0 and confident_yoy_delta <= -1.0:
-    signal = 'tone_deteriorating_strong'
-  elif hedging_yoy_delta >= 0.5 or confident_yoy_delta <= -0.5:
-    signal = 'tone_deteriorating'
-  elif hedging_yoy_delta <= -0.5 and confident_yoy_delta >= 0.5:
-    signal = 'tone_improving_strong'
-  elif hedging_yoy_delta <= -0.3 or confident_yoy_delta >= 0.3:
-    signal = 'tone_improving'
-
-  return {
+  base = {
     'ticker': ticker,
     'success': True,
     'error': None,
+    'reads': 'sec_8k_item_202_press_release',
+    'quarters_requested': quarters,
     'quarters_scored': len(scores),
+    'releases_found': len(releases),
+    'releases_unscored': unscored,
     'scores': scores,
-    'yoy_shift': {
-      'net_score_delta':     net_yoy_delta,
-      'hedging_per_1k_delta': round(hedging_yoy_delta, 2),
-      'confident_per_1k_delta': round(confident_yoy_delta, 2),
-      'compared_periods':    f'{latest["filing_date"]} vs {yoy_ref["filing_date"]}',
+    'warnings': warnings,
+  }
+
+  if len(scores) < 2:
+    return {
+      **base,
+      'tone_shift': None,
+      'signal': None,
+      'signal_basis': ('not classified: a tone shift needs two scored '
+                       f'releases and {len(scores)} were scored'),
+      'note': 'Need 2+ quarterly releases to compute a tonal shift.',
+    }
+
+  # Tone shift: newest release against the oldest one scored. Whatever that
+  # span turns out to be, it is measured and named rather than assumed.
+  latest = scores[0]
+  ref = scores[-1]
+  net_delta = latest['net_score'] - ref['net_score']
+  hedging_delta = latest['hedging_per_1k_words'] - ref['hedging_per_1k_words']
+  confident_delta = latest['confident_per_1k_words'] - ref['confident_per_1k_words']
+
+  from datetime import datetime as _dt
+
+  span_days = None
+  span_label = 'unknown_span'
+  try:
+    d_latest = _dt.strptime(str(latest['filing_date'])[:10], '%Y-%m-%d')
+    d_ref = _dt.strptime(str(ref['filing_date'])[:10], '%Y-%m-%d')
+    span_days = abs((d_latest - d_ref).days)
+    span_label = _tone_span_label(span_days)
+  except (ValueError, TypeError):
+    pass
+
+  # Signal classifier
+  signal = 'stable'
+  if hedging_delta >= 1.0 and confident_delta <= -1.0:
+    signal = 'tone_deteriorating_strong'
+  elif hedging_delta >= 0.5 or confident_delta <= -0.5:
+    signal = 'tone_deteriorating'
+  elif hedging_delta <= -0.5 and confident_delta >= 0.5:
+    signal = 'tone_improving_strong'
+  elif hedging_delta <= -0.3 or confident_delta >= 0.3:
+    signal = 'tone_improving'
+
+  return {
+    **base,
+    'tone_shift': {
+      'net_score_delta':        net_delta,
+      'hedging_per_1k_delta':   round(hedging_delta, 2),
+      'confident_per_1k_delta': round(confident_delta, 2),
+      'from_filing_date':       ref['filing_date'],
+      'to_filing_date':         latest['filing_date'],
+      'span_days':              span_days,
+      'span_label':             span_label,
+      'compared_periods':       f'{latest["filing_date"]} vs {ref["filing_date"]}',
     },
     'signal': signal,
-    'note': "Regex word counting; YoY delta in hedging-words-per-1k-words is the cleanest tonal shift signal. tone_deteriorating = CFO using more hedging language YoY.",
+    'signal_basis': (
+      f'change in hedging and confident words per 1k over a '
+      f'{span_label.replace("_", " ")} span'
+      + (f' of {span_days} days' if span_days is not None else '')
+      + f' ({ref["filing_date"]} -> {latest["filing_date"]})'),
+    'note': ("Regex word counting over 8-K press-release prose, not call "
+             "transcripts -- there is no analyst Q&A in this text. The "
+             "hedging-words-per-1k delta is the cleanest tonal signal; read "
+             "it against tone_shift.span_label, which says how far apart the "
+             "two releases actually were."),
   }
 
 
@@ -2506,17 +2770,34 @@ def get_earnings_releases(ticker: str, max_quarters: int = 4,
 
   if not releases:
     return {'ticker': ticker, 'success': False,
+            'quarters_requested': max_quarters,
             'error': f'No 8-K Item 2.02 filings found in last 30 8-Ks for {ticker}'}
 
-  return {
+  out = {
     'ticker': ticker,
     'success': True,
     'error': None,
     'source': '8-K Item 2.02 (Results of Operations) — EX-99.1 press release attachment',
     'releases': releases,
     'release_count': len(releases),
-    'note': 'Prepared remarks only. Analyst Q&A requires a paid transcript service.',
+    # The request and the coverage, side by side. A caller asking for four
+    # quarters and receiving two could previously only infer the shortfall by
+    # counting the list themselves.
+    'quarters_requested': max_quarters,
+    'note': ('Company-written press releases, not call transcripts. Prepared '
+             'remarks and the key-metrics table only; the analyst Q&A from '
+             'the call is not filed with the SEC and is not in this text.'),
   }
+  if len(releases) < max_quarters:
+    out['warnings'] = [warning(
+      'fewer_releases_than_requested',
+      f'{max_quarters} quarterly releases were requested and {len(releases)} '
+      f'were found in the last 30 8-K filings for {ticker}. A filer that '
+      f'reports results outside Item 2.02, or that files more than 30 8-Ks '
+      f'between prints, will come back short.',
+      quarters_requested=max_quarters,
+      releases_returned=len(releases))]
+  return out
 
 
 def extract_mda(ticker: str, form_type: str = '10-K',

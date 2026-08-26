@@ -84,7 +84,7 @@ filing documents.
 `extract_guidance` `extract_litigation` `extract_customer_concentration`
 `extract_8k_events` `extract_proxy_compensation` `extract_governance_data`
 `extract_disclosure_data` `get_disclosures_names` `diff_10k`
-`get_earnings_transcripts` `extract_call_sentiment`
+`get_earnings_releases` `extract_earnings_release_sentiment`
 
 **Ownership and structure.** `get_share_count_series` `get_buyback_history`
 `get_shelf_activity` `get_public_float` `get_schedule_13d_filings`
@@ -118,15 +118,18 @@ number: an LBO whose debt exceeds the purchase price is unfinanceable, and
 saying so beats reporting the 40x MOIC that sizing produces.
 
 `analyze_exposures` and `get_thesis_evolution` read book state, which a
-data-source host does not have. They return an empty result rather than failing,
-because empty is the truthful answer there.
+data-source host does not have. `analyze_exposures` returns an empty book rather
+than failing, because empty is the truthful answer there. `get_thesis_evolution`
+asks about one named thesis, so on a book holding no such thesis it refuses --
+the same answer on either host. A null row there would be byte-for-byte what a
+real thesis awaiting its first check-in returns.
 
 ### `finnhub` — 14 tools, news, estimates, insiders
 
 `get_company_news` `get_market_news` `get_company_profile` `get_company_peers`
 `get_basic_financials` `get_financial_statements` `get_earnings_calendar`
 `get_earnings_surprises` `get_forward_estimates` `get_analyst_recommendations`
-`get_analyst_revisions_history` `get_ipo_calendar` `get_insider_transactions`
+`get_analyst_rating_trend` `get_ipo_calendar` `get_insider_transactions`
 `get_insider_sentiment`
 
 ### `fred` — 5 tools, macro

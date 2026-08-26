@@ -8,7 +8,7 @@ description: Estimate the gap between published sell-side consensus and the unst
 Estimates the buyside whisper gap vs published consensus using price
 action + options skew + CFO tone. Disjoint from
 `/estimate-revision-watch` (does NOT pull `get_forward_estimates` or
-`get_analyst_revisions_history` — consumes consensus from upstream).
+`get_analyst_rating_trend` — consumes consensus from upstream).
 
 ## Inputs
 
@@ -40,7 +40,8 @@ skew, 25-delta call IV vs put IV.
 
 ### 3. CFO tone trajectory
 
-`extract_call_sentiment(ticker, quarters=2)`. Last call: confident /
+`extract_earnings_release_sentiment(ticker, quarters=2)`. Last release:
+confident /
 stable / hedging; trend over 2 quarters.
 
 - Recent confident post-beat → whisper above consensus (analysts

@@ -60,8 +60,11 @@ Conversation context decays; the DB does not. Three hard habits:
    construction). Vendors mix GAAP and adjusted EPS (live CHWY: 67% apart);
    the returned `basis_flag` must be stated in the output, and
    `divergent_scoring_basis_suspect` means prediction quality is at risk.
-2. **Revision velocity.** `get_analyst_revisions_history` + `get_forward_estimates`
-   -> rising/flat/falling -> signal `revision_velocity`.
+2. **Rating velocity.** `get_analyst_rating_trend` + `get_forward_estimates`
+   -> rising/flat/falling -> signal `revision_velocity`. Note what the first
+   tool is: rating buckets over time, not estimate revisions. Read its
+   `signal` alongside `momentum.3mo_total_analysts_delta` so new coverage is
+   not mistaken for upgrades.
 3. **Supplier / MOPS (if applicable).** `get_supply_chain`; if it contains TSMC
    (2330) / Foxconn (2317) / MediaTek (2454) / ASE (3711) call
    `get_taiwan_monthly_revenue`. Else mark signal `supplier_mops = na`.
@@ -76,7 +79,7 @@ Conversation context decays; the DB does not. Three hard habits:
    - `get_short_interest` (SI % float, days-to-cover), `get_options_metrics`
      (IV skew, put/call volume ratio, term structure, AND the ATM straddle as
      `implied_move`), `get_price_history` (3M momentum + ~500 daily bars), and
-     reuse the Layer-0 `get_analyst_revisions_history` pct_bullish.
+     reuse the Layer-0 `get_analyst_rating_trend` pct_bullish.
      `get_options_metrics(ticker)` is the only call needed — spot is fetched
      internally, and on failure `implied_move` carries an `error` key rather
      than being absent.
@@ -137,13 +140,16 @@ max_age_hours=24)` skip recompute and load via `latest_component`.
 6. **Peer readthrough.** Invoke `/peer-readthrough-fanout(ticker, earnings_date)`.
    It derives peers dynamically, fans out one `/cross-company-readthrough` per
    reported peer, aggregates, and persists. -> signal `peer_readthrough`.
-7. **Guidance archaeology.** Spawn a sub-agent: read `get_earnings_transcripts`
-   (last 4Q) + `extract_forward_signals`, extract `{guided_low, guided_high,
+7. **Guidance archaeology.** Spawn a sub-agent: read `get_earnings_releases`
+   (last 4Q — 8-K press releases, not call transcripts, so there is no analyst
+   Q&A in them) + `extract_forward_signals`, extract `{guided_low, guided_high,
    actual}` per quarter, then apply `classify_guide_style` + `bar_position` +
    `guidance_direction` (vs current `get_forward_estimates`). The agent also
-   calls `extract_call_sentiment(ticker, quarters=4)` — a deteriorating CFO
-   tonal trajectory caps guidance_direction at neutral even for a sandbagger
-   (tone leads the guide). Additionally DELEGATE `/expectations-hurdle-check`:
+   calls `extract_earnings_release_sentiment(ticker, quarters=4)` — a
+   deteriorating CFO tonal trajectory caps guidance_direction at neutral even
+   for a sandbagger (tone leads the guide). Check `tone_shift.span_label`
+   before reading that trajectory as year-over-year; for many filers the two
+   releases compared are one quarter apart. Additionally DELEGATE `/expectations-hurdle-check`:
    its easy/balanced/difficult setup feeds bar_position (a "difficult" whisper
    setup overrides a "normal" consensus bar to "hard"). -> signal `guidance`.
 8. **KPI drill-down.** Build candidates from `get_segment_financials` (materiality)
@@ -169,8 +175,10 @@ Every template ends with the same contract: STRICT JSON, every number cited
 Guidance archaeology for {TICKER} ahead of {EARNINGS_DATE}.
 Do NOT assume the company's guidance practice, fiscal calendar, executives, or
 metric names from memory — discover everything via tools.
-1. get_earnings_transcripts({TICKER}): search the last 4 quarters for explicit
-   forward guidance (EPS / revenue / segment growth ranges) given by management.
+1. get_earnings_releases({TICKER}): search the last 4 quarterly 8-K press
+   releases for explicit forward guidance (EPS / revenue / segment growth
+   ranges) given by management. These are prepared remarks; the analyst Q&A
+   is not filed with the SEC and is not in this text.
    For each prior quarter with a guide, pair it with the actual
    (get_earnings_surprises) -> {guided_low, guided_high, actual}.
 2. get_forward_estimates({TICKER}) for current consensus.
@@ -184,9 +192,9 @@ Return STRICT JSON: {"component":"guidance","guide_style":...,"bar_position":...
 ```
 Dynamic KPI drill-down for {TICKER} ahead of {EARNINGS_DATE}.
 Derive the 2-3 KPIs the market trades for THIS company. Candidates come ONLY
-from (a) get_segment_financials materiality and (b) metrics analysts repeatedly
-raise in get_earnings_transcripts Q&A. Do not anchor on any example KPIs and do
-not assume KPIs from memory.
+from (a) get_segment_financials materiality and (b) metrics management
+repeatedly leads with in get_earnings_releases. Do not anchor on any example
+KPIs and do not assume KPIs from memory.
 For each top KPI: trajectory from tool data vs any consensus/guide anchor you
 can cite (get_forward_estimates / transcript guidance). No citable anchor ->
 that KPI is neutral with note "no anchor".

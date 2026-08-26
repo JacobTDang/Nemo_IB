@@ -1286,6 +1286,15 @@ def _condense_financial_statements(raw: Dict[str, Any], statement: str, freq: st
 # silently, which is what the old fixed six-month slice did.
 _SENTIMENT_MONTH_CAP = 24
 
+# Rating-trend classifier thresholds, in percentage points of the net_bullish
+# SHARE of covering analysts. The classifier used to read the raw count delta
+# with bands at |2| and |5| ratings, which made 65-of-68 analysts falling to
+# 63-of-68 a "downgrading" verdict -- 2.9pp of drift on a firm covered by
+# sixty-eight houses. Percentage points are the only unit in which a move at
+# 6 analysts and a move at 68 are the same statement.
+_RATING_TREND_PP = 5.0
+_RATING_TREND_STRONG_PP = 10.0
+
 
 def _month_span(year: int, month: int):
   """First and last calendar day of a month."""
@@ -1586,19 +1595,23 @@ class FinnhubServer:
           }
         ),
         Tool(
-          name="get_analyst_revisions_history",
+          name="get_analyst_rating_trend",
           description=(
-            "Full time series of analyst rating-bucket counts (strong buy / buy / hold / sell / strong sell) over the last N months. "
-            "Detects upgrade/downgrade momentum invisible in a single-period snapshot. Returns per-month counts, net_bullish score "
-            "((strong_buy+buy) - (sell+strong_sell)), 1mo/3mo/6mo deltas, and a momentum signal classifier "
-            "(upgrading_strong / upgrading / neutral / downgrading / downgrading_strong). "
-            "Use to detect institutional re-rating before it shows up in price."
+            "Monthly time series of analyst RATING-BUCKET counts (strong buy / buy / hold / sell / strong sell) from "
+            "Finnhub /stock/recommendation. This measures how firms are rated, NOT how they are modelling the company: "
+            "it contains no EPS or revenue numbers and no price targets, so it cannot answer 'are estimates being taken "
+            "up into the print'. Finnhub's estimate and upgrade/downgrade feeds are not on this plan (verified 403). "
+            "Returns per-month bucket counts, net_bullish ((strong_buy+buy)-(sell+strong_sell)), the same figure as a "
+            "share of covering analysts, deltas where the history supports them, and a signal classifier "
+            "(upgrading_strong / upgrading / neutral / downgrading / downgrading_strong) measured on the change in that "
+            "SHARE so a two-analyst move means something different at 6 analysts than at 68. Finnhub typically serves "
+            "only the last ~4 monthly snapshots regardless of lookback_months; the shortfall is reported as a warning."
           ),
           inputSchema={
             "type": "object",
             "properties": {
               "ticker": {"type": "string", "description": "Stock ticker symbol"},
-              "lookback_months": {"type": "integer", "description": "Months of history to include", "default": 12}
+              "lookback_months": {"type": "integer", "description": "Months of history to include. Finnhub usually returns fewer; the response names the shortfall.", "default": 12}
             },
             "required": ["ticker"]
           }
@@ -1773,8 +1786,8 @@ warnings_per_tool={
           )
         case "get_analyst_recommendations":
           return await parent.get_analyst_recommendations(arguments["ticker"])
-        case "get_analyst_revisions_history":
-          return await parent.get_analyst_revisions_history(arguments["ticker"], arguments.get("lookback_months", 12))
+        case "get_analyst_rating_trend":
+          return await parent.get_analyst_rating_trend(arguments["ticker"], arguments.get("lookback_months", 12))
         case "get_company_peers":
           return await parent.get_company_peers(arguments["ticker"])
         case "get_basic_financials":
@@ -1855,10 +1868,26 @@ warnings_per_tool={
     envelope = build_envelope(condensed, ticker, "get_analyst_recommendations")
     return [TextContent(type="text", text=safe_json_dumps(envelope))]
 
-  async def get_analyst_revisions_history(self, ticker: str, lookback_months: int = 12) -> List[TextContent]:
-    """Full time series of analyst rating-bucket counts over lookback_months.
-    Lets the consumer detect upgrade/downgrade momentum that's invisible
-    in a single-period snapshot."""
+  async def get_analyst_rating_trend(self, ticker: str, lookback_months: int = 12) -> List[TextContent]:
+    """Monthly analyst RATING-BUCKET counts over lookback_months.
+
+    Named for what it measures. It was called `get_analyst_revisions_history`,
+    which reads as "how are analysts revising their estimates" -- and a
+    pre-earnings workflow asking that question got a strongBuy/buy/hold/sell
+    distribution back and could not tell. Verified against this key on
+    2026-08-26: `/stock/eps-estimate`, `/stock/revenue-estimate`,
+    `/stock/upgrade-downgrade` and `/stock/price-target` all answer 403 "You
+    don't have access to this resource." There is no estimate-revision feed on
+    this plan, so the name could not be made true and had to change instead.
+
+    The classifier reads the change in net_bullish as a SHARE of covering
+    analysts rather than the raw count. A two-analyst move is a re-rating at 6
+    analysts and noise at 68, and the old thresholds (>= |2| ratings) called
+    65-of-68 going to 63-of-68 a downgrade. Sharing also stops new coverage
+    reading as an upgrade: AMAT went 43 analysts to 45 and picked up 3 net
+    bullish, two of which were initiations, and was reported "upgrading" the
+    day before it gapped -6.57%.
+    """
     result = await self.client.get("/stock/recommendation", {"symbol": ticker})
 
     # Two different nothings, told apart. Finnhub declining the request is an
@@ -1869,17 +1898,17 @@ warnings_per_tool={
     if isinstance(result, dict) and result.get("error"):
       envelope = build_envelope({"periods": [],
                                  "error": f"Finnhub: {result['error']}"},
-                                ticker, "get_analyst_revisions_history",
+                                ticker, "get_analyst_rating_trend",
                                 errors=[f"Finnhub: {result['error']}"])
       envelope["warnings"] = [warning(
         "primary_source_unavailable",
-        "Finnhub did not answer the recommendation request, so no revision "
+        "Finnhub did not answer the recommendation request, so no rating "
         "history is reported. See metadata.errors for what it said; this is "
         "not evidence that the company has no analyst coverage.")]
       return [TextContent(type="text", text=safe_json_dumps(envelope))]
     if not isinstance(result, list) or not result:
       envelope = build_envelope({"periods": []}, ticker,
-                                "get_analyst_revisions_history")
+                                "get_analyst_rating_trend")
       return [TextContent(type="text", text=safe_json_dumps(envelope))]
 
     # Finnhub returns most-recent first
@@ -1906,12 +1935,21 @@ warnings_per_tool={
         "strong_sell":    ss,
         "total":          total,
         "net_bullish":    net_bullish,
+        # net_bullish as a share of the analysts covering that month. The
+        # count alone cannot be compared across firms, or across months in
+        # which coverage changed.
+        "net_bullish_pct": (round(net_bullish / total * 100, 1)
+                            if total else None),
         "pct_bullish":    pct_bullish,
         "pct_bearish":    pct_bearish,
       })
 
-    # Trend deltas (latest vs N months ago)
+    # Trend deltas (latest vs N months ago). A delta the description promises
+    # and the history cannot support is NAMED rather than left absent: an
+    # absent key and a delta of zero look identical to anything reading the
+    # dict with .get().
     momentum = {}
+    momentum_unavailable = {}
     if len(periods) >= 2:
       latest = periods[0]
       prior = periods[1]
@@ -1919,41 +1957,97 @@ warnings_per_tool={
       momentum["1mo_buy_delta"] = latest["buy"] - prior["buy"]
       momentum["1mo_sell_delta"] = latest["sell"] - prior["sell"]
       momentum["1mo_net_bullish_delta"] = latest["net_bullish"] - prior["net_bullish"]
+    else:
+      momentum_unavailable["1mo_net_bullish_delta"] = (
+        f"needs 2 monthly snapshots; Finnhub returned {len(periods)}")
+
+    share_delta_3mo = None
     if len(periods) >= 4:
       latest = periods[0]
       m3 = periods[3]
       momentum["3mo_net_bullish_delta"] = latest["net_bullish"] - m3["net_bullish"]
+      momentum["3mo_total_analysts_delta"] = latest["total"] - m3["total"]
+      if latest["net_bullish_pct"] is not None and m3["net_bullish_pct"] is not None:
+        share_delta_3mo = round(
+          latest["net_bullish_pct"] - m3["net_bullish_pct"], 1)
+      momentum["3mo_net_bullish_share_delta_pp"] = share_delta_3mo
+    else:
+      momentum_unavailable["3mo_net_bullish_delta"] = (
+        f"needs 4 monthly snapshots; Finnhub returned {len(periods)}")
+
     if len(periods) >= 7:
       latest = periods[0]
       m6 = periods[6]
       momentum["6mo_net_bullish_delta"] = latest["net_bullish"] - m6["net_bullish"]
+      momentum["6mo_total_analysts_delta"] = latest["total"] - m6["total"]
+      if latest["net_bullish_pct"] is not None and m6["net_bullish_pct"] is not None:
+        momentum["6mo_net_bullish_share_delta_pp"] = round(
+          latest["net_bullish_pct"] - m6["net_bullish_pct"], 1)
+    else:
+      momentum_unavailable["6mo_net_bullish_delta"] = (
+        f"needs 7 monthly snapshots; Finnhub returned {len(periods)}")
 
-    # Signal classifier. It reads one input, the 3-month delta, and fewer
-    # than four periods means that input does not exist -- "neutral" there
-    # reported no revision momentum when no momentum had been measured.
+    # Signal classifier. It reads one input, the 3-month change in net_bullish
+    # as a share of coverage, and fewer than four periods means that input does
+    # not exist -- "neutral" there reported no momentum where none was measured.
     signal = None
-    if momentum.get("3mo_net_bullish_delta") is not None:
-      d3 = momentum["3mo_net_bullish_delta"]
+    signal_basis = None
+    if share_delta_3mo is None:
+      signal_basis = (
+        "not classified: " + momentum_unavailable.get(
+          "3mo_net_bullish_delta",
+          "no covering analysts in one of the two months compared"))
+    else:
       signal = "neutral"       # measured and flat, which is a reading
-      if d3 >= 5:
+      if share_delta_3mo >= _RATING_TREND_STRONG_PP:
         signal = "upgrading_strong"
-      elif d3 >= 2:
+      elif share_delta_3mo >= _RATING_TREND_PP:
         signal = "upgrading"
-      elif d3 <= -5:
+      elif share_delta_3mo <= -_RATING_TREND_STRONG_PP:
         signal = "downgrading_strong"
-      elif d3 <= -2:
+      elif share_delta_3mo <= -_RATING_TREND_PP:
         signal = "downgrading"
+      signal_basis = (
+        f"net_bullish share moved {share_delta_3mo:+.1f}pp over 3 months "
+        f"({periods[3]['net_bullish']} of {periods[3]['total']} analysts -> "
+        f"{periods[0]['net_bullish']} of {periods[0]['total']}); "
+        f"thresholds +/-{_RATING_TREND_PP}pp and "
+        f"+/-{_RATING_TREND_STRONG_PP}pp")
 
     out = {
       "ticker":           ticker.upper(),
+      "measures":         "analyst_rating_buckets",
       "periods":          periods,
       "periods_returned": len(periods),
+      "lookback_months_requested": lookback_months,
       "momentum":         momentum,
+      "momentum_unavailable": momentum_unavailable,
       "signal":           signal,
+      "signal_basis":     signal_basis,
       "source":           "Finnhub /stock/recommendation",
-      "note":             "Counts reflect Finnhub's firm-rating buckets per month. Net_bullish = (strong_buy+buy)-(sell+strong_sell). Signal classifier uses 3mo net_bullish delta.",
+      "note":             ("Recommendation buckets per month -- how firms RATE "
+                           "the company, not what they MODEL for it. No EPS, "
+                           "revenue or price-target figure is in this response, "
+                           "and none is available on this Finnhub plan. "
+                           "Net_bullish = (strong_buy+buy)-(sell+strong_sell); "
+                           "net_bullish_pct expresses it as a share of covering "
+                           "analysts, and the signal classifier reads the "
+                           "3-month change in that share."),
     }
-    envelope = build_envelope(out, ticker, "get_analyst_revisions_history")
+    envelope = build_envelope(out, ticker, "get_analyst_rating_trend")
+
+    # The window asked for and the window covered were both in the response
+    # and a reader had to spot the gap themselves. lookback_months=12 returns
+    # 4 periods for every ticker tried.
+    if periods and len(periods) < lookback_months:
+      _append_warnings(envelope, [warning(
+        "history_shorter_than_requested",
+        f"{lookback_months} months of rating history were requested and "
+        f"Finnhub returned {len(periods)} monthly snapshots. Deltas needing "
+        f"more history than that are listed in data.momentum_unavailable.",
+        requested_months=lookback_months,
+        returned_months=len(periods))])
+
     return [TextContent(type="text", text=safe_json_dumps(envelope))]
 
   async def get_company_peers(self, ticker: str) -> List[TextContent]:

@@ -654,7 +654,12 @@ def _resolve_ticker(ticker: str) -> Dict[str, str]:
         raise UnknownTicker(
             f"'{ticker}' is not a symbol yfinance can resolve (no longName or "
             f"shortName in its quote response). No lookup was attempted.")
-    return {"name": name, "sector": info.get("sector") or ""}
+    # `industry` rides along because the sector alone is too coarse for some
+    # questions. yfinance has no "Defense" sector -- every prime is
+    # "Industrials" -- and the legislation that matters to them is named at
+    # the industry level.
+    return {"name": name, "sector": info.get("sector") or "",
+            "industry": info.get("industry") or ""}
 
 
 def _lookup_failed(exc: LookupFailure, **payload: Any) -> Dict[str, Any]:
@@ -1678,6 +1683,33 @@ SECTOR_BILL_KEYWORDS: Dict[str, List[str]] = {
     "Defense":                ["NDAA", "defense authorization", "military procurement"],
 }
 
+# yfinance industry -> a keyword sector that its GICS sector cannot reach.
+#
+# "Defense" has always been in SECTOR_BILL_KEYWORDS and has never been
+# reachable: yfinance files every prime under sector "Industrials", so LMT was
+# researched on ["infrastructure", "reshoring", "defense procurement"] and came
+# back with the Restoring the Death Penalty in DC Act and the Native American
+# Housing Assistance Modernization Act. The NDAA -- the one bill that moves a
+# defense prime's revenue line -- was never searched for.
+#
+# Deliberately narrow. An override only belongs here when the provider's
+# taxonomy has no way to express the distinction, never as a second opinion
+# about a sector the provider named correctly.
+INDUSTRY_SECTOR_OVERRIDES: Dict[str, str] = {
+    "aerospace & defense": "Defense",
+}
+
+# See the comment on the request itself: GovTrack's cold path is ~18s.
+_GOVTRACK_TIMEOUT_S = 25
+_POLICY_SIGNALS_TIMEOUT_S = 60.0
+
+# Bills fetched per keyword, and rows carried in `bills`. `bill_count`
+# describes the whole matched set, `rows_returned` describes this page, and
+# `truncated` says when they differ -- the rule
+# testing/test_counts_survive_paging.py holds the SEC tools to, and which
+# get_congress_trades on this server already follows.
+_BILL_ROW_CAP = 10
+
 # Pro-industry vs anti-industry bill language. Complete words/conjugations only
 # (word-boundary matched) — partial stems like "fund"/"invest"/"ban" caused
 # false friends ("refund", "investigation", "banking"). Multi-word phrases are
@@ -1735,26 +1767,65 @@ def _score_bill_title(title: str, status: str) -> float:
     return (pos - neg) * weight
 
 
-def _govtrack_fetch_bills(keywords: List[str], congress: int,
-                           limit: int = 8) -> Tuple[List[Dict], List[str]]:
-    """(bills, errors). A keyword whose query failed is named in `errors`.
+def _fetch_keywords(fetch_one, keywords: List[str]
+                    ) -> Tuple[List[Dict], List[str], List[str]]:
+    """Run `fetch_one(keyword)` over every keyword, concurrently.
 
-    Swallowing the exception made "GovTrack is down" and "no bill mentions
-    semiconductors" the same answer.
+    (bills, errors, keywords_queried). Concurrent because the alternative was
+    a cap: both fetchers used `keywords[:3]` while the response reported the
+    whole mapping in `keywords_searched`, so for Industrials the response said
+    it had looked for "NDAA" and it never had. Four sequential 10s requests
+    across two congresses do not fit the handler's 30s budget; four concurrent
+    ones do.
+
+    A keyword whose query failed is named in `errors`. Swallowing the
+    exception made "GovTrack is down" and "no bill mentions semiconductors"
+    the same answer.
     """
-    import requests
-    bills = []
-    errors: List[str] = []
-    seen_ids: set = set()
+    from concurrent.futures import ThreadPoolExecutor
 
-    for kw in keywords[:3]:
+    if not keywords:
+        return [], [], []
+    with ThreadPoolExecutor(max_workers=min(len(keywords), 6)) as pool:
+        results = list(pool.map(fetch_one, keywords))
+
+    bills: List[Dict] = []
+    errors: List[str] = []
+    seen: set = set()
+    # Merged in keyword order rather than completion order so the same inputs
+    # produce the same list.
+    for rows, errs in results:
+        errors += errs
+        for row in rows:
+            key = row.get("link") or row.get("title")
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            bills.append(row)
+    return bills, errors, list(keywords)
+
+
+def _govtrack_fetch_bills(keywords: List[str], congress: int,
+                           limit: int = 8) -> Tuple[List[Dict], List[str], List[str]]:
+    """(bills, errors, keywords_queried) from GovTrack, one query per keyword."""
+    import requests
+
+    def one(kw: str) -> Tuple[List[Dict], List[str]]:
+        rows: List[Dict] = []
         try:
             resp = requests.get(
                 "https://www.govtrack.us/api/v2/bill/",
                 params={"q": kw, "congress": congress,
                         "order_by": "-introduced_date", "limit": limit},
                 headers={"User-Agent": "Mozilla/5.0"},
-                timeout=10,
+                # Measured 2026-08-26: a cold GovTrack query answers in ~18s
+                # and the same query 0.6s once warm. At the old 10s every
+                # first call of a session timed out, and the tool reported
+                # `provider_unavailable` about a provider that was up. The
+                # queries run concurrently, so this bounds one round rather
+                # than the sum of them.
+                timeout=_GOVTRACK_TIMEOUT_S,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -1762,38 +1833,40 @@ def _govtrack_fetch_bills(keywords: List[str], congress: int,
                 # GovTrack bill objects have no "id" field; dedup on the unique
                 # link (fall back to title). The old "id" key was always None,
                 # which silently dropped every bill.
-                bid = obj.get("link") or obj.get("title")
-                if bid and bid not in seen_ids:
-                    seen_ids.add(bid)
-                    bills.append({
-                        "title": obj.get("title", ""),
-                        "short_title": obj.get("short_title", ""),
-                        "status": obj.get("current_status", "introduced"),
-                        "introduced_date": obj.get("introduced_date", ""),
-                        # current_status_date = latest activity; best recency signal
-                        "activity_date": obj.get("current_status_date")
-                                         or obj.get("introduced_date", ""),
-                        "link": obj.get("link", ""),
-                        "congress": congress,
-                        "source": "govtrack",
-                    })
+                rows.append({
+                    "title": obj.get("title", ""),
+                    "short_title": obj.get("short_title", ""),
+                    "status": obj.get("current_status", "introduced"),
+                    "introduced_date": obj.get("introduced_date", ""),
+                    # current_status_date = latest activity; best recency signal
+                    "activity_date": obj.get("current_status_date")
+                                     or obj.get("introduced_date", ""),
+                    "link": obj.get("link", ""),
+                    "congress": congress,
+                    "source": "govtrack",
+                    # Which query surfaced this bill. GovTrack's `q` searches
+                    # full text, so a bill can arrive on a keyword its title
+                    # never mentions -- naming the keyword is what lets a
+                    # reader discount the Native American Housing Assistance
+                    # Modernization Act arriving on "infrastructure".
+                    "matched_keyword": kw,
+                })
         except Exception as exc:  # noqa: BLE001 - recorded, not hidden
-            errors.append(f"govtrack {kw!r} (congress {congress}): "
-                          f"{type(exc).__name__}: {str(exc)[:120]}")
-            continue
-    return bills, errors
+            return rows, [f"govtrack {kw!r} (congress {congress}): "
+                          f"{type(exc).__name__}: {str(exc)[:120]}"]
+        return rows, []
+
+    return _fetch_keywords(one, keywords)
 
 
 def _congress_api_fetch_bills(keywords: List[str], congress: int,
                                api_key: str,
-                               limit: int = 10) -> Tuple[List[Dict], List[str]]:
-    """(bills, errors) — same contract as _govtrack_fetch_bills."""
+                               limit: int = 10) -> Tuple[List[Dict], List[str], List[str]]:
+    """(bills, errors, keywords_queried) — same contract as _govtrack_fetch_bills."""
     import requests
-    bills = []
-    errors: List[str] = []
-    seen_titles: set = set()
 
-    for kw in keywords[:3]:
+    def one(kw: str) -> Tuple[List[Dict], List[str]]:
+        rows: List[Dict] = []
         try:
             resp = requests.get(
                 "https://api.congress.gov/v3/bill",
@@ -1806,9 +1879,6 @@ def _congress_api_fetch_bills(keywords: List[str], congress: int,
             data = resp.json()
             for b in data.get("bills", []):
                 title = b.get("title", "")
-                if title in seen_titles:
-                    continue
-                seen_titles.add(title)
                 latest = b.get("latestAction", {})
                 action_text = (latest.get("text") or "").lower()
                 if "became public law" in action_text:
@@ -1819,7 +1889,7 @@ def _congress_api_fetch_bills(keywords: List[str], congress: int,
                     status = "referred"
                 else:
                     status = "introduced"
-                bills.append({
+                rows.append({
                     "title": title,
                     "short_title": "",
                     "status": status,
@@ -1828,12 +1898,14 @@ def _congress_api_fetch_bills(keywords: List[str], congress: int,
                     "link": "",
                     "congress": congress,
                     "source": "congress.gov",
+                    "matched_keyword": kw,
                 })
         except Exception as exc:  # noqa: BLE001 - recorded, not hidden
-            errors.append(f"congress.gov {kw!r} (congress {congress}): "
-                          f"{type(exc).__name__}: {str(exc)[:120]}")
-            continue
-    return bills, errors
+            return rows, [f"congress.gov {kw!r} (congress {congress}): "
+                          f"{type(exc).__name__}: {str(exc)[:120]}"]
+        return rows, []
+
+    return _fetch_keywords(one, keywords)
 
 
 def _fetch_policy_signals(ticker: str, sector: str,
@@ -1844,16 +1916,32 @@ def _fetch_policy_signals(ticker: str, sector: str,
     unknown ticker, a sector with no keyword mapping (which silently answered
     with the technology/semiconductor/defense default), and GovTrack being
     unreachable. Each is now named.
+
+    Three labels were wrong on top of that, all found on LMT. The sector was
+    auto-detected as "Industrials" because that is what yfinance calls a
+    defense prime, so the Defense keyword set was unreachable. The response
+    reported four keywords in `keywords_searched` while the fetcher used three,
+    dropping "NDAA". And `bill_count: 21` shipped beside ten bills with no
+    truncation flag, so the `total_score` behind the verdict was summed over
+    rows the caller could not see.
     """
+    sector_source = "caller"
+    sector_reported = sector or None
     base = {"ticker": ticker, "sector": sector or None,
+            "sector_reported_by_provider": sector_reported,
+            "sector_source": sector_source,
             "lookback_days": lookback_days, "bill_count": None,
+            "rows_returned": None, "truncated": None,
             "bills": [], "signal": None}
 
     if not sector:
         try:
-            sector = _resolve_ticker(ticker)["sector"]
+            resolved = _resolve_ticker(ticker)
         except LookupFailure as exc:
             return _lookup_failed(exc, **base)
+        sector = resolved["sector"]
+        sector_reported = sector or None
+        industry = resolved.get("industry") or ""
         if not sector:
             return {
                 **base, "success": False, "coverage": "not_covered",
@@ -1863,7 +1951,16 @@ def _fetch_policy_signals(ticker: str, sector: str,
                           f"`sector` to search legislation."),
                 "sectors_supported": sorted(SECTOR_BILL_KEYWORDS),
             }
-        base["sector"] = sector
+        override = INDUSTRY_SECTOR_OVERRIDES.get(industry.strip().lower())
+        if override:
+            sector_source = (f"industry {industry!r} overrides provider sector "
+                             f"{sector!r}")
+            sector = override
+        else:
+            sector_source = f"provider sector for {ticker}"
+        base.update({"sector": sector,
+                     "sector_reported_by_provider": sector_reported,
+                     "sector_source": sector_source})
 
     keywords = SECTOR_BILL_KEYWORDS.get(sector)
     if not keywords:
@@ -1893,29 +1990,40 @@ def _fetch_policy_signals(ticker: str, sector: str,
             "answer is from GovTrack alone.")
 
     fetch_errors: List[str] = []
+    # Only keywords actually put to the provider reach `keywords_searched`.
+    # Echoing the mapping there was the lie: it claimed a search for the NDAA
+    # that never happened.
+    queried: List[str] = []
     if api_key:
-        bills, errs = _congress_api_fetch_bills(keywords, current_congress, api_key)
+        bills, errs, kws = _congress_api_fetch_bills(keywords, current_congress, api_key)
         fetch_errors += errs
+        queried += kws
         if not bills:
-            bills, errs = _congress_api_fetch_bills(keywords, prior_congress, api_key)
+            bills, errs, kws = _congress_api_fetch_bills(keywords, prior_congress, api_key)
             fetch_errors += errs
+            queried += kws
     else:
-        bills, errs = _govtrack_fetch_bills(keywords, current_congress)
+        bills, errs, kws = _govtrack_fetch_bills(keywords, current_congress)
         fetch_errors += errs
+        queried += kws
         if len(bills) < 3:
-            more, errs = _govtrack_fetch_bills(keywords, prior_congress)
+            more, errs, kws = _govtrack_fetch_bills(keywords, prior_congress)
             bills += more
             fetch_errors += errs
+            queried += kws
+    keywords_searched = list(dict.fromkeys(queried))
+    base["sector"] = sector
 
     if not bills and fetch_errors:
         # Every query the provider was asked errored. An empty bill list here
         # means the provider is unreachable, not that Congress is idle.
         return {
-            **base, "sector": sector, "success": False,
+            **base, "success": False,
             "coverage": "not_covered", "reason": "provider_unavailable",
             "error": (f"{source} returned no usable response for any of "
-                      f"{keywords[:3]}: " + "; ".join(fetch_errors)),
-            "keywords_searched": keywords, "source": source,
+                      f"{keywords_searched}: " + "; ".join(fetch_errors)),
+            "keywords_searched": keywords_searched,
+            "keywords_mapped": keywords, "source": source,
             "degraded": degraded,
         }
 
@@ -1935,12 +2043,18 @@ def _fetch_policy_signals(ticker: str, sector: str,
             "success": True,
             "coverage": coverage,
             "ticker": ticker, "sector": sector,
-            "keywords_searched": keywords,
+            "sector_reported_by_provider": sector_reported,
+            "sector_source": sector_source,
+            "lookback_days": lookback_days,
+            "keywords_searched": keywords_searched,
+            "keywords_mapped": keywords,
             "bill_count": 0,
+            "rows_returned": 0,
+            "truncated": False,
             "bills": [],
             "signal": "neutral",
             "signal_basis": (f"{source} returned no bill matching "
-                             f"{keywords[:3]} with activity in the last "
+                             f"{keywords_searched} with activity in the last "
                              f"{lookback_days} days"),
             "source": source,
             "degraded": degraded,
@@ -1955,23 +2069,38 @@ def _fetch_policy_signals(ticker: str, sector: str,
 
     if total_score > 0.5:
         signal = "bullish"
-        basis = "net positive legislative activity in sector"
+        direction = "net positive"
     elif total_score < -0.5:
         signal = "bearish"
-        basis = "net negative legislative activity (restrictions/controls) in sector"
+        direction = "net negative (restrictions/controls)"
     else:
         signal = "neutral"
-        basis = "legislative activity is mixed or low probability"
+        direction = "mixed or low probability"
 
-    # Sort by abs score
-    bills_out = sorted(bills, key=lambda b: -abs(b["score"]))[:10]
+    # Sort by abs score, then truncate -- counted first, so `bill_count`
+    # describes the matched set and not the page.
+    bills_out = sorted(bills, key=lambda b: -abs(b["score"]))[:_BILL_ROW_CAP]
+
+    basis = (
+        f"{direction}: title-word polarity weighted by enactment probability, "
+        f"summed over all {len(bills)} bills matching {keywords_searched} "
+        f"with activity in the last {lookback_days} days, total_score "
+        f"{round(total_score, 3)}. Each bill names the keyword that surfaced "
+        f"it in `matched_keyword`; the provider searches full text, so a bill "
+        f"can match on a keyword its title never uses.")
 
     return {
         "success": True,
         "coverage": coverage,
         "ticker": ticker, "sector": sector,
-        "keywords_searched": keywords,
+        "sector_reported_by_provider": sector_reported,
+        "sector_source": sector_source,
+        "lookback_days": lookback_days,
+        "keywords_searched": keywords_searched,
+        "keywords_mapped": keywords,
         "bill_count": len(bills),
+        "rows_returned": len(bills_out),
+        "truncated": len(bills_out) < len(bills),
         "total_score": round(total_score, 3),
         "signal": signal,
         "signal_basis": basis,
@@ -2417,9 +2546,17 @@ class AltDataServer:
                         "Sector is auto-detected from yfinance if not provided; an "
                         "unresolvable ticker, a ticker with no sector, or a sector with "
                         "no keyword mapping returns success=false rather than answering "
-                        "from another sector's keywords. Without CONGRESS_API_KEY the "
+                        "from another sector's keywords. yfinance has no Defense sector, "
+                        "so an 'Aerospace & Defense' industry is mapped to it and "
+                        "'sector_source' says so alongside "
+                        "'sector_reported_by_provider'. Without CONGRESS_API_KEY the "
                         "answer is GovTrack-only: coverage='partial' and the missing key "
                         "is named in 'degraded'. "
+                        "Bills are found by full-text keyword search, so a bill can match "
+                        "on a keyword its title never uses -- every row names its "
+                        "'matched_keyword' and 'signal_basis' states what was summed. "
+                        "'bill_count' counts the whole matched set, 'rows_returned' the "
+                        "page returned, and 'truncated' says when they differ. "
                         "Most relevant for: semiconductors (CHIPS Act), defense (NDAA), "
                         "pharma (drug pricing), energy (IRA credits), fintech (crypto regs)."
                     ),
@@ -2823,10 +2960,17 @@ warnings_per_tool={
                 asyncio.to_thread(
                     _fetch_policy_signals, ticker, sector, lookback_days,
                 ),
-                timeout=30.0,
+                # Two rounds at most -- the current congress, then the prior
+                # one if the current returned almost nothing -- and each round
+                # queries every keyword concurrently, so the budget is two
+                # cold GovTrack requests plus parsing rather than one per
+                # keyword.
+                timeout=_POLICY_SIGNALS_TIMEOUT_S,
             )
         except asyncio.TimeoutError:
-            return _err("get_policy_signals", "GovTrack/Congress.gov timed out after 30s", ticker)
+            return _err("get_policy_signals",
+                        f"GovTrack/Congress.gov timed out after "
+                        f"{_POLICY_SIGNALS_TIMEOUT_S:.0f}s", ticker)
         except Exception as exc:
             return _err("get_policy_signals",
                         f"{type(exc).__name__}: {str(exc)[:200]}", ticker)

@@ -38,7 +38,8 @@ from tools.web_search_server.sec_utils import (
     get_buyback_history, get_segment_financials, extract_risk_factors,
     extract_mda, get_earnings_releases, get_patent_filings,
     get_company_filings_history, get_supply_chain, diff_10k,
-    get_schedule_13d_filings, track_segment_growth, extract_call_sentiment,
+    get_schedule_13d_filings, track_segment_growth,
+    extract_earnings_release_sentiment,
     extract_forward_signals,
 )
 from tools.web_search_server.guidance import extract_guidance
@@ -280,13 +281,13 @@ def _build_all_tools() -> List[Tool]:
           }
         ),
         Tool(
-          name="extract_call_sentiment",
-          description="Score sentiment over the last N quarterly earnings releases. Counts confident terms (record, strong, momentum) vs hedging terms (uncertainty, softness, headwinds), normalized per 1000 words. Computes net_score per quarter and YoY tonal shift. Signal classifier: tone_improving / stable / tone_deteriorating / tone_deteriorating_strong. CFO language shifts often precede price moves — the 1999 dot-com and 2008 housing collapses were visible in management tone 6+ months before consensus.",
+          name="extract_earnings_release_sentiment",
+          description="Score management tone over the last N quarterly earnings PRESS RELEASES (8-K Item 2.02, EX-99.1). This is not a call transcript: it is company-written prepared prose with no analyst Q&A in it, so it cannot be read as 'what management said under questioning'. Counts confident terms (record, strong, momentum) vs hedging terms (uncertainty, softness, headwinds), normalized per 1000 words, and reports the tonal change between the newest release scored and the oldest. That comparison is labelled with the span it actually covers (tone_shift.span_label / span_days) — it is a year-over-year read only when the two releases are about a year apart, which for many filers they are not. Signal classifier: tone_improving / stable / tone_deteriorating / tone_deteriorating_strong. CFO language shifts often precede price moves.",
           inputSchema={
             "type": "object",
             "properties": {
               "ticker": {"type": "string", "description": "Stock symbol"},
-              "quarters": {"type": "integer", "description": "Number of quarterly releases to score", "default": 4}
+              "quarters": {"type": "integer", "description": "Number of quarterly releases to score. Fewer may be available; the response names the shortfall.", "default": 4}
             },
             "required": ["ticker"]
           }
@@ -370,8 +371,8 @@ def _build_all_tools() -> List[Tool]:
           }
         ),
         Tool(
-          name="get_earnings_transcripts",
-          description="Pull the last N quarterly earnings releases as filed with the SEC (8-K Item 2.02 with EX-99.1 attachment). Each release contains the company-written prepared remarks, key financial metrics table, segment commentary, and CEO/CFO quotes — the SEC-authoritative equivalent of a paid transcript service's prepared remarks section. Note: analyst Q&A is NOT in 8-K filings; for Q&A use a paid transcript provider. Returns up to N quarterly releases newest-first with full text and metadata.",
+          name="get_earnings_releases",
+          description="Pull the last N quarterly earnings PRESS RELEASES as filed with the SEC (8-K Item 2.02 with EX-99.1 attachment). Each release contains the company-written prepared remarks, key financial metrics table, segment commentary, and CEO/CFO quotes — the SEC-authoritative equivalent of a paid transcript service's prepared-remarks section. This is NOT a call transcript: the analyst Q&A is not filed with the SEC, so for Q&A use a paid transcript provider. Returns up to N quarterly releases newest-first with full text and metadata; if fewer are found than requested the response says so.",
           inputSchema={
             "type": "object",
             "properties": {
@@ -1159,8 +1160,11 @@ class WebSearchServer:
         # worse than naming none.
         "get_urls_content": "web fetch (caller-supplied URLs)",
         "get_patent_filings": "Google Patents",
-        "get_earnings_transcripts": "Finnhub",
-        "extract_call_sentiment": "Finnhub",
+        # Both of these read SEC 8-K exhibits on the SEC server. They were
+        # pinned to "Finnhub", which sent anyone auditing provenance to the
+        # wrong vendor entirely.
+        "get_earnings_releases": "SEC EDGAR (8-K Item 2.02, EX-99.1)",
+        "extract_earnings_release_sentiment": "SEC EDGAR (8-K Item 2.02, EX-99.1)",
         "rag_search": "Nemo RAG index",
         "rag_ingest": "Nemo RAG index",
         "search": "SearXNG",
@@ -1170,10 +1174,16 @@ warnings_per_tool={
         # (README.md, docs/audits/2026-08-25-codex-audit.md, or a tool's own
         # docstring). A caveat that cannot be sourced is not added: an invented
         # limitation is worse than a missing one, because it will be believed.
-        "get_earnings_transcripts": [
-          warning("may_not_be_a_transcript",
-                  "May return an earnings release rather than a call "
-                  "transcript. Check the document before quoting management."),
+        "get_earnings_releases": [
+          warning("no_analyst_qa",
+                  "A press release, not a call transcript: prepared remarks "
+                  "and the metrics table only. The analyst Q&A is not filed "
+                  "with the SEC and is not in this text."),
+        ],
+        "extract_earnings_release_sentiment": [
+          warning("no_analyst_qa",
+                  "Scores press-release prose, not a call transcript. The "
+                  "analyst Q&A is not filed with the SEC and is not scored."),
         ],
         "extract_litigation": [
           warning("may_be_a_cross_reference",
@@ -1287,8 +1297,8 @@ warnings_per_tool={
           return await parent.extract_mda(args['ticker'], args.get('form_type', '10-K'), args.get('max_chars', 80000))
         elif name == 'extract_forward_signals':
           return await parent.extract_forward_signals(args['ticker'], args.get('lookback_quarters', 4))
-        elif name == 'get_earnings_transcripts':
-          return await parent.get_earnings_transcripts(args['ticker'], args.get('max_quarters', 4), args.get('max_chars_per_release', 50000))
+        elif name == 'get_earnings_releases':
+          return await parent.get_earnings_releases(args['ticker'], args.get('max_quarters', 4), args.get('max_chars_per_release', 50000))
         elif name == 'get_patent_filings':
           return await parent.get_patent_filings(args['company_name'], args.get('years_back', 5), args.get('sample_count', 5))
         elif name == 'get_company_filings_history':
@@ -1301,8 +1311,8 @@ warnings_per_tool={
           return await parent.get_schedule_13d_filings(args['ticker'], args.get('limit', 15), args.get('include_passive', True))
         elif name == 'track_segment_growth':
           return await parent.track_segment_growth(args['ticker'], args.get('form_type', '10-K'))
-        elif name == 'extract_call_sentiment':
-          return await parent.extract_call_sentiment(args['ticker'], args.get('quarters', 4))
+        elif name == 'extract_earnings_release_sentiment':
+          return await parent.extract_earnings_release_sentiment(args['ticker'], args.get('quarters', 4))
         elif name == 'compare_fund_holdings':
           return await parent.compare_fund_holdings(args['fund'])
         elif name == 'list_known_funds':
@@ -1514,7 +1524,7 @@ warnings_per_tool={
     result = await asyncio.to_thread(extract_forward_signals, ticker, lookback_quarters)
     return [TextContent(type="text", text=safe_json_dumps(result))]
 
-  async def get_earnings_transcripts(self, ticker: str, max_quarters: int = 4, max_chars_per_release: int = 50000) -> List[TextContent]:
+  async def get_earnings_releases(self, ticker: str, max_quarters: int = 4, max_chars_per_release: int = 50000) -> List[TextContent]:
     result = await asyncio.to_thread(get_earnings_releases, ticker, max_quarters, max_chars_per_release)
     return [TextContent(type="text", text=safe_json_dumps(result))]
 
@@ -1542,8 +1552,8 @@ warnings_per_tool={
     result = await asyncio.to_thread(track_segment_growth, ticker, form_type)
     return [TextContent(type="text", text=safe_json_dumps(result))]
 
-  async def extract_call_sentiment(self, ticker: str, quarters: int = 4) -> List[TextContent]:
-    result = await asyncio.to_thread(extract_call_sentiment, ticker, quarters)
+  async def extract_earnings_release_sentiment(self, ticker: str, quarters: int = 4) -> List[TextContent]:
+    result = await asyncio.to_thread(extract_earnings_release_sentiment, ticker, quarters)
     return [TextContent(type="text", text=safe_json_dumps(result))]
 
   async def compare_fund_holdings(self, fund: str) -> List[TextContent]:
