@@ -25,8 +25,13 @@ a 52/53-week year.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+import os
+import threading
+import time
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
+from . import sec_series
 from .foreign_issuer import form_mismatch_note, not_covered_reason
 from .sec_series import NotCovered, _period_rank, fetch_concept_series
 
@@ -114,6 +119,233 @@ LEASE_IMPUTED_INTEREST_CONCEPTS = (
 _MODERATE_ACCRUAL_PCT = 5.0
 
 
+# ===================================================== one walk, many concepts
+#
+# Every tool here reads a *set* of concepts: `get_working_capital_trends` asks
+# for 19, `get_operating_leases` for 18, `get_accruals_quality` for 5. `_series`
+# evaluates all of them rather than stopping at the first hit, for the reason
+# its own docstring gives, and that is not the thing to change.
+#
+# What was expensive is that each concept went through its own
+# `fetch_concept_series`, and that walks the filings from scratch: a fresh
+# `Company`, a fresh filing list, and a fresh `filing.xbrl()` per filing. The
+# parse is the smaller half of the cost. edgartools enriches every fact in a
+# filing on the first query against an XBRL object and memoises the result *on
+# that object*, so a new object per concept rebuilds the whole fact table --
+# for a bank's 10-K that dominates everything else.
+#
+# Measured on JPM, 2 filings and 19 concepts, inside the running container:
+# 19 filing walks, 36 `filing.xbrl()` parses of the same 2 filings, 189
+# seconds, of which 37s was parsing and the remaining 152s was rebuilding that
+# fact table 36 times over.
+#
+# `sec_series.concept_point` was written for exactly this caller and says so:
+# parse the filing once, read every concept out of the one parsed object.
+
+
+class ToolTimeout(Exception):
+    """One call ran past its wall-clock budget.
+
+    Separate from every other failure here because it is the only one that
+    says nothing whatsoever about the filer. It must never be reported as a
+    coverage gap, and it must never come back attached to a partial answer.
+    """
+
+
+# A call that outlives its client helps nobody: an MCP client has usually given
+# up long before, so the work is spent producing an answer nothing is waiting
+# for -- and against the SEC it is a sustained request rate with no reader.
+DEFAULT_BUDGET_SECONDS = 120.0
+
+
+def _budget_seconds() -> float:
+    """Wall-clock budget for one call, from NEMO_SEC_TOOL_BUDGET_S.
+
+    An explicit `0` removes the bound, for an operator who genuinely wants an
+    unbounded sweep and knows they are waiting for it. Anything unparseable or
+    negative falls back to the default rather than being read as "no limit":
+    a typo in a tuning variable must not silently restore the seven-minute
+    call this bound exists to stop.
+    """
+    raw = os.environ.get("NEMO_SEC_TOOL_BUDGET_S", "").strip()
+    if not raw:
+        return DEFAULT_BUDGET_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_BUDGET_SECONDS
+    if value < 0:
+        return DEFAULT_BUDGET_SECONDS
+    return value
+
+
+class _Deadline:
+    """A wall-clock bound, checked between units of work.
+
+    Checked between filings and between concepts rather than interrupting one
+    in flight: a parse already running is left to finish. The overshoot is
+    therefore bounded by a single filing parse rather than by the whole walk,
+    which is the honest trade -- cancelling a parse would need a thread nobody
+    can join, and a half-parsed filing is not a result.
+    """
+
+    def __init__(self, seconds: float, label: str):
+        self._budget = seconds
+        self._label = label
+        self._started = time.monotonic()
+        self.filings_parsed = 0
+        self.concepts_read = 0
+
+    @property
+    def elapsed(self) -> float:
+        return time.monotonic() - self._started
+
+    def check(self, doing: str) -> None:
+        if self._budget <= 0:
+            return
+        elapsed = self.elapsed
+        if elapsed <= self._budget:
+            return
+        # Phrased to say only what the fetch did, never what the filer
+        # discloses -- the rule test_outage_is_not_a_finding enforces. A chain
+        # abandoned to the clock was not evaluated, and an empty result here
+        # would read as a coverage gap the filings were never asked about.
+        raise ToolTimeout(
+            f"{self._label} exceeded its {self._budget:g}s budget: still "
+            f"{doing} after {elapsed:.1f}s, having parsed "
+            f"{self.filings_parsed} filing(s) and read "
+            f"{self.concepts_read} concept(s). No partial result is returned: "
+            f"the concept chains it never reached would be indistinguishable "
+            f"from empty ones once written into the output. Raise "
+            f"NEMO_SEC_TOOL_BUDGET_S (or set it to 0 for no bound) to allow "
+            f"longer.")
+
+
+class _SharedFilings:
+    """Filings for one ticker, parsed once and read by every concept.
+
+    Keyed two ways on purpose. The filing *list* depends on (form, limit), so
+    that is what caches a list. The parsed XBRL is keyed by accession, so
+    `get_operating_leases` -- which asks for `limit` filings for the balance
+    concepts and 1 for each maturity bucket -- parses the newest filing once
+    and not twice.
+    """
+
+    def __init__(self, ticker: str, deadline: _Deadline):
+        self._ticker = ticker
+        self._deadline = deadline
+        self._lists: Dict[Tuple[str, int], List[Tuple[Any, Any]]] = {}
+        self._parsed: Dict[str, Any] = {}
+
+    def _walk(self, form: str, limit: int) -> List[Tuple[Any, Any]]:
+        """(filing, parsed xbrl) for each filing, parsed at most once."""
+        cached = self._lists.get((form, limit))
+        if cached is not None:
+            return cached
+
+        sec_series._require_identity()
+        company = sec_series.Company(self._ticker)
+        # amendments=False for the reason fetch_concept_series gives: a 10-K/A
+        # carrying only Part III takes a slot in the walk and hides the real
+        # 10-K behind it.
+        filings = company.get_filings(
+            form=form, amendments=False).head(limit)
+
+        walked: List[Tuple[Any, Any]] = []
+        for filing in filings:
+            self._deadline.check(
+                f"parsing {self._ticker}'s {form} filings")
+            accession = str(getattr(filing, "accession_no", "") or "")
+            if accession and accession in self._parsed:
+                walked.append((filing, self._parsed[accession]))
+                continue
+            sec_series._throttle()
+            try:
+                xbrl = filing.xbrl()
+            except Exception:
+                # One unparseable filing must not sink the series -- the same
+                # rule fetch_concept_series applies, applied once per filing
+                # here instead of once per filing per concept.
+                continue
+            if xbrl is None:
+                continue
+            if accession:
+                self._parsed[accession] = xbrl
+            self._deadline.filings_parsed += 1
+            walked.append((filing, xbrl))
+
+        self._lists[(form, limit)] = walked
+        return walked
+
+    def series(self, concept: str, form: str, limit: int) -> List[Any]:
+        """Every fact for one concept, across the filings already walked.
+
+        Raises NotCovered exactly where `fetch_concept_series` does, so
+        `_series` keeps its "swallow NotCovered, propagate everything else"
+        contract unchanged.
+        """
+        points: List[Any] = []
+        for filing, xbrl in self._walk(form, limit):
+            self._deadline.check(
+                f"reading {concept} from {self._ticker}'s {form} filings")
+            try:
+                point = sec_series.concept_point(
+                    xbrl, concept,
+                    filing_date=str(filing.filing_date),
+                    form=str(filing.form),
+                    accession=str(getattr(filing, "accession_no", "")))
+            except Exception:
+                continue
+            self._deadline.concepts_read += 1
+            if point is not None:
+                points.append(point)
+
+        if not points:
+            raise NotCovered(
+                f"{self._ticker}: concept {concept!r} found in none of the "
+                f"last {limit} {form} filings")
+        return points
+
+
+# Per-thread, because the MCP server hands each tool call to its own worker via
+# asyncio.to_thread. Cleared in a finally: pool threads are reused, and a walk
+# left behind would serve one ticker's filings to the next ticker's call.
+_ACTIVE = threading.local()
+
+
+@contextmanager
+def _shared_filings(ticker: str, deadline: _Deadline) -> Iterator[None]:
+    """Share one filing walk across every `_series` call in this block.
+
+    Skipped when `fetch_concept_series` has been replaced. The tests swap that
+    name for a stub serving canned FilingPoints, and several of them assert
+    what happens when it raises; honouring the replacement matters more than
+    the speedup, and there are no real filings to share in that case anyway.
+    """
+    if fetch_concept_series is not sec_series.fetch_concept_series:
+        yield
+        return
+    previous = getattr(_ACTIVE, "walk", None)
+    _ACTIVE.walk = _SharedFilings(ticker, deadline)
+    try:
+        yield
+    finally:
+        _ACTIVE.walk = previous
+
+
+def _concept_series(ticker: str, concept: str, form: str,
+                    limit: int) -> List[Any]:
+    """One concept's series, reusing filings already parsed for this call.
+
+    With no shared walk active this is `fetch_concept_series` verbatim, which
+    is what keeps that name the seam the tests replace.
+    """
+    walk = getattr(_ACTIVE, "walk", None)
+    if walk is None:
+        return fetch_concept_series(ticker, concept, form=form, limit=limit)
+    return walk.series(concept, form, limit)
+
+
 def _period_bounds(period: str) -> Tuple[str, int]:
     """(period end date, span in days) for a fact's period label.
 
@@ -177,14 +409,20 @@ def _series(ticker: str, concepts: Sequence[str], form: str,
 
     Only NotCovered is swallowed, and only to try the next concept. A network
     failure or an unknown ticker propagates: reporting an outage as "this filer
-    does not disclose it" is the one answer worse than an error.
+    does not disclose it" is the one answer worse than an error. ToolTimeout is
+    not swallowed either, for the same reason: a chain abandoned to the clock
+    is not a chain the filer does not tag.
+
+    Every concept still costs a lookup, but under `_shared_filings` the
+    lookups share one parse of each filing instead of re-walking EDGAR per
+    concept. The evaluation order and the freshness rule are untouched.
     """
     best_rows: Dict[str, Dict[str, Any]] = {}
     best_concept: Optional[str] = None
     best_end = ""
     for concept in concepts:
         try:
-            points = fetch_concept_series(ticker, concept, form=form, limit=limit)
+            points = _concept_series(ticker, concept, form, limit)
         except NotCovered:
             continue
         rows = _by_period(points)
@@ -240,10 +478,16 @@ def get_accruals_quality(ticker: str, limit: int = 2,
     periods of history.
     """
     tried = _flat((NET_INCOME_CONCEPTS, OCF_CONCEPTS, ASSETS_CONCEPTS))
+    deadline = _Deadline(_budget_seconds(), f"get_accruals_quality({ticker})")
     try:
-        ni_rows, ni_concept = _series(ticker, NET_INCOME_CONCEPTS, form, limit)
-        ocf_rows, ocf_concept = _series(ticker, OCF_CONCEPTS, form, limit)
-        asset_rows, asset_concept = _series(ticker, ASSETS_CONCEPTS, form, limit)
+        with _shared_filings(ticker, deadline):
+            ni_rows, ni_concept = _series(ticker, NET_INCOME_CONCEPTS, form, limit)
+            ocf_rows, ocf_concept = _series(ticker, OCF_CONCEPTS, form, limit)
+            asset_rows, asset_concept = _series(ticker, ASSETS_CONCEPTS, form, limit)
+    except ToolTimeout as exc:
+        return {"ticker": ticker, "success": False, "timed_out": True,
+                "error": str(exc), "periods": [], "latest": None,
+                "trend": None, "flag": None, "concepts_tried": tried}
     except Exception as exc:  # noqa: BLE001 - surface the failure, never mask it
         return {"ticker": ticker, "success": False,
                 "error": f"fetching earnings-quality concepts failed: {exc}",
@@ -360,13 +604,20 @@ def get_working_capital_trends(ticker: str, limit: int = 2,
     """
     tried = _flat((REVENUE_CONCEPTS, COST_OF_REVENUE_CONCEPTS,
                    RECEIVABLES_CONCEPTS, INVENTORY_CONCEPTS, PAYABLES_CONCEPTS))
+    deadline = _Deadline(_budget_seconds(),
+                         f"get_working_capital_trends({ticker})")
     try:
-        rev_rows, rev_concept = _series(ticker, REVENUE_CONCEPTS, form, limit)
-        cogs_rows, cogs_concept = _series(
-            ticker, COST_OF_REVENUE_CONCEPTS, form, limit)
-        ar_rows, ar_concept = _series(ticker, RECEIVABLES_CONCEPTS, form, limit)
-        inv_rows, inv_concept = _series(ticker, INVENTORY_CONCEPTS, form, limit)
-        ap_rows, ap_concept = _series(ticker, PAYABLES_CONCEPTS, form, limit)
+        with _shared_filings(ticker, deadline):
+            rev_rows, rev_concept = _series(ticker, REVENUE_CONCEPTS, form, limit)
+            cogs_rows, cogs_concept = _series(
+                ticker, COST_OF_REVENUE_CONCEPTS, form, limit)
+            ar_rows, ar_concept = _series(ticker, RECEIVABLES_CONCEPTS, form, limit)
+            inv_rows, inv_concept = _series(ticker, INVENTORY_CONCEPTS, form, limit)
+            ap_rows, ap_concept = _series(ticker, PAYABLES_CONCEPTS, form, limit)
+    except ToolTimeout as exc:
+        return {"ticker": ticker, "success": False, "timed_out": True,
+                "error": str(exc), "periods": [], "latest": None,
+                "concepts_tried": tried}
     except Exception as exc:  # noqa: BLE001
         return {"ticker": ticker, "success": False,
                 "error": f"fetching working-capital concepts failed: {exc}",
@@ -497,22 +748,29 @@ def get_operating_leases(ticker: str, limit: int = 1,
                       LEASE_PAYMENTS_TOTAL_CONCEPTS,
                       LEASE_IMPUTED_INTEREST_CONCEPTS)
     tried = _flat(tuple(balance_chains) + tuple(LEASE_MATURITY_CONCEPTS.values()))
+    deadline = _Deadline(_budget_seconds(), f"get_operating_leases({ticker})")
     try:
-        total_rows, _ = _series(ticker, LEASE_LIABILITY_CONCEPTS, form, limit)
-        current_rows, _ = _series(
-            ticker, LEASE_LIABILITY_CURRENT_CONCEPTS, form, limit)
-        noncurrent_rows, _ = _series(
-            ticker, LEASE_LIABILITY_NONCURRENT_CONCEPTS, form, limit)
-        rou_rows, _ = _series(ticker, ROU_ASSET_CONCEPTS, form, limit)
-        payments_rows, _ = _series(
-            ticker, LEASE_PAYMENTS_TOTAL_CONCEPTS, form, limit)
-        interest_rows, _ = _series(
-            ticker, LEASE_IMPUTED_INTEREST_CONCEPTS, form, limit)
-        schedule: Dict[str, Optional[float]] = {}
-        for bucket, concepts in LEASE_MATURITY_CONCEPTS.items():
-            rows, _ = _series(ticker, concepts, form, 1)
-            # None means untagged; 0.0 means the filer disclosed nothing due.
-            schedule[bucket] = _latest_value(rows)
+        with _shared_filings(ticker, deadline):
+            total_rows, _ = _series(ticker, LEASE_LIABILITY_CONCEPTS, form, limit)
+            current_rows, _ = _series(
+                ticker, LEASE_LIABILITY_CURRENT_CONCEPTS, form, limit)
+            noncurrent_rows, _ = _series(
+                ticker, LEASE_LIABILITY_NONCURRENT_CONCEPTS, form, limit)
+            rou_rows, _ = _series(ticker, ROU_ASSET_CONCEPTS, form, limit)
+            payments_rows, _ = _series(
+                ticker, LEASE_PAYMENTS_TOTAL_CONCEPTS, form, limit)
+            interest_rows, _ = _series(
+                ticker, LEASE_IMPUTED_INTEREST_CONCEPTS, form, limit)
+            schedule: Dict[str, Optional[float]] = {}
+            for bucket, concepts in LEASE_MATURITY_CONCEPTS.items():
+                rows, _ = _series(ticker, concepts, form, 1)
+                # None means untagged; 0.0 means the filer disclosed nothing due.
+                schedule[bucket] = _latest_value(rows)
+    except ToolTimeout as exc:
+        return {"ticker": ticker, "success": False, "timed_out": True,
+                "error": str(exc), "lease_liability": None,
+                "maturity_schedule": {}, "periods": [],
+                "concepts_tried": tried}
     except Exception as exc:  # noqa: BLE001
         return {"ticker": ticker, "success": False,
                 "error": f"fetching operating-lease concepts failed: {exc}",
