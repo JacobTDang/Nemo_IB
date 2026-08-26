@@ -1620,7 +1620,21 @@ class SECFilingParser:
 
         try:
             filings = Company(ticker).get_filings(form='DEF 14A')
-            if not filings: return {'ticker': ticker, 'board_members': [], 'candidates': [], 'success': False}
+            if not filings:
+                # success:False with no error at all -- a caller could not log
+                # it, act on it, or tell it from any other failure. Foreign
+                # private issuers are the common case: proxy statements are a
+                # domestic filing, so TSM has none by definition rather than
+                # by omission.
+                return {
+                    'ticker': ticker, 'board_members': [], 'candidates': [],
+                    'success': False,
+                    'error': (f'No DEF 14A (proxy statement) on EDGAR for '
+                              f'{ticker}. Foreign private issuers file none: '
+                              f'proxy statements are a domestic requirement, '
+                              f'and board data for such a filer is in its '
+                              f'20-F or 40-F instead.'),
+                }
             latest = filings[0]
             html, text = safe_get_html(latest), safe_get_text(latest)
 

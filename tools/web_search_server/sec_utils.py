@@ -460,7 +460,8 @@ def get_disclosures_names(ticker:str, form_type: str = '10-K') -> Dict[str, Any]
   return {
     'ticker': ticker,
     'success': False,
-    'error': f'Unable to get disclosures for {ticker}',
+    'error': _filing_miss(ticker, form_type,
+                          f'Unable to get disclosures for {ticker}'),
     'disclosure_names': None
   }
 
@@ -922,7 +923,8 @@ def get_capex_pct_revenue(ticker: str, form_type: str = '10-K') -> Dict[str, Any
       }
     else:
       return {
-        'error': f"Unable to get xbrl data for: {ticker}",
+        'error': _filing_miss(ticker, form_type,
+                              f"Unable to get xbrl data for: {ticker}"),
         'success': False
       }
 
@@ -991,7 +993,8 @@ def get_tax_rate(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
 
     else:
       return{
-        'error': f'Unable to get xbrl data',
+        'error': _filing_miss(ticker, form_type,
+                              f'Unable to get xbrl data for {ticker}'),
         'success': False
       }
   except Exception as e:
@@ -1856,7 +1859,9 @@ def diff_10k(ticker: str, item: str = '1A',
 
   if len(filings) < 2:
     return {'ticker': ticker, 'success': False,
-            'error': f'Need 2+ 10-K filings to diff, found {len(filings)}'}
+            'error': _filing_miss(
+              ticker, '10-K',
+              f'Need 2+ 10-K filings to diff, found {len(filings)}')}
 
   def _filing_year(f):
     return int(str(f.filing_date)[:4])
@@ -1970,7 +1975,9 @@ def get_supply_chain(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
   try:
     filing_data = get_latest_filing(ticker, form_type)
     if not filing_data:
-      return {'ticker': ticker, 'success': False, 'error': 'no filing'}
+      return {'ticker': ticker, 'success': False,
+              'error': _filing_miss(ticker, form_type,
+                                    f'No {form_type} filing found for {ticker}')}
     filing_obj = filing_data.get('filing_object')
     if filing_obj is None:
       return {'ticker': ticker, 'success': False, 'error': 'no filing object'}
@@ -4127,7 +4134,8 @@ def extract_customer_concentration(ticker: str,
     filing_data = get_latest_filing(ticker, form_type)
     if not filing_data:
       return _concentration_failure(
-        ticker, f'No {form_type} filing found for {ticker}')
+        ticker, _filing_miss(ticker, form_type,
+                             f'No {form_type} filing found for {ticker}'))
 
     filing_obj = filing_data.get('filing_object')
     if filing_obj is None:
