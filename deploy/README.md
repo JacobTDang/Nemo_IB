@@ -48,11 +48,17 @@ claude mcp add --transport http nemo-altdata   http://<host>:8814/mcp/
 
 | Server | Port | Module | Tools |
 |---|---|---|---|
-| SEC EDGAR | 8810 | `tools.web_search_server.web_search` | 42 of 45 |
-| Market data and modelling | 8811 | `tools.financial_modeling_engine.analysis_tools` | 19 |
+| SEC EDGAR | 8810 | `tools.web_search_server.web_search` | 48 of 50 |
+| Market data and modelling | 8811 | `tools.financial_modeling_engine.analysis_tools` | 20 |
 | Finnhub | 8812 | `tools.news_agregator.finnhub_server` | 14 |
 | FRED macro | 8813 | `tools.news_agregator.fred_server` | 5 |
-| Alt data | 8814 | `tools.altdata_server.server` | 5 |
+| Alt data | 8814 | `tools.altdata_server.server` | 9 |
+
+96 tools served. The SEC server declares 50 and serves 48: `rag_search` and
+`rag_ingest` are capability-gated and hidden without the RAG stack, which the
+image does not install. Counts here are measured, not maintained -- run
+`python -m tools.manifest` inside a container to reproduce them, and note it
+reports what *that* environment can serve rather than a fixed number.
 
 **Register the URL with its trailing slash.** `Mount` only matches `/mcp/`, so
 posting to `/mcp` answers `307` and every single call pays an extra round trip.

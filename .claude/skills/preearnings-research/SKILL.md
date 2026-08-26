@@ -27,7 +27,7 @@ Conversation context decays; the DB does not. Three hard habits:
    News-digest template:
    ```
    News digest for {TICKER} ahead of {EARNINGS_DATE}.
-   Read mcp__nemo_finnhub__get_company_news({TICKER}, last 30d) IN FULL and
+   Read mcp__nemo-finnhub__get_company_news({TICKER}, last 30d) IN FULL and
    score sentiment yourself from the headline and summary text.
    Return STRICT JSON only — no article text: {"component":"news_digest",
    "net_sentiment":X,"direction":"...","overhangs":["<one line each>"],

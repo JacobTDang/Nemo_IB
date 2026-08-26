@@ -33,7 +33,7 @@ already recorded.
 
 ### 2. Pull the post-tick state
 
-Call `mcp__nemo_financial__get_thesis_evolution` for each active thesis
+Call `mcp__nemo-financial__get_thesis_evolution` for each active thesis
 (or the specified thesis_id). Look at the most recent evolution entries
 since the tick.
 
@@ -49,12 +49,12 @@ For each thesis, classify its kill-switch status:
 ### 3. For each thesis with approaching/triggered status, gather evidence
 
 Pull the specific data points that fired the falsifier:
-- Revenue falsifiers → `mcp__nemo_web__get_segment_financials`
-- Short interest falsifiers → `mcp__nemo_financial__get_short_interest`
-- Macro falsifiers → `mcp__nemo_fred__get_macro_snapshot`
-- Management falsifiers → `mcp__nemo_finnhub__get_company_news`
+- Revenue falsifiers → `mcp__nemo-sec__get_segment_financials`
+- Short interest falsifiers → `mcp__nemo-financial__get_short_interest`
+- Macro falsifiers → `mcp__nemo-fred__get_macro_snapshot`
+- Management falsifiers → `mcp__nemo-finnhub__get_company_news`
   (search for executive change keywords)
-- Multiple expansion falsifiers → `mcp__nemo_financial__get_market_data`
+- Multiple expansion falsifiers → `mcp__nemo-financial__get_market_data`
 
 Include the exact observed value in the output so the analyst can
 verify the trigger logic was correct (no false alarms).

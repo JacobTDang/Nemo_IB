@@ -20,8 +20,14 @@ question, not standalone thesis quality.
 
 ### 1. Snapshot the current book
 
-Call `mcp__nemo_alpaca__get_paper_positions` — returns current paper
+Call `mcp__nemo-alpaca__get_paper_positions` — returns current paper
 positions with ticker, quantity, market value, and current price.
+
+> **Requires the alpaca server, which the homelab image does not ship.**
+> It places orders, and a data-source host holds no positions and should
+> not be able to trade. Without it this step has no source of positions:
+> ask for them rather than reporting an empty portfolio, which reads as
+> "you hold nothing" instead of "I cannot see what you hold".
 
 **Empty-book early return:**
 If `positions == []` OR total portfolio value == 0:
@@ -38,7 +44,7 @@ Otherwise compute:
 
 ### 2. Decompose existing exposures
 
-Call `mcp__nemo_financial__analyze_exposures` — pulls active theses
+Call `mcp__nemo-financial__analyze_exposures` — pulls active theses
 from the DB and classifies them into factor buckets via the
 `exposure_analyzer` taxonomy (ai_capex_long, memory_cycle,
 rate_sensitive_long_duration, rate_sensitive_short_duration,
@@ -53,8 +59,8 @@ Record:
 
 For the proposed ticker, identify its factor buckets:
 - Direct ticker match in the exposure_analyzer taxonomy?
-- Sector match (call `mcp__nemo_finnhub__get_company_profile`)
-- Theme match (call `mcp__nemo_financial__get_industry_etfs` and check
+- Sector match (call `mcp__nemo-finnhub__get_company_profile`)
+- Theme match (call `mcp__nemo-financial__get_industry_etfs` and check
   if ticker appears in any returned ETF top holdings)
 
 ### 4. Compute the marginal exposure
@@ -69,7 +75,7 @@ For each factor bucket the proposed ticker belongs to:
 For each existing position in the same factor buckets:
 - Flag as a "duplicate exposure" pair if both names share > 1 factor
 - Compute a rough correlation proxy: 60-day rolling correlation via
-  `mcp__nemo_financial__get_price_history` for both tickers (small
+  `mcp__nemo-financial__get_price_history` for both tickers (small
   data window OK — this is a sanity check, not a Barra factor model)
 
 ### 6. Determine recommended sizing
