@@ -1,9 +1,19 @@
 """Unit tests for the terminal-multiple sensitivity sweep in _scenario_dcf_math.
 
-The main bear/base/bull output uses the conservative min(perpetuity, exit_multiple)
-terminal value. The new terminal_sensitivity field strips the perpetuity floor and
-shows pure exit-multiple PT across five multiples per scenario, so the analyst can
-see how load-bearing the terminal multiple assumption is.
+Every price in the payload -- the headline bear/base/bull PT and every cell of
+the terminal_sensitivity grid -- is built on the same conservative
+min(perpetuity, exit_multiple) terminal value, so the grid is a real
+sensitivity of the headline and the cell at the base multiple reproduces it.
+
+The grid used to strip the perpetuity floor and price the pure exit multiple
+instead, which put two prices from two methods side by side with nothing to
+tell them apart: NVDA's base case read 151.96 beside a 25x cell of 303.54.
+See testing/test_scenario_grid_matches_its_headline.py for that defect.
+
+The sweep still answers how load-bearing the terminal multiple is. Where the
+perpetuity binds across the whole sweep the row is flat, which is the true
+answer -- the multiple is setting nothing -- and terminal_sensitivity_floor_note
+says so.
 
 Run:
   .venv\\Scripts\\python.exe testing\\test_scenario_dcf_sensitivity.py
@@ -81,34 +91,38 @@ def test_sensitivity_shape():
 
 
 def test_sensitivity_monotonic_in_multiple():
-  print("\n== sensitivity is monotonically increasing in multiple ==")
+  print("\n== sensitivity is monotonically non-decreasing in multiple ==")
   result = _run(terminal_multiple=15.0)
   for case in ('bear', 'base', 'bull'):
     row = result['terminal_sensitivity'][case]
     px = [row['11.0x'], row['13.0x'], row['15.0x'], row['17.0x'], row['19.0x']]
     is_sorted = all(px[i] <= px[i + 1] for i in range(len(px) - 1))
-    spread = max(px) - min(px)
-    _check(f"{case}: prices increase with multiple",
+    _check(f"{case}: prices never fall as the multiple rises",
            is_sorted, hint=f"px={px}")
-    _check(f"{case}: spread > 0 (multiple is doing work)",
-           spread > 0, hint=f"spread={spread}")
+    # A flat row is an answer, not a bug: the perpetuity is binding at every
+    # multiple in the sweep, so the exit multiple sets nothing. It has to say
+    # so rather than look like a broken table.
+    if max(px) - min(px) == 0:
+      _check(f"{case}: a flat row is explained",
+             bool(result.get('terminal_sensitivity_floor_note')),
+             hint="flat row with no floor note")
 
 
-def test_sensitivity_uses_pure_exit_multiple_not_min():
-  print("\n== sensitivity strips perpetuity floor ==")
-  # With this profile the perpetuity floor binds in the main output (the
-  # _dcf_math min() picks the lower of growth-perpetuity and exit-multiple).
-  # The sensitivity row at the base multiple should therefore be >= the main
-  # base PT, and meaningfully different from it.
+def test_sensitivity_agrees_with_the_headline_at_the_base_multiple():
+  print("\n== sensitivity is a sensitivity of the headline ==")
+  # The one cell whose answer is already known. Priced on a different terminal
+  # method it came out at twice the headline; priced on the same one it has to
+  # reproduce it exactly.
   result = _run(terminal_multiple=15.0)
-  main_base = result['base']['price_per_share']
-  sens_base_at_base = result['terminal_sensitivity']['base']['15.0x']
-  _check("sensitivity@15x >= main base PT (no perpetuity floor)",
-         sens_base_at_base >= main_base,
-         hint=f"main={main_base} sens@15x={sens_base_at_base}")
-  _check("sensitivity@15x meaningfully differs from main base PT",
-         abs(sens_base_at_base - main_base) > 0.5,
-         hint=f"diff={abs(sens_base_at_base - main_base):.2f}")
+  for case in ('bear', 'base', 'bull'):
+    main = result[case]['price_per_share']
+    cell = result['terminal_sensitivity'][case]['15.0x']
+    _check(f"{case}: sensitivity@15x == headline PT",
+           abs(cell - main) <= 0.02,
+           hint=f"main={main} sens@15x={cell}")
+  _check("the grid states the rule it applies",
+         'min' in (result.get('terminal_sensitivity_method') or '').lower(),
+         hint=str(result.get('terminal_sensitivity_method'))[:80])
 
 
 def test_perpetuity_only_mode_skips_sensitivity():
@@ -138,7 +152,7 @@ def main() -> int:
   test_sensitivity_present_when_exit_multiple_positive()
   test_sensitivity_shape()
   test_sensitivity_monotonic_in_multiple()
-  test_sensitivity_uses_pure_exit_multiple_not_min()
+  test_sensitivity_agrees_with_the_headline_at_the_base_multiple()
   test_perpetuity_only_mode_skips_sensitivity()
   test_existing_keys_still_present()
 

@@ -69,6 +69,74 @@ def cross_currency_note(quote_currency, filing_currency) -> str:
             f"figures with an explicit currency.")
 
 
+def missing_inputs_note(ticker: str, multiples, missing: List[str]) -> str:
+    """Why a multiple is absent, naming the inputs the provider did not report.
+
+    `multiples` is one name or several. Several share a sentence when they
+    share a cause -- a missing market cap takes pe_ratio and pb_ratio together,
+    and saying it twice reads as two separate problems.
+
+    `multiples_suppressed_reason` was wired to the cross-currency and
+    negative-EV paths only, so a filer whose provider record is merely thin
+    lost its ratios with the explanation left null. MU is a US filer reporting
+    in USD; `marketCap` and `sharesOutstanding` both came back null, pe_ratio
+    and pb_ratio were dropped, and the field built to say why said nothing --
+    while provider_trailing_pe 21.249 sat in the same payload. A null reason
+    reads as "we could not obtain this multiple", which is the one thing it
+    was not: we declined to build it on an input that is missing rather than
+    zero.
+    """
+    names = [multiples] if isinstance(multiples, str) else list(multiples)
+    subject = (names[0] if len(names) == 1
+               else f"{', '.join(names[:-1])} and {names[-1]}")
+    verb = "is" if len(names) == 1 else "are"
+    inputs = " and no ".join(missing)
+    return (f"{subject} {verb} not reported for {ticker}: the market-data "
+            f"provider returned no {inputs}. An absent input is not a zero, "
+            f"so the ratio is refused rather than computed against a "
+            f"substitute.")
+
+
+def non_positive_ev_note(ticker: str, enterprise_value, market_cap,
+                         total_debt, cash) -> str:
+    """Why EV multiples are refused on an enterprise value at or below zero.
+
+    The provider reports -233.9bn for BRK-B while its own market cap plus debt
+    less cash is +842.7bn, because it counts Berkshire's insurance investments
+    as cash. Left alone that produced ev_revenue -0.61 and ev_ebitda -1.79 --
+    not cheap valuations but non-valuations, which sort below zero and read as
+    the cheapest name in any comp table they land in.
+    """
+    substitute = (market_cap or 0) + (total_debt or 0) - (cash or 0)
+    return (f"EV multiples are not reported: the provider's enterprise value "
+            f"for {ticker} is {enterprise_value:,.0f}, which is not positive. "
+            f"A multiple over a non-positive numerator has no ordering and "
+            f"sorts below every real one. Market cap plus debt less cash is "
+            f"{substitute:,.0f} if you need a substitute.")
+
+
+def _absent(value) -> bool:
+    """Whether a provider figure is missing. NaN counts as missing.
+
+    A NaN reaching a ratio produces a NaN, which `_json_safe` turns into a
+    null at the very end -- indistinguishable from a field the provider never
+    sent, and therefore just as much in need of an explanation.
+    """
+    if value is None:
+        return True
+    return isinstance(value, float) and value != value
+
+
+# The two inputs each multiple divides. Ordered so the report reads the way an
+# analyst would list them.
+_MULTIPLE_INPUTS = ('pe_ratio', 'pb_ratio', 'ev_revenue', 'ev_ebitda', 'ev_ebit')
+
+# An input more than one multiple depends on. Its absence takes a whole block
+# of ratios with it, which is what makes it worth stating at the top level
+# rather than only per-multiple.
+_SHARED_INPUTS = ('marketCap', 'enterpriseValue')
+
+
 # Identity fields a resolved quote carries. Measured against live yfinance: a
 # symbol that does not exist comes back as `{'trailingPegRatio': None}` with an
 # empty `history_metadata`, while a real filer carries 189 info keys and 28
@@ -239,17 +307,14 @@ def get_data(ticker: str) -> Dict[str, Any]:
   # kept; only the ratios built on it go.
   ev_usable = (data['enterpriseValue'] is not None
                and data['enterpriseValue'] > 0)
+  ev_reason = None
   if comparable and not ev_usable and data['enterpriseValue'] is not None:
-    reason = (
-        f"EV multiples are not reported: the provider's enterprise value for "
-        f"{ticker} is {data['enterpriseValue']:,.0f}, which is not positive. "
-        f"A multiple over a non-positive numerator has no ordering and sorts "
-        f"below every real one. Market cap plus debt less cash is "
-        f"{(data['marketCap'] or 0) + (data['totalDebt'] or 0) - (data['cash'] or 0):,.0f} "
-        f"if you need a substitute.")
+    ev_reason = non_positive_ev_note(
+        ticker, data['enterpriseValue'], data['marketCap'],
+        data['totalDebt'], data['cash'])
     existing = data.get('multiples_suppressed_reason')
     data['multiples_suppressed_reason'] = (
-        f"{existing} {reason}" if existing else reason)
+        f"{existing} {ev_reason}" if existing else ev_reason)
 
   # calculate multiples -- each wrapped independently so one failure doesn't skip all
   try:
@@ -292,6 +357,63 @@ def get_data(ticker: str) -> Dict[str, Any]:
           f"EBIT ending {data.get('ebit_period_end')}")
   except Exception as e:
     print(f'Error calculating EV/EBIT for {ticker}: {str(e)}', file=sys.stderr)
+
+  # Every multiple that ended up absent, with the input that made it absent.
+  # Suppression used to be explained only where a whole block went at once
+  # (cross-currency, non-positive EV); anything narrower left the ratio null
+  # and the reason null beside it. Downstream, comparable_company_analysis
+  # then had nothing to attribute its exclusions to and asserted one fixed
+  # cause for all of them.
+  divisors = {
+    'pe_ratio':   {'marketCap': data['marketCap'],
+                   'netIncomeToCommon': data['netIncomeToCommon']},
+    'pb_ratio':   {'marketCap': data['marketCap'],
+                   'book value': book_value},
+    'ev_revenue': {'enterpriseValue': data['enterpriseValue'],
+                   'revenue': data['revenue']},
+    'ev_ebitda':  {'enterpriseValue': data['enterpriseValue'],
+                   'EBITDA': data['EBITDA']},
+    'ev_ebit':    {'enterpriseValue': data['enterpriseValue'],
+                   'EBIT': data['EBIT']},
+  }
+  detail = {}
+  shared_absences = []
+  for name in _MULTIPLE_INPUTS:
+    if not _absent(data.get(name)):
+      continue
+    if not comparable:
+      detail[name] = data['multiples_suppressed_reason']
+      continue
+    if ev_reason is not None and name.startswith('ev_'):
+      detail[name] = ev_reason
+      continue
+    missing = [label for label, value in divisors[name].items()
+               if _absent(value)]
+    if missing:
+      detail[name] = missing_inputs_note(ticker, name, missing)
+      shared = tuple(label for label in missing if label in _SHARED_INPUTS)
+      if shared:
+        shared_absences.append((shared, name))
+    else:
+      # Both divisors present and the ratio still absent: the calculation
+      # itself raised and was logged to stderr. Say that rather than blame an
+      # input that was there.
+      detail[name] = (
+          f"{name} is not reported for {ticker}: both inputs were present but "
+          f"the ratio could not be computed from them.")
+
+  # An input several multiples share takes a block of them with it, which is
+  # what earns a top-level statement. A single missing line item does not: it
+  # would turn multiples_suppressed_reason non-null for healthy filers and
+  # cost the field its meaning.
+  if detail and data['multiples_suppressed_reason'] is None and shared_absences:
+    grouped = {}
+    for shared, name in shared_absences:
+      grouped.setdefault(shared, []).append(name)
+    data['multiples_suppressed_reason'] = " ".join(
+        missing_inputs_note(ticker, names, list(shared))
+        for shared, names in grouped.items())
+  data['multiples_suppressed_detail'] = detail or None
 
   return _json_safe(data)
 

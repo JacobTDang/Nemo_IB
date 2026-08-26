@@ -93,6 +93,8 @@ Should NOT use: When there are no truly comparable public companies, or if the e
 
 scenario_dcf_description = """Runs the DCF model under three scenarios (Bear / Base / Bull) using different revenue growth rates and EBITDA margin assumptions. Returns a price-per-share range across all three cases.
 
+Every price in the payload -- the headline bear/base/bull price and every cell of terminal_sensitivity -- uses the same conservative min(perpetuity, exit multiple) terminal value, so the grid cell at terminal_sensitivity_base_multiple equals that scenario's headline price. terminal_value_method on each scenario names which of the two is binding; where the perpetuity binds across the whole sweep the row is flat and terminal_sensitivity_floor_note says so.
+
 MODELING PHASE ONLY -- called by the Financial Modeling Agent, not the execution engine.
 
 Data that must be in the variable store before modeling:
@@ -108,6 +110,8 @@ Data that must be in the variable store before modeling:
 - historical income statement           <- get_financial_statements ic annual (for margin trend)"""
 
 lbo_description = """Leveraged buyout model. Computes IRR and MOIC to equity given entry EV, debt structure (leverage turns, interest rate), and exit multiple over a hold period.
+
+Refuses rather than modelling an impossible structure: entry EBITDA at or below zero (nothing to lever, to service the debt, or to price the exit off), an exit_multiple at or below zero (a non-positive exit enterprise value), a hold_years below 1, and acquisition debt meeting or exceeding entry_ev. Each refusal names the input to change.
 
 MODELING PHASE ONLY -- called by the Financial Modeling Agent, not the execution engine.
 ONLY run when the user query involves M&A, private equity, buyout potential, or takeout analysis.
@@ -165,7 +169,8 @@ def _to_native(obj):
   return obj
 
 
-def peer_distribution(values, *, lower=0.0, upper=1000.0) -> dict:
+def peer_distribution(values, *, lower=0.0, upper=1000.0,
+                      tickers=None, reasons=None) -> dict:
   """Summary statistics over comparable multiples only.
 
   A multiple built on a denominator approaching zero is arithmetically correct
@@ -180,19 +185,56 @@ def peer_distribution(values, *, lower=0.0, upper=1000.0) -> dict:
 
   Exclusions are counted and explained. A distribution quietly computed over a
   different set than the caller asked for is worse than one that says so.
+
+  `tickers` and `reasons` carry the cause of each absence down from the
+  caller. Without them this function knows a value is missing and nothing
+  about why, and it used to fill that gap with one fixed sentence -- "a
+  foreign issuer whose multiples are suppressed across currencies, or a filer
+  tagging nothing" -- printed over every exclusion regardless of cause. Run
+  against MU, BRK-B and ZZZZNOTREAL the real causes were a null provider
+  market cap, a negative enterprise value, and a symbol that is not a company;
+  the counts were right and the stated reason was wrong for all three. An
+  analyst told "foreign issuer" goes looking for a currency problem that is
+  not there and never learns one of their comparables does not exist.
   """
   supplied = list(values or [])
-  numbers = [float(v) for v in supplied
-             if isinstance(v, (int, float)) and not isinstance(v, bool)
-             and v == v and abs(v) != float('inf')]
-  # A peer with no comparable multiple at all -- a foreign issuer whose
-  # cross-currency multiples are suppressed, or a filer that tags nothing --
-  # was filtered out before the count, so a four-name comp set reported
-  # "included 2, excluded 0" and published a median of the two that remained.
-  # Suppressing the multiple is right; making the peer disappear is not.
-  absent = len(supplied) - len(numbers)
-  kept = [v for v in numbers if lower < v <= upper]
-  implausible = len(numbers) - len(kept)
+  labels = list(tickers or [])
+  labels += [f"peer {i + 1}" for i in range(len(labels), len(supplied))]
+  reasons = dict(reasons or {})
+
+  def _is_number(v):
+    return (isinstance(v, (int, float)) and not isinstance(v, bool)
+            and v == v and abs(v) != float('inf'))
+
+  # A peer with no comparable multiple at all was filtered out before the
+  # count, so a four-name comp set reported "included 2, excluded 0" and
+  # published a median of the two that remained. Suppressing the multiple is
+  # right; making the peer disappear is not.
+  kept, excluded, absent, implausible = [], [], 0, 0
+  for label, value in zip(labels, supplied):
+    if not _is_number(value):
+      absent += 1
+      excluded.append({
+          'ticker': label,
+          'value': None,
+          'reason': reasons.get(label) or (
+              f"{label} reported no comparable multiple and no cause was "
+              f"supplied with the value"),
+      })
+      continue
+    number = float(value)
+    if lower < number <= upper:
+      kept.append(number)
+      continue
+    implausible += 1
+    excluded.append({
+        'ticker': label,
+        'value': number,
+        'reason': (
+            f"{label}'s multiple of {number:,.2f} falls outside "
+            f"({lower}, {upper}]: such a multiple comes from a denominator at "
+            f"or near zero, or from negative earnings, and is not comparable"),
+    })
   dropped = absent + implausible
 
   stats = {
@@ -203,23 +245,31 @@ def peer_distribution(values, *, lower=0.0, upper=1000.0) -> dict:
       'low': None, 'high': None,
   }
   if dropped:
-    parts = []
-    if absent:
-      parts.append(
-          f"{absent} peer(s) reported no comparable multiple -- a foreign "
-          f"issuer whose multiples are suppressed across currencies, or a "
-          f"filer tagging nothing")
-    if implausible:
-      parts.append(
-          f"{implausible} peer(s) fell outside ({lower}, {upper}]: such a "
-          f"multiple comes from a denominator at or near zero, or from "
-          f"negative earnings, and is not comparable")
-    stats['excluded_reason'] = (
-        "; ".join(parts) +
-        ". A distribution computed over a different set than the caller asked "
-        "for must say so.")
+    if tickers:
+      stats['excluded_reason'] = (
+          "; ".join(f"{e['ticker']}: {e['reason']}" for e in excluded) +
+          ". A distribution computed over a different set than the caller "
+          "asked for must say so.")
+    else:
+      # Called with bare values, so there is no cause to report. Saying so is
+      # the honest form; asserting one is how the misattribution started.
+      parts = []
+      if absent:
+        parts.append(
+            f"{absent} peer(s) reported no comparable multiple, with no cause "
+            f"supplied alongside the values")
+      if implausible:
+        parts.append(
+            f"{implausible} peer(s) fell outside ({lower}, {upper}]: such a "
+            f"multiple comes from a denominator at or near zero, or from "
+            f"negative earnings, and is not comparable")
+      stats['excluded_reason'] = (
+          "; ".join(parts) +
+          ". A distribution computed over a different set than the caller "
+          "asked for must say so.")
   stats['excluded_absent'] = absent
   stats['excluded_implausible'] = implausible
+  stats['excluded_peers'] = excluded
   if not kept:
     return stats
 
@@ -487,7 +537,52 @@ def _lbo_math(entry_ev: float, revenue_base: float, ebitda_margin: float,
   revenue_growth = [as_rate('revenue_growth', g, allow_negative=True)
                     for g in (revenue_growth or [])]
 
+  # An exit multiple at or below zero is not a structure. At -5x the model
+  # produced exit_ev -241,576,500,000 -- a manufactured negative enterprise
+  # value, the class get_market_data already refuses to build multiples on --
+  # and then floored equity_proceeds to 0.0, so the payload read as an
+  # ordinary wiped-out deal: moic 0.0, irr_pct -100.0, success true. A client
+  # charting MOIC across exit multiples gets a clean zero where they should
+  # get an error.
+  if exit_multiple is None or exit_multiple <= 0:
+    raise ValueError(
+      f"exit_multiple must be greater than zero, received {exit_multiple}. "
+      f"At or below zero the exit enterprise value is not positive, which is "
+      f"not a low valuation but no valuation at all -- and the equity "
+      f"proceeds floor at zero, making an invalid input indistinguishable "
+      f"from a deal that went to zero.")
+
+  # MOIC ** (1 / hold_years) divides by the hold period, so a zero one left
+  # the tool answering "Failed to call tool 'calculate_lbo': float division by
+  # zero" -- a stack-trace fragment that names neither the input nor the fix.
+  if hold_years is None or hold_years < 1:
+    raise ValueError(
+      f"hold_years must be at least 1, received {hold_years}. There is no "
+      f"entry and exit inside a zero-length hold, so there is no return to "
+      f"annualise. Raise hold_years.")
+
   entry_ebitda = revenue_base * ebitda_margin
+  # Every figure below is sized off entry EBITDA: the debt, the exit
+  # enterprise value, and the cash that services the debt in between. With
+  # none of it the model reported entry_multiple 0 on a 5,115,451,801,600
+  # purchase -- a claim that a $5.1tn company was bought at 0x EBITDA -- next
+  # to debt_amount 0.0 and leverage_turns_entry 5, which cannot both be true,
+  # and moic 0.0 with success true.
+  #
+  # calculate_dcf meets the same division and answers None with a note,
+  # because there its enterprise value survives a missing share count and
+  # only the per-share figure is unanswerable. Here nothing survives, so the
+  # refusal is the whole model -- the same shape as the unfundable-structure
+  # guard below.
+  if entry_ebitda <= 0:
+    raise ValueError(
+      f"entry EBITDA is {entry_ebitda:,.0f} (revenue_base "
+      f"{revenue_base:,.0f} x ebitda_margin {ebitda_margin}), so there is "
+      f"nothing to lever, nothing to service the debt, and nothing to price "
+      f"the exit off. An LBO is financed against EBITDA; at zero the entry "
+      f"multiple is not 0x, it is undefined. Correct revenue_base or "
+      f"ebitda_margin.")
+
   debt_amount = entry_ebitda * leverage_turns
   if debt_amount >= entry_ev:
     # Debt is sized off EBITDA and equity off EV, so an entry multiple below
@@ -497,8 +592,7 @@ def _lbo_math(entry_ev: float, revenue_base: float, ebitda_margin: float,
     raise ValueError(
       f"acquisition debt {debt_amount:,.0f} ({leverage_turns}x entry EBITDA "
       f"{entry_ebitda:,.0f}) meets or exceeds the entry_ev {entry_ev:,.0f}. "
-      f"That is an entry multiple of "
-      f"{(entry_ev / entry_ebitda if entry_ebitda else 0):.2f}x against "
+      f"That is an entry multiple of {entry_ev / entry_ebitda:.2f}x against "
       f"{leverage_turns}x of leverage -- the structure cannot be funded. "
       "Lower leverage_turns or raise entry_ev."
     )
@@ -555,7 +649,7 @@ def _lbo_math(entry_ev: float, revenue_base: float, ebitda_margin: float,
   return {
     'entry_ev': round(entry_ev, 2),
     'entry_ebitda': round(entry_ebitda, 2),
-    'entry_multiple': round(entry_ev / entry_ebitda, 2) if entry_ebitda > 0 else 0,
+    'entry_multiple': round(entry_ev / entry_ebitda, 2),
     'debt_amount': round(debt_amount, 2),
     'equity_invested': round(equity_invested, 2),
     'leverage_turns_entry': round(leverage_turns, 2),
@@ -662,60 +756,92 @@ def _scenario_dcf_math(base_inputs: dict,
   base_inputs: dict of all DCF inputs except revenue_growth and ebitda_margin.
   bear/base/bull_growth: 5-element list of annual growth rates per scenario.
   bear/base/bull_margin: EBITDA margin assumption per scenario (decimal).
+
+  Every price in this payload is built the same way, on the headline's
+  `min(perpetuity, exit_multiple)` terminal value. That is why:
+
+  The terminal_sensitivity grid used to strip the perpetuity floor and price
+  each multiple on the pure exit-multiple terminal value, so the payload
+  carried two price targets from two different methods with nothing to
+  separate them. For NVDA the base case reported price_per_share 151.96 at
+  terminal_multiple 25 while terminal_sensitivity.base["25x"] read 303.54 --
+  the same scenario, the same multiple, twice the price, because the
+  perpetuity (4.373tn) beat the exit-multiple terminal value (10.286tn) in the
+  headline's min() and the grid ignored it. The bear row showed the same gap,
+  60.80 against 119.79. Both numbers were arithmetically correct; a grid keyed
+  by the headline's own multiple reads as a sensitivity around the headline,
+  and the higher number is the one that ends up in a deck.
+
+  Applying the same rule per cell makes the grid a genuine sensitivity: the
+  cell at the base multiple IS the headline price, which is checkable, where a
+  label would only have been readable.
+
+  Nothing is lost by it. The grid existed to show how load-bearing the
+  terminal multiple is, and it now answers that honestly: where the perpetuity
+  binds across the sweep the row goes flat, and a flat row is the true answer
+  -- the exit multiple is doing no work at all. The old grid hid exactly that
+  behind a 255-to-352 range the model would never have produced.
+  terminal_value_method on each scenario names which of the two bound.
+
+  The headline's min() convention is deliberate and is not touched.
   """
-  results = {}
-  for case_name, growth, margin in (
+  cases = (
     ('bear', bear_growth, bear_margin),
     ('base', base_growth, base_margin),
     ('bull', bull_growth, bull_margin),
-  ):
+  )
+
+  results = {}
+  models = {}
+  for case_name, growth, margin in cases:
     inputs = dict(base_inputs)
     inputs['revenue_growth'] = growth
     inputs['ebitda_margin'] = margin
     r = _dcf_math(**inputs)
+    models[case_name] = r
     results[case_name] = {
       'price_per_share': r['price_per_share'],
       'enterprise_value': r['enterprise_value'],
       'equity_value': r['equity_value'],
       'pv_terminal_value': r['pv_terminal_value'],
+      'terminal_value_perpetuity': r['terminal_value_perpetuity'],
+      'terminal_value_exit_multiple': r['terminal_value_exit_multiple'],
+      'terminal_value_used': r['terminal_value_used'],
+      # Which of the two the min() picked. This single fact explains the
+      # whole valuation and was never reported.
+      'terminal_value_method': (
+          'perpetuity'
+          if r['terminal_value_used'] == r['terminal_value_perpetuity']
+          else 'exit_multiple'),
       'revenue_growth_y1_pct': round(growth[0] * 100, 2) if growth else 0,
       'ebitda_margin_pct': round(margin * 100, 2),
     }
+    if r.get('price_per_share_note'):
+      results[case_name]['price_per_share_note'] = r['price_per_share_note']
 
   prices = [results[c]['price_per_share'] for c in ('bear', 'base', 'bull')
             if results[c]['price_per_share'] is not None]
 
-  # Terminal-multiple sensitivity: re-run each scenario at five terminal
-  # multiples spaced around the base assumption. Uses pure exit-multiple
-  # terminal value (no perpetuity floor) so the analyst sees what the
-  # multiple alone implies. The main bear/base/bull PT above remains the
-  # conservative min(perpetuity, exit) figure; the diff between the two
-  # reveals how much of the conservativeness comes from the perpetuity floor.
+  # Terminal-multiple sensitivity: re-price each scenario at five terminal
+  # multiples spaced around the base assumption, under the headline's own
+  # min(perpetuity, exit_multiple) rule.
   base_multiple = base_inputs.get('terminal_multiple', 0)
   sensitivity = None
+  floor_bound_cases = []
   if base_multiple and base_multiple > 0:
     raw_multiples = [base_multiple - 4, base_multiple - 2,
                      base_multiple, base_multiple + 2, base_multiple + 4]
     # Clamp to positive; a 0x or negative exit multiple is meaningless
     multiples = [m for m in raw_multiples if m > 0]
     sensitivity = {}
-    for case_name, growth, margin in (
-      ('bear', bear_growth, bear_margin),
-      ('base', base_growth, base_margin),
-      ('bull', bull_growth, bull_margin),
-    ):
-      # One _dcf_math call per scenario gives us pv_fcfs and the
-      # exit-multiple terminal at the original multiple, from which we
-      # scale by m / original_multiple.
-      probe_inputs = dict(base_inputs)
-      probe_inputs['revenue_growth'] = growth
-      probe_inputs['ebitda_margin'] = margin
-      r = _dcf_math(**probe_inputs)
-
+    for case_name, growth, margin in cases:
+      r = models[case_name]
       pv_fcfs_sum = sum(r['pv_fcfs'])
       original_multiple = r['assumptions']['terminal_multiple']
+      # Terminal-year EBITDA: the exit-multiple terminal value at 1x.
       unit_terminal = (r['terminal_value_exit_multiple'] / original_multiple
                        if original_multiple > 0 else 0)
+      perpetuity = r['terminal_value_perpetuity']
       wacc = r['assumptions']['wacc']
       n_years = len(growth)
       cash_v = r['assumptions']['cash']
@@ -724,13 +850,18 @@ def _scenario_dcf_math(base_inputs: dict,
 
       row = {}
       for m in multiples:
-        terminal_value_m = unit_terminal * m
+        terminal_value_m = min(perpetuity, unit_terminal * m)
         pv_terminal_m = terminal_value_m / ((1 + wacc) ** n_years)
         ev = pv_fcfs_sum + pv_terminal_m
         eq = ev + cash_v - debt_v
-        px = eq / shares_v if shares_v > 0 else 0
-        row[f"{m}x"] = round(px, 2)
+        # None, not zero, for the same reason _dcf_math reports None: $0.00
+        # per share reads as a worthless equity rather than a question nobody
+        # supplied a share count to answer.
+        px = eq / shares_v if shares_v and shares_v > 0 else None
+        row[f"{m}x"] = round(px, 2) if px is not None else None
       sensitivity[case_name] = row
+      if unit_terminal * min(multiples) >= perpetuity:
+        floor_bound_cases.append(case_name)
 
   output = {
     'bear': results['bear'],
@@ -738,13 +869,27 @@ def _scenario_dcf_math(base_inputs: dict,
     'bull': results['bull'],
     'price_range': {
       'low': round(min(prices), 2) if prices else None,
-      'mid': round(results['base']['price_per_share'], 2),
+      'mid': (round(results['base']['price_per_share'], 2)
+              if results['base']['price_per_share'] is not None else None),
       'high': round(max(prices), 2) if prices else None,
     }
   }
   if sensitivity is not None:
     output['terminal_sensitivity'] = sensitivity
     output['terminal_sensitivity_base_multiple'] = base_multiple
+    output['terminal_sensitivity_method'] = (
+      "Each cell is priced on min(perpetuity, exit multiple), the same "
+      "terminal-value rule as the headline bear/base/bull price. The cell at "
+      f"{base_multiple}x therefore equals the headline price for its "
+      "scenario. Read terminal_value_method on each scenario for which of the "
+      "two is binding.")
+    if floor_bound_cases:
+      output['terminal_sensitivity_floor_note'] = (
+        f"The perpetuity is below the exit-multiple terminal value at every "
+        f"multiple in this sweep for: {', '.join(floor_bound_cases)}. Those "
+        f"rows are flat because the exit multiple is not setting the terminal "
+        f"value -- the perpetuity is. Moving the multiple changes nothing "
+        f"until it falls below the perpetuity.")
   return output
 
 
@@ -1843,6 +1988,9 @@ warnings_per_tool={
       )
       return {
         'ticker': r.ticker, 'signal_name': r.signal_name,
+        # Both halves, side by side: date_range alone gave a reader nothing to
+        # check the window against, so a clamped one read as the one requested.
+        'requested_range': r.requested_range,
         'date_range': r.date_range,
         'n_trades': r.n_trades, 'hit_rate_pct': r.hit_rate,
         'mean_return_pct': r.mean_return, 'median_return_pct': r.median_return,
@@ -1850,7 +1998,11 @@ warnings_per_tool={
         'mean_hold_days': r.mean_hold_days,
         'max_drawdown_pct_in_any_trade': r.max_drawdown_pct,
         'sharpe_simple_annualized': r.sharpe_simple,
+        # `warning` means the backtest did not run, and `success` is derived
+        # from it. `caveats` means it ran and the numbers need reading in
+        # context -- a short sample, or a window the data could not cover.
         'warning': r.warning,
+        'caveats': r.caveats,
         'sample_trades': [{
           'entry_date': t.entry_date, 'exit_date': t.exit_date,
           'entry_price': t.entry_price, 'exit_price': t.exit_price,
@@ -1899,18 +2051,37 @@ warnings_per_tool={
   async def comparable_company_analysis(self, comparables: List[str]) -> List[TextContent]:
     tasks = [asyncio.to_thread(get_data, ticker) for ticker in comparables]
     data = await asyncio.gather(*tasks)
+
+    def _reason(peer: dict, metric: str) -> Optional[str]:
+      """Why this peer contributes no `metric`, in its own terms.
+
+      `get_market_data` now refuses a symbol it could not resolve and records
+      the input behind every suppressed multiple, so the cause of each
+      exclusion is available here. It used to be discarded at this boundary
+      and replaced downstream by one fixed sentence covering all of them --
+      a symbol that is not a company was folded into `excluded_absent` with
+      no mention that the lookup had failed at all.
+      """
+      if peer.get('success') is False:
+        return peer.get('error')
+      detail = peer.get('multiples_suppressed_detail') or {}
+      return detail.get(metric) or peer.get('multiples_suppressed_reason')
+
+    def _block(metric: str) -> dict:
+      return _to_native(peer_distribution(
+          [d.get(metric) for d in data],
+          tickers=[d.get('ticker') or t for d, t in zip(data, comparables)],
+          reasons={(d.get('ticker') or t): _reason(d, metric)
+                   for d, t in zip(data, comparables)},
+      ))
+
     result = {
       'comparables': comparables,
-      'pe_ratio': _to_native(peer_distribution(
-          [d.get('pe_ratio') for d in data])),
-      'pb_data': _to_native(peer_distribution(
-          [d.get('pb_ratio') for d in data])),
-      'ev_revenue_data': _to_native(peer_distribution(
-          [d.get('ev_revenue') for d in data])),
-      'ev_ebitda_data': _to_native(peer_distribution(
-          [d.get('ev_ebitda') for d in data])),
-      'ev_ebit_data': _to_native(peer_distribution(
-          [d.get('ev_ebit') for d in data])),
+      'pe_ratio': _block('pe_ratio'),
+      'pb_data': _block('pb_ratio'),
+      'ev_revenue_data': _block('ev_revenue'),
+      'ev_ebitda_data': _block('ev_ebitda'),
+      'ev_ebit_data': _block('ev_ebit'),
     }
     return [TextContent(type="text", text=json.dumps(result))]
 
