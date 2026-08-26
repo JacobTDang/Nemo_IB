@@ -931,6 +931,59 @@ def run_truth_tests(executives: List[Dict[str, Any]], board_members: List[Dict[s
 # MAIN PARSER CLASS
 # =============================================================================
 
+# An 8-K body is unbounded and most of it is not evidence of anything. Carried
+# whole, one filing per event, `extract_8k_events("NVDA", limit=8)` measured
+# 73,716 characters on 2026-08-26 with 50,507 of them raw filing text -- past
+# the tool-result budget, so a caller asking for eight events received none.
+# The earlier total_events/events_returned/truncated work bounded the count;
+# this bounds what a single event costs, which is what actually broke.
+EVENT_TEXT_CAP = 1500
+
+# The first item heading. An 8-K opens with its SEC cover page -- registrant,
+# address, Rule 425 checkboxes, the 12(b) securities table -- and that runs
+# 2,313 characters on AMAT's 2026-03-13 filing before "Item 5.07" appears.
+_FIRST_ITEM_HEADING = re.compile(r'\bItem\s+\d\.\d\d\b')
+
+
+def bound_filing_text(text: str, cap: int = EVENT_TEXT_CAP) -> Dict[str, Any]:
+    """A bounded excerpt of a filing body, plus what was left behind.
+
+    Head-truncating would be the obvious bound and it keeps the wrong end.
+    The cover page is identical across every 8-K a company ever files, so
+    `text[:1500]` returns the registrant's mailing address and stops before
+    the first item section -- the one part that makes the classification
+    checkable. The excerpt therefore starts at the first item heading when
+    there is one, and `text_excerpt_from_char` says where that was so the
+    offset is not something a reader has to infer.
+
+    A body shorter than the cap is returned whole and is not marked
+    truncated: a flag that fires on every event tells a reader nothing. An
+    empty body -- AMAT's 2025-10-23 8-K came back with no extractable text at
+    all -- reports `text_length_chars: 0`, which distinguishes a fetch that
+    returned nothing from a very short filing.
+    """
+    text = text or ''
+    if len(text) <= cap:
+        return {
+            'text': text,
+            'text_length_chars': len(text),
+            'text_chars_returned': len(text),
+            'text_excerpt_from_char': 0,
+            'text_truncated': False,
+        }
+
+    match = _FIRST_ITEM_HEADING.search(text)
+    start = match.start() if match else 0
+    excerpt = text[start:start + cap]
+    return {
+        'text': excerpt,
+        'text_length_chars': len(text),
+        'text_chars_returned': len(excerpt),
+        'text_excerpt_from_char': start,
+        'text_truncated': True,
+    }
+
+
 class SECFilingParser:
     def __init__(self, name: Optional[str] = None, email: Optional[str] = None) -> None:
         self.name, self.email = name, email
@@ -1145,8 +1198,11 @@ class SECFilingParser:
                     'items_source': source,
                     'confidence': cls.confidence,
                     'evidence': asdict(cls.evidence) if cls.evidence else None,
-                    'text': text  # Full 8-K text (no truncation)
+                    # Where the rest of a truncated body lives. A bound with
+                    # no pointer past it makes the dropped text unreachable.
+                    'filing_url': getattr(filing, 'filing_url', None),
                 }
+                event_dict.update(bound_filing_text(text))
 
                 # 5.02-specific structured extraction. Adds an `officer_actions`
                 # list when the filing names departing/appointed officers in
