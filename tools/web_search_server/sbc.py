@@ -172,6 +172,23 @@ def get_sbc_series(ticker: str, limit: int = 5,
             "series": [],
             "concept_used": None,
         }
+    except Exception as exc:  # noqa: BLE001 - reported, never masked
+        # The SBC chain above is guarded, but the revenue and operating-cash-
+        # flow reads that build pct_of_revenue were not, so a failure there
+        # left this function by raising. Every other tool here answers with a
+        # dict naming the ticker and what went wrong; a bare exception reaches
+        # the caller as a framework message with none of that, and cannot be
+        # told apart from a filer that tags no stock compensation.
+        return {
+            "ticker": ticker,
+            "success": False,
+            "timed_out": False,
+            "wrong_form": False,
+            "error": (f"reading stock-compensation denominators for {ticker} "
+                      f"failed: {type(exc).__name__}: {exc}"),
+            "series": [],
+            "concept_used": None,
+        }
 
     series: List[Dict[str, Any]] = []
     for filing_date, value in sbc_values.items():
