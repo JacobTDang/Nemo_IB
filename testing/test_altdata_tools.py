@@ -588,7 +588,8 @@ def test_capex_announcements_returns_required_fields():
     result = _fetch_capex_announcements("TSMC", "Taiwan Semiconductor Manufacturing", lookback_days=180)
     assert "error" not in result, result.get("error")
     required = ["ticker", "company_name", "lookback_days", "announcement_count",
-                "total_announced_usd", "signal", "announcements"]
+                "capex_total_usd", "capex_total_basis", "figures",
+                "amounts_by_category", "signal", "announcements"]
     for field in required:
         assert field in result, f"missing field: {field}"
     assert result["signal"] in {"bullish", "bearish", "neutral", "data_gap"}

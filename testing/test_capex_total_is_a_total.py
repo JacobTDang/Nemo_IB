@@ -25,6 +25,13 @@ aggregate is over distinct dollar figures, with the collapse visible: how
 many articles carried each figure, and how many figures there were. A
 reader can then see that six figures arrived across fourteen articles
 instead of reading a total that quietly counted eight of them twice.
+
+The total was later scoped further -- to figures the text attributes to the
+company SPENDING, rather than every figure in the corpus -- because summing
+distinct figures still summed customer deals and debt raises alongside plant.
+That is test_capex_is_not_revenue.py. The rule this file holds is orthogonal
+and still binding: however the figures are chosen, each one is counted once
+however many outlets restated it.
 """
 import pytest
 
@@ -119,38 +126,48 @@ def test_an_untruncated_result_is_not_flagged(monkeypatch):
 
 def test_a_figure_reported_twice_is_counted_once(nvda):
     """$105B Ohio appeared as two articles and $10B NAVER as two more. Summing
-    per article turned six announcements into eight and the total into a
-    number no filing supports."""
+    per article turned six announcements into eight and every total into a
+    number no filing supports. The figures are now sorted into categories and
+    only some of them are summed, so the rule is checked across all of them:
+    no category may count a figure twice."""
     per_article = 750 + 500 + 250 + 105 + 105 + 10 + 10 + 3 + 2 + 1
     distinct = 750 + 500 + 250 + 105 + 10 + 3 + 2 + 1
 
-    assert nvda["total_announced_usd"] == distinct * 1e9
-    assert nvda["total_announced_usd"] != per_article * 1e9
+    everything = sum(slot["total_usd"]
+                     for slot in nvda["amounts_by_category"].values())
+    assert everything == distinct * 1e9
+    assert everything != per_article * 1e9
+    assert len(nvda["figures"]) == len({f["amount_usd"] for f in nvda["figures"]})
 
 
 def test_the_collapse_is_visible(nvda):
     """A reader has to be able to see that the total is over figures, not
     articles -- otherwise the corrected number is just as unexplained as the
     wrong one."""
-    assert nvda["distinct_amount_count"] == 8
+    assert nvda["figure_count"] == 8
     assert nvda["announcement_count"] == 10
-    assert nvda["total_announced_basis"], (
+    assert nvda["capex_total_basis"], (
         "the total is over distinct figures and the payload does not say so")
-    assert "distinct" in nvda["total_announced_basis"]
+    assert "distinct" in nvda["capex_total_basis"]
 
 
 def test_each_row_says_how_many_articles_carried_its_figure(nvda):
     """The duplication is a property of the corpus, so it belongs on the rows
     the corpus produced."""
-    by_amount = {a["max_amount_usd"]: a for a in nvda["announcements"]}
+    by_amount = {a["largest_figure_usd"]: a for a in nvda["announcements"]}
     assert by_amount[105e9]["mentions"] == 2
     assert by_amount[10e9]["mentions"] == 2
     assert by_amount[750e9]["mentions"] == 1
 
 
-def test_the_largest_single_announcement_is_reported(nvda):
-    """The one figure in the payload that is certainly real on its own."""
-    assert nvda["largest_announcement_usd"] == 750e9
+def test_the_largest_figure_is_reported_without_being_summed(nvda):
+    """The biggest number in the corpus is still shown -- it is the headline a
+    reader is going to ask about -- but it is shown as what it is. $750B leads
+    the figure list and contributes nothing to the capex total, which rests on
+    the single $2B campus."""
+    assert nvda["figures"][0]["amount_usd"] == 750e9
+    assert nvda["figures"][0]["category"] != "capital_expenditure"
+    assert nvda["largest_capex_usd"] == 2e9
 
 
 @pytest.fixture
@@ -170,9 +187,8 @@ def test_articles_with_no_dollar_figure_do_not_inflate_the_count(unpriced):
     """A zero is not a distinct figure; counting it would make the basis line
     disagree with the arithmetic."""
     assert unpriced["announcement_count"] == 3
-    assert unpriced["distinct_amount_count"] == 1
-    assert unpriced["total_announced_usd"] == 4e9
-    assert unpriced["largest_announcement_usd"] == 4e9
+    assert unpriced["figure_count"] == 1
+    assert unpriced["figures"][0]["amount_usd"] == 4e9
 
 
 def test_an_article_with_no_figure_is_not_reported_as_a_restatement(unpriced):
@@ -181,7 +197,7 @@ def test_an_article_with_no_figure_is_not_reported_as_a_restatement(unpriced):
     this figure". There is no figure, so there is nothing to have restated,
     and a count invented for the occasion is the defect this file is about."""
     unpriced_rows = [a for a in unpriced["announcements"]
-                     if a["max_amount_usd"] == 0]
+                     if a["largest_figure_usd"] is None]
     assert len(unpriced_rows) == 2
     for row in unpriced_rows:
         assert row["mentions"] is None, (

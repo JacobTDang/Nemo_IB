@@ -60,6 +60,12 @@ from mcp.types import Tool, TextContent
 
 from tools.altdata_server.text_utils import (
     text_contains, count_matches, extract_dollar_amounts, parse_news_date,
+    # The same compiled pattern and units that produce the VALUES, borrowed so
+    # the classifier can find where each figure SITS in the text. A second copy
+    # here would be free to drift from the one doing the extraction, and a
+    # figure the two disagreed about would be summed without a category.
+    _AMOUNT_PATTERN as _AMOUNT_RE,
+    _UNIT_MULTIPLIERS as _AMOUNT_UNITS,
 )
 
 # ---------------------------------------------------------------------------
@@ -287,6 +293,324 @@ def _capex_signal(announcements: List[Dict]) -> str:
     if bearish_n > bullish_n * 2:
         return "bearish"
     return "neutral"
+
+
+
+# ---------------------------------------------------------------------------
+# What a dollar figure in a headline actually refers to
+# ---------------------------------------------------------------------------
+#
+# A headline number is not capital expenditure because it is large and sits
+# next to the word "expand". `get_capex_announcements("NVDA")` returned
+# $1.62 TRILLION against single-digit-billion actual capex, built from $750B of
+# customer deals, $500B of third-party capital raised by Apollo/BlackRock/KKR,
+# a $250B lease guarantee, a $105B financing backstop and a $10B joint venture.
+# Not one dollar of it was NVIDIA spending on property, plant or equipment.
+#
+# The error was structural: the old code took the LARGEST figure anywhere in an
+# article and scanned the WHOLE article for direction verbs, so any expansion
+# language in the piece attached itself to any number in the piece. Broadcom's
+# "expand U.S. facility after $30 billion chip deal with Apple" is the pure
+# case -- real expansion language, and a figure that is Apple paying Broadcom.
+#
+# So each figure is read in the clause that carries it, and a figure is capital
+# expenditure only on positive evidence: the company named, a spending (or
+# stopping) verb, and a physical asset, with nothing in the clause marking the
+# money as financed, guaranteed, mobilised from third parties, invested in
+# another company's equity, paid in by a customer, or restated as a running
+# programme total. Anything else is unplaced, and unplaced money is never
+# summed into a total labelled capex.
+
+# Clause boundaries. Sentence ends need the abbreviation guard: without it
+# "brings Taiwan Semiconductor Manufacturing Co.'s U.S. investment to $265
+# billion" splits at "Co." and the containment evidence is severed from the
+# figure it governs.
+_CLAUSE_SEPARATOR = re.compile(r"\s+[–—|;:]\s+|\s+-\s+")
+_SENTENCE_END = re.compile(r"[.!?]\s+(?=[A-Z“‘\"'])")
+_ABBREVIATIONS = frozenset([
+    "inc.", "corp.", "co.", "ltd.", "llc.", "plc.", "no.", "vs.", "etc.",
+    "mr.", "mrs.", "ms.", "dr.", "jr.", "sr.", "st.", "gen.", "sen.", "rep.",
+    "gov.", "prof.", "dept.", "est.", "approx.", "fig.",
+])
+_INITIALS = re.compile(r"(?:[A-Za-z]\.)+")
+
+
+def _is_abbreviation(token: str) -> bool:
+    t = token.strip("(\"'“”‘’,")
+    return t.lower() in _ABBREVIATIONS or bool(_INITIALS.fullmatch(t))
+
+
+def _clause_spans(text: str) -> List[Tuple[int, int]]:
+    """(start, end) of each clause in `text`, split on sentence and clause marks."""
+    cuts = {0, len(text)}
+    for m in _CLAUSE_SEPARATOR.finditer(text):
+        cuts.add(m.start())
+        cuts.add(m.end())
+    for m in _SENTENCE_END.finditer(text):
+        head = text[:m.start() + 1].split()
+        if head and _is_abbreviation(head[-1]):
+            continue
+        cuts.add(m.end())
+    ordered = sorted(c for c in cuts if 0 <= c <= len(text))
+    return [(a, b) for a, b in zip(ordered, ordered[1:])
+            if b > a and text[a:b].strip()]
+
+
+# Evidence that the money is NOT the company spending on its own assets,
+# in the order it is tested. Financing precedes cumulative because "expected to
+# total roughly $45 billion" is a tranche of a debt raise, not a programme
+# total; third-party capital precedes deals because "$500 billion private
+# capital deal" is both and is decided by the capital, not by the deal.
+_FIGURE_EXCLUSIONS: List[Tuple[str, frozenset]] = [
+    ("third_party_capital", frozenset([
+        "third-party capital", "third party capital", "private capital",
+        "outside capital", "external capital", "mobilize", "mobilise",
+        "mobilized", "mobilised", "mobilizing", "asset manager",
+        "asset management", "private credit", "sovereign wealth",
+        "co-invest", "co-investment", "limited partners",
+    ])),
+    ("financing", frozenset([
+        # "finance" and "notes" are deliberately not bare terms: "Yahoo
+        # Finance" is in the boilerplate of half this corpus and "the analyst
+        # notes" is a verb. Both would have taken real capex out of the total.
+        "financing", "to finance", "will finance", "financed", "refinance",
+        "refinancing", "raise", "raises", "raising", "raised", "borrow",
+        "borrows", "borrowing", "debt", "bond", "bonds", "senior notes",
+        "notes offering", "loan", "loans", "tranche", "tranches",
+        "credit facility", "revolver", "underwrite", "underwriting",
+        "securitization", "securitisation", "convertible", "leveraged",
+        "repayment",
+    ])),
+    ("guarantee", frozenset([
+        "guarantee", "guarantees", "guaranteed", "guaranty", "backstop",
+        "backstops", "backstopped", "backstopping", "contingent",
+        "lease obligation", "lease obligations", "indemnity",
+    ])),
+    ("equity_or_ma", frozenset([
+        "acquire", "acquires", "acquired", "acquiring", "acquisition",
+        "acquisitions", "merger", "merge", "merges", "takeover", "buyout",
+        "tender offer", "stake", "stakes", "equity investment",
+        "minority investment", "buyback", "buybacks", "repurchase",
+        "repurchases", "dividend", "dividends",
+    ])),
+    ("customer_or_partner_deal", frozenset([
+        "deal", "deals", "agreement", "agreements", "contract", "contracts",
+        "order", "orders", "bookings", "backlog", "supply", "supplies",
+        "purchase", "purchases", "customer", "customers", "signed", "signing",
+        "lands", "landed", "awarded", "revenue", "revenues", "sales",
+        "partnership", "partnerships", "joint venture", "subscription",
+    ])),
+    ("cumulative_total", frozenset([
+        "brings", "bringing", "brought", "total", "totals", "totaling",
+        "totalling", "to date", "so far", "cumulative", "combined",
+        "overall", "including an additional", "includes an additional",
+        "which includes", "up from", "on top of", "running total",
+    ])),
+]
+
+# "invest $1 billion in NAVER Corp" buys shares; "invest $20 billion in a new
+# Ohio factory" buys a factory. The difference is the object, and only the
+# first has a corporate suffix on it.
+_INVESTED_IN_ENTITY = re.compile(
+    r"\bin\s+(?:[A-Z][\w&.’'-]*\s+){0,3}"
+    r"(?:Corp|Corporation|Inc|Incorporated|Ltd|Limited|LLC|PLC|plc|AG|SA|NV|"
+    r"Holdings|Group|Technologies|Industries|Motors|Partners)\b"
+)
+
+# Universal spend verbs. A cancelled fab is still a capital-expenditure
+# announcement, so the stop verbs qualify a figure exactly as the spend verbs
+# do -- the direction of the news is a separate axis from what the money is.
+_CAPEX_SPEND_VERBS = frozenset([
+    "invest", "invests", "investing", "invested", "investment", "investments",
+    "spend", "spends", "spending", "spent", "outlay", "outlays",
+    "commit", "commits", "committing", "committed", "commitment",
+    "pledge", "pledges", "pledging", "pledged", "pour", "pours", "pouring",
+    "plow", "plowing", "plough", "ploughing", "earmark", "earmarks",
+    "earmarked", "build", "builds", "building", "built", "construct",
+    "constructs", "constructing", "construction", "expand", "expands",
+    "expanding", "expansion", "upgrade", "upgrades", "upgrading",
+    "modernize", "modernise", "modernizing", "retool", "retooling",
+    "break ground", "broke ground", "capex", "capital expenditure",
+    "capital spending", "capital investment",
+])
+_CAPEX_STOP_VERBS = frozenset([
+    "cancel", "cancels", "canceled", "cancelled", "cancelling", "cancellation",
+    "halt", "halts", "halted", "halting", "scrap", "scraps", "scrapped",
+    "shelve", "shelves", "shelved", "shelving", "mothball", "mothballed",
+    "suspend", "suspends", "suspended", "suspension", "delay", "delays",
+    "delayed", "abandon", "abandons", "abandoned", "scale back", "scaled back",
+    "wind down", "winding down", "write down", "write-down", "writedown",
+    "impairment",
+])
+# What the money has to be spent ON. Sector-agnostic on purpose: a refinery, a
+# distribution centre and a fab are the same kind of claim.
+_CAPEX_ASSET_NOUNS = frozenset([
+    "plant", "plants", "factory", "factories", "fab", "fabs", "foundry",
+    "foundries", "facility", "facilities", "data center", "data centre",
+    "datacenter", "datacentre", "campus", "site", "sites", "mill", "mills",
+    "refinery", "refineries", "mine", "mines", "smelter", "warehouse",
+    "warehouses", "distribution center", "distribution centre", "store",
+    "stores", "capacity", "manufacturing", "production line", "assembly line",
+    "gigafactory", "megafactory", "infrastructure", "equipment", "machinery",
+    "ai factory", "chipmaking", "fabrication", "network", "pipeline",
+    "terminal", "rail", "fleet",
+])
+# A figure has to belong to the company being asked about. The relevance filter
+# only asks whether the ARTICLE mentions it, which is how "Samsung and SK Hynix
+# to build four new chip plants as South Korea unveils $520 billion" survives a
+# TSMC query -- the body says "semiconductor" and the figure is Samsung's.
+_SELF_REFERENCE = frozenset([
+    "the company", "the firm", "the group", "the chipmaker", "the maker",
+    "the manufacturer", "the automaker", "the retailer", "the miner",
+    "the producer", "the operator",
+])
+# Naming the company is not being the company. "Nvidia supplier King Yuan
+# Electronics to invest up to $1.4 billion in US facility" is a live headline
+# that put a supplier's plant in NVIDIA's capex: the token, the verb and the
+# asset were all in the clause and all belonged to someone else. These words
+# turn the name in front of them into a modifier of the real spender.
+_THIRD_PARTY_ROLES = (
+    "supplier", "suppliers", "customer", "customers", "partner", "partners",
+    "rival", "rivals", "competitor", "competitors", "client", "clients",
+    "vendor", "vendors", "contractor", "contractors", "investor", "investors",
+    "backer", "backers", "spinoff", "backed", "owned", "funded", "led",
+    "linked", "adjacent", "related",
+)
+_ROLE_SUFFIX = re.compile(
+    r"(?:’s|'s)?\s*[- ]\s*(?:" + "|".join(_THIRD_PARTY_ROLES) + r")\b",
+    re.IGNORECASE)
+# The same story with the relationship on the other side: "the supplier to
+# chipmaker Nvidia said on Friday". The linking preposition is what makes the
+# name the OBJECT of the role -- "Apple partner Broadcom" has no "to", and
+# there Broadcom really is the one spending.
+_ROLE_PREFIX = re.compile(
+    r"\b(?:" + "|".join(_THIRD_PARTY_ROLES) + r")\s+(?:to|of|for)\s+"
+    r"(?:[a-z][\w-]*\s+){0,2}$",
+    re.IGNORECASE)
+# A capex announcement is announced. "Nvidia Weighs $3 Billion SB Energy
+# Investment" is a figure under consideration, and a total built from options
+# a company is thinking about is not a total of anything it has committed.
+_UNCOMMITTED = frozenset([
+    "weighs", "weighing", "weighed", "considers", "considering", "considered",
+    "mulls", "mulling", "mulled", "explores", "exploring", "eyes", "eyeing",
+    "in talks", "may invest", "could invest", "might invest", "may spend",
+    "could spend", "would invest", "would spend", "reportedly", "rumored",
+    "rumoured", "is said to", "potential", "potentially", "proposed",
+    "proposal", "seeks", "seeking", "weighing up", "studying",
+])
+
+
+def _names_a_third_party(clause: str, token: str) -> bool:
+    """True when the company is named as somebody else's supplier/partner/rival
+    rather than as the party doing the spending."""
+    at = clause.lower().find(token)
+    if at < 0:
+        return False
+    return bool(_ROLE_SUFFIX.match(clause, at + len(token))
+                or _ROLE_PREFIX.search(clause[:at]))
+
+
+def _classify_figure(clause: str, after: str,
+                     name_tokens: List[str]) -> Tuple[str, str]:
+    """What one dollar figure refers to, and the words that say so.
+
+    Returns (category, evidence). Never guesses: a figure with no positive
+    capex evidence comes back "unclassified" with the reason it failed, which
+    keeps it out of the total instead of into it.
+    """
+    for category, terms in _FIGURE_EXCLUSIONS:
+        hits = sorted(t for t in terms if text_contains(clause, t))
+        if hits:
+            return category, "; ".join(hits[:3])
+        # Equity has a second test no keyword covers: what the money went INTO.
+        if category == "equity_or_ma":
+            m = _INVESTED_IN_ENTITY.search(after[:90])
+            if m:
+                return category, f"invested {m.group(0)}"
+
+    named = [t for t in name_tokens if text_contains(clause, t)]
+    modifiers = [t for t in named if _names_a_third_party(clause, t)]
+    attribution = [t for t in named if t not in modifiers]
+    attribution += [p for p in _SELF_REFERENCE if text_contains(clause, p)]
+    hedges = sorted(t for t in _UNCOMMITTED if text_contains(clause, t))
+    verbs = sorted(t for t in (_CAPEX_SPEND_VERBS | _CAPEX_STOP_VERBS)
+                   if text_contains(clause, t))
+    assets = sorted(t for t in _CAPEX_ASSET_NOUNS if text_contains(clause, t))
+
+    if not attribution:
+        if modifiers:
+            return "unclassified", (
+                f"{modifiers[0]} appears only as a modifier of the party "
+                f"actually spending")
+        return "unclassified", (
+            "the clause carrying the figure does not name "
+            + (" / ".join(name_tokens) if name_tokens else "the company"))
+    if hedges:
+        return "unclassified", (
+            f"the spend is being weighed, not announced ({hedges[0]})")
+    if not verbs:
+        return "unclassified", "no spending or cancellation verb beside the figure"
+    if not assets:
+        return "unclassified", "nothing physical named for the money to be spent on"
+    return "capital_expenditure", (
+        f"{attribution[0]} + {verbs[0]} + {assets[0]}")
+
+
+def _figures_in_article(text: str, name_tokens: List[str]) -> List[Dict[str, Any]]:
+    """Every dollar figure in one article, each read in its own clause."""
+    spans = _clause_spans(text)
+    out: List[Dict[str, Any]] = []
+    for m in _AMOUNT_RE.finditer(text):
+        raw = m.group(1).replace(",", "")
+        try:
+            value = float(raw)
+        except ValueError:
+            continue
+        mult = _AMOUNT_UNITS.get(m.group(2).lower())
+        if not mult:
+            continue
+        clause = next((text[a:b] for a, b in spans if a <= m.start() < b), text)
+        after = text[m.end():min(len(text), m.end() + 120)]
+        category, evidence = _classify_figure(clause, after, name_tokens)
+        out.append({
+            "amount_usd": value * mult,
+            "category": category,
+            "evidence": evidence,
+            "context": clause.strip()[:220],
+        })
+    return out
+
+
+# The order a tie between two readings of the same figure is broken in. Capex
+# comes last on purpose: it is the claim that has to be earned, so a figure one
+# article calls a deal and another calls a plant is not capex.
+_CATEGORY_PRIORITY = [c for c, _ in _FIGURE_EXCLUSIONS] + ["capital_expenditure"]
+
+
+def _resolve_figure(readings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """One verdict for a figure several articles each described differently.
+
+    "unclassified" is an absence of evidence, not evidence of absence, so it
+    never outvotes an article that did say what the money was.
+    """
+    definite = [r for r in readings if r["category"] != "unclassified"]
+    if not definite:
+        return dict(readings[0])
+    counts: Dict[str, int] = {}
+    for r in definite:
+        counts[r["category"]] = counts.get(r["category"], 0) + 1
+    best = max(counts.values())
+    tied = sorted((c for c, n in counts.items() if n == best),
+                  key=_CATEGORY_PRIORITY.index)
+    return dict(next(r for r in definite if r["category"] == tied[0]))
+
+
+def _usd_short(amount: float) -> str:
+    """$265,000,000,000 -> '$265B'. Used in prose, never in a numeric field."""
+    for cutoff, suffix in ((1e12, "T"), (1e9, "B"), (1e6, "M")):
+        if abs(amount) >= cutoff:
+            return f"${amount / cutoff:.6g}{suffix}"
+    return f"${amount:,.0f}"
 
 
 # ---------------------------------------------------------------------------
@@ -1666,6 +1990,9 @@ def _fetch_policy_signals(ticker: str, sector: str,
 # `rows_returned` describes this page, and `truncated` says when they differ --
 # the rule test_counts_survive_paging.py holds the SEC tools to.
 _CAPEX_ROW_CAP = 8
+# Distinct figures carried in `figures`. Kept above the row cap because the
+# figures are what the total is built from and what a caller audits it with.
+_CAPEX_FIGURE_CAP = 20
 
 
 def _fetch_capex_announcements(ticker: str, company_name: str,
@@ -1687,7 +2014,7 @@ def _fetch_capex_announcements(ticker: str, company_name: str,
             return _lookup_failed(exc, ticker=ticker, company_name=None,
                                   lookback_days=lookback_days,
                                   announcement_count=None,
-                                  total_announced_usd=None,
+                                  capex_total_usd=None,
                                   signal="data_gap", announcements=[])
 
     # Sector-agnostic queries: the first two capture capex events in ANY sector
@@ -1763,57 +2090,157 @@ def _fetch_capex_announcements(ticker: str, company_name: str,
             "ticker": ticker, "company_name": company_name,
             "lookback_days": lookback_days, "announcement_count": 0,
             "rows_returned": 0, "truncated": False,
-            "total_announced_usd": 0, "signal": "data_gap",
+            # Withheld, not zero, for the reason the error above gives.
+            "capex_total_usd": None,
+            "capex_total_basis": ("no total: no article was returned, and an "
+                                  "empty news search is not a finding that no "
+                                  "capital expenditure was announced."),
+            "capex_figure_count": 0, "largest_capex_usd": None,
+            "containment_detected": False, "cumulative_program_usd": None,
+            "figure_count": 0, "figures": [], "amounts_by_category": {},
+            "signal": "data_gap",
+            "signal_basis": "no article to read a spending direction from",
             "queries_tried": queries,
             "partial_errors": query_errors,
             "announcements": [],
         }
 
-    announcements = []
+    # Read every dollar figure in its own clause. One row per article (the
+    # count/page contract of test_counts_survive_paging.py), one entry per
+    # DISTINCT figure in `figures` -- a figure restated by five outlets is one
+    # announcement, and it is now one announcement of a stated KIND.
+    readings_by_amount: Dict[float, List[Dict[str, Any]]] = {}
+    articles_by_amount: Dict[float, int] = {}
+    per_article: List[Tuple[Dict, str, List[Dict[str, Any]]]] = []
+
     for r in all_articles:
         title = r.get("title", "")
         body = r.get("body", "")
-        combined = title + " " + body
-        amounts = _extract_dollar_amounts(combined)
-        max_amount = max(amounts) if amounts else 0
+        # The pipe is a clause boundary: without it a headline runs into the
+        # first sentence of the body and the two get read as one claim.
+        combined = f"{title} | {body}"
+        figures = _figures_in_article(combined, name_tokens)
+        per_article.append((r, combined, figures))
+        for amt in {f["amount_usd"] for f in figures}:
+            articles_by_amount[amt] = articles_by_amount.get(amt, 0) + 1
+        for f in figures:
+            readings_by_amount.setdefault(f["amount_usd"], []).append(
+                dict(f, title=title[:120], url=r.get("url", ""),
+                     date=r.get("date", "")))
+
+    resolved: Dict[float, Dict[str, Any]] = {
+        amt: dict(_resolve_figure(readings), mentions=articles_by_amount[amt])
+        for amt, readings in readings_by_amount.items()
+    }
+
+    announcements = []
+    for r, combined, figures in per_article:
+        amounts = {f["amount_usd"] for f in figures}
+        capex_here = [a for a in amounts
+                      if resolved[a]["category"] == "capital_expenditure"]
+        largest = max(amounts) if amounts else None
+        body = r.get("body", "")
         announcements.append({
-            "title": title[:120],
+            "title": r.get("title", "")[:120],
             "date": r.get("date", ""),
             "url": r.get("url", ""),
-            "max_amount_usd": max_amount,
+            "largest_figure_usd": largest,
+            "figure_category": resolved[largest]["category"] if amounts else None,
+            "capex_amount_usd": max(capex_here) if capex_here else None,
+            "mentions": articles_by_amount[largest] if amounts else None,
             "direction": _classify_capex_text(combined),
             "snippet": body[:200] if body else "",
         })
 
-    announcements.sort(key=lambda x: -x["max_amount_usd"])
+    # A total is only checkable if the rows it was built from survive the page
+    # cap. Sorting purely by size buried Broadcom's $1.5B plant upgrade -- the
+    # one figure in its whole corpus that WAS capex -- under six larger
+    # headlines about bookings and debt.
+    announcements.sort(key=lambda a: (a["capex_amount_usd"] is None,
+                                      -(a["capex_amount_usd"] or 0),
+                                      -(a["largest_figure_usd"] or 0)))
 
-    # One announcement restated by four outlets is still one announcement.
-    # Adding up every article's largest figure carried NVIDIA's $105B Ohio
-    # site and its $10B NAVER deal twice each and presented $1.738T as an
-    # aggregate of capital projects when it was an aggregate of headlines.
-    # The dollar figure is the only project fingerprint a news corpus offers,
-    # so the total is over distinct figures and each row says how many
-    # articles carried its own. Two genuinely separate projects of identical
-    # size collapse into one here -- an understatement, where summing every
-    # mention had no bound at all.
-    mentions_by_amount: Dict[float, int] = {}
-    for a in announcements:
-        mentions_by_amount[a["max_amount_usd"]] = \
-            mentions_by_amount.get(a["max_amount_usd"], 0) + 1
-    for a in announcements:
-        # An article carrying no dollar figure has no fingerprint, so it has
-        # nothing to have been restated. Grouping those under 0 put
-        # `mentions: 7` on seven unrelated headlines in a live INTC run.
-        a["mentions"] = (mentions_by_amount[a["max_amount_usd"]]
-                         if a["max_amount_usd"] > 0 else None)
+    by_category: Dict[str, Dict[str, Any]] = {}
+    for amt, fig in sorted(resolved.items(), key=lambda kv: -kv[0]):
+        slot = by_category.setdefault(
+            fig["category"], {"figure_count": 0, "total_usd": 0.0, "amounts_usd": []})
+        slot["figure_count"] += 1
+        slot["total_usd"] += amt
+        slot["amounts_usd"].append(amt)
 
-    distinct_amounts = sorted((amt for amt in mentions_by_amount if amt > 0),
-                              reverse=True)
-    articles_with_amount = sum(n for amt, n in mentions_by_amount.items() if amt > 0)
-    restated = articles_with_amount - len(distinct_amounts)
+    capex_amounts = sorted(
+        (a for a, f in resolved.items() if f["category"] == "capital_expenditure"),
+        reverse=True)
+    cumulative_amounts = sorted(
+        (a for a, f in resolved.items() if f["category"] == "cumulative_total"),
+        reverse=True)
+    cumulative_program = cumulative_amounts[0] if cumulative_amounts else None
+    # "brings TSMC's U.S. investment to $265 billion" is the programme the
+    # $100B announced that week sits INSIDE. Adding the two reported $365B for
+    # $100B of news.
+    containment = bool(cumulative_program) and any(
+        a < cumulative_program for a in capex_amounts)
+
+    other_slots = [(cat, slot) for cat, slot in by_category.items()
+                   if cat != "capital_expenditure"]
+    other = ", ".join(
+        f"{cat} {_usd_short(slot['total_usd'])} across {slot['figure_count']} figure(s)"
+        for cat, slot in other_slots)
+
+    if capex_amounts:
+        capex_total: Optional[float] = sum(capex_amounts)
+        capex_basis = (
+            f"sum of {len(capex_amounts)} distinct figure(s) the text attributes to "
+            f"{company_name} spending on physical assets, drawn from "
+            f"{len(all_articles)} article(s)."
+            + (f" Figures in other categories are excluded, not missed: {other}."
+               if other_slots else
+               " Every dollar figure found was capital expenditure.")
+        )
+        if containment:
+            capex_basis += (
+                f" A cumulative programme figure of {_usd_short(cumulative_program)} "
+                f"appears in the same corpus and is NOT added, because it already "
+                f"contains the announcement(s) counted above."
+            )
+    else:
+        capex_total = None
+        capex_basis = (
+            f"no total. Not one of {len(resolved)} dollar figure(s) across "
+            f"{len(all_articles)} article(s) is attributable to {company_name} "
+            f"spending on physical assets"
+            + (f": {other}." if other_slots else ".")
+            + " A news corpus cannot show that no capital expenditure was "
+              "announced, so this is a withheld total and never a zero."
+        )
+
+    if capex_amounts:
+        signal = _capex_signal([
+            {"direction": _classify_capex_text(resolved[a]["context"]),
+             "max_amount_usd": a}
+            for a in capex_amounts])
+        signal_basis = (
+            f"derived from {len(capex_amounts)} capital-expenditure figure(s) only "
+            f"({', '.join(_usd_short(a) for a in capex_amounts)})"
+            + (f"; {other} did not contribute."
+               if other_slots else "; no figure of another kind was found.")
+        )
+    else:
+        signal = "data_gap"
+        signal_basis = (
+            f"withheld. {len(resolved)} dollar figure(s) were found and none is "
+            f"capital expenditure"
+            + (f" ({other})" if other_slots else "")
+            + ", so there is nothing to read a spending direction from. A "
+              "verdict drawn from customer deals or financing would be a "
+              "verdict about the opposite of capex."
+        )
 
     rows = announcements[:_CAPEX_ROW_CAP]
-    signal = _capex_signal(announcements)
+    figures_out = [
+        dict(resolved[a], amount_usd=a)
+        for a in sorted(resolved, reverse=True)[:_CAPEX_FIGURE_CAP]
+    ]
 
     return {
         "success": True,
@@ -1823,17 +2250,17 @@ def _fetch_capex_announcements(ticker: str, company_name: str,
         "announcement_count": len(announcements),
         "rows_returned": len(rows),
         "truncated": len(rows) < len(announcements),
-        "total_announced_usd": sum(distinct_amounts),
-        "total_announced_basis": (
-            f"sum over {len(distinct_amounts)} distinct dollar figures found "
-            f"across {len(announcements)} articles"
-            + (f"; {restated} article(s) restated a figure already counted"
-               if restated else "")
-            + ". Not a sum of capital projects: a news corpus cannot tell two "
-              "projects of the same size apart."),
-        "distinct_amount_count": len(distinct_amounts),
-        "largest_announcement_usd": distinct_amounts[0] if distinct_amounts else 0,
+        "capex_total_usd": capex_total,
+        "capex_total_basis": capex_basis,
+        "capex_figure_count": len(capex_amounts),
+        "largest_capex_usd": capex_amounts[0] if capex_amounts else None,
+        "containment_detected": containment,
+        "cumulative_program_usd": cumulative_program,
+        "figure_count": len(resolved),
+        "figures": figures_out,
+        "amounts_by_category": by_category,
         "signal": signal,
+        "signal_basis": signal_basis,
         "queries_tried": queries,
         "partial_errors": query_errors,
         "announcements": rows,
@@ -2020,17 +2447,28 @@ class AltDataServer:
                     description=(
                         "Search recent news for capital investment announcements "
                         "(factories, data centers, R&D facilities, major equipment). "
-                        "Extracts dollar amounts, classifies direction, and returns "
-                        "bullish / bearish / neutral / data_gap signal. "
-                        "bullish: new investment announced; bearish: cancellation/delay/cut. "
-                        "Any announcement >= $1B → strong bullish signal. "
+                        "EVERY dollar figure is classified before it is used: "
+                        "capital_expenditure / customer_or_partner_deal / financing / "
+                        "guarantee / third_party_capital / equity_or_ma / "
+                        "cumulative_total / unclassified, each in `figures` with the "
+                        "words that placed it. A customer deal is REVENUE and a "
+                        "financing is DEBT — opposite signals to capex about the same "
+                        "company — so read the category, never the raw number. "
+                        "capex_total_usd sums ONLY distinct capital_expenditure "
+                        "figures; it is null (never 0) when no figure can be "
+                        "attributed to the company spending on physical assets, which "
+                        "is the common case for a company whose news is about demand. "
+                        "capex_total_basis names every figure excluded and why. "
+                        "containment_detected / cumulative_program_usd flag a running "
+                        "programme total ('brings its US investment to $265bn') that "
+                        "already contains the announcement, so the two are not added. "
+                        "signal (bullish / bearish / neutral / data_gap) is derived "
+                        "from capital_expenditure figures alone and is data_gap when "
+                        "there are none. "
                         "Returns success=false with reason='unknown_ticker' for a symbol "
                         "the quote provider cannot resolve, and reason='no_results' when "
                         "no article matched — a news corpus cannot assert that no capex "
                         "was announced, so that is never reported as a zero. "
-                        "total_announced_usd sums DISTINCT dollar figures, not articles: "
-                        "one project restated by four outlets is counted once, and "
-                        "total_announced_basis says how the figure was reached. "
                         "announcement_count counts every matching article; rows_returned "
                         "and truncated describe the announcements list. "
                         "Uses DuckDuckGo news (ddgs). Best for: semiconductors, industrials, "
