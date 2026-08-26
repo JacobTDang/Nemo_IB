@@ -95,6 +95,25 @@ SERVERS: tuple[ServerSpec, ...] = (
 
 CURATED_LIMITS: dict[str, dict[str, Any]] = {
 
+    # --- sec ---------------------------------------------------------------
+    # A tool-level fact rather than a per-response one, which is exactly the
+    # split this dict exists for. Coverage of this extraction is materially
+    # incomplete across filers, so a caller should know before choosing the
+    # tool. The per-response warning fires only when a given answer is
+    # actually incomplete -- attaching it unconditionally made it contradict
+    # `coverage: "full"` on filers whose six buckets were verified against SEC,
+    # and taught readers to skip the warnings array entirely.
+    "get_debt_maturity_schedule": {
+        "expected_freshness": "annual; from the long-term debt footnote of the "
+                              "most recent 10-K",
+        "known_limits": [
+            "Coverage is materially incomplete across filers. A `not_covered` "
+            "response means the maturity split was not disclosed in tagged "
+            "form, NEVER that no debt matures. Check the `coverage` field on "
+            "each response.",
+        ],
+    },
+
     # --- financial ---------------------------------------------------------
     # Audit s7: "Short interest is normally 2-3 weeks stale." The staleness and
     # the absence of a live alternative both ride on the response already; only
