@@ -298,6 +298,15 @@ def _dcf_math(revenue_base: float, ebitda_margin: float, capex_pct_revenue: floa
         f"wacc must be greater than zero, received {wacc}. A zero discount "
         f"rate does not discount: the present value equals the undiscounted "
         f"cash flow and the terminal value is unbounded.")
+
+  # A company does not have negative revenue. Accepted, the model ran happily
+  # and returned a negative enterprise value -- an answer no caller asked for
+  # and no filing supports.
+  if revenue_base is not None and revenue_base <= 0:
+    raise ValueError(
+        f"revenue_base must be greater than zero, received {revenue_base}. "
+        f"A DCF built on it returns a negative enterprise value, which "
+        f"describes no company.")
   if terminal_growth >= wacc:
     raise ValueError(
         f"terminal_growth ({terminal_growth}) must be below wacc ({wacc}). "
@@ -364,13 +373,21 @@ def _dcf_math(revenue_base: float, ebitda_margin: float, capex_pct_revenue: floa
 
   enterprise_value = sum(pv_fcfs) + pv_terminal
   equity_value = enterprise_value + cash - debt
-  price_per_share = equity_value / shares_outstanding if shares_outstanding > 0 else 0
+  # None, not zero. A $3.79bn equity divided by a share count nobody supplied
+  # was reported as "$0.00 per share" -- not an error and not a null, but the
+  # most plausible wrong answer available, reading as "this equity is
+  # worthless". The company is still worth what it is worth, so only the
+  # per-share figure goes.
+  price_per_share = (equity_value / shares_outstanding
+                     if shares_outstanding and shares_outstanding > 0
+                     else None)
 
   output = {
     'ticker': ticker,
     'enterprise_value': round(enterprise_value, 2),
     'equity_value': round(equity_value, 2),
-    'price_per_share': round(price_per_share, 2),
+    'price_per_share': (round(price_per_share, 2)
+                        if price_per_share is not None else None),
     'fcf_projections': yearly_details,
     'pv_fcfs': pv_fcfs,
     'pv_terminal_value': round(pv_terminal, 2),
@@ -395,6 +412,13 @@ def _dcf_math(revenue_base: float, ebitda_margin: float, capex_pct_revenue: floa
   }
   if terminal_value_warning:
     output['warning'] = terminal_value_warning
+  if price_per_share is None:
+    # A null with no reason is only marginally better than the zero it
+    # replaced: the caller still cannot tell a refusal from a gap.
+    output['price_per_share_note'] = (
+        f"price_per_share is not reported because shares_outstanding was "
+        f"{shares_outstanding!r}. The enterprise and equity values above "
+        f"stand; only the per-share figure needs a share count.")
   return output
 
 
@@ -658,7 +682,8 @@ def _scenario_dcf_math(base_inputs: dict,
       'ebitda_margin_pct': round(margin * 100, 2),
     }
 
-  prices = [results[c]['price_per_share'] for c in ('bear', 'base', 'bull')]
+  prices = [results[c]['price_per_share'] for c in ('bear', 'base', 'bull')
+            if results[c]['price_per_share'] is not None]
 
   # Terminal-multiple sensitivity: re-run each scenario at five terminal
   # multiples spaced around the base assumption. Uses pure exit-multiple
@@ -712,9 +737,9 @@ def _scenario_dcf_math(base_inputs: dict,
     'base': results['base'],
     'bull': results['bull'],
     'price_range': {
-      'low': round(min(prices), 2),
+      'low': round(min(prices), 2) if prices else None,
       'mid': round(results['base']['price_per_share'], 2),
-      'high': round(max(prices), 2),
+      'high': round(max(prices), 2) if prices else None,
     }
   }
   if sensitivity is not None:
