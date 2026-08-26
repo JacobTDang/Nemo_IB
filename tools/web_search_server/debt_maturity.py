@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from tools.response_meta import warning
 from .foreign_issuer import form_mismatch_note, not_covered_reason
 from .sec_series import NotCovered, fetch_concept_series
 
@@ -56,6 +57,24 @@ def _bucket_value(ticker: str, concepts: tuple, form: str) -> Optional[float]:
     return None
 
 
+def _coverage_warnings(coverage: str) -> list:
+    """The incompleteness caveat, attached only when it is true.
+
+    It used to ride on every response from this tool, including MSFT's, whose
+    six buckets were verified against SEC and whose `coverage` field says
+    "full" in the same object. A warning that always fires trains a reader to
+    skip the array, so the genuinely incomplete answer it exists for stops
+    standing out. That is not a conservative default; it is the destruction of
+    the signal.
+    """
+    if coverage == "full":
+        return []
+    return [warning(
+        "incomplete_coverage",
+        "Coverage is incomplete for this filer. `not_covered` means the split "
+        "was not disclosed in tagged form, NEVER that no debt matures.")]
+
+
 def get_debt_maturity_schedule(ticker: str,
                                form: str = "10-K") -> Dict[str, Any]:
     """Principal coming due by year, from the long-term debt footnote.
@@ -80,6 +99,7 @@ def get_debt_maturity_schedule(ticker: str,
                 "success": False,
                 "wrong_form": False,
                 "coverage": "unknown",
+                "warnings": _coverage_warnings("unknown"),
                 "error": f"fetching debt-maturity concepts failed: {exc}",
                 "by_year": {},
                 "total": None,
@@ -101,6 +121,7 @@ def get_debt_maturity_schedule(ticker: str,
             "success": False,
             "wrong_form": bool(mismatch),
             "coverage": "not_covered",
+            "warnings": _coverage_warnings("not_covered"),
             "error": not_covered_reason(
                 ticker, form,
                 f"{ticker} does not tag long-term debt maturities in its "
@@ -117,10 +138,12 @@ def get_debt_maturity_schedule(ticker: str,
     near_term = by_year.get("year_1")
     pct_near = (near_term / total * 100.0) if (near_term is not None and total) else None
 
+    coverage = "full" if buckets_found == len(MATURITY_CONCEPTS) else "partial"
     return {
         "ticker": ticker,
         "success": True,
-        "coverage": "full" if buckets_found == len(MATURITY_CONCEPTS) else "partial",
+        "coverage": coverage,
+        "warnings": _coverage_warnings(coverage),
         "by_year": by_year,
         "total": total,
         "buckets_found": buckets_found,

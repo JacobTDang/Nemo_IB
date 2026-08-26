@@ -1157,12 +1157,6 @@ warnings_per_tool={
         # (README.md, docs/audits/2026-08-25-codex-audit.md, or a tool's own
         # docstring). A caveat that cannot be sourced is not added: an invented
         # limitation is worse than a missing one, because it will be believed.
-        "get_debt_maturity_schedule": [
-          warning("incomplete_coverage",
-                  "Coverage is materially incomplete. `not_covered` means the "
-                  "split was not disclosed in tagged form, NEVER that no debt "
-                  "matures."),
-        ],
         "get_earnings_transcripts": [
           warning("may_not_be_a_transcript",
                   "May return an earnings release rather than a call "

@@ -467,8 +467,27 @@ class FredServer:
         series_data[sid] = result
 
     condensed = _condense_snapshot(series_data)
+    # Each series carries its own observation date and FRED publishes them on
+    # different days, so a snapshot routinely mixes them. T10Y2Y at 0.47 sat
+    # beside a DGS10 and DGS2 whose difference is 0.46 -- a spread that is not
+    # the difference of the two yields shown, with no single as-of to say the
+    # components are from different days.
+    observation_dates = sorted({v.get("as_of") for v in condensed.values()
+                                if isinstance(v, dict) and v.get("as_of")})
     envelope = build_envelope(condensed, "macro_snapshot", "get_macro_snapshot",
                               api_calls_made=len(SNAPSHOT_SERIES), errors=errors)
+    envelope["as_of_range"] = (
+        {"earliest": observation_dates[0], "latest": observation_dates[-1]}
+        if observation_dates else None)
+    envelope["as_of_mixed"] = len(observation_dates) > 1
+    if envelope["as_of_mixed"]:
+      envelope.setdefault("warnings", []).append({
+          "code": "mixed_observation_dates",
+          "message": (
+              f"These series were last observed on {len(observation_dates)} "
+              f"different dates ({observation_dates[0]} to "
+              f"{observation_dates[-1]}). A spread shown here is not "
+              f"necessarily the difference of the levels shown beside it.")})
     return [TextContent(type="text", text=safe_json_dumps(envelope))]
 
   async def get_treasury_yields(self) -> List[TextContent]:
