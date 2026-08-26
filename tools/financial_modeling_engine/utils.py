@@ -6,6 +6,35 @@ import re
 import sys
 from datetime import datetime, timedelta, timezone
 
+def ratio_is_comparable(quote_currency, filing_currency) -> bool:
+    """Whether a price-derived figure and a filer-reported one can be divided.
+
+    They can only be divided when they are denominated in the same money. An
+    ADR quotes in USD while the filer reports in its own currency, so every
+    multiple built that way is wrong by the exchange rate -- TSM's P/E came out
+    at 0.977 against a true 30.7.
+
+    An unknown currency is NOT treated as a match. Assuming they agree is the
+    failure this exists to prevent, and it would reproduce the bug for exactly
+    the securities whose metadata is thinnest.
+    """
+    if not quote_currency or not filing_currency:
+        return False
+    return str(quote_currency).strip().upper() == str(filing_currency).strip().upper()
+
+
+def cross_currency_note(quote_currency, filing_currency) -> str:
+    """Why a multiple was refused, naming both currencies."""
+    return (f"Multiples are not reported: the quote is in "
+            f"{quote_currency or 'an unknown currency'} while the financials "
+            f"are reported in {filing_currency or 'an unknown currency'}. "
+            f"Dividing one by the other yields a figure wrong by the exchange "
+            f"rate rather than a valuation multiple. Use "
+            f"provider_trailing_pe, which the data provider computes in a "
+            f"single currency, or the SEC tools, which report the filer's "
+            f"figures with an explicit currency.")
+
+
 def get_data(ticker: str) -> Dict[str, Any]:
   data = {}
 
@@ -78,33 +107,50 @@ def get_data(ticker: str) -> Dict[str, Any]:
     print(f"Could not get the operating income from income statement for {ticker} : {str(e)}", file=sys.stderr)
 
 
+  # The quote currency and the reporting currency are different things for an
+  # ADR, and every multiple below divides one by the other.
+  data['currency'] = info.get('currency')
+  data['financial_currency'] = info.get('financialCurrency')
+  data['provider_trailing_pe'] = info.get('trailingPE')
+  data['multiples_suppressed_reason'] = None
+
+  comparable = ratio_is_comparable(data['currency'], data['financial_currency'])
+  if not comparable:
+    # Refuse rather than emit a plausible wrong number. SAP's cross-currency
+    # P/E was 32.12 against a true 29.7 -- an 8% error with no smell at all,
+    # which is worse than an obviously broken one because it gets acted on.
+    data['multiples_suppressed_reason'] = cross_currency_note(
+        data['currency'], data['financial_currency'])
+    for key in ('pe_ratio', 'pb_ratio', 'ev_revenue', 'ev_ebitda', 'ev_ebit'):
+      data[key] = None
+
   # calculate multiples -- each wrapped independently so one failure doesn't skip all
   try:
-    if data['marketCap'] is not None and data['netIncomeToCommon'] is not None:
+    if comparable and data['marketCap'] is not None and data['netIncomeToCommon'] is not None:
       data['pe_ratio'] = data['marketCap'] / data['netIncomeToCommon']
   except Exception as e:
     print(f'Error calculating P/E ratio for {ticker}: {str(e)}', file=sys.stderr)
 
   try:
-    if data['marketCap'] is not None and book_value is not None:
+    if comparable and data['marketCap'] is not None and book_value is not None:
       data['pb_ratio'] = data['marketCap'] / book_value
   except Exception as e:
     print(f'Error calculating P/B ratio for {ticker}: {str(e)}', file=sys.stderr)
 
   try:
-    if data['enterpriseValue'] is not None and data['revenue'] is not None:
+    if comparable and data['enterpriseValue'] is not None and data['revenue'] is not None:
       data['ev_revenue'] = data['enterpriseValue'] / data['revenue']
   except Exception as e:
     print(f'Error calculating EV/Revenue for {ticker}: {str(e)}', file=sys.stderr)
 
   try:
-    if data['enterpriseValue'] is not None and data['EBITDA'] is not None:
+    if comparable and data['enterpriseValue'] is not None and data['EBITDA'] is not None:
       data['ev_ebitda'] = data['enterpriseValue'] / data['EBITDA']
   except Exception as e:
     print(f'Error calculating EV/EBITDA for {ticker}: {str(e)}', file=sys.stderr)
 
   try:
-    if data['EBIT'] is not None and data['enterpriseValue'] is not None:
+    if comparable and data['EBIT'] is not None and data['enterpriseValue'] is not None:
       data['ev_ebit'] = data['enterpriseValue'] / data['EBIT']
   except Exception as e:
     print(f'Error calculating EV/EBIT for {ticker}: {str(e)}', file=sys.stderr)
