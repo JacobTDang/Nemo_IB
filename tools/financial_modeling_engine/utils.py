@@ -1083,29 +1083,40 @@ def get_price_history(ticker: str, period: str = '2y',
   ytd_idx = df.index[df.index >= pd.Timestamp(jan1, tz=df.index.tz)] if df.index.tz else \
             df.index[df.index >= jan1]
   ytd_ret = None
+  since_listing_ret = None
   if len(ytd_idx) > 0:
-    # Only meaningful when the frame actually reaches back into this year.
-    # On a six-month window the first bar on/after 1 January is late February,
-    # so "YTD" measured five months and reported 140.21% for AMD against a
-    # true 115.21%. A listing younger than the year is a different case and
-    # keeps its YTD.
-    # Did the REQUEST reach back before 1 January? Comparing the frame start
-    # to the first in-frame January bar is trivially true and was the bug: on
-    # a six-month window both are late February.
+    # Two things have to be true, and an earlier version checked only one.
     #
-    # A listing younger than the year is the other case and keeps its YTD --
-    # the frame starts after 1 January because the stock did, not because the
-    # window was short.
+    # The REQUEST must reach back before 1 January. Comparing the frame start
+    # to the first in-frame January bar is trivially true, which is why a
+    # six-month window reported AMD's "YTD" as 140.21% against a true 115.21%
+    # -- on that frame both dates are late February.
+    #
+    # And the STOCK must have traded then. Letting a young listing keep its
+    # YTD looked reasonable -- the frame starts late because the stock did --
+    # and produced -41.44% for CBRS, listed 2026-05-14. That is a return since
+    # listing wearing a year-to-date label, and a caller ranking names on YTD
+    # compares one company's five months against another's eight.
     _PERIOD_DAYS = {'1mo': 31, '3mo': 92, '6mo': 183, 'ytd': 366, '1y': 366,
                     '2y': 731, '5y': 1827, '10y': 3653, 'max': 10 ** 5}
     requested_days = _PERIOD_DAYS.get(str(period).lower(), 0)
     days_since_jan1 = (df.index[-1] - pd.Timestamp(jan1, tz=df.index.tz)).days \
         if df.index.tz else (df.index[-1] - jan1).days
-    covers_year_start = requested_days >= days_since_jan1
-    if covers_year_start:
+    year_start = pd.Timestamp(jan1, tz=df.index.tz) if df.index.tz else jan1
+    traded_in_january = df.index[0] < year_start
+    window_reaches_back = requested_days >= days_since_jan1
+
+    if window_reaches_back and traded_in_january:
       ytd_start = close.loc[ytd_idx[0]]
       if ytd_start:
         ytd_ret = round(((close.iloc[-1] / ytd_start) - 1) * 100, 2)
+    elif window_reaches_back:
+      # Not a short window -- a short life. The honest figure is the return
+      # since it listed, under its own name.
+      first_close = close.iloc[0]
+      if first_close:
+        since_listing_ret = round(((close.iloc[-1] / first_close) - 1) * 100, 2)
+      window_short_fields.append('returns_pct.ytd (listed mid-year)')
     else:
       window_short_fields.append('returns_pct.ytd')
 
@@ -1178,6 +1189,9 @@ def get_price_history(ticker: str, period: str = '2y',
       '3m':  _ret_over(63),
       '6m':  _ret_over(126),
       'ytd': ytd_ret,
+      # Present only when the company listed after 1 January, where it is the
+      # answer year-to-date cannot give.
+      'since_listing': since_listing_ret,
       '1y':  _ret_over(252),
       '3y':  _ret_over(252 * 3),
     },

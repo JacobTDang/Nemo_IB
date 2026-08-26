@@ -74,3 +74,43 @@ def test_ytd_is_measured_from_the_first_trading_day_of_the_year():
         assert short["returns_pct"]["ytd"] == pytest.approx(
             full["returns_pct"]["ytd"], abs=1.0), (
             "YTD moved with the requested window")
+
+
+# --- a company with no January price has no year-to-date --------------------
+#
+# The first version of this fix deliberately let a listing younger than the
+# year keep its YTD, reasoning that the frame starts late because the stock
+# did. That was wrong. Verified against raw bars:
+#
+#   CBRS listed 2026-05-14, first close 311.07 -> 182.15/311.07 - 1 = -41.44%
+#   SPCX listed 2026-06-12, first close 160.95 -> 139.63/160.95 - 1 = -13.25%
+#
+# and both were reported as `ytd`. That is a since-listing return wearing a
+# year-to-date label, and a caller ranking names on YTD compares one company's
+# five months against another's eight.
+#
+# The same response already warned that its window "cannot answer a 52-week or
+# year-to-date question" -- and then populated it anyway.
+
+
+@pytest.mark.network
+def test_a_company_that_did_not_trade_in_january_has_no_ytd():
+    from tools.financial_modeling_engine.utils import get_price_history
+
+    result = get_price_history("CBRS", period="max", include_recent_bars=1)
+    ytd = (result.get("returns_pct") or {}).get("ytd")
+    assert ytd is None, (
+        f"CBRS listed 2026-05-14 and reported ytd={ytd}, which is its return "
+        f"since listing, not year-to-date")
+
+    since = (result.get("returns_pct") or {}).get("since_listing")
+    assert since is not None, (
+        "the since-listing return is the real answer and should not be lost")
+
+
+@pytest.mark.network
+def test_a_company_that_traded_in_january_keeps_its_ytd():
+    from tools.financial_modeling_engine.utils import get_price_history
+
+    result = get_price_history("NVDA", period="1y", include_recent_bars=1)
+    assert (result["returns_pct"] or {}).get("ytd") is not None

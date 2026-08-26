@@ -30,6 +30,7 @@ Plus aggregate:
 from __future__ import annotations
 
 import math
+import statistics
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -358,8 +359,12 @@ def backtest_signal(
   hold_days_list = [t.hold_days for t in trades]
   hit_rate = sum(1 for r in returns if r > 0) / len(returns) * 100
   mean_ret = sum(returns) / len(returns)
-  sorted_r = sorted(returns)
-  median_ret = sorted_r[len(sorted_r) // 2]
+  # statistics.median, not sorted[n//2]: on an even sample the latter returns
+  # the UPPER middle value, which always favours the higher number. BETA's two
+  # trades [+9.808, -26.218] reported a median of 9.808 against a true -8.205
+  # -- the winner shown, the loser hidden. Small samples are where a backtest
+  # is least trustworthy and most likely to be run.
+  median_ret = statistics.median(returns)
 
   # Sharpe-ish: mean return / std deviation, annualized by sqrt(252/hold_days)
   if len(returns) > 1:
