@@ -275,17 +275,21 @@ def get_data(ticker: str) -> Dict[str, Any]:
   return _json_safe(data)
 
 
-def find_key(possible_key : List[str], indexes: pd.Index) -> Optional[str]:
-  # find key with in the list of indexes
+def find_key(possible_key: List[str], indexes: pd.Index) -> Optional[str]:
+  """The first candidate label present in `indexes`, or None.
+
+  None means this statement does not carry the line under any of the names we
+  know. That is the common case for banks, which report no 'Operating Income'
+  at all, and the caller turns it into an absent field rather than a zero.
+
+  It used to announce "using llm to compare indexes to possible keys" and then
+  "complete failure, key DNE" on stderr. No LLM was ever called -- the fallback
+  was a TODO that printed and returned None -- so every bank lookup logged a
+  claim about work that did not happen.
+  """
   for key in possible_key:
     if key in indexes:
       return str(key)
-
-  # if that fails then we use a llm fallback - TODO later when I implement quantiazation for models
-  print(f'Unable to find key, using llm to compare indexes to possible keys: {possible_key}', file=sys.stderr)
-
-  # complete failure
-  print('complete failure, key DNE', file=sys.stderr)
   return None
 
 # Curated theme-to-ETF map. Each theme maps to one or more ETF tickers that

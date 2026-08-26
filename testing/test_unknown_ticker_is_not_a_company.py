@@ -127,3 +127,23 @@ def test_corporate_actions_does_not_answer_the_dividend_question(monkeypatch):
 
     assert result.get("pays_dividend") is not False or result.get("success") is False
     assert result.get("success") is False
+
+
+def test_a_missing_statement_line_does_not_claim_an_llm_was_consulted(capsys):
+    """find_key announced "using llm to compare indexes to possible keys" and
+    "complete failure, key DNE" on every bank lookup. No LLM was ever called.
+    A log line describing work that did not happen is worse than silence."""
+    import pandas as pd
+
+    result = utils.find_key(["Operating Income", "Ebit"],
+                            pd.Index(["Net Interest Income", "Total Revenue"]))
+    assert result is None
+
+    captured = capsys.readouterr()
+    assert "llm" not in (captured.err + captured.out).lower()
+
+
+def test_find_key_still_finds_a_present_label():
+    import pandas as pd
+    assert utils.find_key(["Operating Income", "Ebit"],
+                          pd.Index(["Ebit", "Total Revenue"])) == "Ebit"
