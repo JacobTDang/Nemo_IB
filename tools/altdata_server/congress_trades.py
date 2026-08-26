@@ -123,6 +123,24 @@ AMOUNT_BRACKETS: Tuple[Tuple[int, Optional[int]], ...] = (
 _BRACKET_FLOORS = {low: high for low, high in AMOUNT_BRACKETS}
 
 
+# The PTR's table header, repeated at the top of each page. When an entry
+# spans a page break the header is absorbed into the row -- 411 of 16,518
+# stored transactions carry it inside `asset_name`, sometimes mid-name, so the
+# security is split across it.
+_TABLE_HEADER_RE = re.compile(
+    r"\s*ID\s+Owner\s+Asset\s+Transaction\s+Date\s+Notification\s+Amount\s+"
+    r"Cap\.\s+Type\s+Date\s+Gains\s*>\s*\??\s*",
+    re.IGNORECASE)
+
+
+def strip_table_header(name: str) -> str:
+    """Remove the page header from a security name, rejoining what it split."""
+    if not name:
+        return name
+    cleaned = _TABLE_HEADER_RE.sub(" ", name)
+    return re.sub(r"\s{2,}", " ", cleaned).strip()
+
+
 def parse_amount_range(text: str) -> Tuple[Optional[int], Optional[int]]:
     """`"$1,001 - $15,000"` to `(1001, 15000)`.
 
@@ -156,15 +174,20 @@ def parse_amount_range(text: str) -> Tuple[Optional[int], Optional[int]]:
     official_high = _BRACKET_FLOORS[low]
     if len(numbers) == 1:
         # "$50,000,000 +" is open-ended. A lone floor without a "+" lost its
-        # ceiling on the page; the floor still stands.
+        # ceiling on the page; the box it belongs to still defines one.
         return (low, None if "+" in text else official_high)
 
     high = numbers[1]
     if high == official_high:
         return (low, high)
-    # The ceiling disagrees with the band the floor belongs to, so it came
-    # from somewhere else on the page.
-    return (low, None)
+    # The ceiling disagrees with the band the floor belongs to, so it came from
+    # somewhere else on the page -- usually the "Cap. Gains > $200?" header.
+    # The floor identifies which box the filer ticked and the Act defines that
+    # box's ceiling, so the statutory ceiling is what the filing means, not an
+    # inference. Returning None instead made these rows look like unbounded
+    # ">$50,000,000" disclosures, and one such row erases the ceiling of every
+    # total it enters: two suppressed `amount_max_total` across 200 AAPL rows.
+    return (low, official_high)
 
 
 def _iso(date_text: str) -> Optional[str]:

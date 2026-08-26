@@ -42,6 +42,17 @@ def _rows(conn: sqlite3.Connection, sql: str, params: tuple) -> List[Dict[str, A
     return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
 
+# The disclosure bands that genuinely have no ceiling. "Over $50,000,000" on
+# both tables, and "Over $1,000,000" -- the spouse/dependent cap on annual
+# reports, which is a holdings band only (the transaction bracket at that level
+# floors at 1,000,001, so the two never collide).
+#
+# Anything else with a null ceiling lost it to a parsing failure. Treating
+# those as unbounded let 24 broken rows erase `amount_max_total` for every
+# result set they touched.
+_OPEN_ENDED_FLOORS = frozenset({1_000_000, 50_000_000})
+
+
 def _open_ended(rows: List[Dict[str, Any]], low: str, high: str) -> bool:
     """Whether any row has a floor but no disclosed ceiling.
 
@@ -49,17 +60,38 @@ def _open_ended(rows: List[Dict[str, Any]], low: str, high: str) -> bool:
     them as though the ceiling were zero produced a maximum below its own
     minimum -- live, three NVDA holdings totalled 1,600,002 to 1,250,000.
     Once such a row is in the sum the total has no ceiling either.
+
+    Only the top bracket qualifies. A missing ceiling on a mid-bracket floor is
+    a parse failure, not an unbounded disclosure, and treating it as one let 24
+    broken rows erase `amount_max_total` for every result set they touched.
     """
-    return any(r.get(low) is not None and r.get(high) is None for r in rows)
+    return any(r.get(low) is not None and r.get(high) is None
+               and r.get(low) in _OPEN_ENDED_FLOORS for r in rows)
+
+
+def _bracketed_total(low_sum: int, high_sum: Optional[int]) -> Optional[int]:
+    """The ceiling of a bracketed sum, or None when it cannot be one.
+
+    A range whose top is below its own bottom is not a range. Narrowing which
+    floors count as open-ended made that reachable again for any row whose
+    ceiling was lost some other way, so the invariant is enforced here rather
+    than inferred from the bracket table. Whatever bands exist in future, a
+    total that would invert is reported as having no ceiling.
+    """
+    if high_sum is None or high_sum < low_sum:
+        return None
+    return high_sum
 
 
 def _totals(transactions: List[Dict[str, Any]]) -> Dict[str, Any]:
     """A bracketed total, plus the direction counts that give it meaning."""
     unbounded = _open_ended(transactions, "amount_min", "amount_max")
+    low_total = sum(t.get("amount_min") or 0 for t in transactions)
+    high_total = None if unbounded else sum(
+        t.get("amount_max") or 0 for t in transactions)
     return {
-        "amount_min_total": sum(t.get("amount_min") or 0 for t in transactions),
-        "amount_max_total": None if unbounded else sum(
-            t.get("amount_max") or 0 for t in transactions),
+        "amount_min_total": low_total,
+        "amount_max_total": _bracketed_total(low_total, high_total),
         "open_ended_count": sum(1 for t in transactions
                                 if t.get("amount_min") is not None
                                 and t.get("amount_max") is None),
@@ -273,10 +305,20 @@ def ticker_activity(ticker: str, since: Optional[str] = None,
                     until: Optional[str] = None,
                     chamber: Optional[str] = None,
                     limit: int = 500) -> Dict[str, Any]:
-    """Every disclosed trade in one ticker, across both chambers."""
-    wanted = (ticker or "").upper().strip()
-    where = ["t.ticker = ?"]
-    params: List[Any] = [wanted]
+    """Every disclosed trade, narrowed by whichever filters are supplied.
+
+    The ticker is optional. It used to be unconditional, so a caller asking
+    for every trade got `WHERE t.ticker = ''`, which matches nothing: every
+    unfiltered query answered `transaction_count: 0` over a store holding
+    16,518 rows, with `truncated: false` asserting the empty set was the whole
+    set. "What did the Senate trade this quarter?" answered "nothing".
+    """
+    wanted = (ticker or "").upper().strip() or None
+    where: List[str] = []
+    params: List[Any] = []
+    if wanted:
+        where.append("t.ticker = ?")
+        params.append(wanted)
     if since:
         where.append("t.transaction_date >= ?")
         params.append(since)
@@ -287,7 +329,8 @@ def ticker_activity(ticker: str, since: Optional[str] = None,
         where.append("f.chamber = ?")
         params.append(chamber)
 
-    clause = " AND ".join(where)
+    # No filters at all is a legitimate question -- "everything you have".
+    clause = " AND ".join(where) if where else "1 = 1"
     with store.connect() as conn:
         transactions = _rows(conn, f"""
             SELECT {_TXN_COLUMNS} FROM transactions t
@@ -510,12 +553,13 @@ _HOLDING_COLUMNS = """h.ticker, h.cusip, h.asset_name, h.asset_type_code, h.owne
 def _holding_totals(holdings: List[Dict[str, Any]]) -> Dict[str, Any]:
     priced = [h for h in holdings if h.get("value_min") is not None]
     unbounded = _open_ended(priced, "value_min", "value_max")
+    low_total = sum(h["value_min"] or 0 for h in priced)
+    high_total = None if unbounded else sum(h["value_max"] or 0 for h in priced)
     return {
-        "value_min_total": sum(h["value_min"] or 0 for h in priced),
+        "value_min_total": low_total,
         # None, not a smaller number: with an open-ended row in the sum the
         # disclosure states no ceiling, and closing it at one inverts the range.
-        "value_max_total": None if unbounded else sum(
-            h["value_max"] or 0 for h in priced),
+        "value_max_total": _bracketed_total(low_total, high_total),
         "priced_count": len(priced),
         # Never folded into the totals: a holding nobody could price and a
         # holding worth nothing are different disclosures.

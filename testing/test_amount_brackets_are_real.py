@@ -41,9 +41,18 @@ def test_an_open_ended_top_bracket_keeps_no_ceiling():
 
 
 def test_the_capital_gains_header_is_not_an_upper_bound():
-    """The exact shape found in the store, 24 times over."""
-    assert parse_amount_range("$50,001 $200") == (50001, None)
-    assert parse_amount_range("$15,001 Cap. Gains > $200?") == (15001, None)
+    """The exact shape found in the store, 24 times over.
+
+    Originally this asserted the ceiling became None, to avoid inventing a
+    figure. That was reversed once the cost showed up: `_open_ended` treats any
+    floor-without-ceiling as an unbounded ">$50,000,000" disclosure, so two
+    such rows erased `amount_max_total` across all 200 AAPL rows. The floor
+    identifies which statutory box the filer ticked and the Act defines that
+    box's ceiling, so the ceiling is definitional rather than inferred. See
+    test_header_bleed.py.
+    """
+    assert parse_amount_range("$50,001 $200") == (50001, 100000)
+    assert parse_amount_range("$15,001 Cap. Gains > $200?") == (15001, 50000)
 
 
 def test_an_inverted_range_never_survives():

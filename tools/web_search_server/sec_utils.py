@@ -1642,6 +1642,21 @@ _COMPANY_NAME_TO_TICKER: Dict[str, str] = {
 }
 
 
+def _schedule13_party(filing, attribute: str):
+  """(name, cik) of a filing's subject or filer, or (None, None)."""
+  try:
+    for party in (getattr(filing.header, attribute, None) or []):
+      info = getattr(party, 'company_information', None)
+      if info is None:
+        continue
+      cik = getattr(info, 'cik', None)
+      return (getattr(info, 'name', None),
+              str(int(cik)) if cik not in (None, '') else None)
+  except Exception:  # noqa: BLE001 - an unreadable header is reported, not fatal
+    pass
+  return (None, None)
+
+
 def get_schedule_13d_filings(ticker: str, limit: int = 15,
                              include_passive: bool = True) -> Dict[str, Any]:
   """Return SC 13D (activist) and SC 13G (passive) filings naming the
@@ -1668,12 +1683,16 @@ def get_schedule_13d_filings(ticker: str, limit: int = 15,
     return {'ticker': ticker, 'success': False,
             'error': f'Company lookup failed: {type(e).__name__}: {e}'}
 
+  company_cik = str(int(company.cik))
+
   forms_to_pull = ['SC 13D', 'SC 13D/A']
   if include_passive:
     forms_to_pull.extend(['SC 13G', 'SC 13G/A'])
 
   rows: list = []
-  whole_set: dict = {}   # accession -> is_activist, over every matching filing
+  whole_set: dict = {}       # accession -> is_activist, subject-side only
+  filed_by_company: set = set()   # this company's own stakes in other issuers
+  heuristic_disagreements: list = []   # where the header contradicts the proxy
   for form in forms_to_pull:
     try:
       filings = company.get_filings(form=form)
@@ -1689,25 +1708,57 @@ def get_schedule_13d_filings(ticker: str, limit: int = 15,
                         f'absence of filings.'),
               'filings': [], 'failed_form': form}
 
-    # Accession and form come from the submissions index, so the SET can be
-    # counted without fetching a single document. Only the page below pays for
-    # a text fetch, which is why the page is small and the count is not.
+    # Accession, form and file number come from the submissions index, so the
+    # SET can be classified and counted without fetching a single document.
+    #
+    # A CIK's folder holds both sides of a Schedule 13 relationship: filings
+    # where the company is the SUBJECT, and filings it made about OTHER
+    # issuers. Counting both answered "are there activists in Intel?" with 124
+    # when 71 of the first 100 rows were Intel filing on MariaDB, Mobileye,
+    # Joby and Vuzix. EDGAR gives the subject an `005-` file number, present
+    # and constant in the subject's own folder and blank on the filings it
+    # made about others -- verified against header ground truth on INTC, 28 of
+    # 28 in agreement.
+    subject_side = []
     for f in filings:
       try:
-        whole_set.setdefault(f.accession_number, form.startswith('SC 13D'))
+        accession = f.accession_number
       except Exception:
         continue
+      if not str(getattr(f, 'file_number', '') or '').strip():
+        filed_by_company.add(accession)
+        continue
+      whole_set.setdefault(accession, form.startswith('SC 13D'))
+      subject_side.append(f)
 
-    for f in filings.head(limit):
-      filer_name = None
-      filer_cik = None
-      try:
-        if f.header and f.header.filers:
-          ci = f.header.filers[0].company_information
-          filer_name = ci.name
-          filer_cik = ci.cik
-      except Exception:
-        pass
+    # Page the subject-side filings, not the raw folder. Slicing first meant
+    # asking for 3 rows on INTC returned 1, because three quarters of the
+    # folder is Intel filing on other issuers.
+    for f in subject_side[:limit]:
+      # The page already pays for a document fetch, so its rows are verified
+      # against the filing header, which is the authority. The file number is
+      # only a free proxy, used for the set.
+      filer_name, filer_cik = _schedule13_party(f, 'filers')
+      subject_name, subject_cik = _schedule13_party(f, 'subject_companies')
+      subject_verified = subject_cik is not None
+      is_subject = (subject_cik == company_cik) if subject_verified else None
+      if is_subject is False:
+        # The header is the authority: this is a stake the company took in
+        # someone else. Note where it contradicts the file-number proxy, so a
+        # drift in that heuristic surfaces instead of quietly skewing counts.
+        if f.accession_number in whole_set:
+          heuristic_disagreements.append(f.accession_number)
+        continue
+      if is_subject is None and f.accession_number not in whole_set:
+        # The header would not parse and the proxy says this filing is one the
+        # company made about another issuer. Nothing contradicts the proxy, so
+        # it stands -- and the row stays out of both the page and the count
+        # rather than being in one and not the other.
+        continue
+      if is_subject and f.accession_number not in whole_set:
+        heuristic_disagreements.append(f.accession_number)
+        whole_set.setdefault(f.accession_number, form.startswith('SC 13D'))
+        filed_by_company.discard(f.accession_number)
 
       # Try to extract stake percentage from filing body
       stake_pct = None
@@ -1731,6 +1782,13 @@ def get_schedule_13d_filings(ticker: str, limit: int = 15,
         'accession':        f.accession_number,
         'filer_name':       filer_name,
         'filer_cik':        filer_cik,
+        'subject_name':     subject_name,
+        'subject_cik':      subject_cik,
+        'is_subject':       is_subject,
+        # False means the header would not parse. The row is kept and flagged
+        # rather than dropped: an absence created by our own failure would be
+        # indistinguishable from a company nobody has filed on.
+        'subject_verified': subject_verified,
         'stake_pct':        stake_pct,
         'url':              getattr(f, 'filing_url', None),
         'is_amendment':     form.endswith('/A'),
@@ -1746,6 +1804,7 @@ def get_schedule_13d_filings(ticker: str, limit: int = 15,
             'truncated': False,
             'activist_count': 0,
             'passive_count': 0,
+            'filed_by_this_company_count': len(filed_by_company),
             'note': 'No Schedule 13D/G filings found — company may be too small to have a 5%-stake holder, or coverage gap.'}
 
   # Dedupe by accession — edgartools returns the same filing under both
@@ -1781,6 +1840,13 @@ def get_schedule_13d_filings(ticker: str, limit: int = 15,
     'truncated':      matched > len(rows),
     'activist_count': activist_count,
     'passive_count':  passive_count,
+    # Kept rather than discarded: a stake this company took in another issuer
+    # is real information, just the answer to a different question.
+    'filed_by_this_company_count': len(filed_by_company),
+    # The set is classified from the submissions index; the page is verified
+    # against filing headers. They agreed on 28 of 28 filings when the proxy
+    # was chosen, and a non-zero figure here means it has drifted.
+    'subject_filter_disagreements': len(heuristic_disagreements),
     'note':           'Stake percentage extracted via regex on common phrasings; null = parse failed (analyst should check URL).',
   }
 

@@ -59,12 +59,29 @@ def test_the_page_is_reported_separately_from_the_set():
 
 
 @requires_sec
-def test_an_activist_is_not_hidden_by_the_default_limit():
-    """The question this tool exists to answer must not depend on paging."""
+def test_the_answer_does_not_depend_on_the_page_size():
+    """The question this tool exists to answer must not depend on paging.
+
+    This test used to assert `activist_count > 0` for INTC, on the premise
+    that Intel had 31 activist 13D filings. It does not. Those rows were
+    Intel FILING on MariaDB, Mobileye, Joby and Vuzix -- see
+    test_13d_subject_not_filer.py. The true figure is zero activists and 40
+    passive holders, which is unremarkable for a mega-cap.
+
+    Asserting a non-zero count made a wrong number look like proof the paging
+    fix worked. The invariant that actually matters is that the number does
+    not move, so that is what is checked -- whatever the number is.
+    """
     from tools.web_search_server.sec_utils import get_schedule_13d_filings
     small = get_schedule_13d_filings("INTC", limit=3)
-    assert small["activist_count"] > 0, (
-        "INTC has 31 activist 13D filings and the default page reports none")
+    large = get_schedule_13d_filings("INTC", limit=100)
+
+    assert small["activist_count"] == large["activist_count"]
+    assert small["passive_count"] == large["passive_count"]
+    assert small["count"] == large["count"]
+    assert small["passive_count"] > 0, (
+        "Vanguard and BlackRock file 13Gs on Intel; zero would mean the "
+        "subject-side filter is now too aggressive")
 
 
 @requires_sec
@@ -82,6 +99,8 @@ def test_a_throttled_form_query_is_not_reported_as_zero_activists(monkeypatch):
     import tools.web_search_server.sec_utils as su
 
     class _Throttled:
+        cik = 50863
+
         def get_filings(self, form=None):
             if form == "SC 13D":
                 raise RuntimeError("Too Many Requests")
