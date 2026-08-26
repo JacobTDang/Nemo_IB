@@ -181,11 +181,19 @@ def peer_distribution(values, *, lower=0.0, upper=1000.0) -> dict:
   Exclusions are counted and explained. A distribution quietly computed over a
   different set than the caller asked for is worse than one that says so.
   """
-  numbers = [float(v) for v in (values or [])
+  supplied = list(values or [])
+  numbers = [float(v) for v in supplied
              if isinstance(v, (int, float)) and not isinstance(v, bool)
              and v == v and abs(v) != float('inf')]
+  # A peer with no comparable multiple at all -- a foreign issuer whose
+  # cross-currency multiples are suppressed, or a filer that tags nothing --
+  # was filtered out before the count, so a four-name comp set reported
+  # "included 2, excluded 0" and published a median of the two that remained.
+  # Suppressing the multiple is right; making the peer disappear is not.
+  absent = len(supplied) - len(numbers)
   kept = [v for v in numbers if lower < v <= upper]
-  dropped = len(numbers) - len(kept)
+  implausible = len(numbers) - len(kept)
+  dropped = absent + implausible
 
   stats = {
       'included_count': len(kept),
@@ -195,11 +203,23 @@ def peer_distribution(values, *, lower=0.0, upper=1000.0) -> dict:
       'low': None, 'high': None,
   }
   if dropped:
+    parts = []
+    if absent:
+      parts.append(
+          f"{absent} peer(s) reported no comparable multiple -- a foreign "
+          f"issuer whose multiples are suppressed across currencies, or a "
+          f"filer tagging nothing")
+    if implausible:
+      parts.append(
+          f"{implausible} peer(s) fell outside ({lower}, {upper}]: such a "
+          f"multiple comes from a denominator at or near zero, or from "
+          f"negative earnings, and is not comparable")
     stats['excluded_reason'] = (
-        f"{dropped} peer(s) excluded: a multiple outside "
-        f"({lower}, {upper}] comes from a denominator at or near zero, or "
-        f"from negative earnings, and is not comparable. Including one moves "
-        f"the mean without describing any company in the set.")
+        "; ".join(parts) +
+        ". A distribution computed over a different set than the caller asked "
+        "for must say so.")
+  stats['excluded_absent'] = absent
+  stats['excluded_implausible'] = implausible
   if not kept:
     return stats
 
@@ -269,6 +289,20 @@ def _dcf_math(revenue_base: float, ebitda_margin: float, capex_pct_revenue: floa
   depreciation = as_rate('depreciation', depreciation)
   wacc = as_rate('wacc', wacc)
   terminal_growth = as_rate('terminal_growth', terminal_growth, allow_negative=True)
+  # Zero is not a discount rate; it is the absence of one. Accepted, it left
+  # pv_fcfs identical to the undiscounted series and produced a $5.98tn
+  # enterprise value for a bank with a $948bn market cap -- success: true,
+  # price_per_share 0, no warnings.
+  if wacc <= 0:
+    raise ValueError(
+        f"wacc must be greater than zero, received {wacc}. A zero discount "
+        f"rate does not discount: the present value equals the undiscounted "
+        f"cash flow and the terminal value is unbounded.")
+  if terminal_growth >= wacc:
+    raise ValueError(
+        f"terminal_growth ({terminal_growth}) must be below wacc ({wacc}). "
+        f"The perpetuity is undefined at or above it and returns an "
+        f"arbitrarily large number rather than a valuation.")
   revenue_growth = [as_rate('revenue_growth', g, allow_negative=True)
                     for g in (revenue_growth or [])]
 

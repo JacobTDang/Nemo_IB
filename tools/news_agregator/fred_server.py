@@ -198,6 +198,47 @@ def _compute_yoy_pct(observations: List[Dict]) -> Optional[float]:
   return round((latest - year_ago) / year_ago * 100, 2)
 
 
+def _observation_at_offset(valid, months_back: int):
+    """The observation closest to `months_back` before the latest one.
+
+    Selected by DATE. The previous code stepped back a fixed number of ROWS --
+    `valid[-13]` with a comment reading "monthly data" -- which is right for a
+    monthly series and wrong for every other frequency. DGS10 is daily, so its
+    "one year ago" was thirteen business days ago and the ten-year reported a
+    one-year change of +1bp where the real move was roughly +42bp. UNRATE is
+    monthly and looked correct, which is how the row offset survived.
+    """
+    from datetime import date
+
+    if not valid:
+        return None, None
+    try:
+        latest_date = date.fromisoformat(valid[-1]["date"])
+    except (KeyError, ValueError, TypeError):
+        return None, None
+
+    year = latest_date.year - (months_back // 12)
+    month = latest_date.month - (months_back % 12)
+    if month <= 0:
+        month += 12
+        year -= 1
+    day = min(latest_date.day, 28)
+    target = date(year, month, day)
+
+    best, best_gap = None, None
+    for observation in valid:
+        try:
+            observed = date.fromisoformat(observation["date"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        gap = abs((observed - target).days)
+        if best_gap is None or gap < best_gap:
+            best, best_gap = observation, gap
+    if best is None:
+        return None, None
+    return _parse_float(best["value"]), best.get("date")
+
+
 def _condense_snapshot(series_data: Dict[str, Dict]) -> Dict[str, Any]:
   """Condense snapshot series into latest + 3M-ago + 1Y-ago per series.
 
@@ -227,8 +268,8 @@ def _condense_snapshot(series_data: Dict[str, Dict]) -> Dict[str, Any]:
       latest = _get_observation_value(observations)
       # Find ~3 months ago and ~1 year ago values
       valid = [o for o in observations if o.get("value") not in (".", "", None)]
-      three_mo = _parse_float(valid[-4]["value"]) if len(valid) >= 4 else None
-      one_yr = _parse_float(valid[-13]["value"]) if len(valid) >= 13 else None
+      three_mo, three_mo_date = _observation_at_offset(valid, 3)
+      one_yr, one_yr_date = _observation_at_offset(valid, 12)
 
       entry = {
         "label": label,
@@ -238,10 +279,12 @@ def _condense_snapshot(series_data: Dict[str, Dict]) -> Dict[str, Any]:
       entry["unit"] = SERIES_UNITS.get(series_id, "unknown")
       if three_mo is not None and latest is not None:
         entry["3m_ago"] = three_mo
+        entry["3m_ago_date"] = three_mo_date
         entry[change_field_name(series_id, "3m")] = change_value(
             series_id, latest, three_mo)
       if one_yr is not None and latest is not None:
         entry["1y_ago"] = one_yr
+        entry["1y_ago_date"] = one_yr_date
         entry[change_field_name(series_id, "1y")] = change_value(
             series_id, latest, one_yr)
 
@@ -535,8 +578,8 @@ class FredServer:
       observations = raw.get("observations", [])
       valid = [o for o in observations if o.get("value") not in (".", "", None)]
       latest = _parse_float(valid[-1]["value"]) if valid else None
-      three_mo = _parse_float(valid[-4]["value"]) if len(valid) >= 4 else None
-      one_yr = _parse_float(valid[-13]["value"]) if len(valid) >= 13 else None
+      three_mo, _ = _observation_at_offset(valid, 3)
+      one_yr, _ = _observation_at_offset(valid, 12)
 
       # FRED quotes these spreads in PERCENT. Publishing the raw value under a
       # name promising basis points reported high-yield OAS as 2.69 when it is
