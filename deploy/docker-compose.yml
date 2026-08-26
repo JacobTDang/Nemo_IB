@@ -22,7 +22,10 @@
 #   docker buildx build --platform linux/amd64 -t nemo-data:amd64 -f ../Dockerfile ..
 
 x-server: &server
-  image: nemo-data:local
+  # Overridable so the homelab can deploy the amd64 build the notes above
+  # describe. Pinned to one tag, following those instructions produced an
+  # image this file would never use.
+  image: ${NEMO_IMAGE:-nemo-data:local}
   env_file: ../.env
   restart: unless-stopped
   # Docker writes container logs to the HOST disk, outside the tmpfs that
@@ -152,7 +155,7 @@ services:
   # nothing, has no use for a bearer token, and still refused to run without
   # one.
   congress-sync:
-    image: nemo-data:local
+    image: ${NEMO_IMAGE:-nemo-data:local}
     env_file: ../.env
     profiles: ["sync"]
     restart: "no"

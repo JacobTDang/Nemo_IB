@@ -82,7 +82,8 @@ handshake and one live tool call against each server.
 
 ```bash
 docker build -t nemo-data:local .                                  # native, local testing
-docker buildx build --platform linux/amd64 -t nemo-data:amd64 .    # for Proxmox
+docker buildx build --platform linux/amd64 -t nemo-data:amd64 --load .   # for Proxmox
+NEMO_IMAGE=nemo-data:amd64 NEMO_TARGET_ARCH=amd64 docker compose up -d
 ```
 
 The image copies only the servers it serves, which means **a new top-level

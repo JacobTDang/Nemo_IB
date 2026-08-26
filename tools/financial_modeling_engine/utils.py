@@ -1,4 +1,6 @@
 import yfinance as yf
+
+from tools.ticker import normalize_ticker
 from typing import Dict, Any, List, Optional, Tuple
 import pandas as pd
 import numpy as np
@@ -316,6 +318,10 @@ def unresolved_symbol_error(ticker: str, handle: Any,
 def get_data(ticker: str) -> Dict[str, Any]:
   data = {}
 
+  # Providers spell class shares with a dash; filings use a dot. Resolve to
+  # the provider's form so a caller can pass either and still join the two.
+  requested_ticker = ticker
+  ticker = normalize_ticker(ticker) or ticker
   company = yf.Ticker(ticker)
   book_value = None
   operating_income = None
@@ -341,7 +347,8 @@ def get_data(ticker: str) -> Dict[str, Any]:
   if unresolved is not None:
     return unresolved
 
-  data['ticker'] = ticker
+  data['ticker'] = requested_ticker
+  data['ticker_resolved'] = ticker
   data['marketCap'] = info.get('marketCap')
   data['currentPrice'] = info.get('currentPrice') or info.get('regularMarketPrice')
   # yfinance `totalRevenue` and `ebitda` ARE trailing-twelve-month values.

@@ -19,6 +19,8 @@ from __future__ import annotations
 import sqlite3
 from typing import Any, Dict, List, Optional
 
+from tools.ticker import normalize_ticker
+
 from . import congress_store as store
 
 _TXN_COLUMNS = """t.ticker, t.cusip, t.asset_name, t.asset_type_code, t.owner,
@@ -313,11 +315,13 @@ def ticker_activity(ticker: str, since: Optional[str] = None,
     16,518 rows, with `truncated: false` asserting the empty set was the whole
     set. "What did the Senate trade this quarter?" answered "nothing".
     """
-    wanted = (ticker or "").upper().strip() or None
+    # Matched on the normalised form so a filing's `BRK.B` and a provider's
+    # `BRK-B` reach the same rows. The stored text is left as filed.
+    wanted = normalize_ticker(ticker)
     where: List[str] = []
     params: List[Any] = []
     if wanted:
-        where.append("t.ticker = ?")
+        where.append("REPLACE(UPPER(t.ticker), '.', '-') = ?")
         params.append(wanted)
     if since:
         where.append("t.transaction_date >= ?")
