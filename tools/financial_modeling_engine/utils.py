@@ -6,6 +6,25 @@ import re
 import sys
 from datetime import datetime, timedelta, timezone
 
+def _json_safe(value):
+  """Replace NaN and infinity with None, recursively.
+
+  RFC 8259 has no NaN literal. Python emits a bare `NaN` and accepts it back,
+  which is why `"interestExpense": NaN` survived every Python test -- but a
+  JavaScript, Go or Rust client loses the ENTIRE response, not the one field.
+  A tool that silently fails for every non-Python caller is worse than one
+  returning a null.
+  """
+  import math
+  if isinstance(value, dict):
+    return {k: _json_safe(v) for k, v in value.items()}
+  if isinstance(value, list):
+    return [_json_safe(v) for v in value]
+  if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+    return None
+  return value
+
+
 def _balance_or_none(info: dict, key: str):
     """A balance-sheet figure, or None when the provider did not report one.
 
@@ -117,6 +136,16 @@ def get_data(ticker: str) -> Dict[str, Any]:
     key = find_key(OPERATING_INCOME_KEYS, income_statement.index)
     operating_income = income_statement.loc[key].iloc[0]
     data['EBIT'] = operating_income
+    # EBIT comes from the annual statement while revenue_ttm, ebitda_ttm and
+    # net_income_ttm come from the trailing-twelve-month feed. Both are right;
+    # only their pairing is wrong, and unlabelled it reads as TTM like
+    # everything around it. Subtracting one from the other gave NVDA an
+    # implied D&A of $35.1bn against an actual $2.84bn.
+    data['ebit_basis'] = 'fiscal_year'
+    try:
+      data['ebit_period_end'] = str(income_statement.columns[0].date())
+    except Exception:
+      data['ebit_period_end'] = str(income_statement.columns[0])
 
   except Exception as e:
     print(f"Could not get the operating income from income statement for {ticker} : {str(e)}", file=sys.stderr)
@@ -164,13 +193,24 @@ def get_data(ticker: str) -> Dict[str, Any]:
   except Exception as e:
     print(f'Error calculating EV/EBITDA for {ticker}: {str(e)}', file=sys.stderr)
 
+  if data.get('EBIT') is not None and data.get('ebitda_ttm') is not None:
+    data['basis_warning'] = (
+        f"EBIT is {data.get('ebit_basis', 'fiscal-year')} "
+        f"(period ending {data.get('ebit_period_end')}) while revenue_ttm, "
+        f"ebitda_ttm and net_income_ttm are trailing twelve months. Do not "
+        f"subtract one from the other -- the difference is not D&A -- and read "
+        f"ev_ebit as a current enterprise value over a fiscal-year EBIT.")
+
   try:
     if comparable and data['EBIT'] is not None and data['enterpriseValue'] is not None:
       data['ev_ebit'] = data['enterpriseValue'] / data['EBIT']
+      data['ev_ebit_basis'] = (
+          f"current enterprise value / {data.get('ebit_basis','fiscal_year')} "
+          f"EBIT ending {data.get('ebit_period_end')}")
   except Exception as e:
     print(f'Error calculating EV/EBIT for {ticker}: {str(e)}', file=sys.stderr)
 
-  return data
+  return _json_safe(data)
 
 
 def find_key(possible_key : List[str], indexes: pd.Index) -> Optional[str]:
