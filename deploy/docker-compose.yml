@@ -57,11 +57,20 @@ x-server: &server
     # rather than silently publishing every tool. That is tested, and it fails
     # at container start instead of at compose parse.
     MCP_AUTH_TOKEN: ${NEMO_MCP_TOKEN:-}
+    # Prune the filing cache below the 512m tmpfs above, well before it fills.
+    NEMO_FILING_CACHE_CAP_MB: ${NEMO_FILING_CACHE_CAP_MB:-360}
+    NEMO_FILING_CACHE_INTERVAL_S: ${NEMO_FILING_CACHE_INTERVAL_S:-300}
     # Persistent, on the named volume rather than the tmpfs above.
     NEMO_CONGRESS_DB: /app/data/congress.db
   # Both writable paths are RAM-backed and capped. edgartools caches every
   # filing it fetches -- 2MB after a single one, unbounded across tickers --
   # and a long-lived container no longer gets --rm to clean up after it.
+  #
+  # The cap alone was not enough: nothing ever removed a cached filing, so the
+  # mount reached 100% in the running stack and every SEC read failed with
+  # [Errno 28] No space left on device. Each server now prunes least-recently-
+  # used filings on an interval (tools/filing_cache.py), and the cap below
+  # leaves headroom for the single largest filing seen so far (89MB).
   tmpfs:
     - /root/.edgar:rw,size=512m
     - /app/db_cache:rw,size=128m

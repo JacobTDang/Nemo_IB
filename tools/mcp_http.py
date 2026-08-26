@@ -15,6 +15,7 @@ container accumulates nothing across requests.
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import datetime as dt
 import hmac
@@ -30,6 +31,8 @@ from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 
+from tools import filing_cache
+
 DEFAULT_PORT = 8080
 MCP_PATH = "/mcp"
 # What clients should register. Without the trailing slash every request
@@ -38,6 +41,22 @@ MCP_PATH_CANONICAL = "/mcp/"
 
 
 _UNSET = object()
+
+
+async def _prune_filing_cache_forever() -> None:
+    """Evict least-recently-used filings for as long as the server runs.
+
+    The cache is capped by a tmpfs and nothing ever removed from it, so the
+    mount reached 100% in the deployment and every SEC read failed with
+    `[Errno 28] No space left on device`. A cap without eviction is not a
+    limit, it is a scheduled outage.
+
+    Runs once at startup because a container restarted onto an already-full
+    tmpfs would otherwise wait a full interval before it could serve anything.
+    """
+    while True:
+        filing_cache.prune_and_log()
+        await asyncio.sleep(filing_cache.interval_seconds())
 
 
 def build_app(mcp_server: Any, *, stateless: bool = True,
@@ -78,7 +97,13 @@ def build_app(mcp_server: Any, *, stateless: bool = True,
     @contextlib.asynccontextmanager
     async def lifespan(_app):
         async with manager.run():
-            yield
+            janitor = asyncio.create_task(_prune_filing_cache_forever())
+            try:
+                yield
+            finally:
+                janitor.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await janitor
 
     app = Starlette(
         routes=[Route("/health", health), Route("/ready", ready),
