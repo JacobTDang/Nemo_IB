@@ -39,7 +39,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # sentry, excel and slack as well -- excluded from running but present on disk,
 # which on a LAN-reachable host is the difference between "no trading tools"
 # and "trading tools nobody happens to start".
-COPY tools/__init__.py tools/mcp_http.py tools/response_meta.py ./tools/
+COPY tools/__init__.py tools/mcp_http.py tools/response_meta.py tools/manifest.py ./tools/
 COPY tools/news_agregator/ ./tools/news_agregator/
 COPY tools/web_search_server/ ./tools/web_search_server/
 COPY tools/financial_modeling_engine/ ./tools/financial_modeling_engine/
@@ -68,7 +68,7 @@ RUN python -c "\
 import importlib;\
 mods=['tools.mcp_http','tools.news_agregator.fred_server','tools.news_agregator.finnhub_server',\
 'tools.web_search_server.web_search','tools.financial_modeling_engine.analysis_tools',\
-'tools.altdata_server.server'];\
+'tools.altdata_server.server','tools.response_meta','tools.manifest'];\
 [importlib.import_module(m) for m in mods];\
 print('all 5 data-source servers and the HTTP transport import')"
 
