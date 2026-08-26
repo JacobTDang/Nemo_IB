@@ -23,6 +23,17 @@ def _ticker(symbol: str):
     return yf.Ticker(symbol)
 
 
+def _unresolved(symbol: str, handle: Any) -> Optional[Dict[str, Any]]:
+    """A symbol the provider does not know is not a company that pays nothing.
+
+    Without this, a typo answered `pays_dividend: false`, `split_count: 0`,
+    `ttm_dividend: 0.0` and `success: true` -- concrete claims about a security
+    that does not exist.
+    """
+    from .utils import unresolved_symbol_error
+    return unresolved_symbol_error(symbol, handle)
+
+
 def _rows_since(series: "pd.Series", cutoff: datetime) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     if series is None or len(series) == 0:
@@ -59,6 +70,9 @@ def get_corporate_actions(ticker: str, years: int = 10) -> Dict[str, Any]:
 
     try:
         handle = _ticker(ticker)
+        unresolved = _unresolved(ticker, handle)
+        if unresolved is not None:
+            return unresolved
         dividend_rows = _rows_since(getattr(handle, "dividends", None), cutoff)
         split_rows = _rows_since(getattr(handle, "splits", None), cutoff)
     except Exception as exc:  # noqa: BLE001 - reported, not swallowed

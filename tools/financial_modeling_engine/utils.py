@@ -69,6 +69,55 @@ def cross_currency_note(quote_currency, filing_currency) -> str:
             f"figures with an explicit currency.")
 
 
+# Identity fields a resolved quote carries. Measured against live yfinance: a
+# symbol that does not exist comes back as `{'trailingPegRatio': None}` with an
+# empty `history_metadata`, while a real filer carries 189 info keys and 28
+# metadata keys. An emptiness check on `info` does not catch the former.
+_SYMBOL_IDENTITY_KEYS = ('symbol', 'quoteType', 'shortName', 'longName',
+                         'regularMarketPrice', 'currency', 'marketCap')
+
+
+def symbol_is_resolved(handle: Any, info: Optional[Dict[str, Any]] = None) -> bool:
+    """Did the market-data provider recognise this symbol at all?
+
+    yfinance never raises for an unknown symbol -- it logs `HTTP Error 404` and
+    returns empty structures, which every downstream field then reads as None.
+    Without this check the response is a well-formed answer about a company
+    that does not exist: `pays_dividend: false`, `split_count: 0`,
+    `shares_short: null`, all reported as a success.
+    """
+    if getattr(handle, 'history_metadata', None):
+        return True
+    if info is None:
+        try:
+            info = handle.info or {}
+        except AttributeError:
+            # Not a yfinance handle at all -- a test double, or a wrapper that
+            # exposes only the series a caller asked for. We did not observe a
+            # missing symbol, we failed to look, and those are different.
+            # Refusing needs positive evidence of non-existence.
+            return True
+        except Exception:      # noqa: BLE001 - a failed quote is not an answer
+            return False
+    return any(info.get(key) is not None for key in _SYMBOL_IDENTITY_KEYS)
+
+
+def unresolved_symbol_error(ticker: str, handle: Any,
+                            info: Optional[Dict[str, Any]] = None
+                            ) -> Optional[Dict[str, Any]]:
+    """The refusal to return when a symbol did not resolve, or None."""
+    if symbol_is_resolved(handle, info):
+        return None
+    return {
+        'ticker': ticker,
+        'success': False,
+        'error': (f"{ticker!r} did not resolve to a listed security at the "
+                  f"market-data provider. This is a failed lookup, not a "
+                  f"company without financials -- check the symbol, or use "
+                  f"the SEC tools if it is an SEC registrant without a quote."),
+    }
+
+
 def get_data(ticker: str) -> Dict[str, Any]:
   data = {}
 
@@ -84,6 +133,19 @@ def get_data(ticker: str) -> Dict[str, Any]:
 
   # get necessary information
   info = company.info
+
+  # yfinance does not raise for a symbol it cannot find: it logs `HTTP Error
+  # 404` and hands back an empty info dict. Every field below then reads as
+  # None and the response looks like a real company that discloses nothing --
+  # including a cross-currency note blaming two unknown currencies for the
+  # missing multiples, which explains the absence with something that is not
+  # the reason. `history_metadata` is populated only when the provider
+  # actually answered, so it separates "no such symbol" from "a real company
+  # whose fields we could not read".
+  unresolved = unresolved_symbol_error(ticker, company, info)
+  if unresolved is not None:
+    return unresolved
+
   data['ticker'] = ticker
   data['marketCap'] = info.get('marketCap')
   data['currentPrice'] = info.get('currentPrice') or info.get('regularMarketPrice')
@@ -688,6 +750,10 @@ def get_short_interest(ticker: str) -> Dict[str, Any]:
     return {'ticker': ticker, 'success': False,
             'error': f'yfinance init failed: {type(e).__name__}: {e}'}
 
+  unresolved = unresolved_symbol_error(ticker, t, info)
+  if unresolved is not None:
+    return unresolved
+
   def _epoch_to_iso(v):
     try:
       return datetime.fromtimestamp(int(v), tz=timezone.utc).strftime('%Y-%m-%d')
@@ -1102,6 +1168,11 @@ def get_institutional_holdings(ticker: str, top_n: int = 10) -> Dict[str, Any]:
     "error": None,
     "source": "yfinance (aggregates SEC 13F-HR)",
   }
+
+  _handle = yf.Ticker(ticker)
+  unresolved = unresolved_symbol_error(ticker.upper(), _handle)
+  if unresolved is not None:
+    return unresolved
 
   try:
     t = yf.Ticker(ticker)
