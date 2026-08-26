@@ -506,12 +506,20 @@ def _condense_forward_estimates(eps_raw: Any, rev_raw: Any, ebitda_raw: Any) -> 
 
   Input: three Finnhub responses from eps-estimate, revenue-estimate, ebitda-estimate.
   Revenue and EBITDA are returned in raw USD (billions scale applied here for readability).
+
+  When Finnhub declines the request, its own words are kept. All three of
+  these endpoints answer HTTP 403 "You don't have access to this resource" on
+  the free tier; flattening that to "no data" made an entitlement problem look
+  like a company with no analyst coverage, and left the caller nothing to act
+  on.
   """
   result = {}
 
   def _extract(raw: Any, avg_key: str, high_key: str, low_key: str, scale: float = 1.0) -> Dict:
+    if isinstance(raw, dict) and raw.get("error"):
+      return {"error": f"Finnhub: {raw['error']}"}
     if not isinstance(raw, dict) or "data" not in raw:
-      return {"error": "no data"}
+      return {"error": f"Finnhub: unrecognized response ({type(raw).__name__})"}
     periods = []
     for item in (raw["data"] or [])[:6]:
       avg = item.get(avg_key)
@@ -535,6 +543,77 @@ def _condense_forward_estimates(eps_raw: Any, rev_raw: Any, ebitda_raw: Any) -> 
   result["revenue_B"] = _extract(rev_raw, "revenueAvg", "revenueHigh", "revenueLow", scale=BILLION)
   result["ebitda_B"] = _extract(ebitda_raw, "ebitdaAvg", "ebitdaHigh", "ebitdaLow", scale=BILLION)
   return result
+
+
+# Which provider each `_source` tag names. A field with no `_source` came from
+# the primary path, which is the only case that may be credited to Finnhub.
+# The derived EBITDA still credits yfinance -- its input is yfinance revenue --
+# because "derived" is a property of the field, not of the upstream, and the
+# field says so itself via `_source`, `_derived` and the response warning.
+_SOURCE_PROVIDERS = {
+  None: "Finnhub",
+  "yfinance_fallback": "yfinance",
+  "yfinance_fallback_inferred": "yfinance",
+}
+
+_FORWARD_FIELDS = ("eps", "revenue_B", "ebitda_B")
+
+
+def _forward_estimates_provenance(condensed: Dict[str, Any]):
+  """(provider, {field: _source}) for a condensed forward-estimates payload.
+
+  The response said `provider: "Finnhub"` on every call while serving
+  yfinance for all three fields. A caller who credits Finnhub cannot audit the
+  number, cannot reproduce it, and has no way to know the EBITDA line was
+  arithmetic rather than a survey. This names what actually answered, per
+  field and in one summary string, from the `_source` tags the fields already
+  carry -- one source of truth rather than a second opinion that can drift.
+  """
+  sources = {}
+  for field in _FORWARD_FIELDS:
+    value = condensed.get(field)
+    sources[field] = value.get("_source") if isinstance(value, dict) else None
+
+  providers = []
+  for field in _FORWARD_FIELDS:
+    value = condensed.get(field)
+    # A field that errored credits nobody; an empty period list is still an
+    # answer, and the source that gave it is the one to name.
+    if not isinstance(value, dict) or "periods" not in value:
+      continue
+    name = _SOURCE_PROVIDERS.get(sources[field], sources[field])
+    if name not in providers:
+      providers.append(name)
+
+  if not providers:
+    return "none (no forward estimates retrieved)", sources
+  return " + ".join(providers), sources
+
+
+def _infer_ebitda_periods(rev_periods: list, margin: float) -> list:
+  """Revenue estimates multiplied by a single trailing EBITDA margin.
+
+  This is not an estimate anybody published. yfinance surfaces no forward
+  EBITDA, so each period is `revenue_avg * ebitdaMargins` with the current TTM
+  margin held flat -- verified against the live response: 395.7282 * 0.6529 =
+  258.39.
+
+  The analyst count is deliberately dropped. It was copied across from the
+  revenue period, so every derived EBITDA figure reported `analysts: 54` and
+  claimed 54 analysts had published an EBITDA estimate when none had. A number
+  this process computed must not carry a count of people who did not compute
+  it; `_derived` and `_derived_from` say where it came from instead.
+  """
+  periods = []
+  for p in rev_periods or []:
+    entry = {"period": p.get("period", "")}
+    for key in ("avg", "low", "high"):
+      if key in p:
+        entry[key] = round(p[key] * margin, 4)
+    entry["_derived"] = True
+    entry["_derived_from"] = "revenue estimate * trailing ebitdaMargins"
+    periods.append(entry)
+  return periods
 
 
 def _yf_forward_estimates(ticker: str) -> Dict[str, Any]:
@@ -609,17 +688,9 @@ def _yf_forward_estimates(ticker: str) -> Dict[str, Any]:
     try:
       margin = t.info.get("ebitdaMargins")
       if margin:
-        ebitda_periods = []
-        for p in rev_periods:
-          e = {"period": p["period"]}
-          for k in ("avg", "low", "high"):
-            if k in p:
-              e[k] = round(p[k] * margin, 4)
-          if "analysts" in p:
-            e["analysts"] = p["analysts"]
-          ebitda_periods.append(e)
-        out["ebitda_B"] = {"periods": ebitda_periods,
+        out["ebitda_B"] = {"periods": _infer_ebitda_periods(rev_periods, margin),
                            "_source": "yfinance_fallback_inferred",
+                           "_derived": True,
                            "_inferred_margin": round(float(margin), 4)}
     except Exception as exc:
       out["ebitda_B"] = {"error": f"yfinance ebitda inference: {type(exc).__name__}: {exc}"}
@@ -1343,14 +1414,20 @@ warnings_per_tool={
     )
     condensed = _condense_forward_estimates(eps_result, rev_result, ebitda_result)
 
+    # What the primary path said, kept before the fallback overwrites it. The
+    # response used to report `errors: []` while every field was served by
+    # yfinance, so nothing recorded that Finnhub answered 403 three times --
+    # a fixable entitlement problem that read as a silent success.
+    primary_errors = [
+      f"{field}: {condensed[field]['error']}"
+      for field in _FORWARD_FIELDS
+      if isinstance(condensed.get(field), dict) and condensed[field].get("error")
+    ]
+
     # yfinance fallback when Finnhub free-tier returns no data on any sub-field.
     # Only fetch yfinance once per call, and only if at least one sub-field is missing.
     # Wrap in wait_for: Ticker.info is known to hang under Yahoo throttling.
-    needs_fallback = any(
-      isinstance(condensed.get(k), dict) and condensed[k].get("error")
-      for k in ("eps", "revenue_B", "ebitda_B")
-    )
-    if needs_fallback:
+    if primary_errors:
       try:
         # 30s budget — yfinance's earnings_estimate / revenue_estimate calls
         # run ~3s standalone but can hit Yahoo throttling under MCP-subprocess
@@ -1359,15 +1436,42 @@ warnings_per_tool={
           asyncio.to_thread(_yf_forward_estimates, ticker),
           timeout=30.0,
         )
-        for k in ("eps", "revenue_B", "ebitda_B"):
+        for k in _FORWARD_FIELDS:
           if isinstance(condensed.get(k), dict) and condensed[k].get("error"):
             condensed[k] = yf_data.get(k, condensed[k])
       except asyncio.TimeoutError:
-        for k in ("eps", "revenue_B", "ebitda_B"):
+        for k in _FORWARD_FIELDS:
           if isinstance(condensed.get(k), dict) and condensed[k].get("error"):
-            condensed[k] = {"error": "no data (Finnhub) + yfinance_timeout"}
+            condensed[k] = {"error": condensed[k]["error"] + " + yfinance_timeout"}
 
-    envelope = build_envelope(condensed, ticker, "get_forward_estimates", api_calls_made=3)
+    provider, sources = _forward_estimates_provenance(condensed)
+    warnings = []
+    if primary_errors:
+      warnings.append(warning(
+        "primary_source_unavailable",
+        "Finnhub returned no forward estimates for this ticker; the values "
+        "below come from the fallback named in `provider` and in each field's "
+        "`_source`. See metadata.errors for what Finnhub said.",
+        finnhub_errors=primary_errors))
+    if any(str(s or "").endswith("_inferred") for s in sources.values()):
+      warnings.append(warning(
+        "derived_not_an_analyst_estimate",
+        "`ebitda_B` is not an analyst estimate. No forward EBITDA consensus "
+        "was available, so each period is the revenue estimate multiplied by "
+        "the trailing EBITDA margin held flat (`_inferred_margin`). It "
+        "carries no analyst count because no analyst published it.",
+        field="ebitda_B"))
+
+    envelope = build_envelope(condensed, ticker, "get_forward_estimates",
+                              api_calls_made=3, errors=primary_errors)
+    # `provider` and `warnings` are set on the body deliberately. The
+    # dispatcher's @annotating decorator fills both with setdefault, so a value
+    # already present here survives -- which is the only way to correct a
+    # per-response provider without editing the decorator's single static
+    # "Finnhub" for the whole server.
+    envelope["provider"] = provider
+    envelope["sources"] = sources
+    envelope["warnings"] = warnings
     return [TextContent(type="text", text=safe_json_dumps(envelope))]
 
   async def get_financial_statements(self, ticker: str, statement: str, freq: str) -> List[TextContent]:

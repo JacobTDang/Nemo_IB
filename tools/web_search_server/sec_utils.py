@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from edgar import Company
 from edgar.xbrl import XBRL
 from collections import OrderedDict
@@ -14,6 +14,11 @@ import threading
 # refuses to invent a contact address. Defaulting it here misrepresented the
 # caller to the SEC on every request.
 from tools.web_search_server.sec_series import _require_identity
+
+# Structured warnings, built with the same helper the MCP dispatcher validates
+# against, so a caveat raised inside an extractor survives annotation instead
+# of being dropped or rejected for shape.
+from tools.response_meta import warning
 
 # Single-flight LRU cache for SEC filing fetches. The previous plain-dict cache
 # had a check-then-fill race: N concurrent threads asking for the same
@@ -1063,12 +1068,143 @@ def _get_revenue_from_xbrl(xbrl, form_type: str):
   return None
 
 
+# The combined element, tried first and alone. A filer that tags it has
+# already done the addition; summing its halves on top would double-count.
+# AAPL tags all three -- 27,601 combined against 8,077 + 19,524 -- and the
+# halves reconcile to the combined element exactly.
+SGA_COMBINED_CONCEPTS = ('us-gaap:SellingGeneralAndAdministrativeExpense',)
+
+# The selling half, in the order filers use it. Alternation, not a sum: UBER
+# tags SellingAndMarketingExpense (4,898, its "Sales and marketing" line) AND
+# MarketingExpense (1,600, a narrower element), and adding both would invent
+# 1.6bn of expense. MarketingExpense is last for that reason, but it is in the
+# chain at all because for AMZN it IS the income statement line -- "Marketing",
+# 47,129 -- and no broader selling element is tagged.
+#
+# MarketingAndAdvertisingExpense is deliberately absent. It is what a bank
+# tags (JPM: 5,531) and it is an advertising budget, not a selling-and-
+# administrative line.
+SGA_SELLING_CONCEPTS = ('us-gaap:SellingAndMarketingExpense',
+                        'us-gaap:MarketingAndSalesExpense',
+                        'us-gaap:SellingExpense',
+                        'us-gaap:MarketingExpense')
+
+SGA_ADMIN_CONCEPTS = ('us-gaap:GeneralAndAdministrativeExpense',)
+
+
+def _select_sga(read) -> Optional[Dict[str, Any]]:
+  """Selling + G&A, summing the halves when the filer tags no combined element.
+
+  `read` is a concept -> fact-dict (or None) callable, so this is testable
+  without a filing.
+
+  The chain used to be "combined, else G&A". Microsoft tags no combined
+  element at all, so it answered with GeneralAndAdministrativeExpense --
+  7,956,000,000, 2.40% of revenue -- and silently dropped
+  SellingAndMarketingExpense, 26,710,000,000. True selling+G&A is
+  34,666,000,000, 10.4%. That made MSFT look like it spent a third of Apple's
+  SG&A ratio when it in fact spends more, which is the opposite of the truth
+  and exactly the comparison this tool exists to support.
+
+  A selling line with no administrative line beside it is NOT accepted as
+  SG&A. The split pattern this handles is "selling + G&A"; a lone marketing
+  element on a filer that tags no G&A at all is a narrower disclosure than
+  SG&A, and reporting it as SG&A would put a new error where there was an
+  honest absence -- JPM would acquire a 5.5bn "SG&A" against roughly 100bn of
+  noninterest expense. G&A alone IS accepted: plenty of filers have no
+  separate selling line, and the operating-income reconciliation below is what
+  tells that case apart from the MSFT one.
+
+  Returns None when the filer tags nothing in the chain.
+  """
+  for concept in SGA_COMBINED_CONCEPTS:
+    fact = read(concept)
+    if fact:
+      return {'value': fact['value'],
+              'concept_used': fact['concept_used'],
+              'components': [{'concept': fact['concept_used'],
+                              'value': fact['value']}]}
+
+  def _first(concepts):
+    for concept in concepts:
+      fact = read(concept)
+      if fact:
+        return fact
+    return None
+
+  admin = _first(SGA_ADMIN_CONCEPTS)
+  if admin is None:
+    return None
+  selling = _first(SGA_SELLING_CONCEPTS)
+
+  components = []
+  if selling:
+    components.append({'concept': selling['concept_used'],
+                       'value': selling['value']})
+  components.append({'concept': admin['concept_used'], 'value': admin['value']})
+  return {
+    'value': sum(c['value'] for c in components),
+    'concept_used': ' + '.join(c['concept'] for c in components),
+    'components': components,
+  }
+
+
+# A residual worth more than this share of revenue is material enough that a
+# reader comparing SG&A ratios across filers would be misled by it. MSFT's
+# omitted selling line was 8.05% of revenue.
+_RECONCILE_TOLERANCE_PCT_REVENUE = 1.0
+
+
+def _reconcile_operating_income(revenue, gross_profit, sga, rnd,
+                                operating_income) -> Optional[Dict[str, Any]]:
+  """Check gross profit - SG&A - R&D against the operating income the filer tags.
+
+  This is the check that would have caught the SG&A defect without anyone
+  looking at a filing: 225,465 - 7,956 - 35,562 = 181,947 against MSFT's
+  reported 155,237, a gap of exactly the 26,710 of Sales & Marketing that the
+  concept chain dropped. AAPL and NVDA reconciled to the dollar throughout,
+  so the gap was a property of the extraction, not of the arithmetic.
+
+  A residual is not automatically an error. Many filers carry operating
+  expense lines this tool does not read -- restructuring, impairment,
+  amortisation of acquired intangibles -- so `reconciles` false means "there
+  is something here that is not SG&A or R&D", which is a fact the caller
+  needs either way.
+
+  Returns None when either input is absent (banks tag no GrossProfit), because
+  a reconciliation against a missing number is not a reconciliation.
+  """
+  if gross_profit is None or operating_income is None or not revenue:
+    return None
+  implied = gross_profit - (sga or 0) - (rnd or 0)
+  residual = implied - operating_income
+  residual_pct = (residual / revenue) * 100
+  return {
+    'basis': 'gross_profit - sga - rnd',
+    'gross_profit': gross_profit,
+    'sga': sga,
+    'rnd': rnd,
+    'implied_operating_income': implied,
+    'operating_income': operating_income,
+    'residual': residual,
+    'residual_pct_revenue': residual_pct,
+    'tolerance_pct_revenue': _RECONCILE_TOLERANCE_PCT_REVENUE,
+    'reconciles': abs(residual_pct) <= _RECONCILE_TOLERANCE_PCT_REVENUE,
+  }
+
+
 def get_margin_breakdown(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
   """Extract gross margin, SG&A %, R&D % from the latest filing.
 
   Returns ticker, revenue, gross_profit, sga, rnd, *_pct_revenue values, plus
   concepts_used for traceability. Banks (no COGS) typically have no GrossProfit
   XBRL concept; absence is expected, not an error.
+
+  `sga` sums the selling and administrative halves when the filer tags no
+  combined element -- see `_select_sga`. `reconciliation` shows the arithmetic
+  against the filer's own operating income so the number can be checked
+  without leaving the response, and a material gap is reported as a structured
+  warning rather than passing silently.
   """
   try:
     filing_data = get_latest_filing(ticker, form_type)
@@ -1094,20 +1230,25 @@ def get_margin_breakdown(ticker: str, form_type: str = '10-K') -> Dict[str, Any]
         concepts_used['gross_profit'] = gp['concept_used']
         break
 
-    for c in ('us-gaap:SellingGeneralAndAdministrativeExpense',
-              'us-gaap:GeneralAndAdministrativeExpense'):
-      sga = filter_annual_data(xbrl, c, form_type)
-      if sga:
-        result['sga'] = sga['value']
-        result['sga_pct_revenue'] = (sga['value'] / revenue) * 100
-        concepts_used['sga'] = sga['concept_used']
-        break
+    sga = _select_sga(lambda c: filter_annual_data(xbrl, c, form_type))
+    if sga:
+      result['sga'] = sga['value']
+      result['sga_pct_revenue'] = (sga['value'] / revenue) * 100
+      result['sga_components'] = sga['components']
+      concepts_used['sga'] = sga['concept_used']
 
     # BIIB and VRTX tag only the ExcludingAcquiredInProcessCost element --
     # 1,778,600,000 and 3,909,500,000 -- which the prefix match used to reach
     # from a query for us-gaap:ResearchAndDevelopmentExpense.
+    #
+    # ADBE tags only the ...SoftwareExcludingAcquiredInProcessCost element,
+    # 4,294,000,000, and so reported no R&D at all. The reconciliation check
+    # below is what found it: 21,218 - 8,061 - 0 implied operating income of
+    # 13,157 against the 8,706 Adobe tags, an 18.7%-of-revenue residual that
+    # closes to 0.7% once the element is read.
     for c in ('us-gaap:ResearchAndDevelopmentExpense',
-              'us-gaap:ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost'):
+              'us-gaap:ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost',
+              'us-gaap:ResearchAndDevelopmentExpenseSoftwareExcludingAcquiredInProcessCost'):
       rnd = filter_annual_data(xbrl, c, form_type)
       if rnd:
         result['rnd'] = rnd['value']
@@ -1115,7 +1256,35 @@ def get_margin_breakdown(ticker: str, form_type: str = '10-K') -> Dict[str, Any]
         concepts_used['rnd'] = rnd['concept_used']
         break
 
+    oi = filter_annual_data(xbrl, 'us-gaap:OperatingIncomeLoss', form_type)
+    if oi:
+      result['operating_income'] = oi['value']
+      concepts_used['operating_income'] = oi['concept_used']
+
     result['concepts_used'] = concepts_used
+
+    warnings: list = []
+    recon = _reconcile_operating_income(
+      revenue=revenue,
+      gross_profit=result.get('gross_profit'),
+      sga=result.get('sga'),
+      rnd=result.get('rnd'),
+      operating_income=result.get('operating_income'))
+    if recon is not None:
+      result['reconciliation'] = recon
+      if not recon['reconciles']:
+        warnings.append(warning(
+          'operating_income_does_not_reconcile',
+          f"gross_profit - sga - rnd implies operating income of "
+          f"{recon['implied_operating_income']:,.0f} against the "
+          f"{recon['operating_income']:,.0f} {ticker} tags: a residual of "
+          f"{recon['residual']:,.0f} ({recon['residual_pct_revenue']:.2f}% of "
+          f"revenue). Either an operating expense line is not read here "
+          f"(restructuring, impairment, amortisation of acquired intangibles) "
+          f"or the SG&A concept chain missed an element this filer tags.",
+          residual=recon['residual'],
+          residual_pct_revenue=round(recon['residual_pct_revenue'], 4)))
+    result['warnings'] = warnings
 
     if 'gross_profit' not in result:
       print(f"[Validate SEC] {ticker}: gross_profit XBRL concept not found (expected for banks/financials)",
@@ -3645,12 +3814,113 @@ def _clean_customer_name(candidate: str) -> Optional[str]:
   return name
 
 
+# "customers headquartered outside of the United States accounted for 31%" is
+# revenue by geography, not one buyer's share. NVDA's 10-K carries that
+# sentence and it was the single largest contributor to a customer list that
+# summed to 159% of revenue.
+_GEOGRAPHIC_ATTRIBUTION_RE = re.compile(
+  r'(?:customers?|clients?)\s+(?:headquartered|located|domiciled|based|residing)\b',
+  re.IGNORECASE)
+
+# The fiscal year the disclosure describes. Anchored on "fiscal ... <year>" or
+# "year(s) ended <month> <day>, <year>" so a year that merely appears in the
+# sentence -- an acquisition date, a contract term -- is not mistaken for the
+# reporting period.
+_FISCAL_YEAR_RE = re.compile(
+  r'(?:fiscal\s+(?:years?\s+)?(?:ended\s+\w+\s+\d{1,2},?\s*)?(19|20)(\d{2})'
+  r'|years?\s+ended\s+\w+\s+\d{1,2},\s*(19|20)(\d{2}))',
+  re.IGNORECASE)
+
+
+def _sentence_around(text: str, index: int) -> str:
+  """The sentence containing `index`, whitespace-normalised.
+
+  Dedup and fiscal-year detection both need the whole statement, not the
+  fixed +/-120 character window used for the excerpt: the window clipped the
+  same sentence differently depending on where in it the percentage sat, so
+  two views of one disclosure never compared equal.
+  """
+  start = max(text.rfind('. ', 0, index), text.rfind('\n\n', 0, index))
+  start = 0 if start < 0 else start + 2
+  terminator = re.search(r'\.(?=\s|$)', text[index:])
+  end = index + (terminator.end() if terminator else 200)
+  return _normalize_excerpt(text[start:end])
+
+
+def _fiscal_year_in(sentence: str, offset: int) -> Optional[int]:
+  """The fiscal year a disclosure describes, or None if it does not say.
+
+  Prefers the last mention at or before the percentage -- filers write "For
+  fiscal year 2026, sales to one direct customer represented 22%" -- and falls
+  back to the first mention after it.
+
+  Without this, NVDA's FY2026, FY2025 and FY2024 disclosures arrived in one
+  flat list with nothing to tell them apart, so 12% (a FY2025 customer) read
+  as a second current-year customer.
+  """
+  before, after = None, None
+  for match in _FISCAL_YEAR_RE.finditer(sentence):
+    century, year = (match.group(1), match.group(2)) if match.group(1) \
+      else (match.group(3), match.group(4))
+    value = int(f"{century}{year}")
+    if match.start() <= offset:
+      before = value
+    elif after is None:
+      after = value
+  return before if before is not None else after
+
+
+def _tokens(sentence: str) -> set:
+  return {w for w in re.findall(r'[a-z0-9%]+', sentence.lower()) if w}
+
+
+def _first_repeat_index(sentence: str, seen) -> Optional[int]:
+  """The row index of a kept sentence that already says all `sentence` says.
+
+  `seen` is a list of (sentence, row index) for one (percentage, fiscal year,
+  name) claim. Returning the index rather than a bool matters when two
+  genuinely different sentences share a claim -- AVGO words its "top five end
+  customers accounted for 40%" disclosure two ways -- so a third copy is
+  counted against the sentence it repeats, not against whichever row happened
+  to come first.
+
+  Exact-string matching is not enough. NVDA prints the direct-customer
+  sentence twice, the second time behind a "Direct Customers - " lead-in, and
+  states the indirect-customer fact twice with "and we estimate" inserted in
+  one copy. Both pairs are one disclosure printed twice, and both survived
+  exact matching -- which is how 22% and 14% each appeared twice in a list
+  that summed to 159% of revenue.
+
+  The test is token-set containment in either direction, not a similarity
+  score. A score would have to be tuned, and any threshold loose enough to
+  merge those two pairs also merges "Customer A accounted for 15%" with
+  "Customer B accounted for 15%" -- two real customers collapsed into one,
+  which is a worse error than the duplication it fixes. Containment says
+  precisely what is meant: one sentence adds no word the other lacks, so it
+  cannot be naming a different party.
+  """
+  candidate = _tokens(sentence)
+  if not candidate:
+    return None
+  for prior, index in seen:
+    other = _tokens(prior)
+    if other and (candidate <= other or other <= candidate):
+      return index
+  return None
+
+
 def _scan_customer_concentration(text: str) -> Dict[str, Any]:
   """Find major-customer disclosure in filing text.
 
   Returns `explicitly_none` when the filer states no customer crosses the
   threshold. That is a real and useful disclosure, distinct from finding
   nothing at all, and the two must not be conflated.
+
+  Each row carries the fiscal year it describes and is deduplicated against
+  the disclosures already kept for that (percentage, year), so a sentence the
+  filing prints twice is reported once. `periods` totals each year's disclosed
+  shares; a year totalling more than 100% of revenue is impossible and is
+  reported as a warning rather than returned as fact.
   """
   denial_spans = [m.span() for m in _NO_CONCENTRATION_RE.finditer(text)]
 
@@ -3658,6 +3928,7 @@ def _scan_customer_concentration(text: str) -> Dict[str, Any]:
     return any(start <= position < end for start, end in denial_spans)
 
   customers: List[Dict[str, Any]] = []
+  seen_sentences: Dict[tuple, list] = {}
   for match in _CUSTOMER_PCT_RE.finditer(text):
     if _inside_denial(match.start()):
       continue
@@ -3669,18 +3940,68 @@ def _scan_customer_concentration(text: str) -> Dict[str, Any]:
     # other than one buyer's share of revenue.
     if not 0 < pct <= 100:
       continue
+    if _GEOGRAPHIC_ATTRIBUTION_RE.search(match.group(0)):
+      continue
+
+    sentence = _sentence_around(text, match.start())
     window = text[max(0, match.start() - 120):match.end() + 40]
     name_match = _CUSTOMER_NAME_RE.search(window)
+    name = _clean_customer_name(name_match.group(1)) if name_match else None
+    fiscal_year = _fiscal_year_in(sentence,
+                                 sentence.find(_normalize_excerpt(match.group(0))))
+
+    # Group by the claim, not by the sentence alone: two different sentences
+    # each disclosing 15% for the same year are two customers.
+    key = (pct, fiscal_year, name)
+    prior = seen_sentences.setdefault(key, [])
+    duplicate_of = _first_repeat_index(sentence, prior)
+    if duplicate_of is not None:
+      customers[duplicate_of]['occurrences'] += 1
+      continue
+    prior.append((sentence, len(customers)))
+
     customers.append({
-      "name": _clean_customer_name(name_match.group(1)) if name_match else None,
+      "name": name,
       "pct_of_revenue": pct,
+      "fiscal_year": fiscal_year,
+      "occurrences": 1,
       "excerpt": window.strip(),
+      "disclosure": sentence,
     })
 
+  periods: List[Dict[str, Any]] = []
+  warnings: List[Dict[str, Any]] = []
+  for year in sorted({row['fiscal_year'] for row in customers},
+                     key=lambda y: (y is None, -(y or 0))):
+    rows = [r for r in customers if r['fiscal_year'] == year]
+    total = round(sum(r['pct_of_revenue'] for r in rows), 4)
+    periods.append({
+      'fiscal_year': year,
+      'total_pct': total,
+      'disclosure_count': len(rows),
+    })
+    if total > 100:
+      label = f"fiscal year {year}" if year is not None else "an unstated period"
+      warnings.append(warning(
+        'concentration_exceeds_total_revenue',
+        f"Disclosed customer shares for {label} sum to {total:.1f}% of "
+        f"revenue, which is impossible. The extraction has picked up "
+        f"something that is not a single customer's share, or has attributed "
+        f"disclosures from more than one period to this one. Treat these rows "
+        f"as unreliable.",
+        fiscal_year=year, total_pct=total))
+
   return {
+    # Canonical key. The rows are disclosures of a share of revenue and are
+    # usually anonymous -- "one direct customer" -- so calling the array
+    # `named_customers` promised a name that is null on every NVDA row.
+    "customer_disclosures": customers,
+    # Back-compatible alias for callers written against the old key.
     "named_customers": customers,
+    "periods": periods,
     "has_concentration": bool(customers),
     "explicitly_none": bool(denial_spans) and not customers,
+    "warnings": warnings,
   }
 
 
@@ -3740,9 +4061,12 @@ def _concentration_failure(ticker: str, message: str) -> Dict[str, Any]:
     'ticker': ticker,
     'success': False,
     'error': message,
+    'customer_disclosures': [],
     'named_customers': [],
+    'periods': [],
     'has_concentration': False,
     'explicitly_none': False,
+    'warnings': [],
   }
 
 
