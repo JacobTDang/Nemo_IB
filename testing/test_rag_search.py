@@ -21,6 +21,15 @@ Run via:
 """
 from __future__ import annotations
 
+import pytest
+
+# The embedder downloads its sentence-transformers weights from huggingface.co
+# on first use, so every test in this module reaches the network. The RAG stack
+# is not in the homelab image either -- `rag_search` and `rag_ingest` are
+# capability-gated and hidden there -- so an offline run has neither the model
+# nor the tools.
+pytestmark = pytest.mark.network
+
 import asyncio
 import json
 import os
