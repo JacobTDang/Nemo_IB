@@ -17,6 +17,8 @@ import sys
 
 import pytest
 
+from testing._gates import skip_if_provider_unavailable
+
 # Resolve paths relative to repo root
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _VENV_PY = os.path.join(_REPO, ".venv", "Scripts", "python.exe")
@@ -554,6 +556,7 @@ def test_policy_signals_returns_required_fields():
     """Policy signals for any ticker must return the required schema fields."""
     from tools.altdata_server.server import _fetch_policy_signals
     result = _fetch_policy_signals("NVDA", "Technology", lookback_days=180)
+    skip_if_provider_unavailable(result, "GovTrack")
     assert "error" not in result, result.get("error")
     required = ["ticker", "sector", "signal", "bill_count", "bills"]
     for field in required:
@@ -572,6 +575,7 @@ def test_policy_signals_uses_govtrack_without_api_key(monkeypatch):
     monkeypatch.delitem(os.environ, "CONGRESS_API_KEY", raising=False)
     from tools.altdata_server.server import _fetch_policy_signals
     result = _fetch_policy_signals("MSFT", "Technology", lookback_days=180)
+    skip_if_provider_unavailable(result, "GovTrack")
     # Should not error even without API key
     assert "error" not in result, result.get("error")
     assert result["signal"] in {"bullish", "bearish", "neutral", "data_gap"}

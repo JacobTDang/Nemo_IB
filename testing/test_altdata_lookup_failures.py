@@ -22,6 +22,8 @@ import sys
 from datetime import datetime
 
 import pytest
+
+from testing._gates import skip_if_provider_unavailable
 import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -741,6 +743,9 @@ def test_policy_live_known_sector_still_returns_bills(monkeypatch):
 
     out = alt._fetch_policy_signals("NVDA", "Technology", 180)
 
+    # GovTrack going down does not make this tool wrong. It reports the outage
+    # distinctly, and asserting through it would test GovTrack's uptime.
+    skip_if_provider_unavailable(out, "GovTrack")
     assert out["success"] is True, out.get("error")
     assert out["bill_count"] > 0
     assert out["coverage"] == "partial"  # GovTrack only without the API key

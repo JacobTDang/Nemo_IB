@@ -3497,6 +3497,20 @@ def extract_forward_signals(ticker: str,
       ))
 
     if not sources_scanned:
+      # Both sources reported why they failed. Discarding those reasons left a
+      # sentence that cannot tell a filer with no MD&A from an SEC outage, a
+      # missing SEC_EMAIL, or a ticker that does not exist -- and a caller
+      # retrying needs to know which source to retry.
+      source_failures = {}
+      if not er.get('success'):
+        source_failures['earnings_releases'] = str(
+          er.get('error') or 'no reason reported')
+      if not mda.get('success'):
+        source_failures['mda'] = str(mda.get('error') or 'no reason reported')
+
+      detail = ('; '.join(f'{name}: {why}'
+                          for name, why in source_failures.items())
+                or 'both sources returned successfully but carried no text')
       return {
         'ticker':            ticker,
         'success':           False,
@@ -3505,7 +3519,8 @@ def extract_forward_signals(ticker: str,
         'signal_count':      0,
         'signals':           [],
         'by_category':       {},
-        'error':             'No text sources available (earnings releases + MD&A both failed)',
+        'source_failures':   source_failures,
+        'error':             f'No text sources available -- {detail}',
       }
 
     # Dedupe

@@ -140,3 +140,25 @@ requires_playbook = _gate("playbook")
 requires_sec = _gate("sec")
 requires_finnhub = _gate("finnhub")
 requires_fred = _gate("fred")
+
+
+def skip_if_provider_unavailable(result: dict, provider: str = "") -> None:
+    """Skip when the upstream refused to answer at all.
+
+    A live test asserting "GovTrack returns bills for Technology" tests
+    GovTrack, not us. When the provider is genuinely down -- and these servers
+    report that distinctly, with coverage "not_covered" and reason
+    "provider_unavailable" -- the assertion is unanswerable, and failing it
+    reports our tool as broken when the tool did exactly the right thing.
+
+    Deliberately narrow: only the server's own "no provider answered" signal
+    skips. A provider that answered with nothing still fails the test, which is
+    what the test is for.
+    """
+    if not isinstance(result, dict):
+        return
+    if result.get("reason") != "provider_unavailable":
+        return
+    detail = str(result.get("error") or "")[:300]
+    pytest.skip(f"{provider or 'the upstream provider'} did not answer, so "
+                f"this assertion is unanswerable: {detail}")

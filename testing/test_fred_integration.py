@@ -34,14 +34,21 @@ from typing import cast
 from agent.workflows.analysis_workflow import WorkFlow
 from agent.workflows.agent_state import AgentState
 from agent.MCP_manager import MCPConnectionManager
-from testing._gates import requires_fred, requires_openrouter
+from testing._gates import (requires_fred, requires_groq,
+                            requires_openrouter)
 
 
 # The whole module drives the live agent workflow: MCP subprocesses, live FRED
-# calls and live LLM completions. Both gates apply to every test, and both
-# report SKIP_NETWORK_TESTS=1 as unavailable.
+# calls and live LLM completions. Every gate applies to every test, and each
+# reports SKIP_NETWORK_TESTS=1 as unavailable.
+#
+# requires_groq is here because WorkFlow's constructor calls
+# validate_credentials() on the Groq template. Gating on FRED and OpenRouter
+# alone named the two services the module was thought to use and missed the one
+# that actually stops it, so these failed with CredentialsMissing rather than
+# skipping.
 pytestmark = [pytest.mark.network, pytest.mark.slow,
-              requires_fred, requires_openrouter]
+              requires_fred, requires_groq, requires_openrouter]
 
 
 @pytest.fixture
