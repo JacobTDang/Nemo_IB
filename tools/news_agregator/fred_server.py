@@ -55,6 +55,46 @@ SNAPSHOT_SERIES = {
   "UMCSENT": "UMich Consumer Sentiment",
 }
 
+# What each series is actually measured in. A basis point is one hundredth of
+# a percentage point, so a bps change is only meaningful for a percent series.
+# Applied blindly it produced "3m_change_bps": 6000.0 for a 60,000-job move in
+# nonfarm payrolls, and 800000.0 for a change in weekly jobless claims.
+SERIES_UNITS = {
+  # quoted in percent -- a change in basis points is meaningful
+  "DGS10": "percent", "DGS2": "percent", "DGS3MO": "percent",
+  "DGS6MO": "percent", "DGS1": "percent", "DGS3": "percent",
+  "DGS5": "percent", "DGS7": "percent", "DGS20": "percent",
+  "DGS30": "percent", "FEDFUNDS": "percent", "T10Y2Y": "percent",
+  "T10Y3M": "percent", "UNRATE": "percent", "A191RL1Q225SBEA": "percent",
+  "BAMLH0A0HYM2": "percent", "BAMLC0A0CM": "percent",
+  "BAMLC0A4CBBB": "percent", "BAA10Y": "percent",
+  # levels and indices -- a change is in the series' own units
+  "PAYEMS": "thousands_of_persons",
+  "ICSA": "persons",
+  "UMCSENT": "index",
+  "NFCI": "index",
+  "CPIAUCSL": "index",
+  "PCEPILFE": "index",
+  "M2SL": "billions_of_dollars",
+}
+
+
+def is_percent_series(series_id: str) -> bool:
+  """Whether a change in this series can honestly be called basis points."""
+  return SERIES_UNITS.get(series_id) == "percent"
+
+
+def change_field_name(series_id: str, horizon: str) -> str:
+  """`3m_change_bps` for a percent series, `3m_change` for anything else."""
+  return f"{horizon}_change_bps" if is_percent_series(series_id) else f"{horizon}_change"
+
+
+def change_value(series_id: str, latest: float, earlier: float) -> float:
+  """The change, in basis points for a percent series and raw units otherwise."""
+  delta = latest - earlier
+  return round(delta * 100, 1) if is_percent_series(series_id) else round(delta, 4)
+
+
 YIELD_CURVE_SERIES = {
   "DGS3MO": "3M",
   "DGS6MO": "6M",
@@ -195,12 +235,15 @@ def _condense_snapshot(series_data: Dict[str, Dict]) -> Dict[str, Any]:
         "current": latest,
         "as_of": _get_observation_date(observations),
       }
+      entry["unit"] = SERIES_UNITS.get(series_id, "unknown")
       if three_mo is not None and latest is not None:
         entry["3m_ago"] = three_mo
-        entry["3m_change_bps"] = round((latest - three_mo) * 100, 1)
+        entry[change_field_name(series_id, "3m")] = change_value(
+            series_id, latest, three_mo)
       if one_yr is not None and latest is not None:
         entry["1y_ago"] = one_yr
-        entry["1y_change_bps"] = round((latest - one_yr) * 100, 1)
+        entry[change_field_name(series_id, "1y")] = change_value(
+            series_id, latest, one_yr)
 
       condensed[series_id] = entry
 
@@ -476,11 +519,17 @@ class FredServer:
       three_mo = _parse_float(valid[-4]["value"]) if len(valid) >= 4 else None
       one_yr = _parse_float(valid[-13]["value"]) if len(valid) >= 13 else None
 
-      entry = {"label": label, "current_bps": latest, "as_of": _get_observation_date(observations)}
+      # FRED quotes these spreads in PERCENT. Publishing the raw value under a
+      # name promising basis points reported high-yield OAS as 2.69 when it is
+      # 269bp -- a hundredfold error for anything pricing debt off it.
+      entry = {"label": label,
+               "current_bps": round(latest * 100, 1) if latest is not None else None,
+               "current_percent": latest,
+               "as_of": _get_observation_date(observations)}
       if three_mo is not None and latest is not None:
-        entry["3m_change_bps"] = round((latest - three_mo) * 100, 1)
+        entry["3m_change_bps"] = change_value(sid, latest, three_mo)
       if one_yr is not None and latest is not None:
-        entry["1y_change_bps"] = round((latest - one_yr) * 100, 1)
+        entry["1y_change_bps"] = change_value(sid, latest, one_yr)
       condensed[sid] = entry
 
     envelope = build_envelope(condensed, "credit_spreads", "get_credit_spreads",
