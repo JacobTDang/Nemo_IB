@@ -165,6 +165,57 @@ def _to_native(obj):
   return obj
 
 
+def peer_distribution(values, *, lower=0.0, upper=1000.0) -> dict:
+  """Summary statistics over comparable multiples only.
+
+  A multiple built on a denominator approaching zero is arithmetically correct
+  and analytically meaningless. INTC's ev_ebit of -20,768 dragged a four-name
+  peer mean to -5,113 against a median of 53, with success: true and no
+  warning -- and a mean and median on opposite sides of zero is the signature
+  of exactly one outlier doing all the work.
+
+  Negative multiples are excluded for the same reason: a company losing money
+  has no meaningful P/E, and averaging one in states something about the peer
+  group that is not true of any member of it.
+
+  Exclusions are counted and explained. A distribution quietly computed over a
+  different set than the caller asked for is worse than one that says so.
+  """
+  numbers = [float(v) for v in (values or [])
+             if isinstance(v, (int, float)) and not isinstance(v, bool)
+             and v == v and abs(v) != float('inf')]
+  kept = [v for v in numbers if lower < v <= upper]
+  dropped = len(numbers) - len(kept)
+
+  stats = {
+      'included_count': len(kept),
+      'excluded_count': dropped,
+      'excluded_reason': None,
+      'mean': None, 'median': None, 'q1': None, 'q3': None,
+      'low': None, 'high': None,
+  }
+  if dropped:
+    stats['excluded_reason'] = (
+        f"{dropped} peer(s) excluded: a multiple outside "
+        f"({lower}, {upper}] comes from a denominator at or near zero, or "
+        f"from negative earnings, and is not comparable. Including one moves "
+        f"the mean without describing any company in the set.")
+  if not kept:
+    return stats
+
+  import statistics
+  ordered = sorted(kept)
+  stats['mean'] = statistics.fmean(ordered)
+  stats['median'] = statistics.median(ordered)
+  stats['low'] = ordered[0]
+  stats['high'] = ordered[-1]
+  if len(ordered) >= 2:
+    import numpy as _np
+    stats['q1'] = float(_np.percentile(ordered, 25))
+    stats['q3'] = float(_np.percentile(ordered, 75))
+  return stats
+
+
 def as_rate(name: str, value, *, allow_negative: bool = False) -> float:
   """Interpret a rate given as a decimal or a percentage, or refuse.
 
@@ -397,6 +448,7 @@ def _lbo_math(entry_ev: float, revenue_base: float, ebitda_margin: float,
 
   current_revenue = revenue_base
   current_debt = debt_amount
+  cash_accumulated = 0.0
   year_by_year = []
 
   for yr in range(hold_years):
@@ -411,8 +463,15 @@ def _lbo_math(entry_ev: float, revenue_base: float, ebitda_margin: float,
     capex = current_revenue * capex_pct_revenue
     # Cash available after interest, taxes, capex -- sweeps to debt
     fcf_after_service = ebitda - capex - taxes - interest
-    debt_paydown = max(0.0, fcf_after_service)
+    # Sweep only what there is debt to repay. Paying the full free cash flow
+    # against a smaller balance destroyed the surplus -- $191.0bn swept against
+    # a $93.4bn balance in one run -- and the excess never reached the equity
+    # holder, understating MOIC and IRR. Immaterial where equity is large;
+    # material in the thin-equity structure this model exists to evaluate.
+    debt_beginning = current_debt
+    debt_paydown = max(0.0, min(fcf_after_service, current_debt))
     current_debt = max(0.0, current_debt - debt_paydown)
+    cash_accumulated += max(0.0, fcf_after_service - debt_paydown)
 
     year_by_year.append({
       'year': yr + 1,
@@ -421,13 +480,15 @@ def _lbo_math(entry_ev: float, revenue_base: float, ebitda_margin: float,
       'interest': round(interest, 2),
       'taxes': round(taxes, 2),
       'fcf_after_service': round(fcf_after_service, 2),
+      'debt_beginning': round(debt_beginning, 2),
       'debt_paydown': round(debt_paydown, 2),
       'debt_remaining': round(current_debt, 2),
     })
 
   exit_ebitda = current_revenue * ebitda_margin
   exit_ev = exit_ebitda * exit_multiple
-  equity_proceeds = max(0.0, exit_ev - current_debt)
+  # Cash swept past a cleared balance belongs to the equity holder.
+  equity_proceeds = max(0.0, exit_ev - current_debt) + cash_accumulated
 
   moic = equity_proceeds / equity_invested if equity_invested > 0 else 0
   # IRR: single cash-on-cash (no interim distributions) -- MOIC^(1/N) - 1
@@ -444,6 +505,7 @@ def _lbo_math(entry_ev: float, revenue_base: float, ebitda_margin: float,
     'exit_ev': round(exit_ev, 2),
     'exit_multiple': exit_multiple,
     'debt_at_exit': round(current_debt, 2),
+    'cash_accumulated': round(cash_accumulated, 2),
     'equity_proceeds': round(equity_proceeds, 2),
     'moic': round(moic, 2),
     'irr_pct': round(irr * 100, 2),
@@ -1744,11 +1806,16 @@ warnings_per_tool={
     data = await asyncio.gather(*tasks)
     result = {
       'comparables': comparables,
-      'pe_ratio': _to_native(calculate_percentiles(data, 'pe_ratio')),
-      'pb_data': _to_native(calculate_percentiles(data, 'pb_ratio')),
-      'ev_revenue_data': _to_native(calculate_percentiles(data, 'ev_revenue')),
-      'ev_ebitda_data': _to_native(calculate_percentiles(data, 'ev_ebitda')),
-      'ev_ebit_data': _to_native(calculate_percentiles(data, 'ev_ebit')),
+      'pe_ratio': _to_native(peer_distribution(
+          [d.get('pe_ratio') for d in data])),
+      'pb_data': _to_native(peer_distribution(
+          [d.get('pb_ratio') for d in data])),
+      'ev_revenue_data': _to_native(peer_distribution(
+          [d.get('ev_revenue') for d in data])),
+      'ev_ebitda_data': _to_native(peer_distribution(
+          [d.get('ev_ebitda') for d in data])),
+      'ev_ebit_data': _to_native(peer_distribution(
+          [d.get('ev_ebit') for d in data])),
     }
     return [TextContent(type="text", text=json.dumps(result))]
 
