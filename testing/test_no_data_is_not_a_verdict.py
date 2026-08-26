@@ -58,12 +58,21 @@ network = pytest.mark.skipif(SKIP_NETWORK, reason="live network test")
 _403 = "HTTP 403: {\"error\":\"You don't have access to this resource.\"}"
 
 
-def _server(payload):
-    """A FinnhubServer whose single upstream call returns `payload`."""
+def _server(payload, profile=None):
+    """A FinnhubServer whose single upstream call returns `payload`.
+
+    `profile` answers /stock/profile2 separately. Basic financials and
+    earnings surprises now ask it what currency they are reporting in -- an
+    EPS of 27.25 means nothing until you know it is TWD per ordinary share --
+    and a stub that answered the earnings list to that question would have
+    every response here reporting a currency it could not establish.
+    """
     server = FinnhubServer.__new__(FinnhubServer)
 
     class _Client:
         async def get(self, endpoint, params=None):
+            if endpoint == "/stock/profile2":
+                return profile if profile is not None else payload
             return payload
 
     server.client = _Client()
@@ -304,10 +313,11 @@ class TestRealDataIsUntouched:
         assert envelope["data"]["signal"] == "net_selling"
 
     async def test_a_real_earnings_history_carries_no_warning(self):
-        envelope = _envelope(await _server([
-            {"period": "2026-06-30", "year": 2027, "quarter": 1,
-             "actual": 1.87, "estimate": 1.7922, "surprisePercent": 4.341},
-        ]).get_earnings_surprises("NVDA"))
+        envelope = _envelope(await _server(
+            [{"period": "2026-06-30", "year": 2027, "quarter": 1,
+              "actual": 1.87, "estimate": 1.7922, "surprisePercent": 4.341}],
+            profile={"ticker": "NVDA", "currency": "USD"},
+        ).get_earnings_surprises("NVDA"))
         assert envelope.get("warnings", []) == [], envelope["warnings"]
         assert envelope["data"]["beat_count"] == 1
 

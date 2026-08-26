@@ -136,15 +136,25 @@ async def _exercise_all_tools():
       assert data["signal"] in ("net_buying", "net_selling", "neutral"), f"Bad signal: {data['signal']}"
       assert isinstance(data["top_insiders"], list), "top_insiders should be a list"
       assert len(data["top_insiders"]) <= 5, "top_insiders should be capped at 5"
-      # Verify recency buckets have expected keys
+      # Verify recency buckets have expected keys. A bucket is None when
+      # Finnhub's feed stops before the window opens -- AMAT's stopped 56
+      # days short of "the last 30 days" on 2026-08-26 -- so the shape is
+      # asserted on the buckets that exist, and the covered window with it.
       for bucket in ["recent_30d", "recent_90d"]:
-        for k in ["bought", "sold", "net"]:
+        assert bucket in data, f"Missing bucket: {bucket}"
+        if data[bucket] is None:
+          continue
+        for k in ["bought", "sold", "net", "window"]:
           assert k in data[bucket], f"Missing {k} in {bucket}"
       print(f"  OK: condensed insider data")
       print(f"    signal={data['signal']}, net_shares={data['net_shares']:,}")
       print(f"    buys={data['buy_count']}, sells={data['sell_count']}")
       print(f"    top_insiders: {[i['name'] for i in data['top_insiders']]}")
-      print(f"    30d net={data['recent_30d']['net']:,}, 90d net={data['recent_90d']['net']:,}")
+      print(f"    as_of={data['as_of']}, feed lags {data['data_lag_days']} days")
+      for bucket in ["recent_30d", "recent_90d"]:
+        held = data[bucket]
+        print(f"    {bucket}: " + (f"net={held['net']:,} over {held['window']}"
+                                   if held else "not covered by the feed"))
       dump_envelope(result, "get_insider_transactions")
       passed += 1
     else:
