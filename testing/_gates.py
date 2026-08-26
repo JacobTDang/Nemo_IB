@@ -80,11 +80,6 @@ _OFFLINE_REASON = (
 def service_missing(name: str) -> str | None:
     _load_env_once()
     """Return a human-readable reason the service is unavailable, or None."""
-    if name == "groq":
-        if _offline():
-            return _OFFLINE_REASON.format(service="the Groq API")
-        return None if _env_key("GROQ_API_KEY") else (
-            "GROQ_API_KEY is unset or empty; set it in .env to run this test")
     if name == "openrouter":
         if _offline():
             return _OFFLINE_REASON.format(service="the OpenRouter API")
@@ -133,7 +128,6 @@ def _gate(name: str):
     return pytest.mark.skipif(True, reason=reason)
 
 
-requires_groq = _gate("groq")
 requires_openrouter = _gate("openrouter")
 requires_searxng = _gate("searxng")
 requires_playbook = _gate("playbook")

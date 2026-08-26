@@ -97,9 +97,8 @@ not run there.
 
 ## Secrets
 
-`FINNHUB_API_KEY`, `FRED_API_KEY`, `SEC_EMAIL`, `NAME`. No LLM credentials:
-every server here imports and runs with `GROQ_API_KEY` and `OPENROUTER_API_KEY`
-unset, verified.
+`FINNHUB_API_KEY`, `FRED_API_KEY`, `SEC_EMAIL`, `NAME`. No LLM credentials of
+any kind: every server here imports and runs with none set, verified.
 
 `CONGRESS_API_KEY` and `FINMIND_TOKEN` are optional and currently unset, so
 `get_policy_signals`, `get_government_contracts`, and

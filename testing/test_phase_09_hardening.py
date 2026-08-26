@@ -10,7 +10,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pandas as pd
 import numpy as np
 
-from agent.Pre_Mortem_Agent import Pre_Mortem_Agent, PreMortemReport
 from agent.correlation import (
   correlation_matrix, avg_correlation_to_basket, correlation_decision
 )
@@ -23,7 +22,6 @@ from state.events_store import store_event
 from fastapi.testclient import TestClient
 from dashboard.app import app
 
-from testing._gates import requires_groq
 
 
 client = TestClient(app)
@@ -42,43 +40,10 @@ def _clean():
 
 
 # ---- Pre-mortem -----------------------------------------------------------
-
-@requires_groq
-def test_pre_mortem_produces_structured_output():
-  pma = Pre_Mortem_Agent()
-  report = pma.envision(
-    ticker="AAPL", recommendation="BUY",
-    analyst_report_md="Apple BUY: services growth 14% YoY, iPhone -2%, target $215.",
-    variables={"services_growth_yoy": 0.14, "iphone_growth_yoy": -0.02,
-               "pe_trailing": 31, "current_price": 195.0}
-  )
-  assert report is not None, "pre-mortem returned None (parse failure)"
-  assert isinstance(report, PreMortemReport)
-  print(f"  failure_modes: {len(report.failure_modes)}")
-  print(f"  early_warnings: {len(report.early_warnings)}")
-  print(f"  hedge_or_exit: {len(report.hedge_or_exit)}")
-  print(f"  worst_case_loss: {report.worst_case_loss_pct}%")
-  assert len(report.failure_modes) >= 3, \
-    f"need at least 3 failure modes, got {len(report.failure_modes)}"
-  assert len(report.early_warnings) >= 1
-  assert report.worst_case_loss_pct > 0
-  print(f"PASS: pre-mortem produced {len(report.failure_modes)} failure modes "
-        f"with worst case {report.worst_case_loss_pct}%")
-
-
-@requires_groq
-def test_pre_mortem_failure_modes_are_specific():
-  pma = Pre_Mortem_Agent()
-  report = pma.envision(
-    ticker="NVDA", recommendation="BUY",
-    analyst_report_md="NVDA BUY: hyperscaler AI capex tailwind, $1000 target.",
-    variables={"hyperscaler_capex_growth_yoy": 0.30}
-  )
-  assert report
-  # Each failure mode should be > 40 chars (not "things go bad")
-  short = [m for m in report.failure_modes if len(m.strip()) < 40]
-  assert not short, f"failure modes too short: {short}"
-  print(f"PASS: all {len(report.failure_modes)} failure modes are substantive")
+#
+# The two tests here drove Pre_Mortem_Agent against the live Groq API. Groq is
+# no longer a supported backend: it was never a dependency of the five servers
+# in the image, and the agent package it belonged to is not deployed.
 
 
 # ---- Correlation ----------------------------------------------------------
