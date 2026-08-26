@@ -336,23 +336,45 @@ def _condense_yield_curve(series_data: Dict[str, Dict]) -> Dict[str, Any]:
   return result
 
 
+# A month FRED published with no value is not a month FRED does not have.
+# UNRATE carries 2025-10-01 with value "." because no household survey was
+# conducted; dropping it silently left total_observations 4 beside returned 3.
+_FRED_NO_VALUE = (".", "", None)
+
+# Enough to see the shape of a gap without pasting a decade of market holidays.
+_MAX_UNAVAILABLE_DATES = 30
+
+
 def _condense_observations(raw: Dict[str, Any], cap: int = 60) -> Dict[str, Any]:
-  """Condense generic FRED observations: filter nulls, cap count."""
+  """Condense generic FRED observations.
+
+  Two different things used to arrive as one number. `returned` meant
+  "tail-truncated from 1302" on DGS10 and "one value was unavailable" on
+  UNRATE, and a caller could not tell a cut-off tail from a hole in the
+  middle. They are separated here: `truncated` is ours, `unavailable_*` is
+  FRED's, and the three counts reconcile.
+  """
   observations = raw.get("observations", [])
-  # Filter FRED's "." null markers
   valid = [
     {"date": o["date"], "value": _parse_float(o["value"])}
     for o in observations
-    if o.get("value") not in (".", "", None)
+    if o.get("value") not in _FRED_NO_VALUE
   ]
+  unavailable = [o["date"] for o in observations
+                 if o.get("value") in _FRED_NO_VALUE]
+
   # Cap at most recent
-  valid = valid[-cap:]
+  returned = valid[-cap:]
 
   return {
     "series_id": raw.get("series_id", "unknown"),
-    "total_observations": raw.get("count", len(valid)),
-    "returned": len(valid),
-    "observations": valid,
+    "total_observations": raw.get("count", len(observations)),
+    "observations_with_values": len(valid),
+    "unavailable_observations": len(unavailable),
+    "unavailable_dates": unavailable[:_MAX_UNAVAILABLE_DATES],
+    "returned": len(returned),
+    "truncated": len(returned) < len(valid),
+    "observations": returned,
   }
 
 

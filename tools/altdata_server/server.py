@@ -1662,6 +1662,12 @@ def _fetch_policy_signals(ticker: str, sector: str,
 # Capex announcements via DuckDuckGo news
 # ---------------------------------------------------------------------------
 
+# Rows carried in the payload. `announcement_count` describes the whole set,
+# `rows_returned` describes this page, and `truncated` says when they differ --
+# the rule test_counts_survive_paging.py holds the SEC tools to.
+_CAPEX_ROW_CAP = 8
+
+
 def _fetch_capex_announcements(ticker: str, company_name: str,
                                  lookback_days: int) -> Dict[str, Any]:
     try:
@@ -1756,6 +1762,7 @@ def _fetch_capex_announcements(ticker: str, company_name: str,
                       f"that no capital investment was announced."),
             "ticker": ticker, "company_name": company_name,
             "lookback_days": lookback_days, "announcement_count": 0,
+            "rows_returned": 0, "truncated": False,
             "total_announced_usd": 0, "signal": "data_gap",
             "queries_tried": queries,
             "partial_errors": query_errors,
@@ -1780,7 +1787,32 @@ def _fetch_capex_announcements(ticker: str, company_name: str,
 
     announcements.sort(key=lambda x: -x["max_amount_usd"])
 
-    total_usd = sum(a["max_amount_usd"] for a in announcements)
+    # One announcement restated by four outlets is still one announcement.
+    # Adding up every article's largest figure carried NVIDIA's $105B Ohio
+    # site and its $10B NAVER deal twice each and presented $1.738T as an
+    # aggregate of capital projects when it was an aggregate of headlines.
+    # The dollar figure is the only project fingerprint a news corpus offers,
+    # so the total is over distinct figures and each row says how many
+    # articles carried its own. Two genuinely separate projects of identical
+    # size collapse into one here -- an understatement, where summing every
+    # mention had no bound at all.
+    mentions_by_amount: Dict[float, int] = {}
+    for a in announcements:
+        mentions_by_amount[a["max_amount_usd"]] = \
+            mentions_by_amount.get(a["max_amount_usd"], 0) + 1
+    for a in announcements:
+        # An article carrying no dollar figure has no fingerprint, so it has
+        # nothing to have been restated. Grouping those under 0 put
+        # `mentions: 7` on seven unrelated headlines in a live INTC run.
+        a["mentions"] = (mentions_by_amount[a["max_amount_usd"]]
+                         if a["max_amount_usd"] > 0 else None)
+
+    distinct_amounts = sorted((amt for amt in mentions_by_amount if amt > 0),
+                              reverse=True)
+    articles_with_amount = sum(n for amt, n in mentions_by_amount.items() if amt > 0)
+    restated = articles_with_amount - len(distinct_amounts)
+
+    rows = announcements[:_CAPEX_ROW_CAP]
     signal = _capex_signal(announcements)
 
     return {
@@ -1789,11 +1821,22 @@ def _fetch_capex_announcements(ticker: str, company_name: str,
         "ticker": ticker, "company_name": company_name,
         "lookback_days": lookback_days,
         "announcement_count": len(announcements),
-        "total_announced_usd": total_usd,
+        "rows_returned": len(rows),
+        "truncated": len(rows) < len(announcements),
+        "total_announced_usd": sum(distinct_amounts),
+        "total_announced_basis": (
+            f"sum over {len(distinct_amounts)} distinct dollar figures found "
+            f"across {len(announcements)} articles"
+            + (f"; {restated} article(s) restated a figure already counted"
+               if restated else "")
+            + ". Not a sum of capital projects: a news corpus cannot tell two "
+              "projects of the same size apart."),
+        "distinct_amount_count": len(distinct_amounts),
+        "largest_announcement_usd": distinct_amounts[0] if distinct_amounts else 0,
         "signal": signal,
         "queries_tried": queries,
         "partial_errors": query_errors,
-        "announcements": announcements[:8],
+        "announcements": rows,
     }
 
 
@@ -1985,6 +2028,11 @@ class AltDataServer:
                         "the quote provider cannot resolve, and reason='no_results' when "
                         "no article matched — a news corpus cannot assert that no capex "
                         "was announced, so that is never reported as a zero. "
+                        "total_announced_usd sums DISTINCT dollar figures, not articles: "
+                        "one project restated by four outlets is counted once, and "
+                        "total_announced_basis says how the figure was reached. "
+                        "announcement_count counts every matching article; rows_returned "
+                        "and truncated describe the announcements list. "
                         "Uses DuckDuckGo news (ddgs). Best for: semiconductors, industrials, "
                         "energy, cloud hyperscalers."
                     ),
