@@ -8,7 +8,25 @@ import os, sys
 
 import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from agent.openrouter_template import PRIMARY_REASONING_MODEL, _verify_model_alive
+from agent.openrouter_template import _verify_model_alive
+
+def _primary_model():
+    """Resolved inside the test, not at import.
+
+    `PRIMARY_REASONING_MODEL` is a module attribute backed by a live probe, so
+    a module-level from-import made collecting this file cost a network round
+    trip -- and, once a rejected credential started refusing instead of
+    reporting every model alive, made the whole suite uncollectable over a key
+    that almost no test needs.
+    """
+    import pytest
+
+    from agent.openrouter_template import CredentialRejected, primary_reasoning_model
+    try:
+        return primary_reasoning_model()
+    except CredentialRejected as exc:
+        pytest.skip(f"OpenRouter credential rejected: {exc}")
+
 from testing._gates import requires_openrouter
 from dotenv import load_dotenv
 load_dotenv()
@@ -16,7 +34,7 @@ load_dotenv()
 
 def test_a_model_is_resolved():
   """The one half of this file that needs no network."""
-  assert PRIMARY_REASONING_MODEL, "no model resolved"
+  assert _primary_model(), "no model resolved"
 
 
 # A well-formed id no vendor will ever publish. _verify_model_alive returns
@@ -62,7 +80,7 @@ def test_resolved_model_is_alive():
                 "OpenRouter key is being rejected. Nothing here is decidable.")
   assert _verify_model_alive(PRIMARY_REASONING_MODEL, api_key), \
     f"resolved model {PRIMARY_REASONING_MODEL} is not alive (404)"
-  print(f"PASS: resolved model {PRIMARY_REASONING_MODEL!r} is alive")
+  print(f"PASS: resolved model {_primary_model()!r} is alive")
 
 
 @requires_openrouter
@@ -94,9 +112,10 @@ def test_old_dead_model_still_dead():
 
 def test_constructor_default_uses_resolved_model():
   from agent.Financial_Analysis_Agent import Financial_Analysis_Agent
+  expected = _primary_model()   # skips when the credential was rejected
   agent = Financial_Analysis_Agent()
-  assert agent.model_name == PRIMARY_REASONING_MODEL, \
-    f"agent uses {agent.model_name!r}, expected {PRIMARY_REASONING_MODEL!r}"
+  assert agent.model_name == expected, \
+    f"agent uses {agent.model_name!r}, expected {_primary_model()!r}"
   print(f"PASS: Financial_Analysis_Agent picks up {agent.model_name!r}")
 
 
