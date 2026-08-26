@@ -6,6 +6,21 @@ import re
 import sys
 from datetime import datetime, timedelta, timezone
 
+def _balance_or_none(info: dict, key: str):
+    """A balance-sheet figure, or None when the provider did not report one.
+
+    Defaulting to 0 says the company holds none of it. For an unknown ticker
+    yfinance returns an info dict with a single key, so `info.get(key, 0)`
+    reported a company that does not exist as holding no cash and carrying no
+    debt -- and those two fields feed calculate_wacc and
+    calculate_credit_profile, which would then value it as debt-free.
+
+    A genuine zero survives: the key is present and its value is 0.
+    """
+    value = info.get(key)
+    return None if value is None else value
+
+
 def ratio_is_comparable(quote_currency, filing_currency) -> bool:
     """Whether a price-derived figure and a filer-reported one can be divided.
 
@@ -66,8 +81,8 @@ def get_data(ticker: str) -> Dict[str, Any]:
   data['netIncomeToCommon'] = info.get('netIncomeToCommon')
   data['net_income_ttm'] = data['netIncomeToCommon']
   data['enterpriseValue'] = info.get('enterpriseValue')
-  data['cash'] = info.get('totalCash', 0)
-  data['totalDebt'] = info.get('totalDebt', 0)
+  data['cash'] = _balance_or_none(info, 'totalCash')
+  data['totalDebt'] = _balance_or_none(info, 'totalDebt')
   data['sharesOutstanding'] = info.get('sharesOutstanding')
   data['beta'] = info.get('beta')
 

@@ -64,6 +64,24 @@ KNOWN_FUNDS: Dict[str, Dict[str, Any]] = {
 }
 
 
+def _holding_value(row):
+    """A 13F position's reported value, or None when the row does not give one.
+
+    Coercing a missing Value to 0 drops the holding out of every ranking and
+    every total silently, understating a fund's book with nothing to show that
+    anything was lost.
+    """
+    value = row.get("Value")
+    if value is None:
+        return None
+    try:
+        import math
+        number = float(value)
+        return None if math.isnan(number) else number
+    except (TypeError, ValueError):
+        return None
+
+
 def list_known_funds() -> List[Dict[str, str]]:
   """De-dup the alias-rich registry to canonical entries."""
   seen = set()
@@ -139,7 +157,7 @@ def get_fund_holdings(fund_name_or_cik: str, n_filings: int = 2) -> Dict[str, An
             'cusip':   str(row.get('Cusip', '')),
             'class':   str(row.get('Class', '')),
             'shares':  int(row.get('SharesPrnAmount', 0) or 0),
-            'value':   float(row.get('Value', 0) or 0),
+            'value':   _holding_value(row),
             'put_call': str(row.get('PutCall', '')).strip(),
           })
         except Exception:

@@ -985,7 +985,14 @@ def _altman_z_score_math(financials: dict) -> dict:
     1.81 <= Z <= 2.99 -> grey
     Z < 1.81 -> distress
   """
-  ta = financials.get('total_assets', 0) or 1
+  if not _altman_inputs_ok(financials):
+    # Substituting a $1 balance sheet to dodge a division makes every ratio
+    # enormous and the score meaningless rather than absent.
+    return {'score': None, 'zone': None,
+            'error': 'total_assets is missing or zero; the Z-score is undefined '
+                     'without it and a substituted denominator would produce a '
+                     'number rather than an answer'}
+  ta = financials['total_assets']
   wc = financials.get('working_capital', 0)
   re_ = financials.get('retained_earnings', 0)
   ebit = financials.get('ebit', 0)
@@ -1020,6 +1027,14 @@ def _altman_z_score_math(financials: dict) -> dict:
     },
     'method': 'Altman (1968) Z-score (manufacturing form)',
   }
+
+
+def _altman_inputs_ok(financials) -> bool:
+    """Whether a Z-score can be computed at all. Total assets is the
+    denominator of four of the five ratios, so absent or zero means undefined,
+    not zero."""
+    ta = (financials or {}).get('total_assets')
+    return isinstance(ta, (int, float)) and not isinstance(ta, bool) and ta > 0
 
 
 def _detect_insider_clusters(transactions: list, lookback_days: int = 30) -> dict:
