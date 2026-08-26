@@ -118,6 +118,34 @@ def _first_present(payload: dict, keys) -> "object | None":
     return None
 
 
+def _record_success() -> None:
+    """Tell /ready that this server just answered something successfully.
+
+    Imported here rather than at module scope on purpose. Every server imports
+    `response_meta`, `tools.mcp_http` imports uvicorn, starlette and the MCP
+    session manager, and a server that never serves over HTTP still wants
+    provenance -- a module-level import would make all of that a hard
+    dependency of annotation and invite an import cycle.
+
+    Every failure is swallowed, which this module otherwise never does. The
+    distinction is that this is observability: a missing `mcp_http`, or a clock
+    error inside `record_success`, must cost the readiness timestamp and
+    nothing else. Turning it into a tool failure would be a strictly worse bug
+    than the one it fixes.
+    """
+    try:
+        import importlib
+
+        # import_module, not `from tools import mcp_http`: it consults
+        # sys.modules first, so a test that makes the module unavailable
+        # actually makes it unavailable rather than reaching a parent
+        # package attribute left over from an earlier import.
+        mcp_http = importlib.import_module("tools.mcp_http")
+        mcp_http.record_success()
+    except Exception:  # noqa: BLE001 -- telemetry must never fail a tool call
+        pass
+
+
 def annotating(provider, *, per_tool=None, warnings_per_tool=None):
     """Wrap an MCP `call_tool(name, args)` so every response carries provenance.
 
@@ -134,6 +162,11 @@ def annotating(provider, *, per_tool=None, warnings_per_tool=None):
     Anything that is not a JSON object is passed through untouched: a list has
     no place to put provenance without changing its shape, and inventing one
     here would be the guess this module exists to avoid.
+
+    The same seam records the successful call that /ready reports. Nothing else
+    sees every tool's result, so anywhere else is 96 places to remember and one
+    to forget -- and readiness on all five servers currently reads false on a
+    working stack precisely because nobody called `record_success()`.
     """
     import functools
     import json
@@ -146,10 +179,19 @@ def annotating(provider, *, per_tool=None, warnings_per_tool=None):
         async def wrapper(name, args, *rest, **kwargs):
             contents = await handler(name, args, *rest, **kwargs)
             if not contents:
+                # No content at all is not an answer, so it records nothing.
+                # A raised handler never reaches here either: the exception
+                # propagates untouched, which is the honest report.
                 return contents
 
             resolved = per_tool.get(name, provider)
             extra = warnings_per_tool.get(name)
+
+            # Whether this call answered the question, for /ready. A response
+            # that could not carry provenance -- prose, a JSON list -- still
+            # completed, so only an explicit `success: false` counts against
+            # it. "Could not annotate" is not "failed".
+            succeeded = True
 
             for item in contents:
                 text = getattr(item, "text", None)
@@ -162,13 +204,27 @@ def annotating(provider, *, per_tool=None, warnings_per_tool=None):
                 if not isinstance(payload, dict):
                     continue                      # a list has nowhere to put it
 
-                item.text = json.dumps(annotate(
+                annotated = annotate(
                     payload,
                     provider=resolved,
                     source_url=_first_present(payload, _SOURCE_URL_KEYS),
                     data_as_of=_first_present(payload, _PERIOD_KEYS),
                     warnings=list(extra) if extra else None,
-                ), default=str)
+                )
+                # annotate() has already resolved success, including inferring
+                # it from an `error` field, so this reads one answer rather
+                # than a second opinion that could disagree with the body the
+                # caller receives.
+                if annotated.get("success") is False:
+                    succeeded = False
+                item.text = json.dumps(annotated, default=str)
+
+            # Once per call, not once per content block: /ready reads a
+            # timestamp, and a server answering nothing but errors must keep
+            # reporting itself unready -- that is the entire question the
+            # check asks.
+            if succeeded:
+                _record_success()
             return contents
 
         # Exposed so a manifest can read what responses actually report rather
