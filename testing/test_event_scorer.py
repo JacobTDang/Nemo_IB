@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -22,6 +23,17 @@ _results = {'pass': 0, 'fail': 0, 'failures': []}
 
 
 def _check(name: str, condition: bool, hint: str = '') -> None:
+  """Fail the test when `condition` is false.
+
+  This helper used to increment a counter and print PASS/FAIL, and nothing
+  else. Under pytest -- which never calls main() -- no one read the counter,
+  so every test_* function in this file ran to completion, returned None and
+  was reported green no matter what the code did. A gate that cannot fail is
+  not a gate.
+
+  The counters and the printed lines are kept so the summary still reads the
+  same; the raise is what makes pytest see a wrong value.
+  """
   if condition:
     _results['pass'] += 1
     print(f"  PASS  {name}")
@@ -29,6 +41,7 @@ def _check(name: str, condition: bool, hint: str = '') -> None:
     _results['fail'] += 1
     _results['failures'].append((name, hint))
     print(f"  FAIL  {name}  --  {hint}")
+    raise AssertionError(f"{name}: {hint}" if hint else name)
 
 
 def _ev(**overrides):
@@ -119,13 +132,24 @@ def test_magnitude_gate_suppresses_noise():
 
 
 def test_age_affects_market_awareness():
+  """Age is measured from now, so the two events have to be dated from now.
+
+  This test used to pin the pair to the literal strings 2026-05-22 ("~today")
+  and 2026-05-17 ("5 days ago") -- true on the day it was written and wrong
+  every day after. _age_awareness_bump buckets by hours since published_at and
+  tops out at "older than 3 days", so once the clock passed 2026-05-25 both
+  dates fell into the same bucket and the two scores were identical (0.75 vs
+  0.75). The check had been false for months; nothing raised, so nothing said
+  so.
+  """
   print("\n== older events have higher market awareness ==")
+  now = datetime.now(timezone.utc)
   fresh = score_event(_ev(
-    published_at='2026-05-22T10:00:00+00:00',  # ~today
+    published_at=(now - timedelta(minutes=10)).isoformat(),
     urgency='medium',
   ))['market_awareness']
   old = score_event(_ev(
-    published_at='2026-05-17T10:00:00+00:00',  # 5 days ago
+    published_at=(now - timedelta(days=5)).isoformat(),
     urgency='medium',
   ))['market_awareness']
   _check("older event has higher market_awareness",

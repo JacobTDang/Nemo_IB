@@ -9,7 +9,7 @@ summary computed over the empty thing, and a summary always has content:
     get_insider_transactions  signal "neutral", total_bought 0, net_shares 0
     get_insider_sentiment     months [], signal "neutral"
     get_earnings_surprises    quarters [], beat_count 0, miss_count 0
-    get_analyst_revisions_history  error "no recommendation data"
+    get_analyst_rating_trend  error "no recommendation data"
 
 `signal: "neutral"` is the worst of them. It is the same field that reads
 "net_selling" for NVDA, so nothing downstream can separate "insiders were
@@ -265,20 +265,20 @@ class TestEmptyEnvelopesAreLabelled:
         """It answered `error: "no recommendation data"` -- a sentence with no
         code, no coverage label and nothing in metadata.errors."""
         envelope = _envelope(
-            await _server([]).get_analyst_revisions_history("ZZZZNOTREAL"))
+            await _server([]).get_analyst_rating_trend("ZZZZNOTREAL"))
         assert envelope["coverage"] == "not_covered", envelope
         assert envelope["warnings"]
         assert envelope["data"].get("signal") is None
 
     @pytest.mark.parametrize("tool", [
         "get_insider_transactions", "get_insider_sentiment",
-        "get_earnings_surprises", "get_analyst_revisions_history",
+        "get_earnings_surprises", "get_analyst_rating_trend",
     ])
     async def test_the_label_never_claims_the_company_lacks_the_data(self, tool):
         """Three causes produce this body and the response cannot tell them
         apart, so the label must not pick one."""
         payload = [] if tool in ("get_earnings_surprises",
-                                 "get_analyst_revisions_history") \
+                                 "get_analyst_rating_trend") \
             else {"data": [], "symbol": "ZZZZNOTREAL"}
         envelope = _envelope(
             await getattr(_server(payload), tool)("ZZZZNOTREAL"))
@@ -321,13 +321,16 @@ class TestRealDataIsUntouched:
         assert envelope.get("warnings", []) == [], envelope["warnings"]
         assert envelope["data"]["beat_count"] == 1
 
-    async def test_a_real_revisions_history_carries_no_warning(self):
+    async def test_a_real_rating_history_carries_no_warning(self):
+        """lookback_months matches the history on offer, so there is no
+        shortfall to report. Asking for 12 and receiving 2 is a different
+        response and carries `history_shorter_than_requested`."""
         envelope = _envelope(await _server([
             {"period": "2026-08-01", "strongBuy": 23, "buy": 41, "hold": 3,
              "sell": 1, "strongSell": 0},
             {"period": "2026-07-01", "strongBuy": 24, "buy": 40, "hold": 4,
              "sell": 1, "strongSell": 0},
-        ]).get_analyst_revisions_history("NVDA"))
+        ]).get_analyst_rating_trend("NVDA", lookback_months=2))
         assert envelope.get("warnings", []) == [], envelope["warnings"]
         assert envelope["data"]["periods_returned"] == 2
 

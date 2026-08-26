@@ -323,7 +323,7 @@ def test_curated_fields_have_the_declared_types(manifest):
 @pytest.mark.parametrize("tool_name,fragment", [
     # README and docs/audits/2026-08-25-codex-audit.md, section 7.
     ("get_short_interest", "2-3 weeks"),
-    ("get_earnings_transcripts", "release"),
+    ("get_earnings_releases", "not a call transcript"),
     ("get_debt_maturity_schedule", "not_covered"),
     ("get_congress_holdings", "Senate"),
 ])

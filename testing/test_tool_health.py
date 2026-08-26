@@ -29,7 +29,14 @@ from mcp.client.stdio import stdio_client
 from agent.MCP_manager import MCPConnectionManager
 
 
-TICKER = (sys.argv[1] if len(sys.argv) > 1 else "MSFT").upper()
+# Read argv only when this file is the program. pytest collects testing/ by
+# filename glob, so importing this module under pytest ran the line below
+# against pytest's own argv and set TICKER to "TESTING/". Nothing failed
+# because nothing in here is a test function -- but a smoke script that
+# silently retargets itself at whatever word follows the interpreter is a
+# trap, and it fired every single suite run.
+TICKER = ((sys.argv[1] if len(sys.argv) > 1 else "MSFT").upper()
+          if __name__ == "__main__" else "MSFT")
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 RESULTS_PATH = os.path.join(OUT_DIR, "tool_health.json")
 

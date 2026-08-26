@@ -128,7 +128,7 @@ def test_the_caveats_that_prompted_this_are_actually_attached():
     incomplete. `testing/test_conditional_warnings.py` holds both halves.
     """
     expected = {
-        "sec": {"get_earnings_transcripts"},
+        "sec": {"get_earnings_releases"},
         "altdata": {"get_congress_holdings"},
     }
     for label, module, cls in SERVERS:

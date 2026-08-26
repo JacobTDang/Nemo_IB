@@ -45,6 +45,17 @@ _FAILURES: list = []
 
 
 def _check(name: str, condition: bool, hint: str = "") -> None:
+    """Fail the test when `condition` is false.
+
+    This helper used to increment a counter and print PASS/FAIL, and nothing
+    else. Under pytest -- which never calls main() -- no one read the counter,
+    so every test_* function in this file ran to completion, returned None and
+    was reported green no matter what the code did. A gate that cannot fail is
+    not a gate.
+
+    The counters and the printed lines are kept so the summary still reads the
+    same; the raise is what makes pytest see a wrong value.
+    """
     global _PASS, _FAIL
     if condition:
         _PASS += 1
@@ -54,6 +65,7 @@ def _check(name: str, condition: bool, hint: str = "") -> None:
         msg = f"  FAIL  {name}" + (f"  ({hint})" if hint else "")
         print(msg)
         _FAILURES.append(msg)
+        raise AssertionError(f"{name}: {hint}" if hint else name)
 
 
 def _section(title: str) -> None:

@@ -23,6 +23,17 @@ _results = {'pass': 0, 'fail': 0, 'failures': []}
 
 
 def _check(name: str, condition: bool, hint: str = '') -> None:
+  """Fail the test when `condition` is false.
+
+  This helper used to increment a counter and print PASS/FAIL, and nothing
+  else. Under pytest -- which never calls main() -- no one read the counter,
+  so every test_* function in this file ran to completion, returned None and
+  was reported green no matter what the code did. A gate that cannot fail is
+  not a gate.
+
+  The counters and the printed lines are kept so the summary still reads the
+  same; the raise is what makes pytest see a wrong value.
+  """
   if condition:
     _results['pass'] += 1
     print(f"  PASS  {name}")
@@ -30,6 +41,7 @@ def _check(name: str, condition: bool, hint: str = '') -> None:
     _results['fail'] += 1
     _results['failures'].append((name, hint))
     print(f"  FAIL  {name}  --  {hint}")
+    raise AssertionError(f"{name}: {hint}" if hint else name)
 
 
 def _today():
@@ -105,6 +117,20 @@ def test_below_baseline():
 
 
 def test_empty_data_keeps_shape():
+  """No rows means every bucket is None, including prior_90d.
+
+  This check used to require prior_90d == {"bought": 0, "sold": 0, "net": 0}
+  for an empty payload, which is the shape _condense_insider_data returned
+  before the absent-is-not-zero change. That change made the no-rows branch
+  return None for every derived field on purpose: a zeroed bucket claims
+  "insiders bought nothing and sold nothing", which is a finding, where the
+  truth is that Finnhub returned no rows and we know nothing. See the comment
+  on the empty branch of _condense_insider_data and
+  testing/test_absent_is_not_zero.py.
+
+  The keys must still all be present -- callers index them -- so the shape
+  half of this test stands; only the zeros were stale.
+  """
   print("\n== empty data: ratio fields present and None ==")
   result = _condense_insider_data({"data": []})
   for key in ("prior_90d", "prior_period_avg_per_90d_sold",
@@ -114,7 +140,8 @@ def test_empty_data_keeps_shape():
          result["prior_period_avg_per_90d_sold"] is None)
   _check("current_vs_baseline_ratio is None",
          result["current_vs_baseline_ratio"] is None)
-  _check("prior_90d sub-shape", result["prior_90d"] == {"bought": 0, "sold": 0, "net": 0})
+  _check("prior_90d is None, not a zeroed bucket",
+         result["prior_90d"] is None, hint=repr(result["prior_90d"]))
 
 
 def test_too_little_prior_coverage_returns_none():

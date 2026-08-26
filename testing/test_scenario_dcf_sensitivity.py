@@ -15,30 +15,37 @@ perpetuity binds across the whole sweep the row is flat, which is the true
 answer -- the multiple is setting nothing -- and terminal_sensitivity_floor_note
 says so.
 
-Run:
-  .venv\\Scripts\\python.exe testing\\test_scenario_dcf_sensitivity.py
+Why these are asserts and not prints
+------------------------------------
+Every check below used to route through a local `_check(name, condition,
+hint)` helper that incremented a counter and printed PASS or FAIL. It never
+raised. Under pytest each `test_*` function ran to completion and returned
+None, so the file reported six passing tests no matter what the code did --
+forty-odd checks that could not fail, wearing the appearance of a gate. It was
+silently green through a change that broke four of them; that was only found
+by running the file as a script and reading the summary line, which nothing in
+CI does.
+
+A gate that cannot fail is not a gate. The hint strings the helper printed are
+kept as assertion messages, so a failure still says which multiple, which
+scenario and which two numbers disagreed -- the diagnostic value survives, the
+silence does not.
 """
 from __future__ import annotations
 
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tools.financial_modeling_engine.analysis_tools import _scenario_dcf_math
 
 
-_results = {'pass': 0, 'fail': 0, 'failures': []}
-
-
-def _check(name: str, condition: bool, hint: str = '') -> None:
-  if condition:
-    _results['pass'] += 1
-    print(f"  PASS  {name}")
-  else:
-    _results['fail'] += 1
-    _results['failures'].append((name, hint))
-    print(f"  FAIL  {name}  --  {hint}")
+SCENARIOS = ('bear', 'base', 'bull')
+EXPECTED_MULTIPLES = {'11.0x', '13.0x', '15.0x', '17.0x', '19.0x'}
+SWEEP_ORDER = ('11.0x', '13.0x', '15.0x', '17.0x', '19.0x')
 
 
 def _base_inputs(terminal_multiple=15.0):
@@ -67,100 +74,99 @@ def _run(terminal_multiple=15.0):
   )
 
 
-def test_sensitivity_present_when_exit_multiple_positive():
-  print("\n== sensitivity present when terminal_multiple > 0 ==")
-  result = _run(terminal_multiple=15.0)
-  _check("terminal_sensitivity key exists",
-         'terminal_sensitivity' in result)
-  _check("terminal_sensitivity_base_multiple == 15.0",
-         result.get('terminal_sensitivity_base_multiple') == 15.0)
+@pytest.fixture(scope='module')
+def result():
+  """The one payload every check below reads, priced at a 15x exit multiple."""
+  return _run(terminal_multiple=15.0)
 
 
-def test_sensitivity_shape():
-  print("\n== sensitivity is a 3-scenario x 5-multiple table ==")
-  result = _run(terminal_multiple=15.0)
+def test_sensitivity_present_when_exit_multiple_positive(result):
+  assert 'terminal_sensitivity' in result, (
+    "no terminal_sensitivity grid was returned for terminal_multiple=15.0")
+  assert result.get('terminal_sensitivity_base_multiple') == 15.0, (
+    "the grid does not state the multiple it is centred on: "
+    f"{result.get('terminal_sensitivity_base_multiple')!r}")
+
+
+def test_sensitivity_shape(result):
+  """A 3-scenario x 5-multiple table, or the sweep is not a sweep."""
   s = result['terminal_sensitivity']
-  _check("has bear / base / bull keys",
-         set(s.keys()) == {'bear', 'base', 'bull'},
-         hint=str(set(s.keys())))
-  expected_multiples = {'11.0x', '13.0x', '15.0x', '17.0x', '19.0x'}
-  for case in ('bear', 'base', 'bull'):
-    _check(f"{case} row has 5 multiples {expected_multiples}",
-           set(s[case].keys()) == expected_multiples,
-           hint=str(set(s[case].keys())))
+  assert set(s.keys()) == set(SCENARIOS), str(set(s.keys()))
+  for case in SCENARIOS:
+    assert set(s[case].keys()) == EXPECTED_MULTIPLES, (
+      f"{case} row is not the {sorted(EXPECTED_MULTIPLES)} sweep: "
+      f"{sorted(s[case].keys())}")
 
 
-def test_sensitivity_monotonic_in_multiple():
-  print("\n== sensitivity is monotonically non-decreasing in multiple ==")
-  result = _run(terminal_multiple=15.0)
-  for case in ('bear', 'base', 'bull'):
-    row = result['terminal_sensitivity'][case]
-    px = [row['11.0x'], row['13.0x'], row['15.0x'], row['17.0x'], row['19.0x']]
-    is_sorted = all(px[i] <= px[i + 1] for i in range(len(px) - 1))
-    _check(f"{case}: prices never fall as the multiple rises",
-           is_sorted, hint=f"px={px}")
-    # A flat row is an answer, not a bug: the perpetuity is binding at every
-    # multiple in the sweep, so the exit multiple sets nothing. It has to say
-    # so rather than look like a broken table.
-    if max(px) - min(px) == 0:
-      _check(f"{case}: a flat row is explained",
-             bool(result.get('terminal_sensitivity_floor_note')),
-             hint="flat row with no floor note")
+@pytest.mark.parametrize('case', SCENARIOS)
+def test_sensitivity_monotonic_in_multiple(result, case):
+  """A higher exit multiple can never price the same company lower."""
+  row = result['terminal_sensitivity'][case]
+  px = [row[k] for k in SWEEP_ORDER]
+  assert all(px[i] <= px[i + 1] for i in range(len(px) - 1)), (
+    f"{case}: price falls as the multiple rises, px={px}")
 
 
-def test_sensitivity_agrees_with_the_headline_at_the_base_multiple():
-  print("\n== sensitivity is a sensitivity of the headline ==")
-  # The one cell whose answer is already known. Priced on a different terminal
-  # method it came out at twice the headline; priced on the same one it has to
-  # reproduce it exactly.
-  result = _run(terminal_multiple=15.0)
-  for case in ('bear', 'base', 'bull'):
-    main = result[case]['price_per_share']
-    cell = result['terminal_sensitivity'][case]['15.0x']
-    _check(f"{case}: sensitivity@15x == headline PT",
-           abs(cell - main) <= 0.02,
-           hint=f"main={main} sens@15x={cell}")
-  _check("the grid states the rule it applies",
-         'min' in (result.get('terminal_sensitivity_method') or '').lower(),
-         hint=str(result.get('terminal_sensitivity_method'))[:80])
+@pytest.mark.parametrize('case', SCENARIOS)
+def test_a_flat_row_says_why_it_is_flat(result, case):
+  """A flat row is an answer, not a bug -- but only if it says so.
+
+  The perpetuity floor binding at every multiple in the sweep means the exit
+  multiple is setting nothing, which is the true answer. Unexplained it reads
+  as a broken table, and the reader's repair is to distrust the grid rather
+  than the assumption.
+  """
+  row = result['terminal_sensitivity'][case]
+  px = [row[k] for k in SWEEP_ORDER]
+  if max(px) - min(px) != 0:
+    pytest.skip(f"{case} row is not flat: px={px}")
+  assert result.get('terminal_sensitivity_floor_note'), (
+    f"{case}: flat row with no floor note, px={px}")
+
+
+@pytest.mark.parametrize('case', SCENARIOS)
+def test_sensitivity_agrees_with_the_headline_at_the_base_multiple(result, case):
+  """The one cell whose answer is already known.
+
+  Priced on a different terminal method it came out at twice the headline;
+  priced on the same one it has to reproduce it exactly.
+  """
+  main = result[case]['price_per_share']
+  cell = result['terminal_sensitivity'][case]['15.0x']
+  assert abs(cell - main) <= 0.02, (
+    f"{case}: sensitivity@15x != headline PT -- main={main} sens@15x={cell}")
+
+
+def test_the_grid_states_the_rule_it_applies(result):
+  method = result.get('terminal_sensitivity_method') or ''
+  assert 'min' in method.lower(), (
+    "the grid does not name the min(perpetuity, exit_multiple) rule it "
+    f"applies: {str(result.get('terminal_sensitivity_method'))[:80]}")
 
 
 def test_perpetuity_only_mode_skips_sensitivity():
-  print("\n== perpetuity-only mode (terminal_multiple=0) skips sensitivity ==")
+  """terminal_multiple=0 means there is no multiple to sweep."""
   result = _run(terminal_multiple=0)
-  _check("terminal_sensitivity NOT present when terminal_multiple == 0",
-         'terminal_sensitivity' not in result)
-  _check("terminal_sensitivity_base_multiple NOT present",
-         'terminal_sensitivity_base_multiple' not in result)
+  assert 'terminal_sensitivity' not in result, (
+    "a sensitivity grid was returned for a model with no exit multiple")
+  assert 'terminal_sensitivity_base_multiple' not in result, (
+    "a base multiple was reported for a model with no exit multiple")
 
 
-def test_existing_keys_still_present():
-  print("\n== additive change: existing return shape unchanged ==")
-  result = _run(terminal_multiple=15.0)
-  for k in ('bear', 'base', 'bull', 'price_range'):
-    _check(f"key '{k}' still present", k in result)
-  for k in ('low', 'mid', 'high'):
-    _check(f"price_range.{k} still present", k in result['price_range'])
-  for case in ('bear', 'base', 'bull'):
-    for sub in ('price_per_share', 'enterprise_value', 'equity_value',
-                'pv_terminal_value', 'revenue_growth_y1_pct', 'ebitda_margin_pct'):
-      _check(f"{case}.{sub} still present", sub in result[case])
+@pytest.mark.parametrize('key', ('bear', 'base', 'bull', 'price_range'))
+def test_existing_top_level_keys_still_present(result, key):
+  """The grid was an additive change; the existing return shape is unchanged."""
+  assert key in result, f"key '{key}' disappeared from the payload"
 
 
-def main() -> int:
-  print("\nScenario DCF terminal-multiple sensitivity tests\n")
-  test_sensitivity_present_when_exit_multiple_positive()
-  test_sensitivity_shape()
-  test_sensitivity_monotonic_in_multiple()
-  test_sensitivity_agrees_with_the_headline_at_the_base_multiple()
-  test_perpetuity_only_mode_skips_sensitivity()
-  test_existing_keys_still_present()
-
-  print(f"\n== Summary ==\n  PASS: {_results['pass']}\n  FAIL: {_results['fail']}")
-  for n, h in _results['failures']:
-    print(f"  - {n}: {h}")
-  return 0 if _results['fail'] == 0 else 1
+@pytest.mark.parametrize('key', ('low', 'mid', 'high'))
+def test_price_range_keys_still_present(result, key):
+  assert key in result['price_range'], f"price_range.{key} disappeared"
 
 
-if __name__ == "__main__":
-  sys.exit(main())
+@pytest.mark.parametrize('case', SCENARIOS)
+@pytest.mark.parametrize('sub', ('price_per_share', 'enterprise_value',
+                                 'equity_value', 'pv_terminal_value',
+                                 'revenue_growth_y1_pct', 'ebitda_margin_pct'))
+def test_scenario_keys_still_present(result, case, sub):
+  assert sub in result[case], f"{case}.{sub} disappeared"
