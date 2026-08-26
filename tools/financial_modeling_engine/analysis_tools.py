@@ -1490,7 +1490,13 @@ class Financial_Analysis:
               "debt": {"type": "number", "description": "SET TO 0 -- auto-resolved from get_market_data."},
               "shares_outstanding": {"type": "number", "description": "SET TO 0 -- auto-resolved from get_market_data."}
             },
-            "required": ["ticker"]
+            "required": ["ticker"],
+            # Every parameter here is a term in an arithmetic
+            # expression, so one dropped silently changes the
+            # number without changing its shape. `net_debt` was
+            # accepted, never read, and the valuation came back
+            # confident and wrong.
+            "additionalProperties": False
           }
         ),
         Tool(
@@ -1507,7 +1513,13 @@ class Financial_Analysis:
               "market_cap": {"type": "number", "description": "SET TO 0 -- auto-resolved from get_market_data."},
               "total_debt": {"type": "number", "description": "SET TO 0 -- auto-resolved from get_market_data."}
             },
-            "required": []
+            "required": [],
+            # Every parameter here is a term in an arithmetic
+            # expression, so one dropped silently changes the
+            # number without changing its shape. `net_debt` was
+            # accepted, never read, and the valuation came back
+            # confident and wrong.
+            "additionalProperties": False
           }
         ),
         # ---- Modeling phase tools ----
@@ -1536,7 +1548,13 @@ class Financial_Analysis:
               "shares_outstanding": {"type": "number"}
             },
             "required": ["ticker", "bear_growth", "base_growth", "bull_growth",
-                         "bear_margin", "base_margin", "bull_margin"]
+                         "bear_margin", "base_margin", "bull_margin"],
+                         # Every parameter here is a term in an arithmetic
+                         # expression, so one dropped silently changes the
+                         # number without changing its shape. `net_debt` was
+                         # accepted, never read, and the valuation came back
+                         # confident and wrong.
+                         "additionalProperties": False
           }
         ),
         Tool(
@@ -1560,7 +1578,13 @@ class Financial_Analysis:
             },
             "required": ["ticker", "entry_ev", "revenue_base", "ebitda_margin",
                          "capex_pct_revenue", "depreciation", "tax_rate",
-                         "revenue_growth", "debt_interest_rate", "leverage_turns", "exit_multiple"]
+                         "revenue_growth", "debt_interest_rate", "leverage_turns", "exit_multiple"],
+                         # Every parameter here is a term in an arithmetic
+                         # expression, so one dropped silently changes the
+                         # number without changing its shape. `net_debt` was
+                         # accepted, never read, and the valuation came back
+                         # confident and wrong.
+                         "additionalProperties": False
           }
         ),
         Tool(
@@ -1580,7 +1604,13 @@ class Financial_Analysis:
               "market_cap": {"type": "number", "description": "Market cap in dollars (for FCF yield)"}
             },
             "required": ["ticker", "total_debt", "cash", "ebitda",
-                         "interest_expense", "depreciation_abs", "capex_abs", "tax_rate"]
+                         "interest_expense", "depreciation_abs", "capex_abs", "tax_rate"],
+                         # Every parameter here is a term in an arithmetic
+                         # expression, so one dropped silently changes the
+                         # number without changing its shape. `net_debt` was
+                         # accepted, never read, and the valuation came back
+                         # confident and wrong.
+                         "additionalProperties": False
           }
         ),
         Tool(
@@ -1599,7 +1629,13 @@ class Financial_Analysis:
               "shares_repurchased": {"type": "number", "description": "Share repurchases from CF statement (negative = outflow)"},
               "shares_outstanding": {"type": "number", "description": "Total shares outstanding"}
             },
-            "required": ["ticker", "market_cap", "ebitda", "capex_abs", "tax_rate", "depreciation_abs"]
+            "required": ["ticker", "market_cap", "ebitda", "capex_abs", "tax_rate", "depreciation_abs"],
+            # Every parameter here is a term in an arithmetic
+            # expression, so one dropped silently changes the
+            # number without changing its shape. `net_debt` was
+            # accepted, never read, and the valuation came back
+            # confident and wrong.
+            "additionalProperties": False
           }
         ),
         Tool(
