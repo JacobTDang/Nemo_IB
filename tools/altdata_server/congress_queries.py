@@ -90,6 +90,94 @@ _TRUNCATED_NOTE = (
 )
 
 
+def _transaction_aggregate(conn: sqlite3.Connection, where: str,
+                           params: tuple) -> Dict[str, Any]:
+    """Counts and bracketed totals over EVERY matching trade, not the page.
+
+    `transaction_count` always described the full matching set while
+    `member_count` and `totals` were folded up from the rows that fitted under
+    `limit`, and the three sat adjacent with nothing to say which was which.
+    Live, NVDA at limit=10 read "226 transactions, 7 members, $137,010" where
+    the record held 42 members and $12,963,226 -- the dollars understated 98x
+    by a paging artefact.
+
+    So the numbers come from the same WHERE clause as the row list and are
+    computed independently of how many rows that list is allowed to carry.
+    """
+    row = _rows(conn, f"""
+        SELECT COUNT(*)                            AS row_count,
+               COUNT(DISTINCT m.member_id)         AS member_count,
+               SUM(COALESCE(t.amount_min, 0))      AS amount_min_total,
+               SUM(COALESCE(t.amount_max, 0))      AS amount_max_total,
+               SUM(CASE WHEN t.amount_min IS NOT NULL AND t.amount_max IS NULL
+                        THEN 1 ELSE 0 END)         AS open_ended_count,
+               SUM(CASE WHEN t.transaction_type LIKE 'purchase%'
+                        THEN 1 ELSE 0 END)         AS purchase_count,
+               SUM(CASE WHEN t.transaction_type LIKE 'sale%'
+                        THEN 1 ELSE 0 END)         AS sale_count,
+               SUM(CASE WHEN t.transaction_type = 'exchange'
+                        THEN 1 ELSE 0 END)         AS exchange_count
+        FROM transactions t
+        JOIN filings f ON f.filing_id = t.filing_id
+        LEFT JOIN members m ON m.member_id = t.member_id
+        WHERE {where}""", params)[0]
+    return {
+        "row_count": row["row_count"] or 0,
+        "member_count": row["member_count"] or 0,
+        "totals": {
+            "amount_min_total": row["amount_min_total"] or 0,
+            # None, not a smaller number: SUM(COALESCE(max, 0)) closes an
+            # open-ended bracket at zero, which is how a maximum once landed
+            # below its own minimum. With such a row in the sum the disclosure
+            # states no ceiling, so neither does the total.
+            "amount_max_total": None if row["open_ended_count"]
+            else (row["amount_max_total"] or 0),
+            "open_ended_count": row["open_ended_count"] or 0,
+            "purchase_count": row["purchase_count"] or 0,
+            "sale_count": row["sale_count"] or 0,
+            "exchange_count": row["exchange_count"] or 0,
+        },
+    }
+
+
+def _holding_aggregate(conn: sqlite3.Connection, where: str,
+                       params: tuple) -> Dict[str, Any]:
+    """The same guarantee on the holdings side: totals over all matching rows.
+
+    Holdings the filer could not price carry no bounds at all. They are
+    counted, never summed as zero -- a holding nobody could value and a
+    holding worth nothing are different disclosures.
+    """
+    row = _rows(conn, f"""
+        SELECT COUNT(*)                            AS row_count,
+               COUNT(DISTINCT m.member_id)         AS member_count,
+               SUM(COALESCE(h.value_min, 0))       AS value_min_total,
+               SUM(CASE WHEN h.value_min IS NOT NULL
+                        THEN COALESCE(h.value_max, 0) ELSE 0 END)
+                                                   AS value_max_total,
+               SUM(CASE WHEN h.value_min IS NOT NULL
+                        THEN 1 ELSE 0 END)         AS priced_count,
+               SUM(CASE WHEN h.value_min IS NULL
+                        THEN 1 ELSE 0 END)         AS unpriced_count,
+               SUM(CASE WHEN h.value_min IS NOT NULL AND h.value_max IS NULL
+                        THEN 1 ELSE 0 END)         AS open_ended_count
+        FROM holdings h
+        LEFT JOIN members m ON m.member_id = h.member_id
+        WHERE {where}""", params)[0]
+    return {
+        "row_count": row["row_count"] or 0,
+        "member_count": row["member_count"] or 0,
+        "totals": {
+            "value_min_total": row["value_min_total"] or 0,
+            "value_max_total": None if row["open_ended_count"]
+            else (row["value_max_total"] or 0),
+            "priced_count": row["priced_count"] or 0,
+            "unpriced_count": row["unpriced_count"] or 0,
+            "open_ended_count": row["open_ended_count"] or 0,
+        },
+    }
+
+
 def _aggregate_by_member(conn: sqlite3.Connection, table: str,
                          member_ids: List[str], low: str, high: str,
                          date_clause: str = "", params: tuple = ()
@@ -199,20 +287,19 @@ def ticker_activity(ticker: str, since: Optional[str] = None,
         where.append("f.chamber = ?")
         params.append(chamber)
 
+    clause = " AND ".join(where)
     with store.connect() as conn:
         transactions = _rows(conn, f"""
             SELECT {_TXN_COLUMNS} FROM transactions t
             JOIN filings f ON f.filing_id = t.filing_id
             LEFT JOIN members m ON m.member_id = t.member_id
-            WHERE {' AND '.join(where)}
+            WHERE {clause}
             ORDER BY t.transaction_date DESC
             LIMIT ?""", (*params, limit))
-        matching = conn.execute(f"""
-            SELECT COUNT(*) FROM transactions t
-            JOIN filings f ON f.filing_id = t.filing_id
-            WHERE {' AND '.join(where)}""", tuple(params)).fetchone()[0]
+        aggregate = _transaction_aggregate(conn, clause, tuple(params))
 
     coverage = store.coverage()
+    matching = aggregate["row_count"]
     truncated = len(transactions) >= limit and matching > len(transactions)
     return {
         "success": True,
@@ -221,8 +308,8 @@ def ticker_activity(ticker: str, since: Optional[str] = None,
         "truncated": truncated,
         "transaction_count": matching,
         "rows_returned": len(transactions),
-        "member_count": len({t["member"] for t in transactions if t["member"]}),
-        "totals": _totals(transactions),
+        "member_count": aggregate["member_count"],
+        "totals": aggregate["totals"],
         "transactions": transactions,
         "coverage": coverage,
         "note": _note(coverage, _TRUNCATED_NOTE if truncated else ""),
@@ -232,46 +319,64 @@ def ticker_activity(ticker: str, since: Optional[str] = None,
 # ------------------------------------------------------------------ by member
 
 def member_activity(name: str, since: Optional[str] = None,
-                    limit: int = 500) -> Dict[str, Any]:
+                    limit: int = 500,
+                    ticker: Optional[str] = None) -> Dict[str, Any]:
     """One member's disclosed trades, matched loosely on name.
 
     The members actually matched are returned alongside the trades. A loose
     match that does not say who it hit produces numbers nobody can attribute,
     and two members share a surname often enough that it matters.
+
+    `ticker` narrows the query itself rather than the page. Filtering the
+    returned rows afterwards left `totals` describing every trade the member
+    made in anything, beside a `transaction_count` describing one symbol.
     """
+    wanted = (ticker or "").upper().strip() or None
+    aggregate: Dict[str, Any] = {"row_count": 0, "member_count": 0,
+                                 "totals": _totals([])}
+    per_member_agg: Dict[str, Dict[str, Any]] = {}
+    top: List[Dict[str, Any]] = []
     with store.connect() as conn:
         matched = _match_members(conn, name)
 
         transactions: List[Dict[str, Any]] = []
-        aggregate: Dict[str, Dict[str, Any]] = {}
         if matched:
             ids = [m["member_id"] for m in matched]
             placeholders = ",".join("?" * len(ids))
             params: List[Any] = list(ids)
-            date_clause = ""
+            narrowing = ""
             if since:
-                date_clause = "AND t.transaction_date >= ?"
+                narrowing += " AND t.transaction_date >= ?"
                 params.append(since)
+            if wanted:
+                narrowing += " AND t.ticker = ?"
+                params.append(wanted)
+            where = f"t.member_id IN ({placeholders}){narrowing}"
             transactions = _rows(conn, f"""
                 SELECT {_TXN_COLUMNS} FROM transactions t
                 JOIN filings f ON f.filing_id = t.filing_id
                 LEFT JOIN members m ON m.member_id = t.member_id
-                WHERE t.member_id IN ({placeholders}) {date_clause}
+                WHERE {where}
                 ORDER BY t.transaction_date DESC
                 LIMIT ?""", (*params, limit))
-            aggregate = _aggregate_by_member(
+            aggregate = _transaction_aggregate(conn, where, tuple(params))
+            per_member_agg = _aggregate_by_member(
                 conn, "transactions", ids, "amount_min", "amount_max",
-                date_clause.replace("t.", "x."), tuple(params[len(ids):]))
-
-    by_ticker: Dict[str, int] = {}
-    for txn in transactions:
-        if txn.get("ticker"):
-            by_ticker[txn["ticker"]] = by_ticker.get(txn["ticker"], 0) + 1
-    top = sorted(by_ticker.items(), key=lambda kv: -kv[1])[:10]
+                narrowing.replace("t.", "x."), tuple(params[len(ids):]))
+            # Ranked over every matching row too: a leaderboard built from the
+            # page ranks whichever trades sorted onto it.
+            top = _rows(conn, f"""
+                SELECT t.ticker, COUNT(*) AS transaction_count
+                FROM transactions t
+                JOIN filings f ON f.filing_id = t.filing_id
+                WHERE {where} AND t.ticker IS NOT NULL AND t.ticker != ''
+                GROUP BY t.ticker
+                ORDER BY transaction_count DESC, t.ticker
+                LIMIT 10""", tuple(params))
 
     coverage = store.coverage()
     ambiguous = len(matched) > 1
-    total_rows = sum(a.get("count", 0) for a in aggregate.values()) if matched else 0
+    total_rows = aggregate["row_count"]
     truncated = len(transactions) >= limit and total_rows > len(transactions)
     extra = "" if matched else (
         f"'{name}' matched no member in the store. Either the name is spelled "
@@ -284,15 +389,16 @@ def member_activity(name: str, since: Optional[str] = None,
                  f"apart. " + extra)
     return {
         "success": True,
-        "query": {"name": name, "since": since},
+        "query": {"name": name, "since": since, "ticker": wanted},
         "matched_members": matched,
         "ambiguous": ambiguous,
         "truncated": truncated,
-        "per_member": _per_member(matched, aggregate, "amount_min", "amount_max"),
+        "per_member": _per_member(matched, per_member_agg,
+                                  "amount_min", "amount_max"),
         "transaction_count": total_rows,
         "rows_returned": len(transactions),
-        "totals": _totals(transactions),
-        "most_traded": [{"ticker": t, "transaction_count": c} for t, c in top],
+        "totals": aggregate["totals"],
+        "most_traded": top,
         "transactions": transactions,
         "coverage": coverage,
         "note": _note(coverage, (_TRUNCATED_NOTE + " " + extra) if truncated else extra),
@@ -429,18 +535,17 @@ def ticker_holdings(ticker: str, limit: int = 500) -> Dict[str, Any]:
             WHERE h.ticker = ?
             ORDER BY h.as_of DESC, h.value_min DESC
             LIMIT ?""", (wanted, limit))
-        matching = conn.execute(
-            "SELECT COUNT(*) FROM holdings WHERE ticker = ?", (wanted,)
-        ).fetchone()[0]
+        aggregate = _holding_aggregate(conn, "h.ticker = ?", (wanted,))
 
     coverage = store.coverage()
+    matching = aggregate["row_count"]
     truncated = len(holdings) >= limit and matching > len(holdings)
     return {"success": True, "ticker": wanted,
             "truncated": truncated,
             "holding_count": matching,
             "rows_returned": len(holdings),
-            "member_count": len({h["member"] for h in holdings if h["member"]}),
-            "totals": _holding_totals(holdings), "holdings": holdings,
+            "member_count": aggregate["member_count"],
+            "totals": aggregate["totals"], "holdings": holdings,
             "coverage": coverage,
             "note": _note(coverage, (_TRUNCATED_NOTE + " " + _HOLDING_NOTE)
                           if truncated else _HOLDING_NOTE)}
@@ -448,11 +553,13 @@ def ticker_holdings(ticker: str, limit: int = 500) -> Dict[str, Any]:
 
 def member_holdings(name: str, limit: int = 1000) -> Dict[str, Any]:
     """One member's disclosed holdings, matched loosely on name."""
+    aggregate: Dict[str, Any] = {"row_count": 0, "member_count": 0,
+                                 "totals": _holding_totals([])}
+    per_member_agg: Dict[str, Dict[str, Any]] = {}
     with store.connect() as conn:
         matched = _match_members(conn, name)
 
         holdings: List[Dict[str, Any]] = []
-        aggregate: Dict[str, Dict[str, Any]] = {}
         if matched:
             ids = [m["member_id"] for m in matched]
             placeholders = ",".join("?" * len(ids))
@@ -463,12 +570,14 @@ def member_holdings(name: str, limit: int = 1000) -> Dict[str, Any]:
                 WHERE h.member_id IN ({placeholders})
                 ORDER BY h.as_of DESC, h.value_min DESC
                 LIMIT ?""", (*ids, limit))
-            aggregate = _aggregate_by_member(
+            aggregate = _holding_aggregate(
+                conn, f"h.member_id IN ({placeholders})", tuple(ids))
+            per_member_agg = _aggregate_by_member(
                 conn, "holdings", ids, "value_min", "value_max")
 
     coverage = store.coverage()
     ambiguous = len(matched) > 1
-    total_rows = sum(a.get("count", 0) for a in aggregate.values()) if matched else 0
+    total_rows = aggregate["row_count"]
     truncated = len(holdings) >= limit and total_rows > len(holdings)
     extra = _HOLDING_NOTE if matched else (
         f"'{name}' matched no member in the store. {_HOLDING_NOTE}")
@@ -480,10 +589,11 @@ def member_holdings(name: str, limit: int = 1000) -> Dict[str, Any]:
     return {"success": True, "query": {"name": name},
             "matched_members": matched, "ambiguous": ambiguous,
             "truncated": truncated,
-            "per_member": _per_member(matched, aggregate, "value_min", "value_max"),
+            "per_member": _per_member(matched, per_member_agg,
+                                      "value_min", "value_max"),
             "holding_count": total_rows,
             "rows_returned": len(holdings),
-            "totals": _holding_totals(holdings), "holdings": holdings,
+            "totals": aggregate["totals"], "holdings": holdings,
             "coverage": coverage,
             "note": _note(coverage,
                           (_TRUNCATED_NOTE + " " + extra) if truncated else extra)}

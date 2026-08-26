@@ -43,13 +43,15 @@ from __future__ import annotations
 from tools.response_meta import annotating, warning
 
 import asyncio
+import calendar
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from mcp.server import Server
@@ -865,7 +867,16 @@ def _fetch_taiwan_revenue_finmind(company_codes: List[str], months: int) -> Dict
             yoy_pct = None
             if prior_rev and prior_rev != 0:
                 yoy_pct = round((rev_raw - prior_rev) / abs(prior_rev) * 100, 2)
-            parsed.append({"year": yr, "month": mo, "date": r["date"],
+            # FinMind's `date` is the month the figure was ANNOUNCED, one ahead
+            # of the month it describes: TSMC's June 2026 revenue is stamped
+            # 2026-07-01. Passing that through as `date` put it next to
+            # year=2026 / month=6 disagreeing with both, and anything charted
+            # on it attributed every month's revenue to the following month.
+            # `date` is now the first day of the period; the announcement
+            # stamp is kept under a name that says what it is.
+            parsed.append({"year": yr, "month": mo,
+                           "date": f"{yr:04d}-{mo:02d}-01",
+                           "announced_date": r["date"],
                            "revenue_ntd_m": rev_ntd_m, "yoy_pct": yoy_pct})
         results[code] = {"company_code": code, "months_returned": len(parsed),
                          "months": parsed, "source": "finmind"}
@@ -922,22 +933,53 @@ def _usa_filters(company_name: str, start: str, end: str,
     }
 
 
-def _usa_obligations_total(company_name: str, start: str, end: str,
-                            award_types: List[str]) -> float:
-    """Sum real obligation FLOWS over a window via spending_over_time.
+def _fiscal_bucket_month(fiscal_year: Any, month: Any) -> str:
+    """Calendar month for one spending_over_time bucket, as YYYY-MM-01.
+
+    The endpoint labels its buckets by FEDERAL FISCAL month, where month 1 is
+    October. `{"fiscal_year": "2026", "month": "9"}` is June 2026, not
+    September. Reading the label as a calendar month slides the whole series
+    three months and would put the data horizon in the wrong place.
+    """
+    fy, fm = int(fiscal_year), int(month)
+    return f"{fy - 1 if fm <= 3 else fy:04d}-{((fm + 8) % 12) + 1:02d}-01"
+
+
+def _usa_month_series(company_name: Optional[str], start: str, end: str,
+                       award_types: List[str]) -> List[Dict[str, Any]]:
+    """Obligation FLOW per calendar month over a window, oldest first.
 
     Unlike spending_by_award (which returns multi-year contract ceiling
-    values), spending_over_time returns the obligated amount per period.
-    The time_period filter bounds the window, so summing the buckets gives
-    the true period flow.
+    values), spending_over_time returns the obligated amount per period. The
+    time_period filter bounds the window, so the buckets are the true period
+    flow. `company_name` of None asks the same question of the whole federal
+    government, which is how data freshness is measured.
     """
     import requests
-    payload = {"group": "month",
-               "filters": _usa_filters(company_name, start, end, award_types)}
-    resp = requests.post(_SOT_URL, json=payload, timeout=_USA_TIMEOUT, headers=_USA_HEADERS)
+    filters = _usa_filters(company_name or "", start, end, award_types)
+    if not company_name:
+        filters.pop("recipient_search_text", None)
+    resp = requests.post(_SOT_URL, json={"group": "month", "filters": filters},
+                         timeout=_USA_TIMEOUT, headers=_USA_HEADERS)
     resp.raise_for_status()
-    results = resp.json().get("results", [])
-    return float(sum((r.get("aggregated_amount") or 0) for r in results))
+    series = []
+    for row in resp.json().get("results", []) or []:
+        bucket = row.get("time_period") or {}
+        if "fiscal_year" not in bucket or "month" not in bucket:
+            continue
+        series.append({
+            "month": _fiscal_bucket_month(bucket["fiscal_year"], bucket["month"]),
+            "obligations_usd": float(row.get("aggregated_amount") or 0),
+        })
+    series.sort(key=lambda r: r["month"])
+    return series
+
+
+def _usa_obligations_total(company_name: str, start: str, end: str,
+                            award_types: List[str]) -> float:
+    """Total obligation flow over a window."""
+    return float(sum(r["obligations_usd"] for r in
+                     _usa_month_series(company_name, start, end, award_types)))
 
 
 def _usa_top_agencies(company_name: str, start: str, end: str,
@@ -988,18 +1030,149 @@ def _gov_contracts_signal(trailing_total: float, prior_total: Optional[float],
     return "neutral"
 
 
+# ---------------------------------------------------------------- data horizon
+
+# A published month runs at roughly the level of its neighbours. Below this
+# share of the median month it is not a quiet month, it is a month the
+# agencies have not filed yet. 0.8 separates the two cleanly on the measured
+# series: October 2025 (a genuinely thin month at 32% of median) sits inside
+# the published run and does not move the horizon, because only an unbroken
+# run of thin months at the END of the series counts as unpublished.
+_HORIZON_COMPLETENESS = 0.8
+_USA_HORIZON_LOOKBACK_MONTHS = 18
+_USA_HORIZON_TTL_SECONDS = 6 * 3600
+# Above this share of the window sitting past the horizon, the window is
+# mostly unpublished and cannot carry a signal in either direction.
+_LAG_MOSTLY = 0.5
+
+_usa_horizon_cache: Dict[Tuple[str, ...], Tuple[float, Dict[str, Any]]] = {}
+
+
+def _shift_months(day, count: int) -> date:
+    """Calendar-exact month arithmetic, clamped to the length of the month.
+
+    timedelta(days=months * 365/12) drifts: three months before 2026-08-25 came
+    out as 2026-05-26. And a year before 2024-02-29 has to be 2023-02-28,
+    because 2023-02-29 does not exist.
+    """
+    anchor = day.date() if isinstance(day, datetime) else day
+    index = anchor.month - 1 + count
+    year, month = anchor.year + index // 12, index % 12 + 1
+    return date(year, month, min(anchor.day, calendar.monthrange(year, month)[1]))
+
+
+def _data_horizon_from_series(series: List[Dict[str, Any]],
+                               threshold: float = _HORIZON_COMPLETENESS
+                               ) -> Dict[str, Any]:
+    """The last date USASpending has actually published, from its own series.
+
+    Federal contract actions reach USASpending months in arrears -- the
+    Department of Defense above all, whose actions are withheld from public
+    FPDS release for 90 days. Measured government-wide on 2026-08-25, monthly
+    contract obligations held $50-100bn through 2026-05 and then fell to
+    $33.1bn, $39.9bn and $15.5bn. Lockheed's own months went from a $4.1bn
+    median to $147m, $27m and $16m over the same three.
+
+    Those months are unpublished, not empty, and the difference decides
+    whether a trailing total is a finding or a gap. So the horizon is measured
+    from the provider each time rather than assumed from a constant that would
+    silently go stale.
+    """
+    if not series:
+        raise ValueError("cannot measure a data horizon from an empty series")
+
+    amounts = sorted(row["obligations_usd"] for row in series)
+    middle = len(amounts) // 2
+    baseline = (amounts[middle] if len(amounts) % 2
+                else (amounts[middle - 1] + amounts[middle]) / 2)
+    floor = baseline * threshold
+
+    incomplete: List[str] = []
+    for row in reversed(series):
+        if row["obligations_usd"] >= floor:
+            break
+        incomplete.append(row["month"][:7])
+    incomplete.reverse()
+
+    last_published = (incomplete[0] if incomplete else None)
+    if last_published:
+        year, month = int(last_published[:4]), int(last_published[5:7])
+        published_through = _shift_months(date(year, month, 1), -1)
+    else:
+        last = series[-1]["month"]
+        published_through = date(int(last[:4]), int(last[5:7]), 1)
+    end_of_month = calendar.monthrange(published_through.year,
+                                       published_through.month)[1]
+    return {
+        "horizon": published_through.replace(day=end_of_month).strftime("%Y-%m-%d"),
+        "incomplete_months": incomplete,
+        "baseline_usd": baseline,
+        "measured_from": "spending_over_time, government-wide, by month",
+    }
+
+
+def _usa_data_horizon(award_types: List[str]) -> Dict[str, Any]:
+    """Measure how current USASpending's published data is, and cache it.
+
+    Government-wide rather than per company: one company's quiet quarter is
+    ambiguous, the whole federal government's is not. Keyed by award type
+    because the feeds differ -- measured 2026-08-25, grants (02/03/04/05) ran
+    current at $240bn for 2026-07 while contracts (A/B/C/D) stopped at
+    2026-05 -- so the probe measures exactly the universe being summed.
+
+    Cached for six hours: the answer changes daily at most, and the probe
+    would otherwise repeat on every call.
+    """
+    key = tuple(award_types)
+    cached = _usa_horizon_cache.get(key)
+    now = time.monotonic()
+    if cached and now - cached[0] < _USA_HORIZON_TTL_SECONDS:
+        return cached[1]
+
+    today = date.today()
+    series = _usa_month_series(
+        None, _shift_months(today, -_USA_HORIZON_LOOKBACK_MONTHS).strftime("%Y-%m-%d"),
+        today.strftime("%Y-%m-%d"), award_types)
+    horizon = _data_horizon_from_series(series)
+    _usa_horizon_cache[key] = (now, horizon)
+    return horizon
+
+
+def _window_lag_fraction(start: str, end: str, horizon: str) -> float:
+    """How much of [start, end] lies past the provider's published data."""
+    first, last = date.fromisoformat(start), date.fromisoformat(end)
+    edge = date.fromisoformat(horizon)
+    span = (last - first).days
+    if span <= 0:
+        return 0.0
+    return max(0.0, (last - max(first, edge)).days / span)
+
+
 def _gov_windows(today, months: int):
-    """Pure: (trailing_start, trailing_end, prior_start, prior_end) date strings.
-    Calendar-accurate spans (365/12 days per month, not 30) so '12 months' is a
-    true year for the YoY. USASpending time_period is inclusive on both ends,
-    so the prior window ends one day before the trailing window starts (no
-    boundary-day double count)."""
-    span = timedelta(days=round(months * 365 / 12))
-    t_start = today - span
-    return (t_start.strftime("%Y-%m-%d"),
-            today.strftime("%Y-%m-%d"),
-            (t_start - span).strftime("%Y-%m-%d"),
-            (t_start - timedelta(days=1)).strftime("%Y-%m-%d"))
+    """Pure: (trailing_start, trailing_end, compare_start, compare_end).
+
+    The comparison window is the SAME months one year earlier, which is what
+    `yoy_change_pct` claims to measure. It used to be the months immediately
+    before the trailing window: at months=3 the "prior" figure came out equal
+    to the months=6 trailing figure, which is how the substitution was caught.
+
+    A sequential comparison cannot be labelled year-over-year on this series.
+    Federal obligations peak enormously at the 30 September fiscal year end --
+    government-wide, 2025-09 was $148bn against a $60bn median month -- so a
+    window-against-previous-window change measures where in the fiscal year
+    the window happens to sit.
+
+    USASpending's time_period is inclusive on both ends, so the comparison
+    window stops the day before the trailing window's own start date shifted
+    back a year: at months=12 the two windows are adjacent, and the shared
+    boundary day would otherwise be counted in both.
+    """
+    anchor = today.date() if isinstance(today, datetime) else today
+    trailing_start = _shift_months(anchor, -months)
+    return (trailing_start.strftime("%Y-%m-%d"),
+            anchor.strftime("%Y-%m-%d"),
+            _shift_months(trailing_start, -12).strftime("%Y-%m-%d"),
+            (_shift_months(anchor, -12) - timedelta(days=1)).strftime("%Y-%m-%d"))
 
 
 def _fetch_government_contracts(ticker: str, company_name: str,
@@ -1007,6 +1180,7 @@ def _fetch_government_contracts(ticker: str, company_name: str,
     base = {"ticker": ticker, "company_name": company_name or None,
             "period_months": months, "trailing_awards_usd": None,
             "prior_period_awards_usd": None, "yoy_change_pct": None,
+            "data_horizon": None, "window_lag_fraction": None,
             "signal": None, "top_agencies": [], "source": "usaspending.gov"}
 
     # An explicit company_name is the caller asserting the entity; only derive
@@ -1023,23 +1197,37 @@ def _fetch_government_contracts(ticker: str, company_name: str,
 
     award_types = _CONTRACT_AWARD_TYPES + (_GRANT_AWARD_TYPES if include_grants else [])
 
-    # Run the four independent USASpending queries concurrently.
+    # Run the independent USASpending queries concurrently.
     results: Dict[str, Any] = {}
     errors: List[str] = []
-    pool = ThreadPoolExecutor(max_workers=4)
+    degraded: List[str] = []
+    pool = ThreadPoolExecutor(max_workers=5)
     try:
         futures = {
             pool.submit(_usa_obligations_total, company_name, trailing_start, end, award_types): "trailing",
             pool.submit(_usa_obligations_total, company_name, prior_start, prior_end, award_types): "prior",
             pool.submit(_usa_top_agencies, company_name, trailing_start, end, award_types): "agencies",
             pool.submit(_usa_award_count, company_name, trailing_start, end, award_types): "count",
+            pool.submit(_usa_data_horizon, award_types): "horizon",
         }
         for future in as_completed(futures, timeout=_USA_TIMEOUT + 5):
             key = futures[future]
             try:
                 results[key] = future.result()
             except Exception as exc:
-                errors.append(f"{key}: {type(exc).__name__}: {str(exc)[:120]}")
+                detail = f"{key}: {type(exc).__name__}: {str(exc)[:120]}"
+                if key == "horizon":
+                    # A failed freshness probe narrows what can be said without
+                    # invalidating the totals, so it is named as a degradation
+                    # rather than counted against coverage -- but it is never
+                    # read as "no lag", which would be the silent guess this
+                    # measurement exists to remove.
+                    degraded.append(
+                        f"USASpending data-horizon probe failed ({detail}); "
+                        "whether this window falls inside the provider's "
+                        "reporting lag is unknown.")
+                else:
+                    errors.append(detail)
     except Exception as exc:
         errors.append(f"timeout waiting for USASpending: {type(exc).__name__}")
     finally:
@@ -1074,25 +1262,75 @@ def _fetch_government_contracts(ticker: str, company_name: str,
         for a in agencies[:5]
     ]
 
-    signal = _gov_contracts_signal(trailing_total, prior_total, yoy_pct)
+    # How much of the trailing window the provider has not published yet. An
+    # unpublished month reads exactly like a month with no awards, and the two
+    # are opposite findings.
+    measured = results.get("horizon")
+    horizon = measured["horizon"] if measured else None
+    lag_fraction = (round(_window_lag_fraction(trailing_start, end, horizon), 3)
+                    if horizon else None)
+    mostly_unpublished = lag_fraction is not None and lag_fraction >= _LAG_MOSTLY
+
+    warnings: List[Dict[str, Any]] = []
+    if lag_fraction:
+        share = f"{lag_fraction * 100:.0f}%"
+        if mostly_unpublished:
+            warnings.append(warning(
+                "reporting_lag",
+                f"USASpending has published contract obligations only through "
+                f"{horizon}, and {share} of the {months}-month window "
+                f"({trailing_start} to {end}) falls after that date. The "
+                f"trailing total measures what has been published, not what "
+                f"was awarded, so no signal is reported: this is a gap in the "
+                f"record rather than a change in the company's federal "
+                f"business.",
+                data_horizon=horizon,
+                window_lag_fraction=lag_fraction,
+                window=f"{trailing_start}..{end}"))
+        else:
+            warnings.append(warning(
+                "partial_reporting_lag",
+                f"USASpending has published contract obligations only through "
+                f"{horizon}. {share} of the trailing window falls after that "
+                f"date while the year-ago comparison window "
+                f"({prior_start} to {prior_end}) is fully published, so "
+                f"yoy_change_pct is biased downward by roughly that share of "
+                f"the period.",
+                data_horizon=horizon,
+                window_lag_fraction=lag_fraction,
+                window=f"{trailing_start}..{end}"))
+
+    signal = (None if mostly_unpublished
+              else _gov_contracts_signal(trailing_total, prior_total, yoy_pct))
 
     # prior/agencies/count are supporting detail: missing any of them narrows
     # the answer without invalidating the trailing total.
     return {
         "success": True,
-        "coverage": "partial" if errors else "full",
+        "coverage": "partial" if (errors or mostly_unpublished) else "full",
         "company_name": company_name,
         "ticker": ticker,
         "period_months": months,
+        "trailing_window": {"start": trailing_start, "end": end},
+        "comparison_window": {"start": prior_start, "end": prior_end},
         "trailing_awards_usd": round(trailing_total, 2),
         "trailing_award_count": award_count,
         "prior_period_awards_usd": round(prior_total, 2) if prior_total is not None else None,
         "yoy_change_pct": yoy_pct,
+        "data_horizon": horizon,
+        "window_lag_fraction": lag_fraction,
         "signal": signal,
         "top_agencies": top_agencies,
         "source": "usaspending.gov",
         "basis": ("Contract obligations (period flow) via spending_over_time — "
-                  "not multi-year contract ceiling values."),
+                  "not multi-year contract ceiling values. yoy_change_pct "
+                  "compares the trailing window against the same calendar "
+                  "months one year earlier, never against the window "
+                  "immediately before it: federal obligations peak at the "
+                  "30 September fiscal year end, so a sequential change "
+                  "measures the calendar."),
+        "warnings": warnings,
+        "degraded": degraded,
         "partial_errors": errors,
     }
 
@@ -1580,7 +1818,11 @@ class AltDataServer:
                         "Monthly revenue for Taiwan-listed companies via FinMind "
                         "(TWSE feed). Key codes: TSMC=2330, Foxconn=2317, "
                         "MediaTek=2454, ASE Group=3711. "
-                        "Returns NTD millions per month + YoY%. Every requested code "
+                        "Returns NTD millions per month + YoY%. `date` is the first "
+                        "day of the month the revenue DESCRIBES and always agrees "
+                        "with `year`/`month`; FinMind's announcement stamp (a month "
+                        "later) is kept separately as `announced_date`. "
+                        "Every requested code "
                         "failing returns success=false, coverage='not_covered'; some "
                         "failing returns coverage='partial' with codes_failed listed. "
                         "An unset FINMIND_TOKEN is named in 'degraded' (anonymous tier, "
@@ -1646,10 +1888,23 @@ class AltDataServer:
                         "Federal contract (and optional grant) obligations to a company "
                         "via USASpending.gov — free, no auth required. Uses spending_over_time "
                         "for true period FLOW (not multi-year contract ceiling values). "
-                        "Returns trailing-period obligations, prior-period obligations, YoY change, "
-                        "top awarding agencies, and award count. "
+                        "Returns trailing-period obligations, the SAME calendar months "
+                        "one year earlier, the YoY change between them, top awarding "
+                        "agencies, and award count. The comparison is never the window "
+                        "immediately before the trailing one: federal obligations peak "
+                        "at the 30 September fiscal year end, so a sequential change "
+                        "would measure the calendar. "
                         "Signal: YoY > +15% = bullish; YoY < -15% = bearish; "
                         "< $10M total = not_applicable (consumer/B2C company). "
+                        "Agencies publish contract actions months in arrears (DoD "
+                        "actions are withheld from public FPDS for 90 days), so every "
+                        "response carries 'data_horizon' — the last date USASpending "
+                        "has actually published, measured government-wide at call "
+                        "time — and 'window_lag_fraction'. When most of the window "
+                        "falls past that horizon no signal is returned at all: it is "
+                        "coverage='partial' plus a 'reporting_lag' warning, because "
+                        "an unpublished quarter is a gap in the record rather than a "
+                        "collapse in the company's federal business. "
                         "A ticker the quote provider cannot resolve returns success=false "
                         "(USASpending answers '$0 of federal business' for any string, so "
                         "an unknown company would otherwise read as a real zero). If the "
@@ -1931,14 +2186,14 @@ warnings_per_tool={
 
         try:
             if args.get("member"):
+                # The ticker narrows the query, not the page. Filtering the
+                # returned rows afterwards left `totals` and `per_member`
+                # describing every trade the member made in anything, beside a
+                # `transaction_count` describing one symbol.
                 result = await asyncio.to_thread(
                     queries.member_activity, args["member"],
-                    since=args.get("since"), limit=int(args.get("limit", 200)))
-                if args.get("ticker"):
-                    wanted = args["ticker"].upper().strip()
-                    result["transactions"] = [
-                        t for t in result["transactions"] if t.get("ticker") == wanted]
-                    result["transaction_count"] = len(result["transactions"])
+                    since=args.get("since"), limit=int(args.get("limit", 200)),
+                    ticker=args.get("ticker"))
             else:
                 result = await asyncio.to_thread(
                     queries.ticker_activity, args.get("ticker", ""),
