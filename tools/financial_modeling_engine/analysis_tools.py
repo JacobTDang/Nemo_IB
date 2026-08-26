@@ -165,21 +165,61 @@ def _to_native(obj):
   return obj
 
 
+def as_rate(name: str, value, *, allow_negative: bool = False) -> float:
+  """Interpret a rate given as a decimal or a percentage, or refuse.
+
+  The calculators previously did `if x > 1: x /= 100`, which is safe for a
+  value that really is a rate and catastrophic for one that is not: it turns
+  an implausible number into a differently implausible number instead of an
+  error. `calculate_dcf` documents `depreciation` as coming from
+  `get_depreciation`, whose `d&a` is an absolute figure -- NVDA's 2,843,000,000
+  became 28,430,000 and then a multiplier on revenue, and the model returned
+  $242,204,233 per share with success: true.
+
+  0 to 1 is read as a decimal, above 1 to 100 as a percentage. Anything else
+  is refused, naming the parameter, because there is no reading of 2.8 billion
+  that is a rate.
+  """
+  if isinstance(value, bool) or not isinstance(value, (int, float)):
+    raise TypeError(
+        f"{name} must be a number given as a decimal (0.25) or a percentage "
+        f"(25), received {type(value).__name__}")
+  number = float(value)
+  if number != number:                                  # NaN
+    raise ValueError(f"{name} is NaN, which is neither a decimal nor a percentage")
+  if number < 0:
+    if not allow_negative:
+      raise ValueError(f"{name} cannot be negative, received {number}")
+    return number if abs(number) <= 1 else number / 100
+  if number <= 1:
+    return number
+  if number <= 100:
+    return number / 100
+  raise ValueError(
+      f"{name}={number:,.0f} is neither a decimal rate (0.25) nor a "
+      f"percentage (25). If this is an absolute amount, pass the rate "
+      f"instead -- get_depreciation returns `d&a` in dollars and `d&a_pct` as "
+      f"the percentage this expects.")
+
+
 def _dcf_math(revenue_base: float, ebitda_margin: float, capex_pct_revenue: float,
               tax_rate: float, depreciation: float, revenue_growth: list,
               wacc: float, terminal_growth: float, terminal_multiple: float,
               cash: float, debt: float, shares_outstanding: float,
               ticker: str = '') -> dict:
   """5-year FCF DCF model. All margin/rate inputs as decimals."""
-  # Normalize percent-form inputs to decimal (defensive guard)
-  if ebitda_margin > 1:
-    ebitda_margin /= 100
-  if capex_pct_revenue > 1:
-    capex_pct_revenue /= 100
-  if tax_rate > 1:
-    tax_rate /= 100
-  if depreciation > 1:
-    depreciation /= 100
+  # Every rate parameter, interpreted the same way. Previously wacc and
+  # terminal_growth were left out of the normalisation the others got, so
+  # `wacc: 10` -- the percentage convention the rest accept -- became a 1000%
+  # discount rate and a price per share of 1,104,824,357.
+  ebitda_margin = as_rate('ebitda_margin', ebitda_margin)
+  capex_pct_revenue = as_rate('capex_pct_revenue', capex_pct_revenue)
+  tax_rate = as_rate('tax_rate', tax_rate)
+  depreciation = as_rate('depreciation', depreciation)
+  wacc = as_rate('wacc', wacc)
+  terminal_growth = as_rate('terminal_growth', terminal_growth, allow_negative=True)
+  revenue_growth = [as_rate('revenue_growth', g, allow_negative=True)
+                    for g in (revenue_growth or [])]
 
   if terminal_growth == 0:
     terminal_growth = 0.025  # GDP-match default
@@ -277,14 +317,10 @@ def _wacc_math(beta: float, risk_free_rate: float, equity_risk_premium: float = 
                cost_of_debt: float = 0, tax_rate: float = 0,
                market_cap: float = 0, total_debt: float = 0) -> dict:
   """WACC via CAPM. All rate inputs as decimals."""
-  if equity_risk_premium > 1:
-    equity_risk_premium /= 100
-  if risk_free_rate > 1:
-    risk_free_rate /= 100
-  if cost_of_debt > 1:
-    cost_of_debt /= 100
-  if tax_rate > 1:
-    tax_rate /= 100
+  equity_risk_premium = as_rate('equity_risk_premium', equity_risk_premium)
+  risk_free_rate = as_rate('risk_free_rate', risk_free_rate)
+  cost_of_debt = as_rate('cost_of_debt', cost_of_debt)
+  tax_rate = as_rate('tax_rate', tax_rate)
 
   cost_of_equity = risk_free_rate + beta * equity_risk_premium
 
@@ -334,16 +370,13 @@ def _lbo_math(entry_ev: float, revenue_base: float, ebitda_margin: float,
   Returns IRR and MOIC assuming all FCF sweeps debt and no interim equity distributions.
   """
   # Normalize
-  if ebitda_margin > 1:
-    ebitda_margin /= 100
-  if capex_pct_revenue > 1:
-    capex_pct_revenue /= 100
-  if depreciation > 1:
-    depreciation /= 100
-  if tax_rate > 1:
-    tax_rate /= 100
-  if debt_interest_rate > 1:
-    debt_interest_rate /= 100
+  ebitda_margin = as_rate('ebitda_margin', ebitda_margin)
+  capex_pct_revenue = as_rate('capex_pct_revenue', capex_pct_revenue)
+  depreciation = as_rate('depreciation', depreciation)
+  tax_rate = as_rate('tax_rate', tax_rate)
+  debt_interest_rate = as_rate('debt_interest_rate', debt_interest_rate)
+  revenue_growth = [as_rate('revenue_growth', g, allow_negative=True)
+                    for g in (revenue_growth or [])]
 
   entry_ebitda = revenue_base * ebitda_margin
   debt_amount = entry_ebitda * leverage_turns
