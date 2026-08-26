@@ -17,6 +17,13 @@ from typing import Any, Dict, List, Optional
 
 from .foreign_issuer import form_mismatch_note, not_covered_reason
 from .sec_series import NotCovered, fetch_concept_series
+from .shared_filings import (
+    Deadline,
+    ToolTimeout,
+    budget_seconds,
+    concept_series,
+    shared_filings,
+)
 
 # Filers tag SBC under several concepts. Ordered by how commonly each one
 # carries the consolidated figure.
@@ -36,6 +43,26 @@ OCF_CONCEPTS = (
     "us-gaap:NetCashProvidedByUsedInOperatingActivities",
     "us-gaap:NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
 )
+
+
+def _shared_filings(ticker: str, deadline: Deadline):
+    """`shared_filings`, bound to this module's `fetch_concept_series`.
+
+    Read here rather than passed in from the call site so the name stays a
+    module global a test can replace -- which is what the walk checks before
+    it stands down.
+    """
+    return shared_filings(ticker, deadline, fetch_concept_series)
+
+
+def _concept_series(ticker: str, concept: str, form: str, limit: int) -> list:
+    """One concept's series, reusing filings already parsed for this call.
+
+    With no shared walk open this is `fetch_concept_series` verbatim, which is
+    what keeps `_consolidated_by_filing` callable on its own -- several tests
+    call it directly -- and keeps that name the seam they replace.
+    """
+    return concept_series(ticker, concept, form, limit, fetch_concept_series)
 
 
 def _consolidated_by_filing(ticker: str, concepts: tuple, form: str,
@@ -60,7 +87,7 @@ def _consolidated_by_filing(ticker: str, concepts: tuple, form: str,
     best_end = ""
     for concept in concepts:
         try:
-            points = fetch_concept_series(ticker, concept, form=form, limit=limit)
+            points = _concept_series(ticker, concept, form, limit)
         # Only NotCovered is swallowed, and only to try the next concept.
         # A network failure or an unknown ticker propagates: reporting an
         # outage as "this filer does not disclose it" is the one answer
@@ -88,38 +115,63 @@ def get_sbc_series(ticker: str, limit: int = 5,
     Each row carries the raw expense plus its share of revenue and of operating
     cash flow. Ratios are None when the denominator could not be resolved —
     never zero, which would read as "no SBC burden".
+
+    All three chains — eight concepts — are read inside one filing walk. They
+    are the same `limit` 10-Ks, and parsing them once per concept cost GS 40
+    parses of 5 filings and 66.7 seconds.
     """
+    deadline = Deadline(budget_seconds(), f"get_sbc_series({ticker})")
     try:
-        sbc_values, concept_used = _consolidated_by_filing(
-            ticker, SBC_CONCEPTS, form, limit)
-    except Exception as exc:  # noqa: BLE001 - surface the failure, never mask it
+        with _shared_filings(ticker, deadline):
+            try:
+                sbc_values, concept_used = _consolidated_by_filing(
+                    ticker, SBC_CONCEPTS, form, limit)
+            # The clock is not a fetch failure and must not be described as
+            # one: it is handled below, where it can say so in its own words.
+            except ToolTimeout:
+                raise
+            except Exception as exc:  # noqa: BLE001 - surface it, never mask it
+                return {
+                    "ticker": ticker,
+                    "success": False,
+                    "wrong_form": False,
+                    "error": (f"fetching stock-based compensation concepts "
+                              f"failed: {exc}"),
+                    "series": [],
+                    "concept_used": None,
+                }
+
+            if not sbc_values:
+                mismatch = form_mismatch_note(ticker, form)
+                return {
+                    "ticker": ticker,
+                    "success": False,
+                    "wrong_form": bool(mismatch),
+                    "error": not_covered_reason(
+                        ticker, form,
+                        f"stock-based compensation not covered: none of "
+                        f"{list(SBC_CONCEPTS)} found in the last {limit} "
+                        f"{form} filings."),
+                    "series": [],
+                    "concept_used": None,
+                }
+
+            # Inside the same walk: the denominators come from the filings
+            # already parsed above, so they cost concept reads and no fetches.
+            revenue_values, _ = _consolidated_by_filing(
+                ticker, REVENUE_CONCEPTS, form, limit)
+            ocf_values, _ = _consolidated_by_filing(
+                ticker, OCF_CONCEPTS, form, limit)
+    except ToolTimeout as exc:
         return {
             "ticker": ticker,
             "success": False,
+            "timed_out": True,
             "wrong_form": False,
-            "error": f"fetching stock-based compensation concepts failed: {exc}",
+            "error": str(exc),
             "series": [],
             "concept_used": None,
         }
-
-    if not sbc_values:
-        mismatch = form_mismatch_note(ticker, form)
-        return {
-            "ticker": ticker,
-            "success": False,
-            "wrong_form": bool(mismatch),
-            "error": not_covered_reason(
-                ticker, form,
-                f"stock-based compensation not covered: none of "
-                f"{list(SBC_CONCEPTS)} found in the last {limit} {form} "
-                f"filings."),
-            "series": [],
-            "concept_used": None,
-        }
-
-    revenue_values, _ = _consolidated_by_filing(
-        ticker, REVENUE_CONCEPTS, form, limit)
-    ocf_values, _ = _consolidated_by_filing(ticker, OCF_CONCEPTS, form, limit)
 
     series: List[Dict[str, Any]] = []
     for filing_date, value in sbc_values.items():
