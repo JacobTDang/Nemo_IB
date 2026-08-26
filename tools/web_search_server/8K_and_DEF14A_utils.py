@@ -1162,10 +1162,19 @@ class SECFilingParser:
             truth_passed, truth_alerts = True, []
             quality = self._generate_quality_report(list(events_by_date.values()), truth_passed, truth_alerts)
 
+            # One 8-K is one event date, so the filing count IS the event
+            # count -- available for free without parsing every filing.
+            # Reporting the parsed page as `total_events` said "3 events" for
+            # a company with 100.
+            total_events = len(filings)
+            returned = len(events_by_date)
+
             return {
                 'ticker': ticker,
                 'events_by_date': events_by_date,
-                'total_events': len(events_by_date),
+                'total_events': total_events,
+                'events_returned': returned,
+                'truncated': total_events > returned,
                 'success': True,
                 'quality_report': quality
             }

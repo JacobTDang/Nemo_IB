@@ -101,6 +101,11 @@ def service_missing(name: str) -> str | None:
             "CLAUDE.md is absent. It is gitignored, so this lint only runs on a "
             "machine that has the local playbook")
     if name == "sec":
+        # Every other service gate refuses when the run declares itself
+        # offline; this one did not, so SKIP_NETWORK_TESTS=1 still made live
+        # EDGAR calls and the "offline, no network" suite was neither.
+        if _offline():
+            return _OFFLINE_REASON.format(service="SEC EDGAR")
         return None if _env_key("SEC_EMAIL") else (
             "SEC_EMAIL is unset; SEC fair access requires a real contact identity")
     if name == "finnhub":

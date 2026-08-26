@@ -1670,12 +1670,32 @@ def get_schedule_13d_filings(ticker: str, limit: int = 15,
     forms_to_pull.extend(['SC 13G', 'SC 13G/A'])
 
   rows: list = []
+  whole_set: dict = {}   # accession -> is_activist, over every matching filing
   for form in forms_to_pull:
     try:
-      filings = company.get_filings(form=form).head(limit)
-    except Exception:
-      continue
+      filings = company.get_filings(form=form)
+    except Exception as e:
+      # A swallowed failure here reported `activist_count: 0` -- "no activist
+      # investors" -- when the real cause was an SEC rate limit. The one form
+      # most likely to be missing is the one whose absence inverts the answer,
+      # so a failed query refuses rather than under-counting.
+      return {'ticker': ticker, 'success': False,
+              'error': (f'Could not list {form} filings for {ticker}: '
+                        f'{type(e).__name__}: {e}. Counts are omitted rather '
+                        f'than under-reported -- a missing form reads as an '
+                        f'absence of filings.'),
+              'filings': [], 'failed_form': form}
+
+    # Accession and form come from the submissions index, so the SET can be
+    # counted without fetching a single document. Only the page below pays for
+    # a text fetch, which is why the page is small and the count is not.
     for f in filings:
+      try:
+        whole_set.setdefault(f.accession_number, form.startswith('SC 13D'))
+      except Exception:
+        continue
+
+    for f in filings.head(limit):
       filer_name = None
       filer_cik = None
       try:
@@ -1719,6 +1739,10 @@ def get_schedule_13d_filings(ticker: str, limit: int = 15,
             'error': None,
             'filings': [],
             'count': 0,
+            'rows_returned': 0,
+            'truncated': False,
+            'activist_count': 0,
+            'passive_count': 0,
             'note': 'No Schedule 13D/G filings found — company may be too small to have a 5%-stake holder, or coverage gap.'}
 
   # Dedupe by accession — edgartools returns the same filing under both
@@ -1734,17 +1758,24 @@ def get_schedule_13d_filings(ticker: str, limit: int = 15,
 
   # Sort newest first
   rows.sort(key=lambda r: r['filing_date'], reverse=True)
-  rows = rows[:limit]
 
-  activist_count = sum(1 for r in rows if r['is_activist'])
-  passive_count = sum(1 for r in rows if not r['is_activist'])
+  # Count the SET, then take the page. Counting after truncating answered
+  # "are there activists in INTC?" with activist_count 0 at the default limit
+  # and 31 at limit=100 -- not a smaller version of the answer, the opposite
+  # one.
+  matched = len(whole_set)
+  activist_count = sum(1 for is_activist in whole_set.values() if is_activist)
+  passive_count = matched - activist_count
+  rows = rows[:limit]
 
   return {
     'ticker':         ticker,
     'success':        True,
     'error':          None,
     'filings':        rows,
-    'count':          len(rows),
+    'count':          matched,
+    'rows_returned':  len(rows),
+    'truncated':      matched > len(rows),
     'activist_count': activist_count,
     'passive_count':  passive_count,
     'note':           'Stake percentage extracted via regex on common phrasings; null = parse failed (analyst should check URL).',

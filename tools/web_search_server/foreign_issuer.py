@@ -105,24 +105,46 @@ def _normalise_concept(value: Any) -> str:
     return str(value or "").strip().replace("_", ":", 1)
 
 
+class AnnualIndexUnavailable(RuntimeError):
+    """EDGAR could not be asked which annual forms this filer uses.
+
+    Distinct from an empty index, which means the filer files none of them.
+    Kept separate so the caller reports an outage instead of a fact about the
+    company.
+    """
+
+
 def _fetch_annual_filing_index(ticker: str) -> Dict[str, str]:
     """{form: date of its most recent filing} across 10-K, 20-F and 40-F.
 
     Costs the submissions index and nothing more -- no XBRL parse -- because
     `form_mismatch_note` runs on every failure path in the SEC layer and a
     filing download per annotation would not be affordable.
+
+    A form the filer never used comes back as an empty list, not an exception.
+    So an exception never meant "a form this filer never used" -- it meant the
+    lookup broke -- and swallowing it answered a rate limit with "NVDA has no
+    annual report on EDGAR".
     """
     from edgar import Company
 
     _require_identity()
-    company = Company(ticker)
+    try:
+        company = Company(ticker)
+    except Exception as exc:  # noqa: BLE001 - reported, never masked
+        raise AnnualIndexUnavailable(
+            f"could not look up {ticker} on EDGAR: "
+            f"{type(exc).__name__}: {exc}") from exc
+
     index: Dict[str, str] = {}
     for form in ANNUAL_FORMS:
         _throttle()
         try:
             filings = company.get_filings(form=form, amendments=False).head(1)
-        except Exception:  # noqa: BLE001 - a form this filer never used
-            continue
+        except Exception as exc:  # noqa: BLE001 - reported, never masked
+            raise AnnualIndexUnavailable(
+                f"could not list {form} filings for {ticker}: "
+                f"{type(exc).__name__}: {exc}") from exc
         for filing in filings:
             index[form] = str(filing.filing_date)
     return index
@@ -134,6 +156,8 @@ def _annual_filing_index(ticker: str) -> Dict[str, str]:
         cached = _index_cache.get(key)
     if cached is not None:
         return cached
+    # Raises rather than returning {} when EDGAR could not be reached, so a
+    # failed lookup is never memoised and replayed as an answer.
     index = _fetch_annual_filing_index(key)
     with _index_lock:
         _index_cache[key] = index
@@ -240,7 +264,17 @@ def get_foreign_filer_profile(ticker: str) -> Dict[str, Any]:
     issuer reports interim results on 6-K, and 6-K exhibits carry no XBRL, so
     no quarterly tagged figure exists for it anywhere.
     """
-    form, index = _latest_annual_form(ticker)
+    try:
+        form, index = _latest_annual_form(ticker)
+    except AnnualIndexUnavailable as exc:
+        return {
+            "ticker": ticker,
+            "success": False,
+            "is_foreign_private_issuer": None,
+            "error": f"EDGAR lookup failed for {ticker}: {exc}",
+            "annual_form": None,
+            "annual_filing_date": None,
+        }
     if form is None:
         return {
             "ticker": ticker,
@@ -461,7 +495,15 @@ def get_annual_revenue(ticker: str, limit: int = 3,
     a geography, so taking the concept's presence as an answer reports
     NT$352bn against a real NT$3,809bn.
     """
-    form, index = _latest_annual_form(ticker)
+    try:
+        form, index = _latest_annual_form(ticker)
+    except AnnualIndexUnavailable as exc:
+        return {
+            "ticker": ticker, "success": False,
+            "error": f"EDGAR lookup failed for {ticker}: {exc}",
+            "latest_revenue": None, "currency": None, "form": None,
+            "series": [], "concept_used": None, "concepts_tried": [],
+        }
     if form is None:
         return {
             "ticker": ticker, "success": False,

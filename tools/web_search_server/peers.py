@@ -73,10 +73,18 @@ def _company_sic(ticker: str) -> Tuple[Optional[str], Optional[str], Optional[in
             getattr(company, "cik", None))
 
 
+# EDGAR's browse endpoint caps `count` at 100. Fetch that fixed page rather
+# than the caller's `limit`, so the counts describe the same set of filers no
+# matter how many peers were asked for. Passing `limit` through made
+# `peer_count` mean "peers on this page" while being named for the set.
+_SIC_PAGE_MAX = 100
+
+
 def _fetch_sic_ciks(sic: str, limit: int) -> List[int]:
     params = {
         "action": "getcompany", "SIC": sic, "type": "10-K",
-        "dateb": "", "owner": "include", "count": str(limit), "output": "atom",
+        "dateb": "", "owner": "include", "count": str(_SIC_PAGE_MAX),
+        "output": "atom",
     }
     response = requests.get(_BROWSE_URL, params=params, headers=_headers(),
                             timeout=_TIMEOUT_S)
@@ -133,16 +141,29 @@ def find_peers_by_sic(ticker: str, limit: int = 20) -> Dict[str, Any]:
     self_matched = 1 if (cik is not None and cik in ciks) else 0
     unresolved = len(ciks) - len(found) - self_matched
 
+    # Count the resolved set, then take the caller's page.
+    peer_count = len(found)
+    page = found[:limit]
+
+    note = ("SIC groups filers by declared classification, not by "
+            "competitive overlap. Unresolved filers are deregistered or "
+            "private and have no listed ticker.")
+    if len(ciks) >= _SIC_PAGE_MAX:
+        note += (f" EDGAR returns at most {_SIC_PAGE_MAX} filers per SIC "
+                 f"query, so these counts cover that page and the group may "
+                 f"be larger.")
+
     return {
         "ticker": ticker,
         "success": True,
         "sic": sic,
         "industry": industry,
-        "peers": found,
-        "peer_count": len(found),
+        "peers": page,
+        "peer_count": peer_count,
+        "peers_returned": len(page),
+        "truncated": peer_count > len(page),
         "filers_matched": len(ciks),
+        "filers_capped": len(ciks) >= _SIC_PAGE_MAX,
         "unresolved_count": max(unresolved, 0),
-        "note": ("SIC groups filers by declared classification, not by "
-                 "competitive overlap. Unresolved filers are deregistered or "
-                 "private and have no listed ticker."),
+        "note": note,
     }

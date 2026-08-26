@@ -141,14 +141,20 @@ def get_fund_holdings(fund_name_or_cik: str, n_filings: int = 2) -> Dict[str, An
 
   parsed = []
   for f in filings:
+    table_error = None
     try:
       do = f.data_object()
       holdings_df = do.holdings if do and do.has_infotable else None
-    except Exception:
+    except Exception as e:
+      # An infotable that failed to parse is not a fund holding nothing.
       holdings_df = None
+      table_error = f'{type(e).__name__}: {e}'
 
     holdings_list = []
+    rows_in_filing = 0
+    rows_failed = 0
     if holdings_df is not None and not holdings_df.empty:
+      rows_in_filing = len(holdings_df)
       for _, row in holdings_df.iterrows():
         try:
           holdings_list.append({
@@ -161,19 +167,35 @@ def get_fund_holdings(fund_name_or_cik: str, n_filings: int = 2) -> Dict[str, An
             'put_call': str(row.get('PutCall', '')).strip(),
           })
         except Exception:
+          # Counted, not dropped. A silently shorter list reads as the fund
+          # having sold the position.
+          rows_failed += 1
           continue
       # Sort by value descending
       holdings_list.sort(key=lambda h: h['value'], reverse=True)
 
     total_value = sum(h['value'] for h in holdings_list)
-    parsed.append({
+    complete = table_error is None and rows_failed == 0
+    entry = {
       'filing_date':       str(f.filing_date),
       'accession_number':  f.accession_number,
       'total_holdings':    len(holdings_list),
       'total_value_usd':   total_value,
+      'rows_in_filing':    rows_in_filing,
+      'rows_failed':       rows_failed,
+      'complete':          complete,
       'top_holdings':      holdings_list[:20],
       'all_holdings':      holdings_list,
-    })
+    }
+    if not complete:
+      entry['note'] = (
+        f'{rows_failed} of {rows_in_filing} rows failed to parse; '
+        f'total_value_usd excludes them and is a lower bound.'
+        if table_error is None else
+        f'Holdings table could not be read ({table_error}); '
+        f'this filing contributes no positions and is not an empty portfolio.')
+      entry['parse_error'] = table_error
+    parsed.append(entry)
 
   return {
     'success':  True,
