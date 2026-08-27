@@ -271,13 +271,40 @@ def scan(as_of: Optional[str] = None) -> Dict[str, Any]:
     universe = [m["ticker"] for m in pit_store.universe_as_of(as_of)
                 if m["eligible"]]
 
+    # Narrow before spending a request, not after. Asking EDGAR for a signal on
+    # every eligible name is 2,435 companyconcept calls and about nineteen
+    # minutes on the real universe, and nearly all of it buys the news that a
+    # company last reported in May -- which the staleness gate below then
+    # throws away. The store already knows who printed, because the consensus
+    # recorder captures the vendor's actual within days of each one.
+    since = (date.fromisoformat(as_of)
+             - timedelta(days=MAX_SIGNAL_AGE_DAYS)).isoformat()
+    if pit_store.has_consensus_history(as_of):
+        # The recorder has been running, so an empty window is information:
+        # nothing reported, and there is nothing to scan. Falling back to the
+        # whole universe here would spend 2,435 requests to rediscover it.
+        printed = {r["ticker"] for r in pit_store.reporters_since(since, as_of)}
+        considered = [t for t in universe if t in printed]
+        narrowed_by = "recorded prints"
+        narrowing_note = (f"{len(considered)} of {len(universe)} eligible "
+                          f"names have a print recorded since {since}")
+    else:
+        # Nothing recorded at all -- a young store, not a quiet tape. Scanning
+        # nothing here would look identical to a market with no earnings in it,
+        # every night, until the recorder caught up.
+        considered = universe
+        narrowed_by = None
+        narrowing_note = (
+            f"no prints recorded by {as_of}, so every eligible name was asked "
+            f"about; slow, and it eases as the recorder accumulates")
+
     candidates: List[Dict[str, Any]] = []
     rejected: List[Dict[str, Any]] = []
     undetermined: List[Dict[str, Any]] = []
     measured = 0
     resolved_count = 0
 
-    for ticker in universe:
+    for ticker in considered:
         try:
             signal = _signal_for(ticker, as_of)
         except Exception as exc:  # noqa: BLE001 - recorded, not masked
@@ -392,6 +419,9 @@ def scan(as_of: Optional[str] = None) -> Dict[str, Any]:
         "regime_scale": scale,
         "gross_target": gross,
         "screened": len(universe),
+        "considered": len(considered),
+        "narrowed_by": narrowed_by,
+        "narrowing_note": narrowing_note,
         "candidates": candidates[:MAX_NAMES],
         "rejected": rejected,
         # Names the estimator could not judge, kept apart from names the

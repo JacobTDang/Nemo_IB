@@ -55,6 +55,27 @@ def _stamp(as_of: str) -> str:
 
 # --------------------------------------------------------------- seams
 
+def _record_probe(fetched: Dict[str, List[Dict[str, Any]]], stamp: str,
+                  keep, requested: List[str]) -> None:
+    """Keep the canary's own sessions.
+
+    It is fetched every night anyway, as the liveness probe, and it is also
+    what the regime is measured from -- so throwing it away left that
+    measurement depending on the index happening to fall in the rotation, and
+    failing open when it did not: full book size, reported as "unknown", which
+    reads like a calm market rather than a missing one.
+
+    Recorded for its prices only. Universe membership comes from the SEC
+    registrant list and is untouched by this, so it is never proposed as a
+    trade on account of being stored.
+    """
+    if FETCH_CANARY in requested:
+        return
+    rows = fetched.get(FETCH_CANARY) or []
+    if rows:
+        _record_ticker(FETCH_CANARY, rows, stamp, keep=keep)
+
+
 def _fetch_sec_tickers() -> List[Dict[str, Any]]:
     """Every ticker SEC maps to a registrant.
 
@@ -442,6 +463,9 @@ def record_daily_bars(tickers: List[str],
         written += _record_ticker(ticker, rows, _stamp(as_of),
                                   keep=lambda d, _o=as_of: d == _o)
 
+    _record_probe(fetched, _stamp(as_of),
+                  lambda d, _o=as_of: d == _o, list(tickers))
+
     status = coverage_status(covered, len(tickers))
     detail = f"{covered} of {len(tickers)} tickers returned data"
     if failures:
@@ -473,8 +497,15 @@ def bootstrap_history(tickers: List[str], lookback_days: int = 730,
     # undoes it. Everything past `as_of` is dropped before writing.
     end = max(as_of, _today())
 
+    # Asked for by name, so it survives the canary strip. The nightly path
+    # already does this; without it here the index's HISTORY is never written,
+    # and the regime needs 252 sessions of it -- which is why every scan
+    # reported "unknown" at full book size after a complete bootstrap.
+    asked = list(tickers) if FETCH_CANARY in tickers \
+        else [*tickers, FETCH_CANARY]
+
     try:
-        fetched = _fetch_bars(tickers, start=start, end=end)
+        fetched = _fetch_bars(asked, start=start, end=end)
     except Exception as exc:  # noqa: BLE001
         pit_store.finish_run(rows_written=0, status="failed",
                              error=f"{type(exc).__name__}: {exc}")
@@ -489,6 +520,9 @@ def bootstrap_history(tickers: List[str], lookback_days: int = 730,
         covered += 1
         written += _record_ticker(ticker, rows, _stamp(as_of),
                                   keep=lambda d, _o=as_of: d <= _o)
+
+    _record_probe(fetched, _stamp(as_of),
+                  lambda d, _o=as_of: d <= _o, list(tickers))
 
     status = coverage_status(covered, len(tickers))
     pit_store.finish_run(rows_written=written, status=status,
@@ -615,7 +649,11 @@ def record_consensus_snapshots(as_of: Optional[str] = None,
             as_of, row["ticker"], row["fiscal_period"],
             eps_estimate=row.get("eps_estimate"),
             eps_actual=row.get("eps_actual"),
-            analyst_count=row.get("analyst_count"))
+            analyst_count=row.get("analyst_count"),
+            # End of the day it describes, like every other recorder here.
+            # Stamped `now`, a consensus run for a past date is invisible to
+            # that date and visible to every date after it.
+            recorded_at=_stamp(as_of))
         written += 1
 
     status = "ok" if rows else "failed"

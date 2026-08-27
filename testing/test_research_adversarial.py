@@ -747,3 +747,107 @@ def test_a_perfectly_flat_price_series_is_refused_not_priced(store):
     assert out["spread"] is None or out["spread"] > 0
     if out["spread"] is None:
         assert out["reason"]
+
+
+# --- the regime input is nobody's responsibility ----------------------------
+#
+# _regime_scale reads the index's own sessions and returns "unknown" at full
+# book size when it has fewer than twenty. Nothing guarantees it has any. The
+# index is fetched every night as the liveness canary and then deliberately
+# dropped before writing, so it lands in the store only if it happens to be in
+# the universe -- and a name that is not eligible is only fetched on its turn
+# in the rotation, which is a bar every few weeks.
+#
+# The failure is silent and it fails open: every scan runs the full book and
+# reports "unknown", which reads like a calm market rather than a missing one.
+
+
+def test_the_index_is_recorded_even_though_it_is_not_a_candidate(store,
+                                                                 monkeypatch):
+    import pandas as pd
+    import yfinance
+
+    days = ["2026-03-02", "2026-03-03"]
+
+    def frame(*a, **k):
+        rows = [d for d in days
+                if (not k.get("start") or d >= k["start"])
+                and (not k.get("end") or d < k["end"])]
+        data = {}
+        for t in k["tickers"].split():
+            for f in ("Open", "High", "Low", "Close"):
+                data[(t, f)] = [100.0] * len(rows)
+            data[(t, "Volume")] = [1e6] * len(rows)
+            data[(t, "Stock Splits")] = [0.0] * len(rows)
+            data[(t, "Dividends")] = [0.0] * len(rows)
+        f_ = pd.DataFrame(data, index=pd.to_datetime(rows))
+        f_.columns = pd.MultiIndex.from_tuples(f_.columns)
+        return f_
+
+    monkeypatch.setattr(yfinance, "download", frame)
+    monkeypatch.setattr(daily_job, "FETCH_RETRY_BACKOFF", 0.0)
+    monkeypatch.setattr(daily_job, "FETCH_BATCH_PAUSE", 0.0)
+
+    daily_job.record_daily_bars(["AAA"], as_of="2026-03-03")
+
+    assert pit_store.bars_as_of(scanner.REGIME_TICKER, "2026-03-03"), (
+        "the index the regime is measured from was fetched and thrown away")
+
+
+def test_the_index_is_not_smuggled_into_the_universe(store, monkeypatch):
+    """It is recorded for its prices, not proposed as a trade."""
+    monkeypatch.setattr(daily_job, "_fetch_sec_tickers", lambda: [
+        {"ticker": "AAA", "cik": "1", "name": "A Co"}])
+    daily_job.refresh_universe(as_of="2026-03-03")
+    members = {m["ticker"] for m in pit_store.universe_as_of("2026-03-03")}
+    assert scanner.REGIME_TICKER not in members
+
+
+def test_the_bootstrap_records_the_index_history_too(store, monkeypatch):
+    """The nightly path asks for the canary by name so it survives the strip;
+    the bootstrap does not, so the index's HISTORY was never written -- and the
+    regime needs 252 sessions of it. Live, that left every scan reporting
+    "unknown" at full book size after a complete bootstrap of 2,435 names."""
+    import pandas as pd
+    import yfinance
+
+    days = _weekdays_for(60)
+
+    def frame(*a, **k):
+        rows = [d for d in days
+                if (not k.get("start") or d >= k["start"])
+                and (not k.get("end") or d < k["end"])]
+        data = {}
+        for t in k["tickers"].split():
+            for f in ("Open", "High", "Low", "Close"):
+                data[(t, f)] = [100.0] * len(rows)
+            data[(t, "Volume")] = [1e6] * len(rows)
+            data[(t, "Stock Splits")] = [0.0] * len(rows)
+            data[(t, "Dividends")] = [0.0] * len(rows)
+        f_ = pd.DataFrame(data, index=pd.to_datetime(rows))
+        f_.columns = pd.MultiIndex.from_tuples(f_.columns)
+        return f_
+
+    monkeypatch.setattr(yfinance, "download", frame)
+    monkeypatch.setattr(daily_job, "_today", lambda: days[-1])
+
+    daily_job.bootstrap_history(["AAA"], as_of=days[-1])
+
+    # Like for like against an ordinary name: the bootstrap window is
+    # end-exclusive, so neither gets the as_of session itself -- the nightly
+    # pass records that one.
+    got = pit_store.bars_as_of(scanner.REGIME_TICKER, days[-1])
+    peer = pit_store.bars_as_of("AAA", days[-1])
+    assert peer, "the fixture recorded nothing at all"
+    assert len(got) == len(peer), (
+        f"the index has {len(got)} sessions where a name bootstrapped "
+        f"alongside it has {len(peer)}")
+
+
+def _weekdays_for(n):
+    out, d = [], date(2026, 1, 1)
+    while len(out) < n:
+        if d.weekday() < 5:
+            out.append(d.isoformat())
+        d += timedelta(days=1)
+    return out

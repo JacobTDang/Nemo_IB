@@ -522,7 +522,8 @@ def announcements_as_of(ticker: str, as_of: str) -> List[Dict[str, Any]]:
 def record_consensus(as_of_date: str, ticker: str, fiscal_period: str,
                      eps_estimate: Optional[float] = None,
                      analyst_count: Optional[int] = None,
-                     eps_actual: Optional[float] = None) -> None:
+                     eps_actual: Optional[float] = None,
+                     recorded_at: Optional[str] = None) -> None:
     """One day's view of what the street expects.
 
     This is the series with a clock on it. Finnhub returns four quarters at
@@ -538,7 +539,7 @@ def record_consensus(as_of_date: str, ticker: str, fiscal_period: str,
                 analyst_count, recorded_at)
                VALUES (?,?,?,?,?,?,?)""",
             (as_of_date, ticker, fiscal_period, eps_estimate, eps_actual,
-             analyst_count, _now()))
+             analyst_count, recorded_at or _now()))
 
 
 def consensus_as_of(ticker: str, fiscal_period: str,
@@ -715,6 +716,41 @@ def known_activist_accessions(ticker: str) -> set:
 # ---------------------------------------------------------------- run log
 
 _ACTIVE_RUN: Dict[str, Any] = {}
+
+
+def reporters_since(since: str, as_of: str) -> List[Dict[str, Any]]:
+    """Names whose vendor actual was recorded in a window, as known on `as_of`.
+
+    The consensus recorder captures the vendor's own reported figure within
+    days of each print, so this is the store's own answer to "who just
+    reported" -- available without asking EDGAR about every company in the
+    universe to find out that most of them did not.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT ticker, fiscal_period, MAX(as_of_date) AS as_of_date
+               FROM consensus_snapshot
+               WHERE eps_actual IS NOT NULL
+                 AND as_of_date BETWEEN ? AND ?
+                 AND date(recorded_at) <= ?
+               GROUP BY ticker, fiscal_period
+               ORDER BY ticker""", (since, as_of, as_of)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def has_consensus_history(as_of: str) -> bool:
+    """Whether the consensus recorder had written anything by `as_of`.
+
+    The difference between "nothing reported in the last six weeks" and "we
+    have not been watching". The first is information and the scanner should
+    act on it; the second is a young store, and treating it as information
+    would report a quiet tape every night until the recorder catches up.
+    """
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT 1 FROM consensus_snapshot
+               WHERE date(recorded_at) <= ? LIMIT 1""", (as_of,)).fetchone()
+    return row is not None
 
 
 def record_paper_orders(as_of_date: str, candidates: Iterable[Dict[str, Any]],

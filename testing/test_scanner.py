@@ -536,3 +536,100 @@ def test_the_entry_point_files_the_scan(liquid_universe, monkeypatch):
 
     assert scanner.main(["--as-of", "2026-03-03"]) == 0
     assert pit_store.paper_orders_as_of("2026-03-03", accepted_only=True)
+
+
+# --- asking EDGAR about 2,435 companies to reject 2,300 of them -------------
+#
+# scan() fetched a signal for every eligible name. Measured on the real
+# universe that is 2,435 companyconcept requests and about 19 minutes, and
+# nearly all of it is spent learning that a company last reported in May --
+# which the staleness gate then throws out. This project has already earned
+# real SEC 429s once.
+#
+# The store already knows who reported: the consensus recorder captures the
+# vendor's actual within days of each print. Narrowing on that before spending
+# a request is the same test applied earlier, against data already paid for.
+
+
+def _reported(store, ticker, period, as_of, actual=1.0):
+    store.record_consensus(as_of, ticker, period, eps_estimate=0.9,
+                           eps_actual=actual,
+                           recorded_at=f"{as_of}T21:00:00Z")
+
+
+def test_only_names_that_recently_reported_are_asked_about(liquid_universe,
+                                                           monkeypatch):
+    _reported(liquid_universe, "AAA", "2026Q1", "2026-03-02")
+
+    asked = []
+    monkeypatch.setattr(scanner, "_signal_for",
+                        lambda t, a: asked.append(t) or _signal(t, 3.0))
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0010))
+
+    scanner.scan(as_of="2026-03-03")
+
+    assert asked == ["AAA"], (
+        f"asked EDGAR about {asked}; only AAA has a print on the record")
+
+
+def test_a_name_whose_print_is_old_is_not_asked_about(liquid_universe,
+                                                      monkeypatch):
+    """The staleness gate, moved in front of the request instead of behind."""
+    _reported(liquid_universe, "AAA", "2025Q3", "2025-09-01")
+
+    asked = []
+    monkeypatch.setattr(scanner, "_signal_for",
+                        lambda t, a: asked.append(t) or _signal(t, 3.0))
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0010))
+
+    result = scanner.scan(as_of="2026-03-03")
+    assert asked == []
+    assert result["candidates"] == []
+
+
+def test_an_estimate_without_an_actual_is_not_a_print(liquid_universe,
+                                                      monkeypatch):
+    """A company on next week's calendar has a consensus recorded and has not
+    reported. Treating that as a print would scan it before the news exists."""
+    liquid_universe.record_consensus("2026-03-02", "AAA", "2026Q1",
+                                     eps_estimate=0.9, eps_actual=None,
+                                     recorded_at="2026-03-02T21:00:00Z")
+
+    asked = []
+    monkeypatch.setattr(scanner, "_signal_for",
+                        lambda t, a: asked.append(t) or _signal(t, 3.0))
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0010))
+
+    scanner.scan(as_of="2026-03-03")
+    assert asked == []
+
+
+def test_a_store_with_no_prints_recorded_says_so_rather_than_finding_nothing(
+        liquid_universe, monkeypatch):
+    """The recorder only accumulates forward, so a young store knows about no
+    prints at all. Silently scanning nothing would look exactly like a quiet
+    tape; silently scanning everything would spend 2,435 requests without
+    saying why. It scans the universe and states that it had to."""
+    asked = []
+    monkeypatch.setattr(scanner, "_signal_for",
+                        lambda t, a: asked.append(t) or _signal(t, 3.0))
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0010))
+
+    result = scanner.scan(as_of="2026-03-03")
+
+    assert set(asked) == {"AAA", "BBB"}
+    assert result["narrowed_by"] is None
+    assert "no prints" in result["narrowing_note"].lower() or \
+        "announcement" in result["narrowing_note"].lower()
+
+
+def test_the_scan_reports_how_far_it_narrowed(liquid_universe, monkeypatch):
+    _reported(liquid_universe, "AAA", "2026Q1", "2026-03-02")
+    monkeypatch.setattr(scanner, "_signal_for", lambda t, a: _signal(t, 3.0))
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0010))
+
+    result = scanner.scan(as_of="2026-03-03")
+
+    assert result["screened"] == 2
+    assert result["considered"] == 1
+    assert result["narrowed_by"] == "recorded prints"
