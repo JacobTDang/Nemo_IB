@@ -65,6 +65,14 @@ def _stamp(day: str) -> str:
     return f"{day}T21:00:00Z"
 
 
+def _announcements(ticker: str,
+                   as_of: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    """When the market learned each quarter, from the Item 2.02 filing."""
+    from research import announcements
+
+    return announcements.for_quarters(ticker, as_of=as_of)
+
+
 def _filing_dates(ticker: str,
                   as_of: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
     """The filer's own period end and filing date, per fiscal period."""
@@ -93,6 +101,8 @@ def seed(tickers: Sequence[str],
     written = 0
     incomplete = 0
     undated = 0
+    announcement_dated = 0
+    filing_dated = 0
     # Which quarters had no matching filing, by name. A count alone hides the
     # difference between one derived quarter that did not resolve and a filer
     # whose vendor labels are a year off its own -- the second can never be
@@ -106,6 +116,7 @@ def seed(tickers: Sequence[str],
         try:
             rows = _fetch_surprises(ticker)
             dates = _filing_dates(ticker, as_of=as_of)
+            announced = _announcements(ticker, as_of=as_of)
         except Exception as exc:  # noqa: BLE001 - counted and reported
             failed.append(f"{ticker}: {type(exc).__name__}: {exc}")
             continue
@@ -161,15 +172,30 @@ def seed(tickers: Sequence[str],
             written += pit_store.record_consensus(
                 period_end, ticker, fiscal, eps_estimate=estimate,
                 recorded_at=_stamp(period_end), source=SOURCE) or 0
+
+            # The actual is known when the market learned it, which is the
+            # Item 2.02 release rather than the 10-Q -- a median of eight days
+            # earlier on the names measured, twenty-three for JPM. Everything
+            # downstream takes its timing from this row, and eight days into a
+            # drift that is largest in its first days is most of the drift.
+            # With no release on record the filing date stands, because late
+            # is the safe direction.
+            release = announced.get(fiscal) or {}
+            learned = release.get("announced_date") or known_at
+            if release.get("announced_date"):
+                announcement_dated += 1
+            else:
+                filing_dated += 1
             written += pit_store.record_consensus(
-                known_at, ticker, fiscal, eps_estimate=estimate,
-                eps_actual=actual, recorded_at=_stamp(known_at),
+                learned, ticker, fiscal, eps_estimate=estimate,
+                eps_actual=actual, recorded_at=_stamp(learned),
                 source=SOURCE) or 0
 
     return {"tickers": len(tickers), "quarters_seen": seen,
             "written": written, "incomplete": incomplete, "undated": undated,
             "unmatched": unmatched, "duplicates": duplicates,
-            "failed": failed}
+            "announcement_dated": announcement_dated,
+            "filing_dated": filing_dated, "failed": failed}
 
 
 # ------------------------------------------------------------- entry point
