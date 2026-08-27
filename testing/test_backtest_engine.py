@@ -2,6 +2,7 @@
 and trade construction. No network calls in pure-Python tests; the
 realworld test uses yfinance with a known liquid ticker."""
 import sys
+import pytest
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -92,6 +93,11 @@ def test_rule_eval():
   _check("  OR at i=4 (close 108 > 107)", _eval_rule(rule3, ind, 4) is True)
 
 
+# These read live market data to check it against reality, which is the
+# point of them -- so they belong in the live suite, not the offline one.
+# Ungated, they reached Yahoo through curl_cffi under SKIP_NETWORK_TESTS=1
+# and passed only while the vendor was healthy.
+@pytest.mark.network
 def test_backtest_realworld():
   _section("3. Real-world backtest (MSFT, RSI<30)")
   r = backtest_signal('MSFT', NAMED_SIGNALS['oversold_rsi'], hold_days=30,

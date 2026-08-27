@@ -3,9 +3,10 @@
 Stateless by design. A request comes in, a response goes out, and nothing
 survives the container.
 
-## Why nothing persists
+## What persists and what does not
 
-Two paths are written at runtime:
+The servers keep nothing. The scheduled jobs keep everything. Two paths are
+written at runtime by the servers:
 
 | Path | What writes it | Growth |
 |---|---|---|
@@ -15,59 +16,74 @@ Two paths are written at runtime:
 Both are mounted as size-capped tmpfs, so they live in RAM, cannot grow past
 their cap, and are freed when the container exits.
 
-One path is deliberately **not** disposable. The congressional disclosure store
-at `/app/data/congress.db` sits on the named volume `congress-data`, because
-rebuilding it means re-fetching and re-parsing thousands of PDFs from the House
-Clerk -- slow, and rude to a public service. Putting it in the tmpfs above would
-make the pipeline unusable, since every restart would start from nothing. Measured with the mounts in
-place: the image layer stays untouched apart from the `/etc/resolv.conf` and
-`/etc/hosts` that Docker manages itself.
+Two paths are deliberately **not** disposable, and both belong to the scheduled
+jobs rather than to the servers.
+
+`/app/data/congress.db` on the named volume `congress-data`, because rebuilding
+it means re-fetching and re-parsing thousands of PDFs from the House Clerk --
+slow, and rude to a public service.
+
+`/app/data/pit.db` on `research-data`, which is the one thing here that cannot
+be rebuilt at any price. Filings can be re-read from EDGAR at the cost of time;
+what analysts expected on a past Tuesday cannot be recovered by Thursday, and
+the vendor serves four quarters of consensus history however many are asked
+for. See [The scheduled jobs](#the-scheduled-jobs).
+
+Putting either in the tmpfs above would make its pipeline unusable, since every
+restart would begin from nothing. Measured with the mounts in place: the image
+layer stays untouched apart from the `/etc/resolv.conf` and `/etc/hosts` that
+Docker manages itself.
 
 The trade is that a cold container re-fetches filings from SEC. The in-process
 throttle keeps that inside SEC's fair-access ceiling, and the cache still works
 normally for the life of a session — it just does not outlive it.
 
-## Registering with Claude Code
+## Registering with an MCP client
 
-The servers speak streamable HTTP, so Claude Code connects to them rather than
+The servers speak streamable HTTP, so a client connects to them rather than
 spawning them. Bring the stack up first:
 
 ```bash
 docker compose -f deploy/docker-compose.yml up -d
 ```
 
-Then register each one:
+Then point the client at each one, with `Authorization: Bearer $NEMO_MCP_TOKEN`
+on every request:
 
-```bash
-claude mcp add --transport http nemo-sec       http://<host>:8810/mcp/
-claude mcp add --transport http nemo-financial http://<host>:8811/mcp/
-claude mcp add --transport http nemo-finnhub   http://<host>:8812/mcp/
-claude mcp add --transport http nemo-fred      http://<host>:8813/mcp/
-claude mcp add --transport http nemo-altdata   http://<host>:8814/mcp/
+```
+nemo-sec        http://<host>:8810/mcp/
+nemo-financial  http://<host>:8811/mcp/
+nemo-finnhub    http://<host>:8812/mcp/
+nemo-fred       http://<host>:8813/mcp/
+nemo-altdata    http://<host>:8814/mcp/
 ```
 
 | Server | Port | Module | Tools |
 |---|---|---|---|
-| SEC EDGAR | 8810 | `tools.web_search_server.web_search` | 48 of 50 |
+| SEC EDGAR | 8810 | `tools.web_search_server.web_search` | 48 of 51 |
 | Market data and modelling | 8811 | `tools.financial_modeling_engine.analysis_tools` | 20 |
 | Finnhub | 8812 | `tools.news_agregator.finnhub_server` | 14 |
 | FRED macro | 8813 | `tools.news_agregator.fred_server` | 5 |
 | Alt data | 8814 | `tools.altdata_server.server` | 9 |
 
-96 tools served. The SEC server declares 50 and serves 48: `rag_search` and
-`rag_ingest` are capability-gated and hidden without the RAG stack, which the
-image does not install. Counts here are measured, not maintained -- run
-`python -m tools.manifest` inside a container to reproduce them, and note it
-reports what *that* environment can serve rather than a fixed number.
+96 tools served. The SEC server declares 51 and serves 48: `search`,
+`rag_search` and `rag_ingest` are capability-gated and hidden, because this
+image installs neither SearXNG nor the RAG stack -- the Dockerfile copies three
+`agent/` modules and `agent.rag` is not among them.
+
+Counts here are checked, not maintained: `testing/test_readme_counts.py` reads
+each server's own registry and fails when a page disagrees with it. Run
+`python -m tools.manifest` inside a container to see them for yourself, and
+note it reports what *that* environment can serve. On a host that happens to
+have SearXNG running, the SEC server serves 49.
 
 **Register the URL with its trailing slash.** `Mount` only matches `/mcp/`, so
 posting to `/mcp` answers `307` and every single call pays an extra round trip.
 
-The SEC server advertises 42 of its 45 tools: `search` and the two rag tools
-are hidden because SearXNG and the RAG stack are not in this image. That is
-deliberate. `search` returns an empty result list rather than an error when
-SearXNG is missing, so advertising it would make an absent container
-indistinguishable from a query that matched nothing.
+Gating `search` is the deliberate part. It returns an empty result list rather
+than an error when SearXNG is missing, so advertising it would make an absent
+container indistinguishable from a query that matched nothing. `rag_search` at
+least raises.
 
 stdio still works for local use -- swap `http` for `server` in the command.
 
@@ -98,7 +114,7 @@ not run there.
 
 ## Secrets
 
-`FINNHUB_API_KEY`, `FRED_API_KEY`, `SEC_EMAIL`, `NAME`. No LLM credentials of
+`FINNHUB_API_KEY`, `FRED_API_KEY`, `SEC_EMAIL`, `NAME`. No model credentials of
 any kind: every server here imports and runs with none set, verified.
 
 `CONGRESS_API_KEY` and `FINMIND_TOKEN` are optional and currently unset, so
@@ -148,8 +164,8 @@ Where it lives is a real trade-off:
   file already holds every API key, so the marginal exposure is small.
 
 For a homelab that should come back up on its own, `.env` with `chmod 600` is
-the pragmatic choice. The client end is not free either: `claude mcp add
---header "Authorization: Bearer ..."` writes the token to `~/.claude.json` in
+the pragmatic choice. The client end is not free either: a client configured
+with `Authorization: Bearer ...` stores that header in its own config file in
 plaintext, so that file is a secret on every machine you register from.
 
 ## Blockers hit while building this, and how they present
@@ -201,6 +217,62 @@ safe to cron; nothing already parsed is fetched twice.
 - Employee count is not available from XBRL: no filer examined tags it, so it
   would need cover-page text extraction.
 
+## The scheduled jobs
+
+Six services in the compose file are not servers. They bind no port, serve
+nothing, and finish — so they sit under the `sync` profile and `docker compose
+up` never starts them. A `restart: unless-stopped` batch job is a loop.
+
+```bash
+docker compose run --rm research-daily --bootstrap   # first four nights
+docker compose run --rm research-daily               # every night after
+docker compose run --rm research-scan
+```
+
+Cron lines, in the order they should run:
+
+```cron
+30 22 * * 1-5   cd /srv/nemo/deploy && docker compose run --rm research-daily
+ 0 23 * * 1-5   cd /srv/nemo/deploy && docker compose run --rm research-scan
+*/20 13-23 * * 1-5  cd /srv/nemo/deploy && docker compose run --rm research-watch
+ 0  7 * * 6     cd /srv/nemo/deploy && docker compose run --rm research-score
+ 0  8 1 * *     cd /srv/nemo/deploy && docker compose run --rm research-seed
+ 0  6 * * *     cd /srv/nemo/deploy && docker compose run --rm congress-sync
+```
+
+Order matters between the first two: the scan reads the universe and the prices
+the recorder wrote that evening, so a scan that runs first sees yesterday.
+
+`research-watch` reports the detection latency accumulated so far on every
+pass, not just what it recorded this time -- catching a filing quickly is the
+reason for the twenty-minute timer, and a job that never says how quickly
+cannot be judged.
+
+Each job exits non-zero when a stage fails and zero when it merely finds
+nothing. That distinction is the whole contract with cron — most nights the
+watcher finds no 13D and the scanner finds no candidate, and a job that pages
+on those is one nobody reads by the time it matters.
+
+### The volume is the part worth backing up
+
+`research-daily` writes to `research-data`, a named volume holding one SQLite
+file. It survives `docker compose down` and container replacement, and it is
+the only thing here that cannot be rebuilt: the filings can be re-read from
+EDGAR at the cost of time, but what analysts expected on a past Tuesday is
+gone, and the vendor serves four quarters of consensus history however many you
+ask for.
+
+`congress-sync` writes to `congress-data`, which is reconstructible from the
+public record — expensively, but reconstructible.
+
+### A cold store needs four bootstrap nights
+
+The nightly ask is capped at 3,000 names, because asking for all 10,388 SEC
+registrants at once earns a rate limit; the rest arrive on a rotating slice
+that covers the list in about four runs. Without `--bootstrap` each of those
+names gets one session and eligibility needs sixty, so the universe would take
+a couple of hundred days to fill instead of four.
+
 ## Authentication
 
 Two layers. The network one does most of the work.
@@ -229,10 +301,10 @@ and code in the client.
 ```bash
 export NEMO_MCP_TOKEN=$(openssl rand -hex 32)
 docker compose -f deploy/docker-compose.yml up -d
-
-claude mcp add --transport http nemo-sec http://<host>:8810/mcp/ \
-  --header "Authorization: Bearer $NEMO_MCP_TOKEN"
 ```
+
+Then register `http://<host>:8810/mcp/` in the client, with the header
+`Authorization: Bearer $NEMO_MCP_TOKEN`.
 
 **A server with no token refuses to start.** Defaulting to open means one
 forgotten variable silently publishes every tool while the running server looks

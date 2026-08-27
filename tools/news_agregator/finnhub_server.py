@@ -402,6 +402,14 @@ def _condense_earnings_calendar(raw: Dict[str, Any]) -> Dict[str, Any]:
   slimmed_events = []
   for event in events[:15]:
     slim = {"symbol": event.get("symbol", ""), "date": event.get("date", "")}
+    # Which quarter the print covers. Without it the row is a ticker and a
+    # date -- joinable to nothing, and this codebase has already been bitten
+    # by an announcement keyed on the vendor's calendar bucket instead of on
+    # fiscal identity.
+    if event.get("quarter") is not None:
+      slim["quarter"] = event["quarter"]
+    if event.get("year") is not None:
+      slim["year"] = event["year"]
     if event.get("epsEstimate") is not None:
       slim["eps_estimate"] = event["epsEstimate"]
     if event.get("revenueEstimate") is not None:
@@ -414,11 +422,18 @@ def _condense_earnings_calendar(raw: Dict[str, Any]) -> Dict[str, Any]:
       slim["hour"] = event["hour"]
     slimmed_events.append(slim)
 
-  return {
+  out = {
     "total_companies": len(events),
     "by_date": by_date,
     "events": slimmed_events
   }
+  # A cap is fine. A cap the reader cannot see is not: 15 events out of 288
+  # looks exactly like a quiet week unless the truncation is stated. Callers
+  # needing the whole set pass `symbol`, or read the endpoint directly.
+  if len(events) > len(slimmed_events):
+    out["events_truncated"] = True
+    out["events_shown"] = len(slimmed_events)
+  return out
 
 
 def _condense_ipo_calendar(raw: Dict[str, Any]) -> Dict[str, Any]:

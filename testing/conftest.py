@@ -133,3 +133,31 @@ def pytest_collection_modifyitems(session, config, items):
         return real_getaddrinfo(host, port, *args, **kwargs)
 
     socket.getaddrinfo = guarded
+
+    # curl_cffi resolves inside libcurl, in C, and never calls the Python
+    # socket module -- so the guard above does not see it. yfinance moved to
+    # that transport, which is how five tests kept reaching Yahoo under
+    # SKIP_NETWORK_TESTS=1 and only surfaced when a rate limit made them fail
+    # instead of pass. Patching Session.request covers the module-level
+    # helpers too, since those build a Session internally.
+    try:
+        from curl_cffi import requests as curl_requests
+    except ImportError:
+        return
+
+    real_request = curl_requests.Session.request
+
+    def guarded_request(self, method, url, *args, **kwargs):
+        from urllib.parse import urlparse
+
+        host = urlparse(str(url)).hostname or ""
+        if host not in _OFFLINE_LOCAL:
+            raise OfflineNetworkAttempt(
+                f"this test tried to reach {host!r} over curl_cffi while "
+                f"SKIP_NETWORK_TESTS=1. The offline suite must not reach the "
+                f"network: gate it with one of the decorators in "
+                f"testing/_gates.py, or stub the fetch. Set "
+                f"NEMO_ALLOW_OFFLINE_NETWORK=1 to audit instead of enforce.")
+        return real_request(self, method, url, *args, **kwargs)
+
+    curl_requests.Session.request = guarded_request

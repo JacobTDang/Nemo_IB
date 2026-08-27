@@ -4,8 +4,11 @@ against the state of the repository at that date. Not reviewed or acted on;
 kept as a work list rather than as a description of current behaviour.
 
 Read the counts with care: it reports the README claiming 5 servers / 76 tools
-against an implementation declaring 96. The README has since been rewritten and
-its inventory is now measured against a running instance.
+against an implementation declaring 96. The README has since been rewritten,
+and its inventory is now checked against each server's own registry by
+testing/test_readme_counts.py rather than asserted -- which is how the 96 here
+was later found to be the served count against 99 declared, three being
+capability-gated out of the image.
 -->
 
 # Codex-Found Issues and Data Gaps

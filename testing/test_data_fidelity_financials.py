@@ -13,6 +13,7 @@ The plausibility band catches regressions in either yfinance's response
 shape or the field-name change. Update REF_* values quarterly.
 """
 import sys, os, math
+import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tools.financial_modeling_engine.utils import get_data
@@ -30,6 +31,11 @@ def _within(actual, ref, tol):
   return abs(actual - ref) / ref <= tol
 
 
+# These read live market data to check it against reality, which is the
+# point of them -- so they belong in the live suite, not the offline one.
+# Ungated, they reached Yahoo through curl_cffi under SKIP_NETWORK_TESTS=1
+# and passed only while the vendor was healthy.
+@pytest.mark.network
 def test_get_data_returns_explicit_ttm_keys():
   d = get_data('AAPL')
   assert 'revenue_ttm' in d, \
@@ -47,6 +53,7 @@ def test_get_data_returns_explicit_ttm_keys():
         f"ebitda_ttm=${d['ebitda_ttm']/1e9:.1f}B)")
 
 
+@pytest.mark.network
 def test_aapl_revenue_ttm_in_plausibility_band():
   d = get_data('AAPL')
   rev = d.get('revenue_ttm') or d.get('revenue')
@@ -58,6 +65,7 @@ def test_aapl_revenue_ttm_in_plausibility_band():
         f"of ref ${REF_REVENUE_TTM_AAPL/1e9:.0f}B")
 
 
+@pytest.mark.network
 def test_aapl_ebitda_ttm_in_plausibility_band():
   d = get_data('AAPL')
   ebitda = d.get('ebitda_ttm') or d.get('EBITDA')
@@ -69,6 +77,7 @@ def test_aapl_ebitda_ttm_in_plausibility_band():
         f"of ref ${REF_EBITDA_TTM_AAPL/1e9:.0f}B")
 
 
+@pytest.mark.network
 def test_revenue_ttm_distinguishable_from_sec_annual_base():
   """The critical invariant: TTM and the SEC-derived annual base must be
   DIFFERENT numbers (otherwise renaming had no effect). For AAPL today,
