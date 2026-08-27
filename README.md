@@ -240,7 +240,8 @@ bar_revision       where a vendor's later disagreement goes, so the original
 corporate_action   splits and dividends, dated to their own ex-date
 universe_snapshot  who was eligible each day, and why the rest were not
 consensus_snapshot what the street expected, and what the vendor reported
-announcement       fiscal identity, never the vendor's calendar bucket
+announcement       fiscal identity and whether the print was before the open
+                   or after the close, which decides the reaction session
 paper_order        decisions, with the session they were for and no fill price
 activist_filing    13D events with four timestamps, latency derived at read
 run_log            every run, so a day the job did not run is visible
@@ -248,8 +249,11 @@ run_log            every run, so a day the job did not run is visible
 
 ### What answers today, and what does not
 
-The time-series surprise, the spread and cost model, the universe screen, the
-13D watcher and the scanner all run now. The analyst surprise needs eight
+The time-series surprise, the cross-sectional one, the spread and cost model,
+the universe screen, the 13D watcher and the scanner all run now. Which
+surprise the scan ranks on is one constant, and each carries its own
+coefficient: a sigma and a rank are different quantities and pricing them with
+one number would make them look comparable. The analyst surprise needs eight
 quarters of recorded consensus; seeding supplies four and the recorder adds one
 a quarter, so it refuses until it has them and says how many it holds.
 

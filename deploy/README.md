@@ -243,6 +243,11 @@ Cron lines, in the order they should run:
 Order matters between the first two: the scan reads the universe and the prices
 the recorder wrote that evening, so a scan that runs first sees yesterday.
 
+`research-watch` reports the detection latency accumulated so far on every
+pass, not just what it recorded this time -- catching a filing quickly is the
+reason for the twenty-minute timer, and a job that never says how quickly
+cannot be judged.
+
 Each job exits non-zero when a stage fails and zero when it merely finds
 nothing. That distinction is the whole contract with cron — most nights the
 watcher finds no 13D and the scanner finds no candidate, and a job that pages
