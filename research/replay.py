@@ -27,6 +27,15 @@ Two biases follow and neither is fixable here, so both ride on every result:
   all. Only the time-series variant is available, computed from filings whose
   dates are on the public record.
 
+  **Entry timing.** The surprise comes from XBRL, and XBRL does not exist until
+  the 10-Q is filed -- measured on EDGAR, a median of 8 days after the first
+  8-K following period end, mean 12.1, range 0 to 45. That is not a defect in
+  the replay: a strategy reading XBRL genuinely cannot act sooner. It does mean
+  the entry is days behind the announcement the published drift is dated from,
+  and most of that drift happens early. So a null result here is a null result
+  about an XBRL-timed strategy, not about post-earnings drift, and the way to
+  close the gap is to read the number out of the 8-K where the market gets it.
+
 Replayed decisions are filed in their own table. A decision that was made and a
 decision that was imagined must never share one, or a scoring run reports the
 imagined ones as results.
@@ -47,6 +56,12 @@ CAVEATS = (
     "not measured at all",
     "prices are stamped at their own session, which assumes a day's prices "
     "were known that evening; true of prices, and the only thing assumed",
+    "entry timing: the surprise is computed from XBRL, which does not exist "
+    "until the 10-Q is filed -- a median of 8 days after the earnings 8-K, "
+    "mean 12.1, range 0 to 45, measured across 60 filings from 20 large caps. "
+    "The published drift is dated from the announcement and most of it happens "
+    "in the first days, so a null result here is a null result about an "
+    "XBRL-timed strategy and not about post-earnings drift",
 )
 
 

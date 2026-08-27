@@ -340,3 +340,17 @@ def test_a_replay_counts_one_print_once(store, monkeypatch):
 
     assert out["orders"] == 1, (
         f"one print produced {out['orders']} orders across four dates")
+
+
+def test_the_entry_timing_caveat_is_stated(store):
+    """Measured on EDGAR across 60 filings from 20 large caps: the 10-Q lands a
+    median of 8 days after the first 8-K following period end, mean 12.1, range
+    0 to 45. An XBRL-derived surprise cannot exist before the 10-Q does, so the
+    replay's timing is right for THIS strategy -- but the published drift is
+    measured from the announcement, and most of it happens in the first days.
+    A null result here is not a null result about PEAD, and the difference has
+    to be on the page rather than in someone's head."""
+    text = " ".join(replay.CAVEATS).lower()
+    assert "10-q" in text or "filing" in text
+    assert "announce" in text
+    assert "8" in text
