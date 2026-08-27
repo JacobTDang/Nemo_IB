@@ -40,7 +40,8 @@ def test_a_full_universe_still_admits_new_names(store, monkeypatch):
     monkeypatch.setattr(daily_job, "MAX_NIGHTLY_TICKERS", 100)
     store.record_universe("2026-03-02", [
         {"ticker": f"OLD{i}", "cik": str(i), "eligible": True}
-        for i in range(100)])
+        for i in range(100)],
+                          recorded_at="2026-03-02T21:00:00Z")
 
     asked = daily_job.nightly_tickers("2026-03-03",
                                       [f"OLD{i}" for i in range(100)] + ["IPO"])
@@ -55,7 +56,8 @@ def test_a_full_universe_never_drops_an_eligible_name(store, monkeypatch):
     monkeypatch.setattr(daily_job, "MAX_NIGHTLY_TICKERS", 100)
     store.record_universe("2026-03-02", [
         {"ticker": f"OLD{i}", "cik": str(i), "eligible": True}
-        for i in range(100)])
+        for i in range(100)],
+                          recorded_at="2026-03-02T21:00:00Z")
 
     asked = set(daily_job.nightly_tickers(
         "2026-03-03", [f"OLD{i}" for i in range(100)] + [f"NEW{j}" for j in range(50)]))
@@ -70,7 +72,8 @@ def test_newcomers_still_rotate_when_the_universe_is_full(store, monkeypatch):
     # eligible and rotate freely -- passing for a reason the test is not about.
     store.record_universe("2026-02-01", [
         {"ticker": f"OLD{i}", "cik": str(i), "eligible": True}
-        for i in range(100)])
+        for i in range(100)],
+                          recorded_at="2026-02-01T21:00:00Z")
     registrants = [f"OLD{i}" for i in range(100)] + [f"NEW{j}" for j in range(60)]
 
     seen = set()
@@ -159,7 +162,8 @@ def test_a_signal_that_raises_does_not_kill_the_scan(store, monkeypatch):
                       recorded_at="2026-02-28T21:00:00Z")
     store.record_universe("2026-03-02", [
         {"ticker": "GOOD", "cik": "1", "eligible": True},
-        {"ticker": "BAD", "cik": "2", "eligible": True}])
+        {"ticker": "BAD", "cik": "2", "eligible": True}],
+                          recorded_at="2026-03-02T21:00:00Z")
 
     def signal(ticker, as_of):
         if ticker == "BAD":
@@ -602,7 +606,8 @@ def test_rerunning_a_scan_with_a_different_answer_says_so(store, monkeypatch):
                       recorded_at="2026-02-28T21:00:00Z")
     store.record_universe("2026-03-02", [
         {"ticker": "AAA", "cik": "1", "eligible": True},
-        {"ticker": "BBB", "cik": "2", "eligible": True}])
+        {"ticker": "BBB", "cik": "2", "eligible": True}],
+                          recorded_at="2026-03-02T21:00:00Z")
 
     def sig(t, as_of, _v={"AAA": 3.0, "BBB": 0.2}):
         return {"ticker": t, "success": True, "sue": _v[t],
@@ -726,7 +731,8 @@ def test_a_zero_volume_name_is_refused_by_the_scanner(store, monkeypatch):
     days = _flat("DEAD", 300, volume=0.0, store=store)
     _flat(sc.REGIME_TICKER, 300, store=store)
     store.record_universe(days[-2], [
-        {"ticker": "DEAD", "cik": "1", "eligible": True}])
+        {"ticker": "DEAD", "cik": "1", "eligible": True}],
+                          recorded_at=f"{days[-2]}T21:00:00Z")
     monkeypatch.setattr(sc, "_signal_for", lambda t, a: {
         "ticker": t, "success": True, "sue": 3.0, "known_at": a,
         "sigma_quarters": 8, "sigma_periods": ["2026Q1"],

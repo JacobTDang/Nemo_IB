@@ -439,7 +439,8 @@ def corporate_actions_as_of(ticker: str, as_of: str) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------- universe
 
 def record_universe(as_of_date: str,
-                    entries: Iterable[Dict[str, Any]]) -> int:
+                    entries: Iterable[Dict[str, Any]],
+                    recorded_at: Optional[str] = None) -> int:
     """What the universe was on one date, eligible names and rejected ones.
 
     Rejections are kept deliberately. A name excluded for liquidity today may
@@ -447,7 +448,7 @@ def record_universe(as_of_date: str,
     tell the difference between a screen that worked and a screen that was
     never applied.
     """
-    stamp = _now()
+    stamp = recorded_at or _now()
     written = 0
     with connect() as conn:
         for e in entries:
@@ -476,13 +477,15 @@ def universe_as_of(as_of_date: str) -> List[Dict[str, Any]]:
     with connect() as conn:
         row = conn.execute(
             """SELECT MAX(as_of_date) FROM universe_snapshot
-               WHERE as_of_date <= ?""", (as_of_date,)).fetchone()
+               WHERE as_of_date <= ? AND date(recorded_at) <= ?""",
+            (as_of_date, as_of_date)).fetchone()
         latest = row[0] if row else None
         if latest is None:
             return []
         rows = conn.execute(
-            "SELECT * FROM universe_snapshot WHERE as_of_date = ? ORDER BY ticker",
-            (latest,)).fetchall()
+            """SELECT * FROM universe_snapshot
+               WHERE as_of_date = ? AND date(recorded_at) <= ?
+               ORDER BY ticker""", (latest, as_of_date)).fetchall()
     return [{**dict(r), "eligible": bool(r["eligible"])} for r in rows]
 
 
@@ -490,7 +493,8 @@ def universe_as_of(as_of_date: str) -> List[Dict[str, Any]]:
 
 def record_announcement(ticker: str, fiscal_period: str, announced_date: str,
                         timing: str = "unknown",
-                        source: Optional[str] = None) -> None:
+                        source: Optional[str] = None,
+                        recorded_at: Optional[str] = None) -> None:
     """Keyed on fiscal identity, never on a vendor's calendar bucket.
 
     get_earnings_surprises labels AMAT's 13 August print `2026-09-30` -- a
@@ -509,7 +513,7 @@ def record_announcement(ticker: str, fiscal_period: str, announced_date: str,
                 recorded_at)
                VALUES (?,?,?,?,?,?)""",
             (ticker, fiscal_period, announced_date, timing or "unknown",
-             source, _now()))
+             source, recorded_at or _now()))
 
 
 def announcements_as_of(ticker: str, as_of: str) -> List[Dict[str, Any]]:

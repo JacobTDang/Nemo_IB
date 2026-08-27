@@ -742,7 +742,8 @@ def test_a_new_listing_can_reach_eligibility(store, monkeypatch):
         {"ticker": "OLD", "cik": "1", "eligible": True},
         {"ticker": "IPO", "cik": "2", "eligible": False,
          "exclusion_reason": "insufficient history"},
-    ])
+    ],
+                          recorded_at="2026-03-02T21:00:00Z")
 
     asked = {}
     monkeypatch.setattr(daily_job, "_fetch_bars",
@@ -807,7 +808,8 @@ def test_eligible_names_are_never_starved_by_the_rotation(store, monkeypatch):
                         lambda **kw: {"status": "ok"})
     monkeypatch.setattr(daily_job, "MAX_NIGHTLY_TICKERS", 100)
     store.record_universe("2026-03-02", [
-        {"ticker": f"T{i}", "cik": str(i), "eligible": True} for i in range(60)])
+        {"ticker": f"T{i}", "cik": str(i), "eligible": True} for i in range(60)],
+                          recorded_at="2026-03-02T21:00:00Z")
 
     asked = {}
     monkeypatch.setattr(daily_job, "_fetch_bars",

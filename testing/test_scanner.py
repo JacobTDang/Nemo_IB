@@ -58,7 +58,8 @@ def liquid_universe(store):
     store.record_universe("2026-03-02", [
         {"ticker": "AAA", "cik": "1", "eligible": True},
         {"ticker": "BBB", "cik": "2", "eligible": True},
-    ])
+    ],
+                          recorded_at="2026-03-02T21:00:00Z")
     return store
 
 
@@ -318,7 +319,8 @@ def test_a_name_outside_the_universe_is_never_considered(store, monkeypatch):
                       recorded_at="2026-03-02T21:00:00Z")
     store.record_universe("2026-03-02", [
         {"ticker": "XXX", "cik": "9", "eligible": False,
-         "exclusion_reason": "below $500k median dollar volume"}])
+         "exclusion_reason": "below $500k median dollar volume"}],
+                          recorded_at="2026-03-02T21:00:00Z")
     _patch_signals(monkeypatch, {"XXX": _signal("XXX", 5.0)})
 
     result = scanner.scan(as_of="2026-03-03")
@@ -334,7 +336,8 @@ def test_a_position_is_capped_by_what_the_name_trades(store, monkeypatch):
     store.record_bars(scanner.REGIME_TICKER, _sessions(300),
                       recorded_at="2026-03-02T21:00:00Z")
     store.record_universe("2026-03-02", [
-        {"ticker": "THIN", "cik": "3", "eligible": True}])
+        {"ticker": "THIN", "cik": "3", "eligible": True}],
+                          recorded_at="2026-03-02T21:00:00Z")
     _patch_signals(monkeypatch, {"THIN": _signal("THIN", 3.0)})
     monkeypatch.setattr(scanner, "_cost_for",
                         lambda t, as_of, dollars: {

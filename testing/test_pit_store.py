@@ -178,7 +178,8 @@ def test_universe_membership_is_a_daily_fact(store):
         {"ticker": "AAPL", "cik": "320193", "eligible": True},
         {"ticker": "TINY", "cik": "999", "eligible": False,
          "exclusion_reason": "below $500k median dollar volume"},
-    ])
+    ],
+                          recorded_at="2026-03-02T21:00:00Z")
     members = store.universe_as_of("2026-03-02")
     assert [m["ticker"] for m in members if m["eligible"]] == ["AAPL"]
     excluded = [m for m in members if not m["eligible"]][0]
@@ -189,9 +190,11 @@ def test_a_name_that_leaves_the_universe_stays_in_the_record(store):
     """Survivorship, prevented. A delisted name must remain visible on the
     dates it was eligible, or a later study silently drops it."""
     store.record_universe("2026-03-02", [{"ticker": "GONE", "cik": "1",
-                                          "eligible": True}])
+                                          "eligible": True}],
+                          recorded_at="2026-03-02T21:00:00Z")
     store.record_universe("2026-04-02", [{"ticker": "AAPL", "cik": "320193",
-                                          "eligible": True}])
+                                          "eligible": True}],
+                          recorded_at="2026-04-02T21:00:00Z")
 
     assert [m["ticker"] for m in store.universe_as_of("2026-03-02")] == ["GONE"]
     assert [m["ticker"] for m in store.universe_as_of("2026-04-02")] == ["AAPL"]
@@ -381,7 +384,8 @@ def test_membership_is_the_last_one_recorded_not_an_exact_date(store):
     the job fell back to every registrant on the SEC list.
     """
     store.record_universe("2026-03-02", [
-        {"ticker": "AAPL", "cik": "320193", "eligible": True}])
+        {"ticker": "AAPL", "cik": "320193", "eligible": True}],
+                          recorded_at="2026-03-02T21:00:00Z")
 
     assert [m["ticker"] for m in store.universe_as_of("2026-03-05")] == ["AAPL"]
     assert store.universe_as_of("2026-03-01") == [], (

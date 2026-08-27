@@ -202,7 +202,8 @@ def _refresh_universe_for(tickers: Sequence[str], as_of: str) -> int:
     for index, ticker in enumerate(tickers):
         entries.append({"ticker": ticker, "cik": str(index),
                         **daily_job._screen(ticker, as_of)})
-    return pit_store.record_universe(as_of, entries)
+    return pit_store.record_universe(as_of, entries,
+                                     recorded_at=_stamp(as_of))
 
 
 def run(dates: Sequence[str], horizon_days: int = 20,

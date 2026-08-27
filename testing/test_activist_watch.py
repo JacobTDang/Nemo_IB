@@ -438,7 +438,8 @@ def test_the_watchlist_defaults_to_the_eligible_universe(store, monkeypatch):
         {"ticker": "INTC", "cik": "50863", "eligible": True},
         {"ticker": "TINY", "cik": "999", "eligible": False,
          "exclusion_reason": "below $500k median dollar volume"},
-    ])
+    ],
+                          recorded_at="2026-08-26T21:00:00Z")
     asked = []
 
     def fetch(ticker):
@@ -459,7 +460,8 @@ def test_a_capped_pass_is_never_reported_as_full_coverage(store, monkeypatch):
     the names past the cap were not watched and their silence means nothing."""
     store.record_universe("2026-08-26", [
         {"ticker": t, "cik": str(i), "eligible": True}
-        for i, t in enumerate(["AAA", "BBB", "CCC"])])
+        for i, t in enumerate(["AAA", "BBB", "CCC"])],
+                          recorded_at="2026-08-26T21:00:00Z")
     monkeypatch.setattr(activist_watch, "_fetch_company_filings",
                         lambda ticker: (INTC_CIK, []))
 
@@ -475,9 +477,11 @@ def test_the_universe_is_read_as_it_stood_on_the_day(store, monkeypatch):
     watcher that reads today's universe when replaying a March pass silently
     rewrites who was being observed."""
     store.record_universe("2026-03-02", [{"ticker": "GONE", "cik": "1",
-                                          "eligible": True}])
+                                          "eligible": True}],
+                          recorded_at="2026-03-02T21:00:00Z")
     store.record_universe("2026-08-26", [{"ticker": "INTC", "cik": "50863",
-                                          "eligible": True}])
+                                          "eligible": True}],
+                          recorded_at="2026-08-26T21:00:00Z")
     asked = []
     monkeypatch.setattr(activist_watch, "_fetch_company_filings",
                         lambda ticker: (asked.append(ticker), (INTC_CIK, []))[1])

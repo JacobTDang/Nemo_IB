@@ -595,7 +595,11 @@ def refresh_universe(as_of: Optional[str] = None) -> Dict[str, Any]:
         eligible += 1 if verdict["eligible"] else 0
         entries.append({**reg, **verdict})
 
-    written = pit_store.record_universe(as_of, entries)
+    # End of the day it screened, like every other recorder here. Stamped
+    # `now`, a screen run for a past date is visible to that date -- and the
+    # universe is what the scanner draws candidates from.
+    written = pit_store.record_universe(as_of, entries,
+                                        recorded_at=_stamp(as_of))
     status = "ok" if registrants else "failed"
     pit_store.finish_run(rows_written=written, status=status,
                          error=None if status == "ok" else "no registrants")
