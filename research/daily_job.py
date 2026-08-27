@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import statistics
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -91,14 +92,49 @@ def _fetch_sec_tickers() -> List[Dict[str, Any]]:
     return out
 
 
-def _fetch_bars(tickers: Iterable[str], start: Optional[str] = None,
-                end: Optional[str] = None) -> Dict[str, List[Dict[str, Any]]]:
-    """Raw OHLCV per ticker. `auto_adjust=False` is load-bearing.
+# yfinance starts a thread per ticker, so the request size is bounded by the
+# process thread limit rather than by anything about the data. The full SEC
+# list raises "can't start new thread" outright; 200 is comfortably under it
+# and still amortises the round trip.
+FETCH_BATCH_SIZE = 200
 
-    An adjusted close is recomputed as new splits and dividends land, so the
-    same request returns different numbers months later. Raw prices never move;
-    the actions are recorded separately and the adjustment is rebuilt at read
-    time.
+# The first request against a cold yfinance session answers 401 "Invalid
+# Crumb" and the next one works. Measured: the top 200 names returned 0, then
+# 200 unretried. Against the full universe that lost every mega-cap, because
+# the batches that fail are the ones that go out first.
+FETCH_RETRIES = 3
+FETCH_RETRY_BACKOFF = 5.0
+
+# A rate-limited batch does not raise. yfinance catches per-ticker errors
+# itself and returns an empty frame, so 200 unanswered names look exactly like
+# 200 companies that did not trade -- and a batch of delisted shells, which the
+# SEC list has thousands of, really is empty. Nothing in the response tells the
+# two apart, so each batch carries a name that always trades. If it comes back,
+# the batch reached the vendor and the absences are real.
+FETCH_CANARY = "SPY"
+
+# A short pause between batches. 52 of them arriving as fast as the process can
+# issue them is what provokes the rate limiting in the first place, and half a
+# second each costs a nightly job under half a minute.
+FETCH_BATCH_PAUSE = 0.5
+
+
+def _fetch_bars(tickers: Iterable[str], start: Optional[str] = None,
+                end: Optional[str] = None,
+                failures: Optional[List[str]] = None
+                ) -> Dict[str, List[Dict[str, Any]]]:
+    """Raw OHLCV per ticker, in batches, with the actions that shaped them.
+
+    `auto_adjust=False` is load-bearing but not sufficient -- see
+    `_to_as_traded` for what the vendor means by unadjusted. `actions=True`
+    costs nothing and carries the splits that conversion needs.
+
+    A batch that fails costs its own names and no others: on a universe this
+    size an occasional 502 is routine, and each of those names loses one
+    session out of the sixty the screen reads. What it must not do is go
+    unmentioned, so anything lost is appended to `failures` and ends up in the
+    run log. Every batch failing is a different thing and raises, because a
+    market where no ticker returned data is not a market where nobody traded.
     """
     import yfinance as yf
 
@@ -106,12 +142,51 @@ def _fetch_bars(tickers: Iterable[str], start: Optional[str] = None,
     if not tickers:
         return {}
 
-    # `actions=True` costs nothing -- the splits and dividends come down the
-    # same response -- and without them the prices below cannot be put back
-    # into the space they were actually traded in.
-    frame = yf.download(tickers=" ".join(tickers), start=start, end=end,
-                        auto_adjust=False, actions=True, group_by="ticker",
-                        progress=False, threads=True)
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    lost: List[str] = []
+    batches = [tickers[i:i + FETCH_BATCH_SIZE]
+               for i in range(0, len(tickers), FETCH_BATCH_SIZE)]
+
+    for index, batch in enumerate(batches):
+        asked = batch if FETCH_CANARY in batch else [*batch, FETCH_CANARY]
+        last: Optional[BaseException] = None
+        for attempt in range(FETCH_RETRIES):
+            try:
+                frame = yf.download(tickers=" ".join(asked), start=start,
+                                    end=end, auto_adjust=False, actions=True,
+                                    group_by="ticker", progress=False,
+                                    threads=True)
+                rows = _rows_from_frame(frame, asked)
+                if FETCH_CANARY not in rows:
+                    raise RuntimeError(
+                        f"batch returned no data for {FETCH_CANARY}, so it did "
+                        f"not reach the vendor")
+            except Exception as exc:  # noqa: BLE001 - retried, then raised
+                last = exc
+                if attempt + 1 < FETCH_RETRIES and FETCH_RETRY_BACKOFF:
+                    time.sleep(FETCH_RETRY_BACKOFF * (attempt + 1))
+                continue
+            if FETCH_CANARY not in batch:
+                rows.pop(FETCH_CANARY, None)
+            out.update(rows)
+            break
+        else:
+            lost.append(
+                f"batch {index + 1} of {len(batches)} failed after "
+                f"{FETCH_RETRIES} attempts ({len(batch)} tickers, "
+                f"{batch[0]}..{batch[-1]}): {type(last).__name__}: {last}")
+        if FETCH_BATCH_PAUSE and index + 1 < len(batches):
+            time.sleep(FETCH_BATCH_PAUSE)
+
+    if lost and not out:
+        raise RuntimeError(f"every batch failed; first: {lost[0]}")
+    if failures is not None:
+        failures.extend(lost)
+    return out
+
+
+def _rows_from_frame(frame: Any, tickers: List[str]
+                     ) -> Dict[str, List[Dict[str, Any]]]:
     out: Dict[str, List[Dict[str, Any]]] = {}
     for ticker in tickers:
         # Not `if len(tickers) > 1`. yfinance returns a two-level column
@@ -292,10 +367,12 @@ def record_daily_bars(tickers: List[str],
     as_of = as_of or _today()
     pit_store.start_run("daily_bars", as_of_date=as_of)
 
+    failures: List[str] = []
     try:
         fetched = _fetch_bars(tickers, start=as_of,
                               end=(date.fromisoformat(as_of)
-                                   + timedelta(days=1)).isoformat())
+                                   + timedelta(days=1)).isoformat(),
+                              failures=failures)
     except Exception as exc:  # noqa: BLE001 - reported, never masked
         pit_store.finish_run(rows_written=0, status="failed",
                              error=f"{type(exc).__name__}: {exc}")
@@ -314,12 +391,15 @@ def record_daily_bars(tickers: List[str],
         written += _record_ticker(ticker, rows, _stamp(as_of))
 
     status = coverage_status(covered, len(tickers))
-    pit_store.finish_run(
-        rows_written=written, status=status,
-        error=None if status == "ok"
-        else f"{covered} of {len(tickers)} tickers returned data")
+    detail = f"{covered} of {len(tickers)} tickers returned data"
+    if failures:
+        detail = f"{detail}; {len(failures)} batch(es) lost: " \
+                 + " | ".join(failures[:3])
+    pit_store.finish_run(rows_written=written, status=status,
+                         error=None if status == "ok" and not failures
+                         else detail)
     return {"status": status, "written": written, "covered": covered,
-            "requested": len(tickers)}
+            "requested": len(tickers), "failures": failures}
 
 
 def bootstrap_history(tickers: List[str], lookback_days: int = 730,
@@ -484,6 +564,42 @@ def record_consensus_snapshots(as_of: Optional[str] = None,
                          error=None if rows else "calendar returned no rows")
     return {"status": status, "written": written, "seen": len(rows)}
 
+# Yahoo answers a 10,388-name night with YFRateLimitError, and a universe that
+# only ever fetches its existing members can never admit a new listing: no
+# history means not eligible, not eligible means never fetched, never fetched
+# means no history. So the nightly ask is every eligible name plus a rotating
+# slice of the rest, which bounds the request and still walks the whole
+# registrant list inside a cycle.
+MAX_NIGHTLY_TICKERS = 3000
+
+
+def nightly_tickers(as_of: str, registrants: List[str]) -> List[str]:
+    """Everyone eligible, plus this night's slice of everyone else.
+
+    Eligible names are never rotated out. They are what a signal actually
+    reads, and a hole in one of those series is a hole where it costs most.
+    The slice is keyed on the date so it is deterministic -- a rerun of a given
+    night asks for exactly what that night asked for, which is the same
+    property the rest of the store is built on.
+    """
+    eligible = eligible_tickers(as_of)
+    keep = list(dict.fromkeys(eligible))
+    known = set(keep)
+    rest = [t for t in registrants if t not in known]
+
+    room = MAX_NIGHTLY_TICKERS - len(keep)
+    if room <= 0 or not rest:
+        return keep
+
+    # Ordinal of the date, so consecutive nights take consecutive slices and
+    # the cycle length is len(rest) / room nights.
+    offset = (date.fromisoformat(as_of).toordinal() * room) % len(rest)
+    slice_ = rest[offset:offset + room]
+    if len(slice_) < room:
+        slice_ += rest[:room - len(slice_)]
+    return keep + slice_
+
+
 def run_all(as_of: Optional[str] = None,
             bootstrap: bool = False) -> Dict[str, Any]:
     """A day's pass. Each stage logs separately so a partial day reads as one.
@@ -494,17 +610,57 @@ def run_all(as_of: Optional[str] = None,
     as_of = as_of or _today()
     results: Dict[str, Any] = {"as_of": as_of}
 
-    known = eligible_tickers(as_of)
-    if not known:
-        try:
-            known = [r["ticker"] for r in _fetch_sec_tickers()]
-        except Exception as exc:  # noqa: BLE001
-            return {**results, "error": f"universe unavailable: {exc}"}
+    try:
+        registrants = [r["ticker"] for r in _fetch_sec_tickers()]
+    except Exception as exc:  # noqa: BLE001
+        return {**results, "error": f"universe unavailable: {exc}"}
+
+    asked = nightly_tickers(as_of, registrants)
+    results["asked"] = len(asked)
 
     if bootstrap:
-        results["bootstrap"] = bootstrap_history(known, as_of=as_of)
+        results["bootstrap"] = bootstrap_history(asked, as_of=as_of)
 
-    results["daily_bars"] = record_daily_bars(known, as_of=as_of)
+    results["daily_bars"] = record_daily_bars(asked, as_of=as_of)
     results["universe"] = refresh_universe(as_of=as_of)
     results["consensus"] = record_consensus_snapshots(as_of=as_of)
     return results
+
+
+# ------------------------------------------------------------- entry point
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """`python -m research.daily_job`, which is what the schedule invokes.
+
+    Returns an exit code rather than printing and hoping. A partial night is
+    normal on a universe this size and exits 0; a stage that failed exits 1,
+    because the only way a scheduler ever learns about it is the exit code, and
+    a hole nobody was told about is the one that later reads as data.
+    """
+    import argparse
+    import json
+
+    parser = argparse.ArgumentParser(
+        prog="daily_job",
+        description="Record one day into the point-in-time store.")
+    parser.add_argument("--as-of", dest="as_of", default=None,
+                        help="date to record as (default: today)")
+    parser.add_argument("--bootstrap", action="store_true",
+                        help="pull history first; needed once on a cold store")
+    args = parser.parse_args(argv)
+
+    kwargs: Dict[str, Any] = {"as_of": args.as_of}
+    if args.bootstrap:
+        kwargs["bootstrap"] = True
+    result = run_all(**kwargs)
+    print(json.dumps(result, indent=2, default=str))
+
+    if result.get("error"):
+        return 1
+    stages = [v for k, v in result.items()
+              if isinstance(v, dict) and "status" in v]
+    return 1 if any(s["status"] == "failed" for s in stages) else 0
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised via main()
+    raise SystemExit(main())

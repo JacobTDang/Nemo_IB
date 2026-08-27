@@ -367,3 +367,19 @@ def test_ohlc_stays_internally_consistent(store):
     assert (b["open"], b["high"], b["low"], b["close"]) == (49.0, 52.0, 48.0, 50.0)
     assert b["low"] <= b["open"] <= b["high"]
     assert b["volume"] == 1000.0
+
+
+def test_membership_is_the_last_one_recorded_not_an_exact_date(store):
+    """Exact-date matching makes the universe vanish on any day the job did
+    not run -- a weekend, a holiday, an outage -- and a simulation standing on
+    that date sees no market at all. It also broke the job's own bootstrap
+    order: bars are recorded before the screen runs, so asking for today's
+    membership during the bar stage always answered "nobody is eligible" and
+    the job fell back to every registrant on the SEC list.
+    """
+    store.record_universe("2026-03-02", [
+        {"ticker": "AAPL", "cik": "320193", "eligible": True}])
+
+    assert [m["ticker"] for m in store.universe_as_of("2026-03-05")] == ["AAPL"]
+    assert store.universe_as_of("2026-03-01") == [], (
+        "membership was visible before it was ever recorded")

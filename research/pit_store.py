@@ -411,10 +411,25 @@ def record_universe(as_of_date: str,
 
 
 def universe_as_of(as_of_date: str) -> List[Dict[str, Any]]:
+    """Membership as it last stood on or before `as_of_date`.
+
+    Not an exact-date match. The screen does not run on weekends, holidays or
+    any day the job failed, and on those dates an exact match answers that the
+    market had no members -- which is not a fact about the market. It also
+    inverted the job's own ordering: bars are recorded before the screen runs,
+    so asking for today's membership mid-run always returned nothing and the
+    nightly ask silently widened to every registrant the SEC lists.
+    """
     with connect() as conn:
+        row = conn.execute(
+            """SELECT MAX(as_of_date) FROM universe_snapshot
+               WHERE as_of_date <= ?""", (as_of_date,)).fetchone()
+        latest = row[0] if row else None
+        if latest is None:
+            return []
         rows = conn.execute(
             "SELECT * FROM universe_snapshot WHERE as_of_date = ? ORDER BY ticker",
-            (as_of_date,)).fetchall()
+            (latest,)).fetchall()
     return [{**dict(r), "eligible": bool(r["eligible"])} for r in rows]
 
 

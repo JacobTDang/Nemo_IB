@@ -343,10 +343,14 @@ def test_a_single_ticker_fetch_returns_its_bars(monkeypatch):
     import pandas as pd
 
     idx = pd.to_datetime(["2024-06-10", "2024-06-11"])
-    frame = pd.DataFrame(
-        {("NVDA", "Open"): [1.0, 2.0], ("NVDA", "High"): [1.0, 2.0],
-         ("NVDA", "Low"): [1.0, 2.0], ("NVDA", "Close"): [1.0, 2.0],
-         ("NVDA", "Volume"): [10, 20]}, index=idx)
+    cols = {}
+    for sym in ("NVDA", daily_job.FETCH_CANARY):
+        cols[(sym, "Open")] = [1.0, 2.0]
+        cols[(sym, "High")] = [1.0, 2.0]
+        cols[(sym, "Low")] = [1.0, 2.0]
+        cols[(sym, "Close")] = [1.0, 2.0]
+        cols[(sym, "Volume")] = [10, 20]
+    frame = pd.DataFrame(cols, index=idx)
     frame.columns = pd.MultiIndex.from_tuples(frame.columns)
 
     import yfinance
@@ -378,13 +382,22 @@ def test_a_single_ticker_fetch_returns_its_bars(monkeypatch):
 
 
 def _frame(rows, ticker="NVDA"):
+    """A response shaped like the vendor's, canary included.
+
+    Every batch goes out with a known-liquid name attached so an unanswered
+    batch can be told from names that genuinely have no sessions. A fixture
+    that omits it is indistinguishable from a batch that never landed.
+    """
     import pandas as pd
+    from research.daily_job import FETCH_CANARY
     idx = pd.to_datetime([r["d"] for r in rows])
     data = {}
-    for field, key in (("Open", "c"), ("High", "c"), ("Low", "c"),
-                       ("Close", "c"), ("Volume", "v"),
-                       ("Stock Splits", "s"), ("Dividends", "div")):
-        data[(ticker, field)] = [r.get(key, 0.0) for r in rows]
+    for sym in (ticker, FETCH_CANARY):
+        for field, key in (("Open", "c"), ("High", "c"), ("Low", "c"),
+                           ("Close", "c"), ("Volume", "v"),
+                           ("Stock Splits", "s"), ("Dividends", "div")):
+            src = rows if sym == ticker else [{"c": 1.0, "v": 1.0} for _ in rows]
+            data[(sym, field)] = [r.get(key, 0.0) for r in src]
     f = pd.DataFrame(data, index=idx)
     f.columns = pd.MultiIndex.from_tuples(f.columns)
     return f
@@ -457,3 +470,385 @@ def test_todays_bar_is_never_rescaled(store, monkeypatch):
     bar = store.bars_as_of("NVDA", "2024-06-10")[0]
     assert round(bar["close"], 2) == 121.79
     assert round(bar["volume"]) == 313_434_100
+
+
+# --- the universe does not fit in one request -------------------------------
+#
+# yfinance starts a thread per ticker. Asked for all 10,388 SEC names at once
+# it raises RuntimeError: can't start new thread, which is what the nightly job
+# would have done on its first run against the real universe. Every hand test
+# used a handful of tickers and passed.
+
+
+def test_a_large_fetch_is_split_into_batches(monkeypatch):
+    calls = []
+
+    def fake_download(*args, **kwargs):
+        import pandas as pd
+        asked = kwargs["tickers"].split()
+        calls.append(len(asked))
+        idx = pd.to_datetime(["2026-08-26"])
+        data = {}
+        for t in asked:
+            for field in ("Open", "High", "Low", "Close", "Volume",
+                          "Stock Splits", "Dividends"):
+                data[(t, field)] = [1.0]
+        f = pd.DataFrame(data, index=idx)
+        f.columns = pd.MultiIndex.from_tuples(f.columns)
+        return f
+
+    import yfinance
+    monkeypatch.setattr(yfinance, "download", fake_download)
+
+    tickers = [f"T{i}" for i in range(500)]
+    got = daily_job._fetch_bars(tickers, start="2026-08-26", end="2026-08-27")
+
+    assert len(calls) > 1, "500 tickers went out as a single request"
+    # +1 for the canary each batch carries.
+    assert max(calls) <= daily_job.FETCH_BATCH_SIZE + 1
+    assert len(got) == 500, f"batching lost tickers: {len(got)} of 500"
+
+
+def test_a_transient_batch_failure_is_retried(monkeypatch):
+    """The first request against a cold session fails and the second works.
+
+    Measured, not assumed: asked for the top 200 names twice in a row, the
+    first call returned 0 and the second returned 200. Against the full
+    universe that cost every mega-cap -- AAPL, MSFT, NVDA and 4,553 others --
+    because the failing batches are simply the ones that go out first.
+    """
+    import pandas as pd
+    state = {"n": 0}
+
+    def fake_download(*args, **kwargs):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise RuntimeError("Invalid Crumb")
+        asked = kwargs["tickers"].split()
+        idx = pd.to_datetime(["2026-08-26"])
+        data = {}
+        for t in asked:
+            for field in ("Open", "High", "Low", "Close", "Volume",
+                          "Stock Splits", "Dividends"):
+                data[(t, field)] = [1.0]
+        f = pd.DataFrame(data, index=idx)
+        f.columns = pd.MultiIndex.from_tuples(f.columns)
+        return f
+
+    import yfinance
+    monkeypatch.setattr(yfinance, "download", fake_download)
+    monkeypatch.setattr(daily_job, "FETCH_RETRY_BACKOFF", 0.0)
+
+    got = daily_job._fetch_bars([f"T{i}" for i in range(500)],
+                                start="2026-08-26", end="2026-08-27")
+
+    assert len(got) == 500, f"a retried batch was lost: {len(got)} of 500"
+
+
+def test_a_batch_that_keeps_failing_is_reported_not_swallowed(monkeypatch):
+    """It cannot take the night down, and it cannot go unmentioned either.
+
+    One lost batch costs each of its names a single session out of the sixty
+    the screen reads, so the day is still worth keeping -- but a gap nobody
+    recorded is the one that later reads as a market where those names did not
+    trade. So the batch is skipped, and the run says which.
+    """
+    import pandas as pd
+
+    def fake_download(*args, **kwargs):
+        asked = kwargs["tickers"].split()
+        if "T0" in asked:
+            raise ConnectionError("Yahoo returned 502")
+        data = {}
+        for t in asked:
+            for field in ("Open", "High", "Low", "Close", "Volume",
+                          "Stock Splits", "Dividends"):
+                data[(t, field)] = [1.0]
+        f = pd.DataFrame(data, index=pd.to_datetime(["2026-08-26"]))
+        f.columns = pd.MultiIndex.from_tuples(f.columns)
+        return f
+
+    import yfinance
+    monkeypatch.setattr(yfinance, "download", fake_download)
+    monkeypatch.setattr(daily_job, "FETCH_RETRY_BACKOFF", 0.0)
+    monkeypatch.setattr(daily_job, "FETCH_BATCH_PAUSE", 0.0)
+
+    failures = []
+    got = daily_job._fetch_bars([f"T{i}" for i in range(500)],
+                                start="2026-08-26", end="2026-08-27",
+                                failures=failures)
+
+    assert 0 < len(got) < 500
+    assert len(failures) == 1
+    assert "502" in failures[0]
+
+
+def test_a_lost_batch_reaches_the_run_log(store, monkeypatch):
+    """Where an operator will actually see it."""
+    def fetch(tickers, **kw):
+        kw.get("failures", []).append("batch 2 of 52: ConnectionError: 502")
+        return {"AAPL": _bars("2026-03-03")}
+
+    monkeypatch.setattr(daily_job, "_fetch_bars", fetch)
+    daily_job.record_daily_bars(["AAPL", "MSFT"], as_of="2026-03-03")
+
+    run = daily_job.last_run("daily_bars")
+    assert run["status"] == "partial"
+    assert "502" in str(run["error"]), (
+        f"the lost batch is not in the run log: {run['error']!r}")
+
+
+def test_every_batch_failing_is_raised_not_returned_empty(monkeypatch):
+    """Total failure must not read as a market where nobody traded."""
+    def fake_download(*args, **kwargs):
+        raise ConnectionError("Yahoo returned 502")
+
+    import yfinance
+    monkeypatch.setattr(yfinance, "download", fake_download)
+    monkeypatch.setattr(daily_job, "FETCH_RETRY_BACKOFF", 0.0)
+
+    with pytest.raises(RuntimeError, match="502"):
+        daily_job._fetch_bars([f"T{i}" for i in range(500)],
+                              start="2026-08-26", end="2026-08-27")
+
+
+# --- telling a dead batch from dead tickers ---------------------------------
+#
+# The failing batch does not raise. yfinance catches per-ticker errors itself
+# and hands back an empty frame -- 0 rows by 1200 columns for 200 names -- so a
+# rate-limited batch looks exactly like 200 companies that did not trade.
+# Retrying on exceptions alone missed all of it: the full universe still lost
+# every mega-cap and reported 59% coverage with no error anywhere.
+#
+# An empty frame cannot be read either way on its own, because a batch of 200
+# delisted shells is genuinely empty and the SEC list has thousands of those.
+# So each batch carries a known-liquid name. If that name comes back, the batch
+# worked and the absences are real; if it does not, the vendor did not answer.
+
+
+def _empty_frame():
+    import pandas as pd
+    return pd.DataFrame()
+
+
+def test_a_batch_that_answers_nothing_is_retried_not_believed(monkeypatch):
+    import pandas as pd
+    state = {"n": 0}
+
+    def fake_download(*args, **kwargs):
+        state["n"] += 1
+        if state["n"] == 1:
+            return _empty_frame()
+        asked = kwargs["tickers"].split()
+        data = {}
+        for t in asked:
+            for field in ("Open", "High", "Low", "Close", "Volume",
+                          "Stock Splits", "Dividends"):
+                data[(t, field)] = [1.0]
+        f = pd.DataFrame(data, index=pd.to_datetime(["2026-08-26"]))
+        f.columns = pd.MultiIndex.from_tuples(f.columns)
+        return f
+
+    import yfinance
+    monkeypatch.setattr(yfinance, "download", fake_download)
+    monkeypatch.setattr(daily_job, "FETCH_RETRY_BACKOFF", 0.0)
+
+    got = daily_job._fetch_bars(["AAPL", "MSFT"], start="2026-08-26",
+                                end="2026-08-27")
+
+    assert set(got) == {"AAPL", "MSFT"}, (
+        "an unanswered batch was recorded as two companies that did not trade")
+
+
+def test_genuinely_dead_tickers_are_absent_not_an_error(monkeypatch):
+    """The other side of it. If the canary answers, the batch reached the
+    vendor and the missing names really have no sessions -- which must record
+    as absence, not raise and take the night down with it."""
+    import pandas as pd
+
+    def fake_download(*args, **kwargs):
+        asked = kwargs["tickers"].split()
+        alive = [t for t in asked if t == daily_job.FETCH_CANARY]
+        data = {}
+        for t in alive:
+            for field in ("Open", "High", "Low", "Close", "Volume",
+                          "Stock Splits", "Dividends"):
+                data[(t, field)] = [1.0]
+        f = pd.DataFrame(data, index=pd.to_datetime(["2026-08-26"]))
+        f.columns = pd.MultiIndex.from_tuples(f.columns)
+        return f
+
+    import yfinance
+    monkeypatch.setattr(yfinance, "download", fake_download)
+    monkeypatch.setattr(daily_job, "FETCH_RETRY_BACKOFF", 0.0)
+
+    got = daily_job._fetch_bars(["DEAD1", "DEAD2"], start="2026-08-26",
+                                end="2026-08-27")
+
+    assert got == {}, "a dead ticker produced a bar"
+
+
+def test_the_canary_is_not_smuggled_into_the_results(monkeypatch):
+    """It is scaffolding. Recording it as though the caller asked would put a
+    ticker in the universe that nothing screened."""
+    import pandas as pd
+
+    def fake_download(*args, **kwargs):
+        asked = kwargs["tickers"].split()
+        data = {}
+        for t in asked:
+            for field in ("Open", "High", "Low", "Close", "Volume",
+                          "Stock Splits", "Dividends"):
+                data[(t, field)] = [1.0]
+        f = pd.DataFrame(data, index=pd.to_datetime(["2026-08-26"]))
+        f.columns = pd.MultiIndex.from_tuples(f.columns)
+        return f
+
+    import yfinance
+    monkeypatch.setattr(yfinance, "download", fake_download)
+
+    got = daily_job._fetch_bars(["AAPL"], start="2026-08-26", end="2026-08-27")
+    assert set(got) == {"AAPL"}
+
+    # ...but a caller who genuinely wants it still gets it.
+    got = daily_job._fetch_bars(["AAPL", daily_job.FETCH_CANARY],
+                                start="2026-08-26", end="2026-08-27")
+    assert set(got) == {"AAPL", daily_job.FETCH_CANARY}
+
+
+# --- the universe has to be able to grow ------------------------------------
+#
+# run_all fetched bars for the eligible names and screened every registrant.
+# A newly listed company is not eligible, because it has no history; it then
+# never gets a bar, because only eligible names are fetched; so it never
+# acquires history. Nothing errors and nothing is logged -- the universe simply
+# never admits another name for as long as the job runs.
+#
+# Asking for all 10,388 registrants nightly is the other extreme, and Yahoo
+# answers it with YFRateLimitError. So the nightly ask is the eligible set plus
+# a rotating slice of everything else, which bounds the request and still gets
+# every name its sixty sessions inside a cycle.
+
+
+def test_a_new_listing_can_reach_eligibility(store, monkeypatch):
+    monkeypatch.setattr(daily_job, "_fetch_sec_tickers", lambda: [
+        {"ticker": "OLD", "cik": "1", "name": "Old Co"},
+        {"ticker": "IPO", "cik": "2", "name": "Newly Listed Inc"},
+    ])
+    sessions = [f"2026-01-{d:02d}" for d in range(1, 32)] + \
+               [f"2026-02-{d:02d}" for d in range(1, 29)]
+    store.record_bars("OLD", _bars(*sessions), recorded_at="2026-03-02T21:00:00Z")
+    store.record_universe("2026-03-02", [
+        {"ticker": "OLD", "cik": "1", "eligible": True},
+        {"ticker": "IPO", "cik": "2", "eligible": False,
+         "exclusion_reason": "insufficient history"},
+    ])
+
+    asked = {}
+    monkeypatch.setattr(daily_job, "_fetch_bars",
+                        lambda tickers, **kw: asked.update(t=list(tickers)) or {})
+    monkeypatch.setattr(daily_job, "record_consensus_snapshots",
+                        lambda **kw: {"status": "ok"})
+
+    daily_job.run_all(as_of="2026-03-03")
+
+    assert "IPO" in asked["t"], (
+        "an ineligible name is never fetched, so it can never become eligible")
+
+
+def test_the_nightly_ask_is_bounded(store, monkeypatch):
+    """10,388 names in one night is what the rate limiter answers."""
+    registrants = [{"ticker": f"T{i}", "cik": str(i), "name": f"Co {i}"}
+                   for i in range(5000)]
+    monkeypatch.setattr(daily_job, "_fetch_sec_tickers", lambda: registrants)
+    monkeypatch.setattr(daily_job, "record_consensus_snapshots",
+                        lambda **kw: {"status": "ok"})
+
+    asked = {}
+    monkeypatch.setattr(daily_job, "_fetch_bars",
+                        lambda tickers, **kw: asked.update(t=list(tickers)) or {})
+
+    daily_job.run_all(as_of="2026-03-03")
+
+    assert len(asked["t"]) <= daily_job.MAX_NIGHTLY_TICKERS
+
+
+def test_the_rotation_covers_everyone_eventually(store, monkeypatch):
+    """A slice that is the same every night starves the rest forever."""
+    registrants = [{"ticker": f"T{i}", "cik": str(i), "name": f"Co {i}"}
+                   for i in range(600)]
+    monkeypatch.setattr(daily_job, "_fetch_sec_tickers", lambda: registrants)
+    monkeypatch.setattr(daily_job, "record_consensus_snapshots",
+                        lambda **kw: {"status": "ok"})
+    monkeypatch.setattr(daily_job, "MAX_NIGHTLY_TICKERS", 100)
+
+    seen = set()
+    def fetch(tickers, **kw):
+        seen.update(tickers)
+        return {}
+    monkeypatch.setattr(daily_job, "_fetch_bars", fetch)
+
+    for day in range(1, 15):
+        daily_job.run_all(as_of=f"2026-03-{day:02d}")
+
+    assert len(seen) == 600, f"only {len(seen)} of 600 names were ever asked for"
+
+
+def test_eligible_names_are_never_starved_by_the_rotation(store, monkeypatch):
+    """They are the ones a signal actually reads. A rotation that pushes them
+    out leaves holes in exactly the series that matter."""
+    registrants = [{"ticker": f"T{i}", "cik": str(i), "name": f"Co {i}"}
+                   for i in range(600)]
+    monkeypatch.setattr(daily_job, "_fetch_sec_tickers", lambda: registrants)
+    monkeypatch.setattr(daily_job, "record_consensus_snapshots",
+                        lambda **kw: {"status": "ok"})
+    monkeypatch.setattr(daily_job, "MAX_NIGHTLY_TICKERS", 100)
+    store.record_universe("2026-03-02", [
+        {"ticker": f"T{i}", "cik": str(i), "eligible": True} for i in range(60)])
+
+    asked = {}
+    monkeypatch.setattr(daily_job, "_fetch_bars",
+                        lambda tickers, **kw: asked.update(t=set(tickers)) or {})
+
+    daily_job.run_all(as_of="2026-03-03")
+
+    assert {f"T{i}" for i in range(60)} <= asked["t"]
+
+
+# --- the entry point cron actually calls ------------------------------------
+
+def test_a_failed_night_exits_non_zero(store, monkeypatch):
+    """The only way a scheduler ever finds out. A job that prints an error and
+    exits 0 is a job whose failures nobody sees until someone reads a chart
+    built on a hole."""
+    monkeypatch.setattr(daily_job, "run_all",
+                        lambda **kw: {"as_of": "2026-03-03",
+                                      "error": "universe unavailable: 503"})
+    assert daily_job.main(["--as-of", "2026-03-03"]) == 1
+
+
+def test_a_partial_night_exits_zero(store, monkeypatch):
+    """Partial is normal on a universe this size and must not page anyone."""
+    monkeypatch.setattr(daily_job, "run_all",
+                        lambda **kw: {"as_of": "2026-03-03",
+                                      "daily_bars": {"status": "partial"},
+                                      "universe": {"status": "ok"},
+                                      "consensus": {"status": "ok"}})
+    assert daily_job.main(["--as-of", "2026-03-03"]) == 0
+
+
+def test_a_failed_stage_exits_non_zero(store, monkeypatch):
+    monkeypatch.setattr(daily_job, "run_all",
+                        lambda **kw: {"as_of": "2026-03-03",
+                                      "daily_bars": {"status": "ok"},
+                                      "universe": {"status": "failed"},
+                                      "consensus": {"status": "ok"}})
+    assert daily_job.main(["--as-of", "2026-03-03"]) == 1
+
+
+def test_the_flags_reach_run_all(store, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(daily_job, "run_all",
+                        lambda **kw: seen.update(kw) or {"as_of": "x"})
+    daily_job.main(["--as-of", "2026-03-03", "--bootstrap"])
+    assert seen == {"as_of": "2026-03-03", "bootstrap": True}
