@@ -98,6 +98,7 @@ def seed(tickers: Sequence[str],
     # whose vendor labels are a year off its own -- the second can never be
     # seeded at all, and an operator has no way to find that out from a total.
     unmatched: Dict[str, List[str]] = {}
+    duplicates: Dict[str, List[str]] = {}
     failed: List[str] = []
     seen = 0
 
@@ -108,6 +109,19 @@ def seed(tickers: Sequence[str],
         except Exception as exc:  # noqa: BLE001 - counted and reported
             failed.append(f"{ticker}: {type(exc).__name__}: {exc}")
             continue
+
+        # Finnhub returns TGT's 2027Q2 twice, with different calendar buckets
+        # and the same actual. Which one is the quarter is not answerable from
+        # the payload, and taking whichever arrives first attaches an estimate
+        # to a quarter on a coin flip, so neither is seeded.
+        counts: Dict[str, int] = {}
+        for row in rows:
+            if row.get("year") and row.get("quarter"):
+                label = f"{row['year']}Q{row['quarter']}"
+                counts[label] = counts.get(label, 0) + 1
+        repeated = sorted(k for k, n in counts.items() if n > 1)
+        if repeated:
+            duplicates[ticker] = repeated
 
         for row in rows:
             seen += 1
@@ -123,6 +137,8 @@ def seed(tickers: Sequence[str],
                 continue
 
             fiscal = f"{year}Q{quarter}"
+            if fiscal in duplicates.get(ticker, ()):
+                continue
             filed = dates.get(fiscal) or {}
             period_end, known_at = filed.get("period_end"), filed.get("known_at")
             if not period_end or not known_at:
@@ -152,7 +168,8 @@ def seed(tickers: Sequence[str],
 
     return {"tickers": len(tickers), "quarters_seen": seen,
             "written": written, "incomplete": incomplete, "undated": undated,
-            "unmatched": unmatched, "failed": failed}
+            "unmatched": unmatched, "duplicates": duplicates,
+            "failed": failed}
 
 
 # ------------------------------------------------------------- entry point

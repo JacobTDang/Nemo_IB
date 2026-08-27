@@ -291,3 +291,35 @@ def test_a_name_that_matched_is_not_listed_as_unmatched(store, monkeypatch):
                         lambda t: SURPRISES)
     out = seed_consensus.seed(["MSFT"])
     assert out["unmatched"] == {}
+
+
+def test_two_vendor_rows_for_one_quarter_seed_neither(store, monkeypatch):
+    """Finnhub returns TGT's 2027Q2 twice, with different calendar buckets and
+    the same actual. Which one is the quarter is not answerable from the
+    payload, and taking whichever arrives first would attach an estimate to a
+    quarter on a coin flip. The server already counts these as
+    `duplicate_fiscal_periods`; here they are simply not seeded."""
+    monkeypatch.setattr(seed_consensus, "_fetch_surprises", lambda t: [
+        {"year": 2027, "quarter": 2, "period": "2026-09-30",
+         "estimate_eps": 2.40, "actual_eps": 2.46},
+        {"year": 2027, "quarter": 2, "period": "2025-09-30",
+         "estimate_eps": 2.31, "actual_eps": 2.46},
+        {"year": 2026, "quarter": 4, "period": "2026-03-31",
+         "estimate_eps": 4.1432, "actual_eps": 4.27},
+    ])
+    monkeypatch.setattr(seed_consensus, "_filing_dates", lambda t, as_of=None: {
+        "2027Q2": {"period_end": "2026-08-01", "known_at": "2026-08-20"},
+        "2026Q4": {"period_end": "2026-03-31", "known_at": "2026-04-29"},
+    })
+
+    out = seed_consensus.seed(["TGT"], as_of="2026-08-27")
+
+    assert pit_store.consensus_as_of("TGT", "2027Q2", "2026-12-31") is None
+    assert out["duplicates"]["TGT"] == ["2027Q2"]
+    # ...and the unambiguous quarter is still seeded.
+    assert pit_store.actual_as_of("TGT", "2026Q4", "2026-12-31") == 4.27
+
+
+def test_a_clean_payload_reports_no_duplicates(store, monkeypatch):
+    monkeypatch.setattr(seed_consensus, "_fetch_surprises", lambda t: SURPRISES)
+    assert seed_consensus.seed(["MSFT"])["duplicates"] == {}
