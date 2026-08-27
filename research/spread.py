@@ -104,6 +104,29 @@ MIN_SESSIONS = 21
 # the caller at.
 RESOLVING_WINDOW = 252
 
+# The instrument the estimator is measured against, and the reason it can be.
+# SPY's quoted spread is one cent on a ~$600 price -- 0.17 basis points --
+# essentially always and for years at a time. EDGE on the store's own SPY
+# history returns 22bp at a 60-session window, 27bp at 252, 41bp at 504 and
+# 37bp at 1008: between 130 and 240 times the truth, and `resolved=True` at the
+# longer two, because `resolved` asks whether the estimate differs from zero
+# and a biased estimator with a tight standard error passes that easily.
+#
+# So a longer window does not sharpen this. It removes the warning.
+#
+# What the reference buys is a floor for the estimator itself. If a name's
+# estimate cannot be told apart from the reference's, then whatever its true
+# spread is, it is under what daily bars resolve -- and for a name that liquid
+# the honest number is the tick, not the estimator's noise. It is already in
+# the store: the recorder writes it every night as the liveness canary.
+REFERENCE_TICKER = "SPY"
+
+# How much larger than the reference an estimate must be before it is treated
+# as a measurement rather than as the same noise. Two, because the reference
+# itself moves by a factor of about 1.9 across windows (22bp to 41bp) and
+# anything inside that range is indistinguishable from it.
+RESOLUTION_MULTIPLE = 2.0
+
 # Two-sided 95%. Used one-sided here: the upper end of the interval is the
 # pessimistic reading and the only one this module volunteers.
 CONFIDENCE_Z = 1.96
@@ -612,6 +635,63 @@ def _join_warnings(*warnings: Optional[str]) -> Optional[str]:
     return "; also ".join(present) if present else None
 
 
+def spread_basis(ticker: str, as_of: str,
+                 window: int = DEFAULT_WINDOW) -> Dict[str, Any]:
+    """The spread to charge, and whether it was measured or floored.
+
+    Three outcomes, and the difference between them is the whole point:
+
+      `measured` -- the estimate stands clear of what the reference instrument
+      produces on the same window, so it is carrying information about this
+      name rather than about the estimator.
+
+      `at_resolution_floor` -- it does not. Whatever this name's spread is, it
+      is below what daily bars can resolve, which for a name this liquid means
+      the tick. Charging EDGE's number here would charge the estimator's bias:
+      40bp for SPY, whose market is a cent wide.
+
+      `unknown` -- the reference is not in the store for this window, so there
+      is no yardstick. Picking one of the other two silently is how 40bp
+      becomes a fact.
+    """
+    own = estimate_spread(ticker, as_of, window)
+    tick_floor = own.get("tick_floor")
+
+    reference = estimate_spread(REFERENCE_TICKER, as_of, window)
+    ref_level = reference.get("spread") or reference.get("spread_upper")
+    if ref_level is None:
+        return {"ticker": ticker, "as_of": as_of, "window": window,
+                "basis": "unknown", "spread": None, "tick_floor": tick_floor,
+                "reference_spread": None,
+                "reason": (f"{REFERENCE_TICKER} has no estimate on this window, "
+                           f"so there is nothing to measure the estimator "
+                           f"against: {reference.get('reason') or 'no data'}")}
+
+    own_level = own.get("spread")
+    if own_level is not None and own_level > ref_level * RESOLUTION_MULTIPLE:
+        return {"ticker": ticker, "as_of": as_of, "window": window,
+                "basis": "measured", "spread": own_level,
+                "tick_floor": tick_floor, "reference_spread": ref_level,
+                "reason": (f"{own_level * 1e4:.1f}bp stands clear of the "
+                           f"{ref_level * 1e4:.1f}bp the reference produces on "
+                           f"the same window")}
+
+    if tick_floor is None:
+        return {"ticker": ticker, "as_of": as_of, "window": window,
+                "basis": "unknown", "spread": None, "tick_floor": None,
+                "reference_spread": ref_level,
+                "reason": "no last price, so there is no tick to floor at"}
+
+    shown = f"{own_level * 1e4:.1f}bp" if own_level is not None else "no estimate"
+    return {"ticker": ticker, "as_of": as_of, "window": window,
+            "basis": "at_resolution_floor", "spread": tick_floor,
+            "tick_floor": tick_floor, "reference_spread": ref_level,
+            "reason": (f"{shown} is not clear of the {ref_level * 1e4:.1f}bp "
+                       f"the reference produces on the same window, so this is "
+                       f"the estimator's floor rather than this name's spread; "
+                       f"charging one tick ({tick_floor * 1e4:.2f}bp) instead")}
+
+
 def round_trip_cost(ticker: str, as_of: str, position_dollars: float,
                     window: int = DEFAULT_WINDOW,
                     basis: str = "upper") -> Dict[str, Any]:
@@ -647,20 +727,30 @@ def round_trip_cost(ticker: str, as_of: str, position_dollars: float,
             f"position_dollars must be positive; got {position_dollars!r}. A "
             f"zero or negative position is a caller bug, and answering it "
             f"with a cost of zero would let the bug travel")
-    if basis not in ("upper", "point"):
+    if basis not in ("upper", "point", "adaptive"):
         raise ValueError(
-            f"basis must be 'upper' or 'point'; got {basis!r}")
+            f"basis must be 'upper', 'point' or 'adaptive'; got {basis!r}")
 
     base = _window(ticker, as_of, window)
     est = _estimate(base, ticker, as_of, window)
     result = {**est, "position_dollars": position_dollars,
-              "spread_basis": basis, "spread_used": None,
+              "spread_basis": basis, "resolution": None, "spread_used": None,
               "half_spread": None, "spread_cost": None, "impact_cost": None,
               "cost": None, "participation": None,
               "max_position_dollars": None, "daily_volatility": None,
               "exceeds_liquidity_limit": None}
 
-    charged = est["spread_upper"] if basis == "upper" else est["spread"]
+    if basis == "adaptive":
+        # Measured where the estimator has something to say, floored at the
+        # tick where it does not. See `spread_basis`.
+        decided = spread_basis(ticker, as_of, window)
+        result["resolution"] = decided["basis"]
+        charged = decided["spread"]
+        if charged is None:
+            result["reason"] = decided["reason"]
+            return result
+    else:
+        charged = est["spread_upper"] if basis == "upper" else est["spread"]
     if charged is None:
         if basis == "point" and est["spread_upper"] is not None:
             result["reason"] = (

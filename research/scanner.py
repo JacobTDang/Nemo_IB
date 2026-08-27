@@ -117,19 +117,26 @@ def _signal_for(ticker: str, as_of: str) -> Dict[str, Any]:
 def _cost_for(ticker: str, as_of: str, position_dollars: float) -> Dict[str, Any]:
     """Round-trip cost, with the floor beside the bound.
 
-    EDGE cannot resolve a mega-cap's spread from daily bars. Live at 252
-    sessions MSFT, AAPL and JPM all came back unresolved, so the model charged
-    the 95% upper bound -- 19.8bp, 39.6bp and 54.0bp against true spreads near
-    a basis point. Charging the bound is the right conservative default and it
-    is also, for these names, mostly sampling error.
+    EDGE cannot resolve a mega-cap's spread from daily bars, and a longer
+    window does not help -- it removes the warning. Measured against SPY, whose
+    market is a cent wide at 0.17bp, the estimator returns 22bp at 60 sessions,
+    27bp at 252 and 41bp at 504, reporting `resolved=True` at the last of
+    those. Charging its upper bound put every name in the universe inside the
+    same 20-50bp band and erased the liquidity gradient entirely.
 
-    The floor is knowable: one tick against the price, which no spread can be
-    tighter than. Carrying both turns an unmeasurable number into a stated
-    range, so a name the estimator could not judge stops looking like a name
-    the strategy turned down.
+    `basis="adaptive"` charges EDGE where its estimate stands clear of what the
+    reference produces on the same window, and one tick where it does not --
+    because a name that liquid has a tick-wide market, and the estimator's
+    output there is its own bias. The gradient comes back: 0.2bp for SPY, 0.5
+    for AAPL and MSFT, 1.6 for KO, 3.0 for BJ, 82 for MOV, 120 for PLAB.
+
+    The floor is still carried beside it, so a name whose cost is a bound
+    rather than a measurement can still be told apart from one the strategy
+    turned down.
     """
     cost = spread.round_trip_cost(ticker, as_of, position_dollars,
-                                  window=spread.RESOLVING_WINDOW)
+                                  window=spread.RESOLVING_WINDOW,
+                                  basis="adaptive")
     if cost.get("cost") is None:
         return cost
     tick_floor = cost.get("tick_floor")
@@ -301,8 +308,9 @@ def scan(as_of: Optional[str] = None) -> Dict[str, Any]:
     candidates: List[Dict[str, Any]] = []
     rejected: List[Dict[str, Any]] = []
     undetermined: List[Dict[str, Any]] = []
-    measured = 0
-    resolved_count = 0
+    priced = 0
+    measured_count = 0
+    floored_count = 0
 
     for ticker in considered:
         try:
@@ -363,10 +371,17 @@ def scan(as_of: Optional[str] = None) -> Dict[str, Any]:
         cost_bps = cost["cost"] * 10_000
         floor_bps = (cost.get("cost_floor") or cost["cost"]) * 10_000
         net_bps = expected_bps - cost_bps
-        resolved = bool(cost.get("resolved"))
-        measured += 1
+        # Not EDGE's `resolved` flag, which asks only whether the estimate
+        # differs from zero -- SPY passes that at 41bp against a market a cent
+        # wide. What a reader needs is whether the charge is this name's
+        # measured spread or the tick it was floored to.
+        resolution = cost.get("resolution")
+        resolved = resolution == "measured"
+        priced += 1
         if resolved:
-            resolved_count += 1
+            measured_count += 1
+        elif resolution == "at_resolution_floor":
+            floored_count += 1
 
         if net_bps <= 0:
             row = {"ticker": ticker, "sue": value,
@@ -427,8 +442,9 @@ def scan(as_of: Optional[str] = None) -> Dict[str, Any]:
         # Names the estimator could not judge, kept apart from names the
         # strategy turned down.
         "undetermined": undetermined,
-        "costs_total": measured,
-        "costs_resolved": resolved_count,
+        "costs_total": priced,
+        "costs_measured": measured_count,
+        "costs_floored": floored_count,
         "assumptions": {
             "drift_bps_per_sue": DRIFT_BPS_PER_SUE,
             "calibrated": DRIFT_CALIBRATED,

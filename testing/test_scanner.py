@@ -300,15 +300,15 @@ def test_a_name_that_clears_the_bound_is_a_candidate(liquid_universe,
 
 def test_the_scan_says_how_much_of_its_cost_is_measured(liquid_universe,
                                                         monkeypatch):
-    """If every cost is a bound, the ranking is a ranking of standard errors
-    and the reader has to be told."""
+    """If nothing was measured, the ranking is a ranking of floors and the
+    reader has to be told."""
     _patch_signals(monkeypatch, {"AAA": _signal("AAA", 3.0),
                                  "BBB": _signal("BBB", 2.5)})
     monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0010))
 
     result = scanner.scan(as_of="2026-03-03")
 
-    assert result["costs_resolved"] == 0
+    assert result["costs_measured"] == 0
     assert result["costs_total"] == 2
 
 
@@ -653,3 +653,56 @@ def test_a_scan_that_had_nothing_to_do_leaves_a_record_saying_why(
     assert run["status"] == "ok"
     assert run["error"], "a scan with no candidates recorded no reason"
     assert "eligible" in run["error"] or "print" in run["error"]
+
+
+# --- the cost the scanner charges -------------------------------------------
+#
+# It charged EDGE's 95% upper bound, which for a mega-cap is the estimator's
+# bias rather than the name's spread: 39.7bp for AAPL, 21.7bp for MSFT, 39.1bp
+# for SPY itself, whose market is one cent wide. Nothing cleared, and the
+# liquidity gradient the kill criteria are supposed to test for was absent --
+# every name in the universe came back inside the same 20-50bp band.
+
+def test_the_scanner_charges_the_adaptive_basis(liquid_universe, monkeypatch):
+    seen = {}
+
+    def cost(ticker, as_of, dollars):
+        from research import spread as sp
+        seen["basis"] = "adaptive"
+        return sp.round_trip_cost(ticker, as_of, dollars,
+                                  window=sp.RESOLVING_WINDOW,
+                                  basis="adaptive")
+
+    monkeypatch.setattr(scanner, "_cost_for", cost)
+    _reported(liquid_universe, "AAA", "2026Q1", "2026-03-02")
+    monkeypatch.setattr(scanner, "_signal_for", lambda t, a: _signal(t, 3.0))
+
+    scanner.scan(as_of="2026-03-03")
+    assert seen.get("basis") == "adaptive"
+
+
+def test_the_real_cost_seam_asks_for_the_adaptive_basis():
+    """Pinning the production seam rather than a stub of it."""
+    import inspect
+    source = inspect.getsource(scanner._cost_for)
+    assert 'basis="adaptive"' in source or "basis='adaptive'" in source
+
+
+def test_the_scan_reports_which_costs_were_measured(liquid_universe,
+                                                    monkeypatch):
+    """`resolved` asks whether EDGE's estimate differs from zero, which a
+    biased estimator passes easily -- SPY comes back resolved at 41bp. Counting
+    it told the reader nothing. What matters is whether the charge is this
+    name's spread or the tick it was floored to."""
+    _reported(liquid_universe, "AAA", "2026Q1", "2026-03-02")
+    monkeypatch.setattr(scanner, "_signal_for", lambda t, a: _signal(t, 3.0))
+    monkeypatch.setattr(scanner, "_cost_for", lambda t, a, d: {
+        "cost": 0.0002, "cost_floor": 0.00002, "reason": None,
+        "spread": 0.0001, "resolved": False,
+        "resolution": "at_resolution_floor"})
+
+    result = scanner.scan(as_of="2026-03-03")
+
+    assert result["costs_measured"] == 0
+    assert result["costs_floored"] == 1
+    assert result["costs_total"] == 1
