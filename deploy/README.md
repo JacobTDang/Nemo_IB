@@ -48,26 +48,30 @@ claude mcp add --transport http nemo-altdata   http://<host>:8814/mcp/
 
 | Server | Port | Module | Tools |
 |---|---|---|---|
-| SEC EDGAR | 8810 | `tools.web_search_server.web_search` | 48 of 50 |
+| SEC EDGAR | 8810 | `tools.web_search_server.web_search` | 48 of 51 |
 | Market data and modelling | 8811 | `tools.financial_modeling_engine.analysis_tools` | 20 |
 | Finnhub | 8812 | `tools.news_agregator.finnhub_server` | 14 |
 | FRED macro | 8813 | `tools.news_agregator.fred_server` | 5 |
 | Alt data | 8814 | `tools.altdata_server.server` | 9 |
 
-96 tools served. The SEC server declares 50 and serves 48: `rag_search` and
-`rag_ingest` are capability-gated and hidden without the RAG stack, which the
-image does not install. Counts here are measured, not maintained -- run
-`python -m tools.manifest` inside a container to reproduce them, and note it
-reports what *that* environment can serve rather than a fixed number.
+96 tools served. The SEC server declares 51 and serves 48: `search`,
+`rag_search` and `rag_ingest` are capability-gated and hidden, because this
+image installs neither SearXNG nor the RAG stack -- the Dockerfile copies three
+`agent/` modules and `agent.rag` is not among them.
+
+Counts here are checked, not maintained: `testing/test_readme_counts.py` reads
+each server's own registry and fails when a page disagrees with it. Run
+`python -m tools.manifest` inside a container to see them for yourself, and
+note it reports what *that* environment can serve. On a host that happens to
+have SearXNG running, the SEC server serves 49.
 
 **Register the URL with its trailing slash.** `Mount` only matches `/mcp/`, so
 posting to `/mcp` answers `307` and every single call pays an extra round trip.
 
-The SEC server advertises 42 of its 45 tools: `search` and the two rag tools
-are hidden because SearXNG and the RAG stack are not in this image. That is
-deliberate. `search` returns an empty result list rather than an error when
-SearXNG is missing, so advertising it would make an absent container
-indistinguishable from a query that matched nothing.
+Gating `search` is the deliberate part. It returns an empty result list rather
+than an error when SearXNG is missing, so advertising it would make an absent
+container indistinguishable from a query that matched nothing. `rag_search` at
+least raises.
 
 stdio still works for local use -- swap `http` for `server` in the command.
 

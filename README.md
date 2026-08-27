@@ -4,8 +4,11 @@ Two things that share a machine and a set of upstreams.
 
 **MCP servers** that aggregate company, market, macro and alternative financial
 data from primary sources, served over streamable HTTP for any MCP client. Five
-ship in the homelab image and declare **98 tools** between them. Every count on
-this page is measured against a running instance rather than maintained by hand.
+ship in the homelab image and serve **96 tools** between them. They declare 99:
+`search`, `rag_search` and `rag_ingest` are capability-gated and hidden,
+because SearXNG and the RAG stack are not in this image. Every count on this
+page is checked against the servers' own registries by `testing/test_readme_counts.py`,
+so it fails rather than drifts.
 
 **A point-in-time record** that the same image feeds on a schedule, and the jobs
 that read it. Nothing about it is a server: they are batch jobs that finish. See
@@ -13,7 +16,7 @@ that read it. Nothing about it is a server: they are batch jobs that finish. See
 
 | Server | Tools | Reads from | Needs |
 |---|---:|---|---|
-| `sec` | 50 | SEC EDGAR (XBRL, filing text) | `SEC_EMAIL` |
+| `sec` | 48 | SEC EDGAR (XBRL, filing text) | `SEC_EMAIL` |
 | `financial` | 20 | yfinance, local valuation models | — |
 | `finnhub` | 14 | Finnhub | `FINNHUB_API_KEY` |
 | `fred` | 5 | FRED | `FRED_API_KEY` |
@@ -77,7 +80,7 @@ with no argument — but HTTP is what the image serves.
 
 ## The tools
 
-### `sec` — 50 tools, SEC EDGAR
+### `sec` — 48 tools, SEC EDGAR
 
 Financial statements, filing text, ownership and structure, read from XBRL and
 filing documents.
@@ -108,9 +111,12 @@ filer returns which form it actually files, rather than an empty result. Values
 carry their reporting currency — TSM reports in TWD, and a P/E built on a USD
 price and TWD earnings is wrong by ~30x.
 
-Two further tools, `rag_search` and `rag_ingest`, are declared but hidden unless
-the RAG stack is present, which it is not in the image. That is why the server
-declares 50 and serves 48.
+Three further tools are declared and hidden: `search` needs SearXNG, and
+`rag_search` and `rag_ingest` need the RAG stack. The image has neither, which
+is why this server declares 51 and serves 48. `search` is the one worth gating
+on principle rather than on tidiness — it answers a missing SearXNG with an
+empty result list and no error, so advertising it would make an absent
+container look like a query that matched nothing.
 
 ### `financial` — 20 tools, market data and valuation
 
