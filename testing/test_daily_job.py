@@ -185,3 +185,129 @@ def test_running_twice_in_a_day_changes_nothing(store, monkeypatch):
 
     assert len(store.bars_as_of("AAPL", as_of="2026-03-04")) == 1
     assert store.revisions("AAPL") == []
+
+
+# --- the vendor's own actual, or the analyst signal can never be built ------
+#
+# SUE_af pairs a street estimate with a reported figure. A street estimate is
+# non-GAAP and XBRL is GAAP, and they are not small differences: Finnhub's MSFT
+# 2026Q2 actual is 4.14 against 5.16 in the 10-Q, NVDA 1.05 against 1.08.
+# Pairing across the two manufactures a surprise larger than the real one.
+#
+# So the analyst variant needs the VENDOR's actual, not the filing's -- and
+# that number is only visible in the calendar for a short window after the
+# print. Not recording it today means SUE_af is unbuildable in two years no
+# matter how much history has accrued, which is the same clock argument that
+# put the recorder first.
+
+
+def test_the_vendors_own_actual_is_recorded_beside_its_estimate(store,
+                                                                monkeypatch):
+    monkeypatch.setattr(daily_job, "_fetch_calendar",
+                        lambda start, end: [
+                            {"ticker": "MSFT", "fiscal_period": "2026Q2",
+                             "eps_estimate": 4.02, "eps_actual": 4.14,
+                             "analyst_count": 30}])
+
+    daily_job.record_consensus_snapshots(as_of="2026-08-01", horizon_days=10)
+
+    snap = store.consensus_as_of("MSFT", "2026Q2", as_of="2026-08-01")
+    assert snap["eps_estimate"] == 4.02
+    assert snap["eps_actual"] == 4.14, (
+        "the vendor's actual was dropped; SUE_af cannot be built from a "
+        "GAAP filing figure paired with a non-GAAP estimate")
+
+
+def test_a_name_that_has_not_reported_has_no_actual(store, monkeypatch):
+    """Absent, not zero. A quarter not yet reported has no actual, and a zero
+    there would read as a company that earned nothing."""
+    monkeypatch.setattr(daily_job, "_fetch_calendar",
+                        lambda start, end: [
+                            {"ticker": "AAPL", "fiscal_period": "2026Q4",
+                             "eps_estimate": 1.55, "eps_actual": None}])
+
+    daily_job.record_consensus_snapshots(as_of="2026-08-01", horizon_days=10)
+
+    snap = store.consensus_as_of("AAPL", "2026Q4", as_of="2026-08-01")
+    assert snap["eps_actual"] is None
+
+
+def test_the_window_looks_back_so_actuals_are_caught(store, monkeypatch):
+    """An actual only appears after the print. A forward-only window would
+    snapshot the estimate every day and never the outcome."""
+    seen = {}
+
+    def calendar(start, end):
+        seen["start"], seen["end"] = start, end
+        return []
+
+    monkeypatch.setattr(daily_job, "_fetch_calendar", calendar)
+    daily_job.record_consensus_snapshots(as_of="2026-08-10", horizon_days=10)
+
+    assert seen["start"] < "2026-08-10", (
+        "the calendar window starts today, so a company that reported "
+        "yesterday never has its actual recorded")
+    assert seen["end"] > "2026-08-10"
+
+
+# --- the fetch seam itself, which had been returning nothing ---------------
+#
+# `_fetch_calendar` read payload["data"]["earnings"]. The key is "events".
+# `.get("earnings") or []` turned a wrong key into an empty calendar, so the
+# consensus job ran green every day and recorded not one row. That is the
+# swallowed-failure class this project has now closed in nine other places,
+# and it is worse here than elsewhere: the estimate series is the one thing
+# that cannot be back-filled, so every green-but-empty day was permanent.
+
+
+def _raw(symbol, q, y, est=1.0, act=None):
+    row = {"symbol": symbol, "date": "2026-08-20", "epsEstimate": est,
+           "quarter": q, "year": y, "numberOfAnalysts": 7, "hour": "amc"}
+    if act is not None:
+        row["epsActual"] = act
+    return row
+
+
+def _patch_client(monkeypatch, rows):
+    async def fake_get(self, endpoint, params=None):
+        assert endpoint == "/calendar/earnings", endpoint
+        return {"earningsCalendar": rows}
+
+    from tools.news_agregator import finnhub_utils
+    monkeypatch.setattr(finnhub_utils.FinnhubClient, "get", fake_get)
+
+
+def test_the_calendar_fetch_returns_rows_at_all(monkeypatch):
+    _patch_client(monkeypatch, [_raw("MSFT", 2, 2026, est=4.02, act=4.14)])
+
+    rows = daily_job._fetch_calendar("2026-08-15", "2026-08-25")
+
+    assert len(rows) == 1, "the fetch seam returned an empty calendar"
+    assert rows[0]["ticker"] == "MSFT"
+    assert rows[0]["fiscal_period"] == "2026Q2"
+    assert rows[0]["eps_estimate"] == 4.02
+    assert rows[0]["eps_actual"] == 4.14
+    assert rows[0]["analyst_count"] == 7
+
+
+def test_the_recorder_is_not_subject_to_the_display_cap(monkeypatch):
+    """The MCP tool caps events at 15 to protect an LLM's context. A recorder
+    has no context to protect and every dropped name is a permanent hole."""
+    _patch_client(monkeypatch, [_raw(f"T{i}", 3, 2026) for i in range(40)])
+
+    rows = daily_job._fetch_calendar("2026-08-15", "2026-08-25")
+
+    assert len(rows) == 40, f"the recorder saw only {len(rows)} of 40 reporters"
+
+
+def test_a_row_without_a_fiscal_period_is_dropped_not_keyed_on_none(monkeypatch):
+    """A snapshot keyed on None collides with every other such row and
+    silently overwrites a real quarter's estimate."""
+    _patch_client(monkeypatch, [
+        {"symbol": "WAT", "date": "2026-08-20", "epsEstimate": 1.0},
+        _raw("GOOD", 3, 2026),
+    ])
+
+    rows = daily_job._fetch_calendar("2026-08-15", "2026-08-25")
+
+    assert [r["ticker"] for r in rows] == ["GOOD"]

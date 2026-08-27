@@ -248,3 +248,43 @@ async def _exercise_all_tools():
 
 if __name__ == "__main__":
   sys.exit(0 if asyncio.run(_exercise_all_tools()) == 0 else 1)
+
+
+def test_a_calendar_event_carries_its_fiscal_identity():
+    """Which quarter the print covers is the join key, and the condenser
+    dropped it.
+
+    This repo already learned this once: an announcement keyed on the vendor's
+    calendar bucket cannot be joined to a filing, which is why
+    test_an_announcement_is_keyed_on_fiscal_identity exists. A calendar entry
+    saying "AAPL reports on the 30th" with no fiscal period is a date and a
+    ticker -- it cannot be matched to an estimate, a filing, or a surprise.
+    Finnhub returns quarter and year on every row; keeping them costs two
+    integers.
+    """
+    from tools.news_agregator.finnhub_server import _condense_earnings_calendar
+
+    out = _condense_earnings_calendar({"earningsCalendar": [
+        {"symbol": "AAPL", "date": "2026-10-30", "epsEstimate": 1.55,
+         "epsActual": 1.64, "quarter": 4, "year": 2026, "hour": "amc"},
+    ]})
+
+    event = out["events"][0]
+    assert event["quarter"] == 4
+    assert event["year"] == 2026
+    assert event["eps_actual"] == 1.64
+
+
+def test_the_cap_says_how_many_it_dropped():
+    """15 of 288 returned is fine; 15 of 288 returned looking like 15 is not."""
+    from tools.news_agregator.finnhub_server import _condense_earnings_calendar
+
+    out = _condense_earnings_calendar({"earningsCalendar": [
+        {"symbol": f"T{i}", "date": "2026-10-30", "quarter": 4, "year": 2026}
+        for i in range(40)
+    ]})
+
+    assert out["total_companies"] == 40
+    assert len(out["events"]) == 15
+    assert out.get("events_truncated") is True, (
+        "the caller cannot tell a 15-company week from a truncated 288-one")

@@ -144,33 +144,66 @@ def _fetch_actions(ticker: str) -> List[Dict[str, Any]]:
 
 
 def _fetch_calendar(start: str, end: str) -> List[Dict[str, Any]]:
-    """Who reports in a window, with the estimate as it stands today.
+    """Who reports in a window, with the estimate as it stands today and the
+    actual once it lands.
+
+    Straight at the endpoint, deliberately, rather than through the MCP tool.
+    That tool condenses for an LLM's context budget: it caps the event list at
+    15 and drops the fields a recorder needs. On a single ordinary week that
+    cap hid 273 of 288 reporters. A recorder has no context budget to protect
+    and every name it drops is a hole no later run can fill, so the two
+    callers want genuinely different things from the same endpoint.
 
     One call for the whole window rather than one per name: at several thousand
     tickers a per-name calendar would exhaust the rate limit long before it
     finished, and the point of this job is that it completes every day.
     """
     import asyncio
-    import json
 
-    from tools.news_agregator.finnhub_server import FinnhubServer
+    from tools.news_agregator.finnhub_utils import FinnhubClient
 
-    server = FinnhubServer()
-    raw = asyncio.run(server.get_earnings_calendar(from_date=start, to_date=end))
-    payload = json.loads(raw[0].text)
-    rows = (payload.get("data") or {}).get("earnings") or []
+    async def pull():
+        client = FinnhubClient()
+        try:
+            return await client.get("/calendar/earnings",
+                                    {"from": start, "to": end})
+        finally:
+            close = getattr(client, "close", None)
+            if close is not None:
+                await close()
+
+    payload = asyncio.run(pull())
+
+    # Fail loud. An error dict here used to become an empty calendar, and an
+    # empty calendar is indistinguishable from a quiet week -- which is how
+    # this seam ran green for its whole life while recording nothing.
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"earnings calendar: unexpected payload "
+                           f"{type(payload).__name__}")
+    if payload.get("error"):
+        raise RuntimeError(f"earnings calendar: {payload['error']}")
+    if "earningsCalendar" not in payload:
+        raise RuntimeError(
+            f"earnings calendar: no 'earningsCalendar' key; got "
+            f"{sorted(payload)[:8]}")
 
     out = []
-    for row in rows:
+    for row in payload["earningsCalendar"] or []:
         ticker = str(row.get("symbol", "")).strip().upper()
-        if not ticker:
+        year, quarter = row.get("year"), row.get("quarter")
+        # No fiscal identity, no row. Keying a snapshot on None would have
+        # every such company collide on one key and overwrite each other.
+        if not ticker or not year or not quarter:
             continue
         out.append({
             "ticker": ticker,
-            "fiscal_period": f"{row.get('year')}Q{row.get('quarter')}"
-                             if row.get("year") and row.get("quarter") else None,
+            "fiscal_period": f"{year}Q{quarter}",
             "eps_estimate": row.get("epsEstimate"),
+            # Only present once the company has reported, which is why the
+            # window looks backwards as well as forwards.
+            "eps_actual": row.get("epsActual"),
             "analyst_count": row.get("numberOfAnalysts"),
+            "timing": row.get("hour") or "unknown",
             "date": row.get("date"),
         })
     return out
@@ -355,7 +388,8 @@ def eligible_tickers(as_of: Optional[str] = None) -> List[str]:
 # ------------------------------------------------------------- consensus
 
 def record_consensus_snapshots(as_of: Optional[str] = None,
-                               horizon_days: int = 10) -> Dict[str, Any]:
+                               horizon_days: int = 10,
+                               lookback_days: int = 5) -> Dict[str, Any]:
     """Today's view of what the street expects, for names about to report.
 
     The one series that cannot be fetched retroactively. Finnhub returns four
@@ -367,11 +401,15 @@ def record_consensus_snapshots(as_of: Optional[str] = None,
     before finishing.
     """
     as_of = as_of or _today()
+    # Backwards as well as forwards. The estimate is visible before the print
+    # and the actual only after it, so a forward-only window would snapshot
+    # what the street expected every single day and never once what happened.
+    start = (date.fromisoformat(as_of) - timedelta(days=lookback_days)).isoformat()
     end = (date.fromisoformat(as_of) + timedelta(days=horizon_days)).isoformat()
     pit_store.start_run("consensus", as_of_date=as_of)
 
     try:
-        rows = _fetch_calendar(as_of, end)
+        rows = _fetch_calendar(start, end)
     except Exception as exc:  # noqa: BLE001
         pit_store.finish_run(rows_written=0, status="failed",
                              error=f"{type(exc).__name__}: {exc}")
@@ -386,6 +424,7 @@ def record_consensus_snapshots(as_of: Optional[str] = None,
         pit_store.record_consensus(
             as_of, row["ticker"], row["fiscal_period"],
             eps_estimate=row.get("eps_estimate"),
+            eps_actual=row.get("eps_actual"),
             analyst_count=row.get("analyst_count"))
         written += 1
 

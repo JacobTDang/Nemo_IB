@@ -103,6 +103,11 @@ CREATE TABLE IF NOT EXISTS consensus_snapshot (
     ticker        TEXT NOT NULL,
     fiscal_period TEXT NOT NULL,
     eps_estimate  REAL,
+    -- The VENDOR's reported figure, not the filing's. A street estimate is
+    -- non-GAAP and XBRL is GAAP -- Finnhub's MSFT 2026Q2 actual is 4.14
+    -- against 5.16 in the 10-Q -- so an analyst surprise must be computed
+    -- within one basis or it manufactures a gap that is not there.
+    eps_actual    REAL,
     analyst_count INTEGER,
     recorded_at   TEXT NOT NULL,
     PRIMARY KEY (as_of_date, ticker, fiscal_period)
@@ -170,9 +175,23 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+# Columns added after the first store existed. CREATE TABLE IF NOT EXISTS
+# leaves an existing table untouched, so a new column needs saying explicitly
+# or a store created yesterday silently lacks it.
+_MIGRATIONS = (
+    ("consensus_snapshot", "eps_actual", "REAL"),
+)
+
+
 def init_schema() -> None:
     with connect() as conn:
         conn.executescript(_SCHEMA)
+        for table, column, decl in _MIGRATIONS:
+            present = {r[1] for r in conn.execute(
+                f"PRAGMA table_info({table})")}
+            if column not in present:
+                conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
 
 # ---------------------------------------------------------------- bars
@@ -355,7 +374,8 @@ def announcements_as_of(ticker: str, as_of: str) -> List[Dict[str, Any]]:
 
 def record_consensus(as_of_date: str, ticker: str, fiscal_period: str,
                      eps_estimate: Optional[float] = None,
-                     analyst_count: Optional[int] = None) -> None:
+                     analyst_count: Optional[int] = None,
+                     eps_actual: Optional[float] = None) -> None:
     """One day's view of what the street expects.
 
     This is the series with a clock on it. Finnhub returns four quarters at
@@ -367,11 +387,11 @@ def record_consensus(as_of_date: str, ticker: str, fiscal_period: str,
     with connect() as conn:
         conn.execute(
             """INSERT OR IGNORE INTO consensus_snapshot
-               (as_of_date, ticker, fiscal_period, eps_estimate, analyst_count,
-                recorded_at)
-               VALUES (?,?,?,?,?,?)""",
-            (as_of_date, ticker, fiscal_period, eps_estimate, analyst_count,
-             _now()))
+               (as_of_date, ticker, fiscal_period, eps_estimate, eps_actual,
+                analyst_count, recorded_at)
+               VALUES (?,?,?,?,?,?,?)""",
+            (as_of_date, ticker, fiscal_period, eps_estimate, eps_actual,
+             analyst_count, _now()))
 
 
 def consensus_as_of(ticker: str, fiscal_period: str,
