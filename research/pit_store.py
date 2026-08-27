@@ -401,7 +401,7 @@ def revisions(ticker: Optional[str] = None) -> List[Dict[str, Any]]:
 
 def record_corporate_action(ticker: str, ex_date: str, action_type: str,
                             value: float,
-                            recorded_at: Optional[str] = None) -> None:
+                            recorded_at: Optional[str] = None) -> int:
     """A split ratio or a dividend per share, kept apart from the prices.
 
     Storing the action rather than a pre-adjusted price is what lets the
@@ -418,12 +418,15 @@ def record_corporate_action(ticker: str, ex_date: str, action_type: str,
             f"read that fails or silently skips it every time after")
 
     with connect() as conn:
-        conn.execute(
+        cur = conn.execute(
             """INSERT OR IGNORE INTO corporate_action
                (ex_date, ticker, action_type, value, recorded_at)
                VALUES (?,?,?,?,?)""",
             (ex_date, ticker, action_type, float(value),
              recorded_at or _now()))
+    # Reported like every other recorder here, so a caller can tell a
+    # write from a rerun that found the row already present.
+    return cur.rowcount or 0
 
 
 def corporate_actions_as_of(ticker: str, as_of: str) -> List[Dict[str, Any]]:
@@ -494,7 +497,7 @@ def universe_as_of(as_of_date: str) -> List[Dict[str, Any]]:
 def record_announcement(ticker: str, fiscal_period: str, announced_date: str,
                         timing: str = "unknown",
                         source: Optional[str] = None,
-                        recorded_at: Optional[str] = None) -> None:
+                        recorded_at: Optional[str] = None) -> int:
     """Keyed on fiscal identity, never on a vendor's calendar bucket.
 
     get_earnings_surprises labels AMAT's 13 August print `2026-09-30` -- a
@@ -507,13 +510,16 @@ def record_announcement(ticker: str, fiscal_period: str, announced_date: str,
     guess, because a guess here is a wrong number with no warning attached.
     """
     with connect() as conn:
-        conn.execute(
+        cur = conn.execute(
             """INSERT OR IGNORE INTO announcement
                (ticker, fiscal_period, announced_date, timing, source,
                 recorded_at)
                VALUES (?,?,?,?,?,?)""",
             (ticker, fiscal_period, announced_date, timing or "unknown",
              source, recorded_at or _now()))
+    # Reported like every other recorder here, so a caller can tell a
+    # write from a rerun that found the row already present.
+    return cur.rowcount or 0
 
 
 def announcements_as_of(ticker: str, as_of: str) -> List[Dict[str, Any]]:
