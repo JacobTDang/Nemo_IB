@@ -244,7 +244,8 @@ def _to_as_traded(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
-def _record_ticker(ticker: str, rows: List[Dict[str, Any]], stamp: str) -> int:
+def _record_ticker(ticker: str, rows: List[Dict[str, Any]], stamp: str,
+                   keep=None) -> int:
     """Actions first, then the bars they explain.
 
     Order matters on a cold store: a reader that finds bars without the split
@@ -252,15 +253,28 @@ def _record_ticker(ticker: str, rows: List[Dict[str, Any]], stamp: str) -> int:
     one, and this is the only moment both are in hand.
     """
     for row in rows:
+        # Never earlier than the action's own ex-date. On a backfill the window
+        # runs past `as_of` to catch intervening splits, and stamping those at
+        # `as_of` would claim a 2025 split was known in 2024. For a bootstrap
+        # every ex-date is at or before the stamp, so this changes nothing.
+        when = max(stamp, f"{row['trade_date']}T21:00:00Z")
         if row.get("split"):
             pit_store.record_corporate_action(
                 ticker, row["trade_date"], "split", float(row["split"]),
-                recorded_at=stamp)
+                recorded_at=when)
         if row.get("dividend"):
             pit_store.record_corporate_action(
                 ticker, row["trade_date"], "dividend", float(row["dividend"]),
-                recorded_at=stamp)
-    return pit_store.record_bars(ticker, _to_as_traded(rows), recorded_at=stamp)
+                recorded_at=when)
+    as_traded = _to_as_traded(rows)
+    if keep is not None:
+        # A past-dated run fetches beyond `as_of` only so the conversion above
+        # can see the splits in between. Those later sessions belong to their
+        # own days, with their own stamps, and writing them under this one
+        # would both misdate them and hand the reader a session that had not
+        # happened yet.
+        as_traded = [r for r in as_traded if keep(r["trade_date"])]
+    return pit_store.record_bars(ticker, as_traded, recorded_at=stamp)
 
 
 def _fetch_calendar(start: str, end: str) -> List[Dict[str, Any]]:
@@ -363,11 +377,20 @@ def record_daily_bars(tickers: List[str],
     as_of = as_of or _today()
     pit_store.start_run("daily_bars", as_of_date=as_of)
 
+    # Through today, not through tomorrow, whenever `as_of` is in the past.
+    # The vendor has already divided that session's price by every split since,
+    # and a one-day window carries no split column to undo it with -- backfill
+    # 2024-06-07 after NVDA's 10:1 and a 1208.88 print lands in the store as
+    # 120.89, in a table whose whole premise is that its numbers are what the
+    # stock actually printed. Only the requested session is recorded; the rest
+    # of the window is there to be divided by.
+    today = _today()
+    end = (date.fromisoformat(max(as_of, today))
+           + timedelta(days=1)).isoformat()
+
     failures: List[str] = []
     try:
-        fetched = _fetch_bars(tickers, start=as_of,
-                              end=(date.fromisoformat(as_of)
-                                   + timedelta(days=1)).isoformat(),
+        fetched = _fetch_bars(tickers, start=as_of, end=end,
                               failures=failures)
     except Exception as exc:  # noqa: BLE001 - reported, never masked
         pit_store.finish_run(rows_written=0, status="failed",
@@ -384,7 +407,8 @@ def record_daily_bars(tickers: List[str],
             # here would make the two indistinguishable forever.
             continue
         covered += 1
-        written += _record_ticker(ticker, rows, _stamp(as_of))
+        written += _record_ticker(ticker, rows, _stamp(as_of),
+                                  keep=lambda d, _o=as_of: d == _o)
 
     status = coverage_status(covered, len(tickers))
     detail = f"{covered} of {len(tickers)} tickers returned data"
@@ -411,8 +435,14 @@ def bootstrap_history(tickers: List[str], lookback_days: int = 730,
     start = (date.fromisoformat(as_of) - timedelta(days=lookback_days)).isoformat()
     pit_store.start_run("bootstrap_history", as_of_date=as_of)
 
+    # Through today when `as_of` is in the past, for the same reason the daily
+    # path does it: the vendor has divided this whole history by every split
+    # since, and only the sessions in the window carry the split column that
+    # undoes it. Everything past `as_of` is dropped before writing.
+    end = max(as_of, _today())
+
     try:
-        fetched = _fetch_bars(tickers, start=start, end=as_of)
+        fetched = _fetch_bars(tickers, start=start, end=end)
     except Exception as exc:  # noqa: BLE001
         pit_store.finish_run(rows_written=0, status="failed",
                              error=f"{type(exc).__name__}: {exc}")
@@ -425,7 +455,8 @@ def bootstrap_history(tickers: List[str], lookback_days: int = 730,
         if not rows:
             continue
         covered += 1
-        written += _record_ticker(ticker, rows, _stamp(as_of))
+        written += _record_ticker(ticker, rows, _stamp(as_of),
+                                  keep=lambda d, _o=as_of: d <= _o)
 
     status = coverage_status(covered, len(tickers))
     pit_store.finish_run(rows_written=written, status=status,
