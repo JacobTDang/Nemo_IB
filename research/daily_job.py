@@ -105,6 +105,14 @@ FETCH_RETRY_BACKOFF = 5.0
 # the batch reached the vendor and the absences are real.
 FETCH_CANARY = "SPY"
 
+# How far back the daily window reaches. A single-session request cannot tell a
+# market holiday from a vendor that did not answer -- both return nothing for
+# every ticker, canary included. With a week of context the canary settles it:
+# bars on the neighbouring days and none on this one means the exchange was
+# shut, no bars at all means the request failed. The extra sessions are never
+# recorded; they exist to be compared against.
+CLOSED_PROBE_DAYS = 7
+
 # A short pause between batches. 52 of them arriving as fast as the process can
 # issue them is what provokes the rate limiting in the first place, and half a
 # second each costs a nightly job under half a minute.
@@ -387,15 +395,34 @@ def record_daily_bars(tickers: List[str],
     today = _today()
     end = (date.fromisoformat(max(as_of, today))
            + timedelta(days=1)).isoformat()
+    start = (date.fromisoformat(as_of)
+             - timedelta(days=CLOSED_PROBE_DAYS)).isoformat()
+
+    # Asked for alongside the universe so its own sessions come back. Excluded
+    # from what gets written unless the caller wanted it in its own right.
+    probe = FETCH_CANARY not in tickers
+    asked = [*tickers, FETCH_CANARY] if probe else list(tickers)
 
     failures: List[str] = []
     try:
-        fetched = _fetch_bars(tickers, start=as_of, end=end,
+        fetched = _fetch_bars(asked, start=start, end=end,
                               failures=failures)
     except Exception as exc:  # noqa: BLE001 - reported, never masked
         pit_store.finish_run(rows_written=0, status="failed",
                              error=f"{type(exc).__name__}: {exc}")
         return {"status": "failed", "error": str(exc), "written": 0}
+
+    # The exchange, before the tickers. If the index traded during the window
+    # but not on this date, the market was shut -- which is a complete run over
+    # nothing, not a failure, and must not sit in missing_days for years.
+    index_rows = fetched.get(FETCH_CANARY) or []
+    if index_rows and not any(r["trade_date"] == as_of for r in index_rows):
+        pit_store.finish_run(
+            rows_written=0, status="closed",
+            error=f"{FETCH_CANARY} has no session on {as_of}; the exchange "
+                  f"was closed")
+        return {"status": "closed", "written": 0, "covered": 0,
+                "requested": len(tickers), "failures": failures}
 
     written = 0
     covered = 0
@@ -405,6 +432,11 @@ def record_daily_bars(tickers: List[str],
             # No bar at all. A vendor that did not answer for a ticker is not
             # a session in which nobody traded, and writing a zero-volume row
             # here would make the two indistinguishable forever.
+            continue
+        if not any(r["trade_date"] == as_of for r in rows):
+            # Present in the window but absent on the day. The window is wider
+            # than the session being recorded, so this is the same absence as
+            # above rather than coverage.
             continue
         covered += 1
         written += _record_ticker(ticker, rows, _stamp(as_of),

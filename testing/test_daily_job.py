@@ -770,7 +770,9 @@ def test_the_nightly_ask_is_bounded(store, monkeypatch):
 
     daily_job.run_all(as_of="2026-03-03")
 
-    assert len(asked["t"]) <= daily_job.MAX_NIGHTLY_TICKERS
+    # Minus the liveness canary, which every fetch carries and none records.
+    universe = [t for t in asked["t"] if t != daily_job.FETCH_CANARY]
+    assert len(universe) <= daily_job.MAX_NIGHTLY_TICKERS
 
 
 def test_the_rotation_covers_everyone_eventually(store, monkeypatch):
@@ -791,6 +793,7 @@ def test_the_rotation_covers_everyone_eventually(store, monkeypatch):
     for day in range(1, 15):
         daily_job.run_all(as_of=f"2026-03-{day:02d}")
 
+    seen.discard(daily_job.FETCH_CANARY)
     assert len(seen) == 600, f"only {len(seen)} of 600 names were ever asked for"
 
 

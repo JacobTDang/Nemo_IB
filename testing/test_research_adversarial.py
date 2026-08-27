@@ -431,3 +431,91 @@ def test_a_past_dated_bootstrap_has_the_same_problem(store, monkeypatch):
         f"bootstrapped 2024-06-07 at {stored['2024-06-07']:.2f}")
     assert "2025-03-03" not in stored, (
         "a session after the bootstrap date was recorded as history")
+
+
+# --- the market is shut about ten times a year ------------------------------
+#
+# On a holiday no US equity has a bar, so the canary is missing from every
+# batch -- and a missing canary is how a rate-limited batch announces itself.
+# The job cannot tell them apart from a one-day request, so it treats
+# Thanksgiving as a total vendor outage: raises, exits non-zero, pages
+# whoever is on call, and leaves the day permanently listed as a gap.
+#
+# Ten false alarms a year is how an alert stops being read.
+
+
+def _holiday_frame(sessions, closed_on, **kw):
+    """A vendor response for a window in which one weekday has no sessions."""
+    import pandas as pd
+
+    start, end = kw.get("start"), kw.get("end")
+    days = [d for d in sessions
+            if d != closed_on
+            and (not start or d >= start) and (not end or d < end)]
+    if not days:
+        return pd.DataFrame()
+    data = {}
+    for t in kw["tickers"].split():
+        for field in ("Open", "High", "Low", "Close"):
+            data[(t, field)] = [100.0] * len(days)
+        data[(t, "Volume")] = [1e6] * len(days)
+        data[(t, "Stock Splits")] = [0.0] * len(days)
+        data[(t, "Dividends")] = [0.0] * len(days)
+    f = pd.DataFrame(data, index=pd.to_datetime(days))
+    f.columns = pd.MultiIndex.from_tuples(f.columns)
+    return f
+
+
+WEEK = ["2026-11-23", "2026-11-24", "2026-11-25", "2026-11-26", "2026-11-27"]
+
+
+def test_a_market_holiday_is_not_a_vendor_outage(store, monkeypatch):
+    import yfinance
+    monkeypatch.setattr(yfinance, "download",
+                        lambda *a, **k: _holiday_frame(WEEK, "2026-11-26", **k))
+    monkeypatch.setattr(daily_job, "FETCH_RETRY_BACKOFF", 0.0)
+    monkeypatch.setattr(daily_job, "FETCH_BATCH_PAUSE", 0.0)
+
+    result = daily_job.record_daily_bars(["AAA", "BBB"], as_of="2026-11-26")
+
+    assert result["status"] != "failed", (
+        f"the market being shut was reported as {result['status']}")
+    assert pit_store.bars_as_of("AAA", "2026-11-26") == [], (
+        "a bar was invented for a day the exchange did not open")
+
+
+def test_a_closed_day_is_not_a_hole_in_the_record(store, monkeypatch):
+    """It must not sit in missing_days forever, or the one real gap is lost
+    among ten holidays."""
+    import yfinance
+    monkeypatch.setattr(yfinance, "download",
+                        lambda *a, **k: _holiday_frame(WEEK, "2026-11-26", **k))
+    monkeypatch.setattr(daily_job, "FETCH_RETRY_BACKOFF", 0.0)
+    monkeypatch.setattr(daily_job, "FETCH_BATCH_PAUSE", 0.0)
+
+    daily_job.record_daily_bars(["AAA"], as_of="2026-11-26")
+
+    assert pit_store.missing_days("daily_bars", "2026-11-26", "2026-11-26") == []
+
+
+def test_a_closed_day_exits_zero(store, monkeypatch):
+    """A scheduler that pages on Thanksgiving is a scheduler nobody reads."""
+    monkeypatch.setattr(daily_job, "run_all",
+                        lambda **kw: {"as_of": "2026-11-26",
+                                      "daily_bars": {"status": "closed"},
+                                      "universe": {"status": "ok"},
+                                      "consensus": {"status": "ok"}})
+    assert daily_job.main(["--as-of", "2026-11-26"]) == 0
+
+
+def test_a_genuine_outage_is_still_loud(store, monkeypatch):
+    """The other side. If the canary has no bar anywhere in the window, the
+    vendor did not answer -- and that is not a holiday."""
+    import pandas as pd
+    import yfinance
+    monkeypatch.setattr(yfinance, "download", lambda *a, **k: pd.DataFrame())
+    monkeypatch.setattr(daily_job, "FETCH_RETRY_BACKOFF", 0.0)
+    monkeypatch.setattr(daily_job, "FETCH_BATCH_PAUSE", 0.0)
+
+    result = daily_job.record_daily_bars(["AAA"], as_of="2026-11-26")
+    assert result["status"] == "failed"

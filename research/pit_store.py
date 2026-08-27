@@ -799,9 +799,13 @@ def missing_days(job: str, start: str, end: str) -> List[str]:
     """Weekdays in the range with no successful run.
 
     A gap you cannot see becomes a conclusion; a gap you can see becomes a
-    caveat. Only a finished run with status 'ok' counts -- a crashed process
-    leaves a started row with no finish, and a failed fetch leaves a finish
-    with no data, and neither is coverage.
+    caveat. Only a finished run counts -- a crashed process leaves a started
+    row with no finish, and a failed fetch leaves a finish with no data, and
+    neither is coverage.
+
+    'closed' counts alongside 'ok'. The exchange shuts about ten weekdays a
+    year, and a holiday listed as a permanent hole is ten false alarms
+    annually, which is how the one real gap stops being noticed.
     """
     from datetime import date, timedelta
 
@@ -809,7 +813,8 @@ def missing_days(job: str, start: str, end: str) -> List[str]:
         covered = {
             r["as_of_date"] for r in conn.execute(
                 """SELECT DISTINCT as_of_date FROM run_log
-                   WHERE job = ? AND status = 'ok' AND finished_at IS NOT NULL
+                   WHERE job = ? AND status IN ('ok', 'closed')
+                     AND finished_at IS NOT NULL
                      AND as_of_date IS NOT NULL""", (job,)).fetchall()
         }
 
