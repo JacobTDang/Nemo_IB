@@ -133,11 +133,19 @@ def fetch_and_diff_10k_risks(ticker: str) -> Dict[str, Any]:
   Edgartools is rate-limited (SEC etiquette). Result is cached at callsite by
   the Session_Cache pattern when invoked through the MCP server.
   """
+  # Imported lazily so the diffing helpers above stay usable without
+  # edgartools installed.
   try:
-    from edgar import Company, set_identity
-    set_identity("nemo-ib agent ops@example.com")  # SEC requires UA header
-  except Exception as e:
+    from edgar import Company
+    from tools.web_search_server.sec_series import _require_identity
+  except ImportError as e:
     return {'error': f'edgartools unavailable: {e}'}
+
+  # SEC requires a UA header naming a real contact. This used to hardcode a
+  # placeholder address, which no amount of configuration could correct.
+  # _require_identity reads SEC_EMAIL and sets edgartools' identity as a side
+  # effect, refusing to invent one.
+  _require_identity()
 
   try:
     company = Company(ticker.upper())

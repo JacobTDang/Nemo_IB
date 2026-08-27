@@ -19,16 +19,15 @@ Capability:
 """
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, List, Optional, Tuple
 
-from edgar import Company, set_identity
+from edgar import Company
 
 
-# Default identity for SEC requests (sec_utils handles this too, but we
-# call set_identity defensively here so the tool works standalone)
-NAME = os.getenv('NAME', 'Investment Analyst')
-SEC_EMAIL = os.getenv('SEC_EMAIL', 'analyst@example.com')
+# SEC identity is resolved on use by sec_series._require_identity (called
+# below), so this tool still works standalone without inventing a contact
+# address when SEC_EMAIL is unset.
+from tools.web_search_server.sec_series import _require_identity
 
 
 # Curated registry of major institutional 13F filers. Names normalized
@@ -63,6 +62,24 @@ KNOWN_FUNDS: Dict[str, Dict[str, Any]] = {
   'scion asset management': {'cik': '0001649339', 'manager': 'Michael Burry'},
   'burry':                  {'cik': '0001649339', 'manager': 'Michael Burry'},
 }
+
+
+def _holding_value(row):
+    """A 13F position's reported value, or None when the row does not give one.
+
+    Coercing a missing Value to 0 drops the holding out of every ranking and
+    every total silently, understating a fund's book with nothing to show that
+    anything was lost.
+    """
+    value = row.get("Value")
+    if value is None:
+        return None
+    try:
+        import math
+        number = float(value)
+        return None if math.isnan(number) else number
+    except (TypeError, ValueError):
+        return None
 
 
 def list_known_funds() -> List[Dict[str, str]]:
@@ -107,8 +124,9 @@ def get_fund_holdings(fund_name_or_cik: str, n_filings: int = 2) -> Dict[str, An
             'error': f'Unknown fund {fund_name_or_cik!r}. Use list_known_funds() to see available.',
             'available': [f['fund'] for f in list_known_funds()]}
 
+  _require_identity()
+
   try:
-    set_identity(f"{NAME} {SEC_EMAIL}")
     company = Company(resolved['cik'])
     filings = list(company.get_filings(form='13F-HR').head(n_filings))
   except Exception as e:
@@ -123,14 +141,20 @@ def get_fund_holdings(fund_name_or_cik: str, n_filings: int = 2) -> Dict[str, An
 
   parsed = []
   for f in filings:
+    table_error = None
     try:
       do = f.data_object()
       holdings_df = do.holdings if do and do.has_infotable else None
-    except Exception:
+    except Exception as e:
+      # An infotable that failed to parse is not a fund holding nothing.
       holdings_df = None
+      table_error = f'{type(e).__name__}: {e}'
 
     holdings_list = []
+    rows_in_filing = 0
+    rows_failed = 0
     if holdings_df is not None and not holdings_df.empty:
+      rows_in_filing = len(holdings_df)
       for _, row in holdings_df.iterrows():
         try:
           holdings_list.append({
@@ -139,23 +163,39 @@ def get_fund_holdings(fund_name_or_cik: str, n_filings: int = 2) -> Dict[str, An
             'cusip':   str(row.get('Cusip', '')),
             'class':   str(row.get('Class', '')),
             'shares':  int(row.get('SharesPrnAmount', 0) or 0),
-            'value':   float(row.get('Value', 0) or 0),
+            'value':   _holding_value(row),
             'put_call': str(row.get('PutCall', '')).strip(),
           })
         except Exception:
+          # Counted, not dropped. A silently shorter list reads as the fund
+          # having sold the position.
+          rows_failed += 1
           continue
       # Sort by value descending
       holdings_list.sort(key=lambda h: h['value'], reverse=True)
 
     total_value = sum(h['value'] for h in holdings_list)
-    parsed.append({
+    complete = table_error is None and rows_failed == 0
+    entry = {
       'filing_date':       str(f.filing_date),
       'accession_number':  f.accession_number,
       'total_holdings':    len(holdings_list),
       'total_value_usd':   total_value,
+      'rows_in_filing':    rows_in_filing,
+      'rows_failed':       rows_failed,
+      'complete':          complete,
       'top_holdings':      holdings_list[:20],
       'all_holdings':      holdings_list,
-    })
+    }
+    if not complete:
+      entry['note'] = (
+        f'{rows_failed} of {rows_in_filing} rows failed to parse; '
+        f'total_value_usd excludes them and is a lower bound.'
+        if table_error is None else
+        f'Holdings table could not be read ({table_error}); '
+        f'this filing contributes no positions and is not an empty portfolio.')
+      entry['parse_error'] = table_error
+    parsed.append(entry)
 
   return {
     'success':  True,

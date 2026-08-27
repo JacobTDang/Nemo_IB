@@ -55,33 +55,6 @@ TRIGGER_THRESHOLD = 0.35
 _running = True
 
 
-def _ensure_alerts_table():
-  """Idempotency table: (thesis_id, falsifier_hash, evidence_id) -> already_fired."""
-  conn = get_connection()
-  try:
-    conn.execute("""
-      CREATE TABLE IF NOT EXISTS falsifier_alerts(
-        alert_id        INTEGER PRIMARY KEY AUTOINCREMENT,
-        thesis_id       INTEGER NOT NULL,
-        ticker          TEXT,
-        falsifier_hash  TEXT,
-        falsifier_text  TEXT,
-        evidence_id     TEXT,
-        score           REAL,
-        reason          TEXT,
-        fired_at        TIMESTAMP,
-        UNIQUE(thesis_id, falsifier_hash, evidence_id)
-      )
-    """)
-    conn.execute(
-      "CREATE INDEX IF NOT EXISTS idx_falsifier_alerts_thesis "
-      "ON falsifier_alerts(thesis_id, fired_at)"
-    )
-    conn.commit()
-  finally:
-    conn.close()
-
-
 def _falsifier_hash(falsifier_text: str) -> str:
   return hashlib.sha256(falsifier_text.strip().encode()).hexdigest()[:16]
 
@@ -308,7 +281,6 @@ def main():
   args = parser.parse_args()
 
   init_schema()
-  _ensure_alerts_table()
   _install_signal_handlers()
 
   print(f"[falsifier_watcher] starting | interval={args.interval}s",

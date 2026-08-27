@@ -1,3 +1,4 @@
+from tools.response_meta import annotating, warning
 from typing import Any, Dict, List, Optional
 import asyncio
 from tools.financial_modeling_engine.corporate_actions import get_corporate_actions
@@ -7,6 +8,7 @@ import sys
 import traceback
 
 from .utils import get_data, calculate_percentiles, get_institutional_holdings, get_options_metrics, get_short_interest, get_price_history, get_industry_etfs, get_historical_analogue
+from .options_quality import audit_options_metrics
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
@@ -21,7 +23,8 @@ from mcp.types import Tool, TextContent
 
 market_data_description = """Retrieves real-time market data for a company from Yahoo Finance including market cap, enterprise value, revenue, EBITDA, cash, debt, shares outstanding, beta, interest expense, and valuation multiples (P/E, P/B, EV/Revenue, EV/EBITDA, EV/EBIT).
 Should use: When you need current financial data for a company to perform valuation analysis, equity bridge calculations, or to get inputs for WACC calculation (beta, market cap, debt, interest expense).
-Should NOT use: When you need historical time-series data or SEC filing data (use SEC tools instead)."""
+Should NOT use: When you need historical time-series data or SEC filing data (use SEC tools instead).
+Share basis: marketCap is stated across every share class and the provider's sharesOutstanding is stated for one of them, so the two do not multiply together for a multi-class filer -- GOOGL is 2.0845x apart and BRK-B 1.5204x. shares_outstanding_basis says which case this response is; use shares_outstanding_all_classes for anything divided by a share count (value per share, book per share, ownership percentages) and read the share_count_basis_mismatch warning when it is present. pe_ratio and pb_ratio divide marketCap and are unaffected."""
 
 extract_13f_holdings_description = """Returns the top institutional holders and mutual fund holders of a stock, plus aggregate institutional ownership statistics. Data sourced from Yahoo's aggregation of SEC 13F-HR filings (institutional holders, filed quarterly) and NPORT-P filings (mutual funds). Each holder row includes shares held, market value in USD, percent of shares outstanding, and quarter-over-quarter percent change in position size.
 Should use: When researching who owns the stock, to detect institutional buying/selling pressure (pct_change_qoq), to size up the 'smart money' bull/bear setup, or to find catalysts in institutional positioning. Critical for the Layer-5 capital-allocation read in the IB analyst playbook.
@@ -33,11 +36,13 @@ Should NOT use: As a primary valuation input — options are sentiment, not fund
 
 short_interest_description = """Short interest snapshot: shares short, days to cover (short ratio), percent of float, and month-over-month change. Source: yfinance (underlying FINRA biweekly disclosures). Includes a signal classifier (low/moderate/elevated/crowded short).
 Should use: For positioning context — crowded shorts on a stock with bull momentum signal squeeze risk; rising shorts on a name with deteriorating fundamentals confirm the bear case. Pair with get_insider_transactions to triangulate sentiment.
-Should NOT use: For intraday positioning — short interest reports lag 2 weeks. Days-to-cover is an estimate based on average volume, not a hard ceiling."""
+Should NOT use: For intraday positioning — short interest reports lag 2 weeks. Days-to-cover is an estimate based on average volume, not a hard ceiling.
+Share basis: float_shares and shares_outstanding come from the provider on different share bases for a multi-class filer -- GOOGL's float exceeds its shares outstanding, so 1 - float/shares gives -85% insider ownership. shares_outstanding_basis says which case this is, shares_outstanding_all_classes is the count the float is comparable with, and float_exceeds_shares_outstanding / short_interest_exceeds_float appear in warnings when the two cannot be combined."""
 
 price_history_description = """Historical price summary: returns over 1M/3M/6M/YTD/1Y/3Y windows, realized volatility (annualized) over 30d/90d/180d/1Y, 52-week high/low with dates, max drawdown from trailing-12-month peak, and a configurable number of recent OHLCV bars. Source: yfinance auto-adjusted daily history.
 Should use: For drawdown framing ('stock down N% from peak'), volatility regime read (vol spike before earnings = expected surprise), and return decomposition over multiple windows.
-Should NOT use: For minute-level technical analysis (this returns daily bars). For intraday spot price use get_market_data."""
+Should NOT use: For minute-level technical analysis (this returns daily bars). For intraday spot price use get_market_data.
+Price basis: every close is back-adjusted onto the newest session's basis for splits AND dividends, which the response now states in price_basis and quantifies in price_adjustment. A close from before a split is stated in post-split shares, so it pairs with get_share_count_series.total_split_adjusted and NOT with total -- NVDA's 2024-05-24 bar against the as-filed count is out by exactly 10.0x. prices_split_adjusted and prices_dividend_adjusted appear in warnings when the window contains either."""
 
 trading_metrics_description = """Execution and position-sizing inputs from daily bars: relative volume (RVOL, the latest session's volume against its own trailing 20-session average), average dollar volume (ADV over 20 and 60 sessions, in USD and in shares), and average true range (ATR, Wilder-smoothed over 14 sessions, plus ATR as a percent of price). Source: the same yfinance daily bars as get_price_history.
 Should use: When deciding HOW to trade a name you have already researched -- how large a position the tape can absorb, how many days it takes to exit, how wide a stop has to be to survive ordinary daily noise, and whether today's volume is unusual enough to signal that something happened.
@@ -81,7 +86,10 @@ THIS IS THE LAST TOOL TO RUN. All of the following must have already executed be
 3. get_capex_pct_revenue(ticker)   -> capex_pct_revenue
 4. get_depreciation(ticker)        -> depreciation
 5. get_tax_rate(ticker)            -> tax_rate
-6. get_market_data(ticker)         -> cash, debt, shares_outstanding
+6. get_market_data(ticker)         -> cash, debt, shares_outstanding_all_classes
+   (per-share output divides the share count, so it needs the all-class figure;
+   the provider's sharesOutstanding covers one class and is 2.0845x short for
+   GOOGL, 1.5204x for BRK-B. Single-class filers are the same number.)
 7. get_basic_financials(ticker)    -> revenue_growth, terminal_multiple
 8. get_macro_snapshot()            -> risk_free_rate, terminal_growth
 9. calculate_wacc()                -> wacc"""
@@ -92,6 +100,8 @@ Should NOT use: When there are no truly comparable public companies, or if the e
 
 scenario_dcf_description = """Runs the DCF model under three scenarios (Bear / Base / Bull) using different revenue growth rates and EBITDA margin assumptions. Returns a price-per-share range across all three cases.
 
+Every price in the payload -- the headline bear/base/bull price and every cell of terminal_sensitivity -- uses the same conservative min(perpetuity, exit multiple) terminal value, so the grid cell at terminal_sensitivity_base_multiple equals that scenario's headline price. terminal_value_method on each scenario names which of the two is binding; where the perpetuity binds across the whole sweep the row is flat and terminal_sensitivity_floor_note says so.
+
 MODELING PHASE ONLY -- called by the Financial Modeling Agent, not the execution engine.
 
 Data that must be in the variable store before modeling:
@@ -100,7 +110,9 @@ Data that must be in the variable store before modeling:
 - capex_pct_revenue     <- get_capex_pct_revenue
 - depreciation          <- get_depreciation
 - tax_rate              <- get_tax_rate
-- cash, debt, shares_outstanding, beta  <- get_market_data
+- cash, debt, shares_outstanding_all_classes, beta  <- get_market_data
+  (all-class, not the provider's single-class sharesOutstanding -- every price
+   in this model is a per-share figure)
 - risk_free_rate        <- get_macro_snapshot
 - revenueGrowthTTMYoy, evEbitdaTTM      <- get_basic_financials
 - forward estimate low/high revenue     <- get_forward_estimates (for bear/bull anchors)
@@ -108,11 +120,13 @@ Data that must be in the variable store before modeling:
 
 lbo_description = """Leveraged buyout model. Computes IRR and MOIC to equity given entry EV, debt structure (leverage turns, interest rate), and exit multiple over a hold period.
 
+Refuses rather than modelling an impossible structure: entry EBITDA at or below zero (nothing to lever, to service the debt, or to price the exit off), an exit_multiple at or below zero (a non-positive exit enterprise value), a hold_years below 1, and acquisition debt meeting or exceeding entry_ev. Each refusal names the input to change.
+
 MODELING PHASE ONLY -- called by the Financial Modeling Agent, not the execution engine.
 ONLY run when the user query involves M&A, private equity, buyout potential, or takeout analysis.
 
 Data that must be in the variable store before modeling:
-- market_cap, totalDebt, totalCash, shares_outstanding  <- get_market_data
+- market_cap, totalDebt, totalCash, shares_outstanding_all_classes  <- get_market_data
 - revenue_base          <- get_revenue_base
 - ebitda_margin         <- get_ebitda_margin
 - capex_pct_revenue     <- get_capex_pct_revenue
@@ -140,7 +154,9 @@ capital_returns_description = """Calculates shareholder return profile: FCF yiel
 MODELING PHASE ONLY -- called by the Financial Modeling Agent, not the execution engine.
 
 Data that must be in the variable store before modeling:
-- market_cap, shares_outstanding          <- get_market_data
+- market_cap, shares_outstanding_all_classes  <- get_market_data
+  (dividend and buyback per share divide the share count; the provider's
+   sharesOutstanding is one class where market_cap is all of them)
 - revenue_base, ebitda_margin             <- get_revenue_base, get_ebitda_margin
 - capex_pct_revenue, depreciation         <- get_capex_pct_revenue, get_depreciation
 - tax_rate                                <- get_tax_rate
@@ -164,21 +180,201 @@ def _to_native(obj):
   return obj
 
 
+def peer_distribution(values, *, lower=0.0, upper=1000.0,
+                      tickers=None, reasons=None) -> dict:
+  """Summary statistics over comparable multiples only.
+
+  A multiple built on a denominator approaching zero is arithmetically correct
+  and analytically meaningless. INTC's ev_ebit of -20,768 dragged a four-name
+  peer mean to -5,113 against a median of 53, with success: true and no
+  warning -- and a mean and median on opposite sides of zero is the signature
+  of exactly one outlier doing all the work.
+
+  Negative multiples are excluded for the same reason: a company losing money
+  has no meaningful P/E, and averaging one in states something about the peer
+  group that is not true of any member of it.
+
+  Exclusions are counted and explained. A distribution quietly computed over a
+  different set than the caller asked for is worse than one that says so.
+
+  `tickers` and `reasons` carry the cause of each absence down from the
+  caller. Without them this function knows a value is missing and nothing
+  about why, and it used to fill that gap with one fixed sentence -- "a
+  foreign issuer whose multiples are suppressed across currencies, or a filer
+  tagging nothing" -- printed over every exclusion regardless of cause. Run
+  against MU, BRK-B and ZZZZNOTREAL the real causes were a null provider
+  market cap, a negative enterprise value, and a symbol that is not a company;
+  the counts were right and the stated reason was wrong for all three. An
+  analyst told "foreign issuer" goes looking for a currency problem that is
+  not there and never learns one of their comparables does not exist.
+  """
+  supplied = list(values or [])
+  labels = list(tickers or [])
+  labels += [f"peer {i + 1}" for i in range(len(labels), len(supplied))]
+  reasons = dict(reasons or {})
+
+  def _is_number(v):
+    return (isinstance(v, (int, float)) and not isinstance(v, bool)
+            and v == v and abs(v) != float('inf'))
+
+  # A peer with no comparable multiple at all was filtered out before the
+  # count, so a four-name comp set reported "included 2, excluded 0" and
+  # published a median of the two that remained. Suppressing the multiple is
+  # right; making the peer disappear is not.
+  kept, excluded, absent, implausible = [], [], 0, 0
+  for label, value in zip(labels, supplied):
+    if not _is_number(value):
+      absent += 1
+      excluded.append({
+          'ticker': label,
+          'value': None,
+          'reason': reasons.get(label) or (
+              f"{label} reported no comparable multiple and no cause was "
+              f"supplied with the value"),
+      })
+      continue
+    number = float(value)
+    if lower < number <= upper:
+      kept.append(number)
+      continue
+    implausible += 1
+    excluded.append({
+        'ticker': label,
+        'value': number,
+        'reason': (
+            f"{label}'s multiple of {number:,.2f} falls outside "
+            f"({lower}, {upper}]: such a multiple comes from a denominator at "
+            f"or near zero, or from negative earnings, and is not comparable"),
+    })
+  dropped = absent + implausible
+
+  stats = {
+      'included_count': len(kept),
+      'excluded_count': dropped,
+      'excluded_reason': None,
+      'mean': None, 'median': None, 'q1': None, 'q3': None,
+      'low': None, 'high': None,
+  }
+  if dropped:
+    if tickers:
+      stats['excluded_reason'] = (
+          "; ".join(f"{e['ticker']}: {e['reason']}" for e in excluded) +
+          ". A distribution computed over a different set than the caller "
+          "asked for must say so.")
+    else:
+      # Called with bare values, so there is no cause to report. Saying so is
+      # the honest form; asserting one is how the misattribution started.
+      parts = []
+      if absent:
+        parts.append(
+            f"{absent} peer(s) reported no comparable multiple, with no cause "
+            f"supplied alongside the values")
+      if implausible:
+        parts.append(
+            f"{implausible} peer(s) fell outside ({lower}, {upper}]: such a "
+            f"multiple comes from a denominator at or near zero, or from "
+            f"negative earnings, and is not comparable")
+      stats['excluded_reason'] = (
+          "; ".join(parts) +
+          ". A distribution computed over a different set than the caller "
+          "asked for must say so.")
+  stats['excluded_absent'] = absent
+  stats['excluded_implausible'] = implausible
+  stats['excluded_peers'] = excluded
+  if not kept:
+    return stats
+
+  import statistics
+  ordered = sorted(kept)
+  stats['mean'] = statistics.fmean(ordered)
+  stats['median'] = statistics.median(ordered)
+  stats['low'] = ordered[0]
+  stats['high'] = ordered[-1]
+  if len(ordered) >= 2:
+    import numpy as _np
+    stats['q1'] = float(_np.percentile(ordered, 25))
+    stats['q3'] = float(_np.percentile(ordered, 75))
+  return stats
+
+
+def as_rate(name: str, value, *, allow_negative: bool = False) -> float:
+  """Interpret a rate given as a decimal or a percentage, or refuse.
+
+  The calculators previously did `if x > 1: x /= 100`, which is safe for a
+  value that really is a rate and catastrophic for one that is not: it turns
+  an implausible number into a differently implausible number instead of an
+  error. `calculate_dcf` documents `depreciation` as coming from
+  `get_depreciation`, whose `d&a` is an absolute figure -- NVDA's 2,843,000,000
+  became 28,430,000 and then a multiplier on revenue, and the model returned
+  $242,204,233 per share with success: true.
+
+  0 to 1 is read as a decimal, above 1 to 100 as a percentage. Anything else
+  is refused, naming the parameter, because there is no reading of 2.8 billion
+  that is a rate.
+  """
+  if isinstance(value, bool) or not isinstance(value, (int, float)):
+    raise TypeError(
+        f"{name} must be a number given as a decimal (0.25) or a percentage "
+        f"(25), received {type(value).__name__}")
+  number = float(value)
+  if number != number:                                  # NaN
+    raise ValueError(f"{name} is NaN, which is neither a decimal nor a percentage")
+  if number < 0:
+    if not allow_negative:
+      raise ValueError(f"{name} cannot be negative, received {number}")
+    return number if abs(number) <= 1 else number / 100
+  if number <= 1:
+    return number
+  if number <= 100:
+    return number / 100
+  raise ValueError(
+      f"{name}={number:,.0f} is neither a decimal rate (0.25) nor a "
+      f"percentage (25). If this is an absolute amount, pass the rate "
+      f"instead -- get_depreciation returns `d&a` in dollars and `d&a_pct` as "
+      f"the percentage this expects.")
+
+
 def _dcf_math(revenue_base: float, ebitda_margin: float, capex_pct_revenue: float,
               tax_rate: float, depreciation: float, revenue_growth: list,
               wacc: float, terminal_growth: float, terminal_multiple: float,
               cash: float, debt: float, shares_outstanding: float,
               ticker: str = '') -> dict:
   """5-year FCF DCF model. All margin/rate inputs as decimals."""
-  # Normalize percent-form inputs to decimal (defensive guard)
-  if ebitda_margin > 1:
-    ebitda_margin /= 100
-  if capex_pct_revenue > 1:
-    capex_pct_revenue /= 100
-  if tax_rate > 1:
-    tax_rate /= 100
-  if depreciation > 1:
-    depreciation /= 100
+  # Every rate parameter, interpreted the same way. Previously wacc and
+  # terminal_growth were left out of the normalisation the others got, so
+  # `wacc: 10` -- the percentage convention the rest accept -- became a 1000%
+  # discount rate and a price per share of 1,104,824,357.
+  ebitda_margin = as_rate('ebitda_margin', ebitda_margin)
+  capex_pct_revenue = as_rate('capex_pct_revenue', capex_pct_revenue)
+  tax_rate = as_rate('tax_rate', tax_rate)
+  depreciation = as_rate('depreciation', depreciation)
+  wacc = as_rate('wacc', wacc)
+  terminal_growth = as_rate('terminal_growth', terminal_growth, allow_negative=True)
+  # Zero is not a discount rate; it is the absence of one. Accepted, it left
+  # pv_fcfs identical to the undiscounted series and produced a $5.98tn
+  # enterprise value for a bank with a $948bn market cap -- success: true,
+  # price_per_share 0, no warnings.
+  if wacc <= 0:
+    raise ValueError(
+        f"wacc must be greater than zero, received {wacc}. A zero discount "
+        f"rate does not discount: the present value equals the undiscounted "
+        f"cash flow and the terminal value is unbounded.")
+
+  # A company does not have negative revenue. Accepted, the model ran happily
+  # and returned a negative enterprise value -- an answer no caller asked for
+  # and no filing supports.
+  if revenue_base is not None and revenue_base <= 0:
+    raise ValueError(
+        f"revenue_base must be greater than zero, received {revenue_base}. "
+        f"A DCF built on it returns a negative enterprise value, which "
+        f"describes no company.")
+  if terminal_growth >= wacc:
+    raise ValueError(
+        f"terminal_growth ({terminal_growth}) must be below wacc ({wacc}). "
+        f"The perpetuity is undefined at or above it and returns an "
+        f"arbitrarily large number rather than a valuation.")
+  revenue_growth = [as_rate('revenue_growth', g, allow_negative=True)
+                    for g in (revenue_growth or [])]
 
   if terminal_growth == 0:
     terminal_growth = 0.025  # GDP-match default
@@ -238,13 +434,21 @@ def _dcf_math(revenue_base: float, ebitda_margin: float, capex_pct_revenue: floa
 
   enterprise_value = sum(pv_fcfs) + pv_terminal
   equity_value = enterprise_value + cash - debt
-  price_per_share = equity_value / shares_outstanding if shares_outstanding > 0 else 0
+  # None, not zero. A $3.79bn equity divided by a share count nobody supplied
+  # was reported as "$0.00 per share" -- not an error and not a null, but the
+  # most plausible wrong answer available, reading as "this equity is
+  # worthless". The company is still worth what it is worth, so only the
+  # per-share figure goes.
+  price_per_share = (equity_value / shares_outstanding
+                     if shares_outstanding and shares_outstanding > 0
+                     else None)
 
   output = {
     'ticker': ticker,
     'enterprise_value': round(enterprise_value, 2),
     'equity_value': round(equity_value, 2),
-    'price_per_share': round(price_per_share, 2),
+    'price_per_share': (round(price_per_share, 2)
+                        if price_per_share is not None else None),
     'fcf_projections': yearly_details,
     'pv_fcfs': pv_fcfs,
     'pv_terminal_value': round(pv_terminal, 2),
@@ -269,6 +473,13 @@ def _dcf_math(revenue_base: float, ebitda_margin: float, capex_pct_revenue: floa
   }
   if terminal_value_warning:
     output['warning'] = terminal_value_warning
+  if price_per_share is None:
+    # A null with no reason is only marginally better than the zero it
+    # replaced: the caller still cannot tell a refusal from a gap.
+    output['price_per_share_note'] = (
+        f"price_per_share is not reported because shares_outstanding was "
+        f"{shares_outstanding!r}. The enterprise and equity values above "
+        f"stand; only the per-share figure needs a share count.")
   return output
 
 
@@ -276,14 +487,10 @@ def _wacc_math(beta: float, risk_free_rate: float, equity_risk_premium: float = 
                cost_of_debt: float = 0, tax_rate: float = 0,
                market_cap: float = 0, total_debt: float = 0) -> dict:
   """WACC via CAPM. All rate inputs as decimals."""
-  if equity_risk_premium > 1:
-    equity_risk_premium /= 100
-  if risk_free_rate > 1:
-    risk_free_rate /= 100
-  if cost_of_debt > 1:
-    cost_of_debt /= 100
-  if tax_rate > 1:
-    tax_rate /= 100
+  equity_risk_premium = as_rate('equity_risk_premium', equity_risk_premium)
+  risk_free_rate = as_rate('risk_free_rate', risk_free_rate)
+  cost_of_debt = as_rate('cost_of_debt', cost_of_debt)
+  tax_rate = as_rate('tax_rate', tax_rate)
 
   cost_of_equity = risk_free_rate + beta * equity_risk_premium
 
@@ -333,18 +540,60 @@ def _lbo_math(entry_ev: float, revenue_base: float, ebitda_margin: float,
   Returns IRR and MOIC assuming all FCF sweeps debt and no interim equity distributions.
   """
   # Normalize
-  if ebitda_margin > 1:
-    ebitda_margin /= 100
-  if capex_pct_revenue > 1:
-    capex_pct_revenue /= 100
-  if depreciation > 1:
-    depreciation /= 100
-  if tax_rate > 1:
-    tax_rate /= 100
-  if debt_interest_rate > 1:
-    debt_interest_rate /= 100
+  ebitda_margin = as_rate('ebitda_margin', ebitda_margin)
+  capex_pct_revenue = as_rate('capex_pct_revenue', capex_pct_revenue)
+  depreciation = as_rate('depreciation', depreciation)
+  tax_rate = as_rate('tax_rate', tax_rate)
+  debt_interest_rate = as_rate('debt_interest_rate', debt_interest_rate)
+  revenue_growth = [as_rate('revenue_growth', g, allow_negative=True)
+                    for g in (revenue_growth or [])]
+
+  # An exit multiple at or below zero is not a structure. At -5x the model
+  # produced exit_ev -241,576,500,000 -- a manufactured negative enterprise
+  # value, the class get_market_data already refuses to build multiples on --
+  # and then floored equity_proceeds to 0.0, so the payload read as an
+  # ordinary wiped-out deal: moic 0.0, irr_pct -100.0, success true. A client
+  # charting MOIC across exit multiples gets a clean zero where they should
+  # get an error.
+  if exit_multiple is None or exit_multiple <= 0:
+    raise ValueError(
+      f"exit_multiple must be greater than zero, received {exit_multiple}. "
+      f"At or below zero the exit enterprise value is not positive, which is "
+      f"not a low valuation but no valuation at all -- and the equity "
+      f"proceeds floor at zero, making an invalid input indistinguishable "
+      f"from a deal that went to zero.")
+
+  # MOIC ** (1 / hold_years) divides by the hold period, so a zero one left
+  # the tool answering "Failed to call tool 'calculate_lbo': float division by
+  # zero" -- a stack-trace fragment that names neither the input nor the fix.
+  if hold_years is None or hold_years < 1:
+    raise ValueError(
+      f"hold_years must be at least 1, received {hold_years}. There is no "
+      f"entry and exit inside a zero-length hold, so there is no return to "
+      f"annualise. Raise hold_years.")
 
   entry_ebitda = revenue_base * ebitda_margin
+  # Every figure below is sized off entry EBITDA: the debt, the exit
+  # enterprise value, and the cash that services the debt in between. With
+  # none of it the model reported entry_multiple 0 on a 5,115,451,801,600
+  # purchase -- a claim that a $5.1tn company was bought at 0x EBITDA -- next
+  # to debt_amount 0.0 and leverage_turns_entry 5, which cannot both be true,
+  # and moic 0.0 with success true.
+  #
+  # calculate_dcf meets the same division and answers None with a note,
+  # because there its enterprise value survives a missing share count and
+  # only the per-share figure is unanswerable. Here nothing survives, so the
+  # refusal is the whole model -- the same shape as the unfundable-structure
+  # guard below.
+  if entry_ebitda <= 0:
+    raise ValueError(
+      f"entry EBITDA is {entry_ebitda:,.0f} (revenue_base "
+      f"{revenue_base:,.0f} x ebitda_margin {ebitda_margin}), so there is "
+      f"nothing to lever, nothing to service the debt, and nothing to price "
+      f"the exit off. An LBO is financed against EBITDA; at zero the entry "
+      f"multiple is not 0x, it is undefined. Correct revenue_base or "
+      f"ebitda_margin.")
+
   debt_amount = entry_ebitda * leverage_turns
   if debt_amount >= entry_ev:
     # Debt is sized off EBITDA and equity off EV, so an entry multiple below
@@ -354,8 +603,7 @@ def _lbo_math(entry_ev: float, revenue_base: float, ebitda_margin: float,
     raise ValueError(
       f"acquisition debt {debt_amount:,.0f} ({leverage_turns}x entry EBITDA "
       f"{entry_ebitda:,.0f}) meets or exceeds the entry_ev {entry_ev:,.0f}. "
-      f"That is an entry multiple of "
-      f"{(entry_ev / entry_ebitda if entry_ebitda else 0):.2f}x against "
+      f"That is an entry multiple of {entry_ev / entry_ebitda:.2f}x against "
       f"{leverage_turns}x of leverage -- the structure cannot be funded. "
       "Lower leverage_turns or raise entry_ev."
     )
@@ -363,6 +611,7 @@ def _lbo_math(entry_ev: float, revenue_base: float, ebitda_margin: float,
 
   current_revenue = revenue_base
   current_debt = debt_amount
+  cash_accumulated = 0.0
   year_by_year = []
 
   for yr in range(hold_years):
@@ -377,8 +626,15 @@ def _lbo_math(entry_ev: float, revenue_base: float, ebitda_margin: float,
     capex = current_revenue * capex_pct_revenue
     # Cash available after interest, taxes, capex -- sweeps to debt
     fcf_after_service = ebitda - capex - taxes - interest
-    debt_paydown = max(0.0, fcf_after_service)
+    # Sweep only what there is debt to repay. Paying the full free cash flow
+    # against a smaller balance destroyed the surplus -- $191.0bn swept against
+    # a $93.4bn balance in one run -- and the excess never reached the equity
+    # holder, understating MOIC and IRR. Immaterial where equity is large;
+    # material in the thin-equity structure this model exists to evaluate.
+    debt_beginning = current_debt
+    debt_paydown = max(0.0, min(fcf_after_service, current_debt))
     current_debt = max(0.0, current_debt - debt_paydown)
+    cash_accumulated += max(0.0, fcf_after_service - debt_paydown)
 
     year_by_year.append({
       'year': yr + 1,
@@ -387,13 +643,15 @@ def _lbo_math(entry_ev: float, revenue_base: float, ebitda_margin: float,
       'interest': round(interest, 2),
       'taxes': round(taxes, 2),
       'fcf_after_service': round(fcf_after_service, 2),
+      'debt_beginning': round(debt_beginning, 2),
       'debt_paydown': round(debt_paydown, 2),
       'debt_remaining': round(current_debt, 2),
     })
 
   exit_ebitda = current_revenue * ebitda_margin
   exit_ev = exit_ebitda * exit_multiple
-  equity_proceeds = max(0.0, exit_ev - current_debt)
+  # Cash swept past a cleared balance belongs to the equity holder.
+  equity_proceeds = max(0.0, exit_ev - current_debt) + cash_accumulated
 
   moic = equity_proceeds / equity_invested if equity_invested > 0 else 0
   # IRR: single cash-on-cash (no interim distributions) -- MOIC^(1/N) - 1
@@ -402,7 +660,7 @@ def _lbo_math(entry_ev: float, revenue_base: float, ebitda_margin: float,
   return {
     'entry_ev': round(entry_ev, 2),
     'entry_ebitda': round(entry_ebitda, 2),
-    'entry_multiple': round(entry_ev / entry_ebitda, 2) if entry_ebitda > 0 else 0,
+    'entry_multiple': round(entry_ev / entry_ebitda, 2),
     'debt_amount': round(debt_amount, 2),
     'equity_invested': round(equity_invested, 2),
     'leverage_turns_entry': round(leverage_turns, 2),
@@ -410,6 +668,7 @@ def _lbo_math(entry_ev: float, revenue_base: float, ebitda_margin: float,
     'exit_ev': round(exit_ev, 2),
     'exit_multiple': exit_multiple,
     'debt_at_exit': round(current_debt, 2),
+    'cash_accumulated': round(cash_accumulated, 2),
     'equity_proceeds': round(equity_proceeds, 2),
     'moic': round(moic, 2),
     'irr_pct': round(irr * 100, 2),
@@ -508,59 +767,92 @@ def _scenario_dcf_math(base_inputs: dict,
   base_inputs: dict of all DCF inputs except revenue_growth and ebitda_margin.
   bear/base/bull_growth: 5-element list of annual growth rates per scenario.
   bear/base/bull_margin: EBITDA margin assumption per scenario (decimal).
+
+  Every price in this payload is built the same way, on the headline's
+  `min(perpetuity, exit_multiple)` terminal value. That is why:
+
+  The terminal_sensitivity grid used to strip the perpetuity floor and price
+  each multiple on the pure exit-multiple terminal value, so the payload
+  carried two price targets from two different methods with nothing to
+  separate them. For NVDA the base case reported price_per_share 151.96 at
+  terminal_multiple 25 while terminal_sensitivity.base["25x"] read 303.54 --
+  the same scenario, the same multiple, twice the price, because the
+  perpetuity (4.373tn) beat the exit-multiple terminal value (10.286tn) in the
+  headline's min() and the grid ignored it. The bear row showed the same gap,
+  60.80 against 119.79. Both numbers were arithmetically correct; a grid keyed
+  by the headline's own multiple reads as a sensitivity around the headline,
+  and the higher number is the one that ends up in a deck.
+
+  Applying the same rule per cell makes the grid a genuine sensitivity: the
+  cell at the base multiple IS the headline price, which is checkable, where a
+  label would only have been readable.
+
+  Nothing is lost by it. The grid existed to show how load-bearing the
+  terminal multiple is, and it now answers that honestly: where the perpetuity
+  binds across the sweep the row goes flat, and a flat row is the true answer
+  -- the exit multiple is doing no work at all. The old grid hid exactly that
+  behind a 255-to-352 range the model would never have produced.
+  terminal_value_method on each scenario names which of the two bound.
+
+  The headline's min() convention is deliberate and is not touched.
   """
-  results = {}
-  for case_name, growth, margin in (
+  cases = (
     ('bear', bear_growth, bear_margin),
     ('base', base_growth, base_margin),
     ('bull', bull_growth, bull_margin),
-  ):
+  )
+
+  results = {}
+  models = {}
+  for case_name, growth, margin in cases:
     inputs = dict(base_inputs)
     inputs['revenue_growth'] = growth
     inputs['ebitda_margin'] = margin
     r = _dcf_math(**inputs)
+    models[case_name] = r
     results[case_name] = {
       'price_per_share': r['price_per_share'],
       'enterprise_value': r['enterprise_value'],
       'equity_value': r['equity_value'],
       'pv_terminal_value': r['pv_terminal_value'],
+      'terminal_value_perpetuity': r['terminal_value_perpetuity'],
+      'terminal_value_exit_multiple': r['terminal_value_exit_multiple'],
+      'terminal_value_used': r['terminal_value_used'],
+      # Which of the two the min() picked. This single fact explains the
+      # whole valuation and was never reported.
+      'terminal_value_method': (
+          'perpetuity'
+          if r['terminal_value_used'] == r['terminal_value_perpetuity']
+          else 'exit_multiple'),
       'revenue_growth_y1_pct': round(growth[0] * 100, 2) if growth else 0,
       'ebitda_margin_pct': round(margin * 100, 2),
     }
+    if r.get('price_per_share_note'):
+      results[case_name]['price_per_share_note'] = r['price_per_share_note']
 
-  prices = [results[c]['price_per_share'] for c in ('bear', 'base', 'bull')]
+  prices = [results[c]['price_per_share'] for c in ('bear', 'base', 'bull')
+            if results[c]['price_per_share'] is not None]
 
-  # Terminal-multiple sensitivity: re-run each scenario at five terminal
-  # multiples spaced around the base assumption. Uses pure exit-multiple
-  # terminal value (no perpetuity floor) so the analyst sees what the
-  # multiple alone implies. The main bear/base/bull PT above remains the
-  # conservative min(perpetuity, exit) figure; the diff between the two
-  # reveals how much of the conservativeness comes from the perpetuity floor.
+  # Terminal-multiple sensitivity: re-price each scenario at five terminal
+  # multiples spaced around the base assumption, under the headline's own
+  # min(perpetuity, exit_multiple) rule.
   base_multiple = base_inputs.get('terminal_multiple', 0)
   sensitivity = None
+  floor_bound_cases = []
   if base_multiple and base_multiple > 0:
     raw_multiples = [base_multiple - 4, base_multiple - 2,
                      base_multiple, base_multiple + 2, base_multiple + 4]
     # Clamp to positive; a 0x or negative exit multiple is meaningless
     multiples = [m for m in raw_multiples if m > 0]
     sensitivity = {}
-    for case_name, growth, margin in (
-      ('bear', bear_growth, bear_margin),
-      ('base', base_growth, base_margin),
-      ('bull', bull_growth, bull_margin),
-    ):
-      # One _dcf_math call per scenario gives us pv_fcfs and the
-      # exit-multiple terminal at the original multiple, from which we
-      # scale by m / original_multiple.
-      probe_inputs = dict(base_inputs)
-      probe_inputs['revenue_growth'] = growth
-      probe_inputs['ebitda_margin'] = margin
-      r = _dcf_math(**probe_inputs)
-
+    for case_name, growth, margin in cases:
+      r = models[case_name]
       pv_fcfs_sum = sum(r['pv_fcfs'])
       original_multiple = r['assumptions']['terminal_multiple']
+      # Terminal-year EBITDA: the exit-multiple terminal value at 1x.
       unit_terminal = (r['terminal_value_exit_multiple'] / original_multiple
                        if original_multiple > 0 else 0)
+      perpetuity = r['terminal_value_perpetuity']
       wacc = r['assumptions']['wacc']
       n_years = len(growth)
       cash_v = r['assumptions']['cash']
@@ -569,27 +861,46 @@ def _scenario_dcf_math(base_inputs: dict,
 
       row = {}
       for m in multiples:
-        terminal_value_m = unit_terminal * m
+        terminal_value_m = min(perpetuity, unit_terminal * m)
         pv_terminal_m = terminal_value_m / ((1 + wacc) ** n_years)
         ev = pv_fcfs_sum + pv_terminal_m
         eq = ev + cash_v - debt_v
-        px = eq / shares_v if shares_v > 0 else 0
-        row[f"{m}x"] = round(px, 2)
+        # None, not zero, for the same reason _dcf_math reports None: $0.00
+        # per share reads as a worthless equity rather than a question nobody
+        # supplied a share count to answer.
+        px = eq / shares_v if shares_v and shares_v > 0 else None
+        row[f"{m}x"] = round(px, 2) if px is not None else None
       sensitivity[case_name] = row
+      if unit_terminal * min(multiples) >= perpetuity:
+        floor_bound_cases.append(case_name)
 
   output = {
     'bear': results['bear'],
     'base': results['base'],
     'bull': results['bull'],
     'price_range': {
-      'low': round(min(prices), 2),
-      'mid': round(results['base']['price_per_share'], 2),
-      'high': round(max(prices), 2),
+      'low': round(min(prices), 2) if prices else None,
+      'mid': (round(results['base']['price_per_share'], 2)
+              if results['base']['price_per_share'] is not None else None),
+      'high': round(max(prices), 2) if prices else None,
     }
   }
   if sensitivity is not None:
     output['terminal_sensitivity'] = sensitivity
     output['terminal_sensitivity_base_multiple'] = base_multiple
+    output['terminal_sensitivity_method'] = (
+      "Each cell is priced on min(perpetuity, exit multiple), the same "
+      "terminal-value rule as the headline bear/base/bull price. The cell at "
+      f"{base_multiple}x therefore equals the headline price for its "
+      "scenario. Read terminal_value_method on each scenario for which of the "
+      "two is binding.")
+    if floor_bound_cases:
+      output['terminal_sensitivity_floor_note'] = (
+        f"The perpetuity is below the exit-multiple terminal value at every "
+        f"multiple in this sweep for: {', '.join(floor_bound_cases)}. Those "
+        f"rows are flat because the exit multiple is not setting the terminal "
+        f"value -- the perpetuity is. Moving the multiple changes nothing "
+        f"until it falls below the perpetuity.")
   return output
 
 
@@ -984,7 +1295,14 @@ def _altman_z_score_math(financials: dict) -> dict:
     1.81 <= Z <= 2.99 -> grey
     Z < 1.81 -> distress
   """
-  ta = financials.get('total_assets', 0) or 1
+  if not _altman_inputs_ok(financials):
+    # Substituting a $1 balance sheet to dodge a division makes every ratio
+    # enormous and the score meaningless rather than absent.
+    return {'score': None, 'zone': None,
+            'error': 'total_assets is missing or zero; the Z-score is undefined '
+                     'without it and a substituted denominator would produce a '
+                     'number rather than an answer'}
+  ta = financials['total_assets']
   wc = financials.get('working_capital', 0)
   re_ = financials.get('retained_earnings', 0)
   ebit = financials.get('ebit', 0)
@@ -1019,6 +1337,14 @@ def _altman_z_score_math(financials: dict) -> dict:
     },
     'method': 'Altman (1968) Z-score (manufacturing form)',
   }
+
+
+def _altman_inputs_ok(financials) -> bool:
+    """Whether a Z-score can be computed at all. Total assets is the
+    denominator of four of the five ratios, so absent or zero means undefined,
+    not zero."""
+    ta = (financials or {}).get('total_assets')
+    return isinstance(ta, (int, float)) and not isinstance(ta, bool) and ta > 0
 
 
 def _detect_insider_clusters(transactions: list, lookback_days: int = 30) -> dict:
@@ -1320,7 +1646,13 @@ class Financial_Analysis:
               "debt": {"type": "number", "description": "SET TO 0 -- auto-resolved from get_market_data."},
               "shares_outstanding": {"type": "number", "description": "SET TO 0 -- auto-resolved from get_market_data."}
             },
-            "required": ["ticker"]
+            "required": ["ticker"],
+            # Every parameter here is a term in an arithmetic
+            # expression, so one dropped silently changes the
+            # number without changing its shape. `net_debt` was
+            # accepted, never read, and the valuation came back
+            # confident and wrong.
+            "additionalProperties": False
           }
         ),
         Tool(
@@ -1337,7 +1669,13 @@ class Financial_Analysis:
               "market_cap": {"type": "number", "description": "SET TO 0 -- auto-resolved from get_market_data."},
               "total_debt": {"type": "number", "description": "SET TO 0 -- auto-resolved from get_market_data."}
             },
-            "required": []
+            "required": [],
+            # Every parameter here is a term in an arithmetic
+            # expression, so one dropped silently changes the
+            # number without changing its shape. `net_debt` was
+            # accepted, never read, and the valuation came back
+            # confident and wrong.
+            "additionalProperties": False
           }
         ),
         # ---- Modeling phase tools ----
@@ -1366,7 +1704,13 @@ class Financial_Analysis:
               "shares_outstanding": {"type": "number"}
             },
             "required": ["ticker", "bear_growth", "base_growth", "bull_growth",
-                         "bear_margin", "base_margin", "bull_margin"]
+                         "bear_margin", "base_margin", "bull_margin"],
+                         # Every parameter here is a term in an arithmetic
+                         # expression, so one dropped silently changes the
+                         # number without changing its shape. `net_debt` was
+                         # accepted, never read, and the valuation came back
+                         # confident and wrong.
+                         "additionalProperties": False
           }
         ),
         Tool(
@@ -1390,7 +1734,13 @@ class Financial_Analysis:
             },
             "required": ["ticker", "entry_ev", "revenue_base", "ebitda_margin",
                          "capex_pct_revenue", "depreciation", "tax_rate",
-                         "revenue_growth", "debt_interest_rate", "leverage_turns", "exit_multiple"]
+                         "revenue_growth", "debt_interest_rate", "leverage_turns", "exit_multiple"],
+                         # Every parameter here is a term in an arithmetic
+                         # expression, so one dropped silently changes the
+                         # number without changing its shape. `net_debt` was
+                         # accepted, never read, and the valuation came back
+                         # confident and wrong.
+                         "additionalProperties": False
           }
         ),
         Tool(
@@ -1410,7 +1760,13 @@ class Financial_Analysis:
               "market_cap": {"type": "number", "description": "Market cap in dollars (for FCF yield)"}
             },
             "required": ["ticker", "total_debt", "cash", "ebitda",
-                         "interest_expense", "depreciation_abs", "capex_abs", "tax_rate"]
+                         "interest_expense", "depreciation_abs", "capex_abs", "tax_rate"],
+                         # Every parameter here is a term in an arithmetic
+                         # expression, so one dropped silently changes the
+                         # number without changing its shape. `net_debt` was
+                         # accepted, never read, and the valuation came back
+                         # confident and wrong.
+                         "additionalProperties": False
           }
         ),
         Tool(
@@ -1429,7 +1785,13 @@ class Financial_Analysis:
               "shares_repurchased": {"type": "number", "description": "Share repurchases from CF statement (negative = outflow)"},
               "shares_outstanding": {"type": "number", "description": "Total shares outstanding"}
             },
-            "required": ["ticker", "market_cap", "ebitda", "capex_abs", "tax_rate", "depreciation_abs"]
+            "required": ["ticker", "market_cap", "ebitda", "capex_abs", "tax_rate", "depreciation_abs"],
+            # Every parameter here is a term in an arithmetic
+            # expression, so one dropped silently changes the
+            # number without changing its shape. `net_debt` was
+            # accepted, never read, and the valuation came back
+            # confident and wrong.
+            "additionalProperties": False
           }
         ),
         Tool(
@@ -1442,7 +1804,15 @@ class Financial_Analysis:
             "adjusting produces an answer wrong by an order of magnitude, and "
             "nothing in the raw data signals the error.\n\n"
             "'latest_split_ratio' is null when no split falls in the window -- "
-            "never 1.0, which would imply a split occurred that changed nothing."
+            "never 1.0, which would imply a split occurred that changed nothing.\n\n"
+            "Dividend basis: the provider restates every historical dividend into "
+            "today's share units, so AAPL's 2020-08-07 payment reads 0.205 against "
+            "an as-declared $0.82. 'amount' is that restated figure and pairs with "
+            "a split-adjusted share count; 'amount_as_declared' is what the company "
+            "declared and pairs with the as-filed cover-page count from the same "
+            "quarter. Mixing them is out by the split ratio, and in the opposite "
+            "direction to get_price_history, whose closes are back-adjusted the "
+            "other way."
           ),
           inputSchema={
             "type": "object",
@@ -1456,6 +1826,84 @@ class Financial_Analysis:
       ]
 
     @self.server.call_tool()
+    @annotating(
+      "Yahoo Finance (yfinance)",
+      per_tool={
+        # These compute from inputs the caller supplies rather than reading an
+        # upstream, so naming a data provider would misattribute the number.
+        "calculate_dcf": "Nemo (computed)",
+        "calculate_scenario_dcf": "Nemo (computed)",
+        "calculate_wacc": "Nemo (computed)",
+        "calculate_lbo": "Nemo (computed)",
+        "calculate_credit_profile": "Nemo (computed)",
+        "calculate_capital_returns": "Nemo (computed)",
+        "comparable_company_analysis": "Nemo (computed)",
+        "backtest_signal": "Nemo (computed)",
+        "get_historical_analogue": "Nemo (curated)",
+        # Both said "SEC EDGAR" and both read yfinance. corporate_actions.py
+        # calls yf.Ticker(symbol); get_institutional_holdings reads
+        # yf.Ticker(ticker).major_holders. The response shapes agree
+        # independently -- tz-aware timestamps and split-adjusted dividends,
+        # neither of which EDGAR publishes.
+        #
+        # Stated explicitly rather than left to the module default so
+        # re-adding EDGAR is a deliberate act. The harm was never only
+        # attribution: get_share_count_series.split_adjustment.source says
+        # "yfinance", so a caller cross-checking a split ratio between the two
+        # believed two independent providers agreed. They had one source read
+        # twice, and the EDGAR label is what sold it.
+        "extract_13f_holdings": "Yahoo Finance (yfinance)",
+        "get_corporate_actions": "Yahoo Finance (yfinance)",
+        "analyze_exposures": "Nemo book state",
+        "record_thesis_evolution": "Nemo book state",
+        "get_thesis_evolution": "Nemo book state",
+      },
+warnings_per_tool={
+        # Sourced from the repository's own documentation. See the sec server
+        # for why nothing unsourced is added here.
+        "get_short_interest": [
+          warning("stale_by_design",
+                  "Exchange short interest is published on a lag and is "
+                  "normally 2-3 weeks old. There is no live alternative "
+                  "configured."),
+        ],
+        "get_options_metrics": [
+          warning("stale_after_hours",
+                  "Options quotes can be stale outside market hours, and "
+                  "illiquid strikes can yield invalid implied-volatility "
+                  "values."),
+        ],
+        "get_corporate_actions": [
+          warning("not_an_independent_source",
+                  "Dividends and splits here are yfinance's, not EDGAR's. "
+                  "get_share_count_series.split_adjustment reads the same "
+                  "upstream -- its own `source` field says \"yfinance\" -- so "
+                  "a split ratio agreeing across the two is one source read "
+                  "twice, not two providers corroborating. For independent "
+                  "confirmation read the filing (get_latest_filing, "
+                  "extract_8k_events)."),
+        ],
+        "extract_13f_holdings": [
+          warning("aggregator_not_the_filing",
+                  "Holdings come from Yahoo's aggregation of SEC 13F-HR and "
+                  "NPORT-P filings, not from EDGAR. Yahoo decides the "
+                  "as-of quarter, which managers it carries and how it "
+                  "reconciles amendments, and none of that is stated in the "
+                  "response. For the filings themselves use the SEC tools "
+                  "(get_fund_holdings, compare_fund_holdings)."),
+        ],
+        "get_market_data": [
+          warning("not_execution_grade",
+                  "yfinance is convenient for research and is not a "
+                  "consolidated execution-grade market-data feed. Do not use "
+                  "it to price a trade."),
+        ],
+        "get_price_history": [
+          warning("not_execution_grade",
+                  "yfinance is convenient for research and is not a "
+                  "consolidated execution-grade market-data feed."),
+        ],
+      })
     async def call_tool(name: str, args: Dict[str, Any]) -> List[TextContent]:
       try:
         if name == "get_corporate_actions":
@@ -1532,8 +1980,21 @@ class Financial_Analysis:
     return [TextContent(type="text", text=json.dumps(_to_native(result), default=str))]
 
   async def get_options_metrics(self, ticker: str) -> List[TextContent]:
+    """Options-market signals, audited before they are served.
+
+    yfinance answers an illiquid chain with numbers shaped like answers.
+    DLNG, live 2026-08-26: an atm_put_iv of 4.0391 beside an atm_call_iv of
+    0.875 on the same strike, and an implied_move that was a bare
+    `{"error": ...}` where every other ticker has a numeric dict -- all under
+    `success: true` and `data_quality: {"iv_status": "ok", "notes": []}`.
+
+    The audit is a pure function of the payload (options_quality) so it can
+    be calibrated against captured responses rather than a live chain.
+    """
     result = await asyncio.to_thread(get_options_metrics, ticker)
-    return [TextContent(type="text", text=json.dumps(_to_native(result), default=str))]
+    return [TextContent(type="text",
+                        text=json.dumps(_to_native(audit_options_metrics(result)),
+                                        default=str))]
 
   async def get_short_interest(self, ticker: str) -> List[TextContent]:
     result = await asyncio.to_thread(get_short_interest, ticker)
@@ -1590,6 +2051,9 @@ class Financial_Analysis:
       )
       return {
         'ticker': r.ticker, 'signal_name': r.signal_name,
+        # Both halves, side by side: date_range alone gave a reader nothing to
+        # check the window against, so a clamped one read as the one requested.
+        'requested_range': r.requested_range,
         'date_range': r.date_range,
         'n_trades': r.n_trades, 'hit_rate_pct': r.hit_rate,
         'mean_return_pct': r.mean_return, 'median_return_pct': r.median_return,
@@ -1597,7 +2061,11 @@ class Financial_Analysis:
         'mean_hold_days': r.mean_hold_days,
         'max_drawdown_pct_in_any_trade': r.max_drawdown_pct,
         'sharpe_simple_annualized': r.sharpe_simple,
+        # `warning` means the backtest did not run, and `success` is derived
+        # from it. `caveats` means it ran and the numbers need reading in
+        # context -- a short sample, or a window the data could not cover.
         'warning': r.warning,
+        'caveats': r.caveats,
         'sample_trades': [{
           'entry_date': t.entry_date, 'exit_date': t.exit_date,
           'entry_price': t.entry_price, 'exit_price': t.exit_price,
@@ -1610,7 +2078,8 @@ class Financial_Analysis:
     return [TextContent(type="text", text=json.dumps(_to_native(result), default=str))]
 
   async def record_thesis_evolution(self, thesis_id: int, observation: str, conviction_delta: float, tag = None) -> List[TextContent]:
-    from state.theses import record_thesis_evolution as _rec, get_thesis
+    from state.theses import (record_thesis_evolution as _rec, get_thesis,
+                              ThesisNotFound)
     try:
       eid = await asyncio.to_thread(_rec, thesis_id, observation, float(conviction_delta), tag)
       th = await asyncio.to_thread(get_thesis, thesis_id)
@@ -1620,39 +2089,93 @@ class Financial_Analysis:
         "thesis_id": thesis_id,
         "new_conviction": th['confidence'] if th else None,
       }
+    except ThesisNotFound as missing:
+      # A known condition, so it reads as a decision rather than as a crash.
+      # The exception class stays out of the response: it names the process
+      # that failed, not the request that could not be answered.
+      result = {"success": False, "thesis_id": thesis_id, "error": str(missing)}
     except Exception as e:
-      result = {"success": False, "error": f"{type(e).__name__}: {e}"}
+      # Anything unrecognised keeps its class. This is not a condition we
+      # modelled, and hiding what it was behind prose would cost the only
+      # diagnostic there is.
+      result = {"success": False, "thesis_id": thesis_id,
+                "error": f"record_thesis_evolution failed: {type(e).__name__}: {e}"}
     return [TextContent(type="text", text=json.dumps(_to_native(result), default=str))]
 
   async def get_thesis_evolution(self, thesis_id: int) -> List[TextContent]:
-    from state.theses import get_thesis_evolution as _get, get_thesis
+    """The reflexivity trace for one thesis, or a refusal naming what is missing.
+
+    `ticker: null, current_conviction: null, evolution_count: 0` used to be
+    the answer for a thesis the book has never held -- and it is exactly the
+    answer for a real thesis awaiting its first check-in, so no caller could
+    tell a missing thesis from an untouched one. The write path already knew
+    the difference and raised; the read path reported the null row.
+
+    An empty book is still an empty book: a data-source host holds no theses
+    and `analyze_exposures` there answers empty and successful, which stays
+    true. Asking for one *named* thesis it does not hold is a different
+    question, and the honest answer to that is the same on either host.
+    """
+    from state.theses import (get_thesis_evolution as _get, get_thesis,
+                              ThesisNotFound)
     try:
-      log = await asyncio.to_thread(_get, thesis_id)
       th = await asyncio.to_thread(get_thesis, thesis_id)
+      if th is None:
+        raise ThesisNotFound(thesis_id)
+      log = await asyncio.to_thread(_get, thesis_id)
       result = {
         "success": True,
         "thesis_id": thesis_id,
-        "ticker": th['ticker'] if th else None,
-        "current_conviction": th['confidence'] if th else None,
-        "falsifiers": th.get('falsifiers') if th else None,
-        "variant_perception": th.get('variant_perception') if th else None,
+        "ticker": th['ticker'],
+        "current_conviction": th['confidence'],
+        "falsifiers": th.get('falsifiers'),
+        "variant_perception": th.get('variant_perception'),
         "evolution_count": len(log),
         "evolution": log,
       }
+    except ThesisNotFound as missing:
+      # No evolution_count and no evolution list: both are measurements over
+      # rows, and there were no rows to measure because there is no thesis.
+      result = {"success": False, "thesis_id": thesis_id, "error": str(missing)}
     except Exception as e:
-      result = {"success": False, "error": f"{type(e).__name__}: {e}"}
+      result = {"success": False, "thesis_id": thesis_id,
+                "error": f"get_thesis_evolution failed: {type(e).__name__}: {e}"}
     return [TextContent(type="text", text=json.dumps(_to_native(result), default=str))]
 
   async def comparable_company_analysis(self, comparables: List[str]) -> List[TextContent]:
     tasks = [asyncio.to_thread(get_data, ticker) for ticker in comparables]
     data = await asyncio.gather(*tasks)
+
+    def _reason(peer: dict, metric: str) -> Optional[str]:
+      """Why this peer contributes no `metric`, in its own terms.
+
+      `get_market_data` now refuses a symbol it could not resolve and records
+      the input behind every suppressed multiple, so the cause of each
+      exclusion is available here. It used to be discarded at this boundary
+      and replaced downstream by one fixed sentence covering all of them --
+      a symbol that is not a company was folded into `excluded_absent` with
+      no mention that the lookup had failed at all.
+      """
+      if peer.get('success') is False:
+        return peer.get('error')
+      detail = peer.get('multiples_suppressed_detail') or {}
+      return detail.get(metric) or peer.get('multiples_suppressed_reason')
+
+    def _block(metric: str) -> dict:
+      return _to_native(peer_distribution(
+          [d.get(metric) for d in data],
+          tickers=[d.get('ticker') or t for d, t in zip(data, comparables)],
+          reasons={(d.get('ticker') or t): _reason(d, metric)
+                   for d, t in zip(data, comparables)},
+      ))
+
     result = {
       'comparables': comparables,
-      'pe_ratio': _to_native(calculate_percentiles(data, 'pe_ratio')),
-      'pb_data': _to_native(calculate_percentiles(data, 'pb_ratio')),
-      'ev_revenue_data': _to_native(calculate_percentiles(data, 'ev_revenue')),
-      'ev_ebitda_data': _to_native(calculate_percentiles(data, 'ev_ebitda')),
-      'ev_ebit_data': _to_native(calculate_percentiles(data, 'ev_ebit')),
+      'pe_ratio': _block('pe_ratio'),
+      'pb_data': _block('pb_ratio'),
+      'ev_revenue_data': _block('ev_revenue'),
+      'ev_ebitda_data': _block('ev_ebitda'),
+      'ev_ebit_data': _block('ev_ebit'),
     }
     return [TextContent(type="text", text=json.dumps(result))]
 

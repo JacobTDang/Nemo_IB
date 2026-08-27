@@ -28,9 +28,9 @@ filings do not support it. Three findings from probing 24 large caps:
    fiscal-offset filers. That is a fuzzy join stacked on a fuzzy extraction.
 
 3. Plenty of guidance is never filed at all. Microsoft and Apple give theirs
-   on the call, and `get_earnings_transcripts` returns 8-K press releases
-   rather than transcripts (known issue). Absence from this corpus is not
-   absence of guidance.
+   on the call, and `get_earnings_releases` returns the 8-K press release --
+   prepared remarks with no analyst Q&A, because the Q&A is never filed with
+   the SEC. Absence from this corpus is not absence of guidance.
 
 So this returns the sentence as filed, with the filing it came from, and
 lets the caller read it. A verdict the data cannot support is worse than no

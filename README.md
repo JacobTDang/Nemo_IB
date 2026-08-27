@@ -1,255 +1,197 @@
 # Nemo_IB
 
-A personal investment-banking research system that runs in two modes:
+MCP servers that aggregate company, market, macro and alternative financial data
+from primary sources, served over streamable HTTP for any MCP client.
 
-1. **Claude Code analyst mode** (primary) — Claude orchestrates 15 skills
-   and 76 MCP tools to drive a full equity-research workflow: thesis →
-   valuation → scenarios → red-team → portfolio fit → kill-switch.
-2. **LangGraph workflow** (fallback) — deterministic hub-and-spoke
-   pipeline with specialized Ollama agents for probing, planning,
-   execution, modeling, analysis.
+Five servers ship in the homelab image and declare **96 tools** between them.
+Every count on this page is measured against a running instance rather than
+maintained by hand.
 
-Paper-trading rail via Alpaca (gated by a deterministic Risk_Officer at
-0.65 confidence threshold). Real-money trading is not supported by
-construction.
+| Server | Tools | Reads from | Needs |
+|---|---:|---|---|
+| `sec` | 48 | SEC EDGAR (XBRL, filing text) | `SEC_EMAIL` |
+| `financial` | 20 | yfinance, local valuation models | — |
+| `finnhub` | 14 | Finnhub | `FINNHUB_API_KEY` |
+| `fred` | 5 | FRED | `FRED_API_KEY` |
+| `altdata` | 9 | House Clerk, Senate eFD, USAspending, GovTrack, ATS boards, FinMind | `SEC_EMAIL` |
 
-## Quick start
+Three further servers exist in the repo and are **deliberately excluded from the
+image** — `alpaca` (6 tools, places orders), `excel` (3), `sentry` (19, reads
+book state). A data-source host holds no positions and should not be able to
+trade, so shipping them would mean "trading tools nobody happens to start".
 
-If Docker Desktop is installed, double-click **`nemo.bat`** at the
-project root. The launcher:
+## What these are for
 
-1. Starts Docker Desktop if not running (~30s first time)
-2. Brings up the SearxNG container and waits for `/healthz` to return
-   200 (~5–15s)
-3. Launches Claude Code in this project directory with
-   `--dangerously-skip-permissions --remote-control --dangerously-load-development-channels server:slack`
+Answering questions about companies from the filings themselves rather than from
+a summary of them. The design rule throughout is that **a tool must never state
+something about a company that it did not read**:
 
-Once Claude Code starts, run `/check-nemo-health` to confirm all 5
-MCP servers + the SearxNG container respond, then ask a question or
-invoke a skill (e.g., `/equity-deep-research MSFT`).
+- A fetch that fails says so. It never reports an outage as "this filer does not
+  disclose it", which is the one answer worse than an error.
+- Amounts that the source publishes as ranges stay ranges. Congressional
+  disclosures carry `amount_min` and `amount_max` and no midpoint, because the
+  filings contain none.
+- Coverage travels with the answer. An empty result from a partially-ingested
+  store is a gap, not a finding, and says which it is.
+- A concept the filer does not tag produces a refusal naming what was looked
+  for, not a plausible substitute. `get_ebitda_margin("GS")` explains why EBITDA
+  is meaningless for a bank instead of returning a number.
 
-## Setup
-
-### 1. Clone + Python deps
-
-```bash
-git clone https://github.com/JacobTDang/Nemo_IB
-cd Nemo_IB
-python -m venv .venv
-.\.venv\Scripts\activate.bat
-pip install -r requirements.txt
-crawl4ai-setup
-```
-
-`crawl4ai-setup` downloads a headless Chromium (~300 MB) used as a
-fallback scraper when Trafilatura can't extract a JS-rendered page.
-
-### 2. Environment variables
-
-Copy `.env.example` to `.env` and fill in:
-
-- `FINNHUB_API_KEY` — market intel (free tier is sufficient)
-- `FRED_API_KEY` — macro data
-- `ALPACA_PAPER_API_KEY` + `ALPACA_PAPER_SECRET_KEY` — paper broker
-- `OPENROUTER_API_KEY` — only needed for the LangGraph fallback mode
-- `SEC_EMAIL` — used as User-Agent for SEC EDGAR (rate-limit friendly)
-
-### 3. SearxNG (web search backend)
+## Running them
 
 ```bash
-docker compose up -d searxng
+cd deploy
+NEMO_MCP_TOKEN=$(openssl rand -hex 32) docker compose up -d
 ```
 
-Aggregates Google + Bing + Brave + DuckDuckGo + Startpage in one query.
-No API keys needed. The launcher (`nemo.bat`) handles this automatically;
-this step is only for manual setup or if you don't use the launcher.
+Ports publish on `127.0.0.1` unless `NEMO_BIND_ADDR` says otherwise, so a
+missing variable fails closed rather than exposing five servers to the LAN. On a
+homelab, set it to the machine's Tailscale address. Full deployment notes,
+authentication, log retention and the blockers a green test suite does not
+catch: [`deploy/README.md`](deploy/README.md).
 
-### 4. Register MCP servers with Claude Code
-
-The project ships 5 stdio MCP servers. Register them at user scope:
+## Registering with an MCP client
 
 ```bash
-PY="C:\path\to\Nemo_IB\.venv\Scripts\python.exe"
-PP="C:\path\to\Nemo_IB"
-claude mcp add -s user nemo_web        -e PYTHONPATH=$PP -- "$PY" -m tools.web_search_server.web_search server
-claude mcp add -s user nemo_financial  -e PYTHONPATH=$PP -- "$PY" -m tools.financial_modeling_engine.analysis_tools server
-claude mcp add -s user nemo_finnhub    -e PYTHONPATH=$PP -- "$PY" -m tools.news_agregator.finnhub_server server
-claude mcp add -s user nemo_fred       -e PYTHONPATH=$PP -- "$PY" -m tools.news_agregator.fred_server server
-claude mcp add -s user nemo_alpaca     -e PYTHONPATH=$PP -- "$PY" -m tools.alpaca.server server
+claude mcp add --transport http nemo-sec       http://127.0.0.1:8810/mcp/ --header "Authorization: Bearer $NEMO_MCP_TOKEN"
+claude mcp add --transport http nemo-financial http://127.0.0.1:8811/mcp/ --header "Authorization: Bearer $NEMO_MCP_TOKEN"
+claude mcp add --transport http nemo-finnhub   http://127.0.0.1:8812/mcp/ --header "Authorization: Bearer $NEMO_MCP_TOKEN"
+claude mcp add --transport http nemo-fred      http://127.0.0.1:8813/mcp/ --header "Authorization: Bearer $NEMO_MCP_TOKEN"
+claude mcp add --transport http nemo-altdata   http://127.0.0.1:8814/mcp/ --header "Authorization: Bearer $NEMO_MCP_TOKEN"
 ```
 
-Verify with `claude mcp list` — all five should show `✓ Connected`.
+The trailing slash on `/mcp/` matters: without it the server answers `307` and
+some clients drop the `Authorization` header across the redirect.
 
-## Skills catalog
+`stdio` still works for local use — `python -m tools.web_search_server.web_search`
+with no argument — but HTTP is what the image serves.
 
-15 skills shipped under `.claude/skills/`. The core skill orchestrates;
-the rest are companion or supporting skills.
+## The tools
 
-### Core
+### `sec` — 48 tools, SEC EDGAR
 
-| Skill | Purpose |
-|---|---|
-| `/equity-deep-research` | 19-step research workflow producing a falsifiable thesis with valuation, expectations, catalysts, risk/reward, positioning, scenarios, and cross-company read-throughs. |
+Financial statements, filing text, ownership and structure, read from XBRL and
+filing documents.
 
-### Companions (callable from core or standalone)
+**Statements and metrics.** `get_revenue_base` `get_annual_revenue`
+`get_ebitda_margin` `get_margin_breakdown` `get_capex_pct_revenue` `get_tax_rate`
+`get_depreciation` `get_historical_fcf` `get_working_capital`
+`get_working_capital_trends` `get_accruals_quality` `get_operating_leases`
+`get_debt_maturity_schedule` `get_sbc_series` `track_segment_growth`
+`get_segment_financials` `get_geographic_revenue` `get_contracted_revenue`
 
-| Skill | What it answers |
-|---|---|
-| `/valuation-check` | Is this priced in? Peer + history multiples + reverse DCF. |
-| `/scenario-builder` | What's the upside/downside? Bear/base/bull math with probability-weighted E[return]. |
-| `/red-team-thesis` | Attack the thesis. Recommend keep / reduce confidence / reduce size / no_position. |
-| `/cross-company-readthrough` | Given an event at A, who else moves? First and second-order beneficiaries/losers. |
-| `/portfolio-fit` | Does this position fit the book? Sector + factor + theme overlap check. |
-| `/factor-exposure-check` | Is this stock-specific alpha or disguised factor beta? |
-| `/estimate-revision-watch` | Will sell-side analysts revise numbers based on this signal? |
-| `/expectations-hurdle-check` | What does the buyside whisper imply vs published consensus? |
-| `/thesis-kill-switch` | Did any falsifier trigger? Recommend continue / monitor / reduce / exit. |
-| `/signal-backtest` | Did this pattern historically work? Hit rate, sharpe, holding period. |
-| `/post-mortem-attribution` | Quantitative return decomposition after a position closes — was it alpha or beta? |
+**Filing text.** `extract_mda` `extract_risk_factors` `extract_forward_signals`
+`extract_guidance` `extract_litigation` `extract_customer_concentration`
+`extract_8k_events` `extract_proxy_compensation` `extract_governance_data`
+`extract_disclosure_data` `get_disclosures_names` `diff_10k`
+`get_earnings_releases` `extract_earnings_release_sentiment`
 
-### Supporting
+**Ownership and structure.** `get_share_count_series` `get_buyback_history`
+`get_shelf_activity` `get_public_float` `get_schedule_13d_filings`
+`get_fund_holdings` `compare_fund_holdings` `list_known_funds`
 
-| Skill | Purpose |
-|---|---|
-| `/premortem` | Before sizing, write 3 explicit failure scenarios. |
-| `/postmortem` | After a position closes, capture the lesson into `knowledge/analogues.md`. |
-| `/check-nemo-health` | Verify all 5 MCP servers + SearxNG respond; auto-poll if anything is down. |
+**Company lookup.** `get_latest_filing` `get_company_filings_history`
+`get_sic_code` `find_peers_by_sic` `get_foreign_filer_profile`
+`get_supply_chain` `get_patent_filings` `get_urls_content`
 
-## MCP server inventory
+Foreign private issuers are handled explicitly: asking for a 10-K on a 20-F
+filer returns which form it actually files, rather than an empty result. Values
+carry their reporting currency — TSM reports in TWD, and a P/E built on a USD
+price and TWD earnings is wrong by ~30x.
 
-5 stdio servers exposing 76 tools total.
+Two further tools, `rag_search` and `rag_ingest`, are declared but hidden unless
+the RAG stack is present, which it is not in the image. That is why the server
+declares 50 and serves 48.
 
-| Server | Tools | Purpose |
-|---|---|---|
-| `nemo_web` | 34 | SEC EDGAR extractors (XBRL + filing parsers), SearxNG search, Trafilatura scraper, RAG vector search via sqlite-vec |
-| `nemo_financial` | 18 | yfinance market data, DCF/WACC/LBO/scenario calculations, 13F holdings, options metrics, price history, exposure analyzer, backtest engine, thesis evolution |
-| `nemo_finnhub` | 13 | Market intel — news, insider transactions, analyst revisions, earnings surprises, forward estimates |
-| `nemo_fred` | 5 | Macro data — treasury yields, credit spreads, macro snapshot |
-| `nemo_alpaca` | 6 | Paper broker — positions, orders (gated by Risk_Officer), risk_check_proposed_trade |
+### `financial` — 20 tools, market data and valuation
 
-## RAG memory layer
+`get_market_data` `get_price_history` `get_options_metrics` `get_short_interest`
+`get_trading_metrics` `get_industry_etfs` `get_corporate_actions`
+`extract_13f_holdings` `comparable_company_analysis` `calculate_dcf`
+`calculate_scenario_dcf` `calculate_wacc` `calculate_lbo`
+`calculate_credit_profile` `calculate_capital_returns` `get_historical_analogue`
+`backtest_signal` `analyze_exposures` `record_thesis_evolution`
+`get_thesis_evolution`
 
-Located in `agent/rag/` with persistence in `db_cache/session.db` via
-sqlite-vec. Stores chunks of analyst writeups, historical analogues,
-extracted 10-K sections, hedge fund letters, and forward-signal
-excerpts. Two MCP tools: `rag_search` (semantic retrieval) and
-`rag_ingest` (manual push). The corpus auto-grows as extractors run.
+The calculators refuse structures they cannot model rather than returning a
+number: an LBO whose debt exceeds the purchase price is unfinanceable, and
+saying so beats reporting the 40x MOIC that sizing produces.
 
-Embedder is sentence-transformers/all-MiniLM-L6-v2 (~80MB, 384-dim).
-Loads in the background at `nemo_web` startup; first `rag_search` is
-served in ~800ms (model already hot).
+`analyze_exposures` and `get_thesis_evolution` read book state, which a
+data-source host does not have. `analyze_exposures` returns an empty book rather
+than failing, because empty is the truthful answer there. `get_thesis_evolution`
+asks about one named thesis, so on a book holding no such thesis it refuses --
+the same answer on either host. A null row there would be byte-for-byte what a
+real thesis awaiting its first check-in returns.
 
-Bootstrap the corpus once:
+### `finnhub` — 14 tools, news, estimates, insiders
+
+`get_company_news` `get_market_news` `get_company_profile` `get_company_peers`
+`get_basic_financials` `get_financial_statements` `get_earnings_calendar`
+`get_earnings_surprises` `get_forward_estimates` `get_analyst_recommendations`
+`get_analyst_rating_trend` `get_ipo_calendar` `get_insider_transactions`
+`get_insider_sentiment`
+
+### `fred` — 5 tools, macro
+
+`get_macro_snapshot` `get_treasury_yields` `get_credit_spreads` `get_fred_series`
+`search_fred`
+
+Spreads reported alongside a curve are struck from that same curve, so the two
+always reconcile.
+
+### `altdata` — 9 tools, alternative data
+
+`get_taiwan_monthly_revenue` `get_job_postings_count` `get_government_contracts`
+`get_policy_signals` `get_capex_announcements` `get_congress_trades`
+`get_congress_holdings` `get_congress_leaderboard` `get_congress_coverage`
+
+**Congressional disclosures** are ingested rather than fetched per call: House
+Clerk PTRs (PDF) and Senate eFD filings are parsed once into SQLite, because a
+round trip plus a PDF parse per filing bought about twenty filings per call and
+made every answer partial.
+
 ```bash
-.\.venv\Scripts\python.exe scripts\bootstrap_rag_corpus.py
+docker compose run --rm congress-sync --house 2024 2025 2026 --senate --senate-annual
+docker compose run --rm congress-sync --status
 ```
 
-## LangGraph workflow (fallback mode)
+Safe to re-run and safe to cron; nothing already parsed is fetched twice. The
+store is on a named volume rather than the container's RAM-backed cache.
 
-Separate from the Claude Code skill flow. Hub-and-spoke graph in
-`agent/workflows/analysis_workflow.py` with specialized Ollama agents
-running locally. Entry: `python main.py`. See `CLAUDE.md` for the
-LangGraph architecture details.
+What it cannot tell you: these are **transactions and year-covering snapshots,
+not live positions**. Congress publishes no current holdings. Members file up to
+45 days after trading, annual reports arrive months after the year they cover,
+and roughly a third of holding rows are Excepted Investment Funds whose contents
+are legally not itemised. Filings that arrive as scans of paper cannot be parsed
+at all and are counted in `coverage` rather than dropped. Holdings are currently
+Senate-only.
 
 ## Tests
 
-### The two suite runs
-
 ```bash
-# Offline. No credentials, no containers, no network. Nothing here should fail.
-SKIP_NETWORK_TESTS=1 .venv/bin/python -m pytest testing/ -q
-
-# Strict. Everything gated must actually run and pass -- a gate that cannot
-# fail is not a gate, and "skipped" otherwise decays into "deleted".
-# Needs GROQ_API_KEY, OPENROUTER_API_KEY and SearXNG up (docker compose up -d searxng).
-NEMO_REQUIRE_SERVICES=1 .venv/bin/python -m pytest testing/ -q
+SKIP_NETWORK_TESTS=1 pytest testing/          # offline: no credentials, no network
+STRICT_GATES=1 pytest testing/                # everything gated must actually run
 ```
 
-Tests that reach a live service carry a gate from `testing/_gates.py`
-(`requires_groq`, `requires_openrouter`, `requires_searxng`, `requires_playbook`,
-`requires_sec`). Offline they skip with a reason naming exactly what is missing.
-Under `NEMO_REQUIRE_SERVICES=1` the same tests fail instead, so a
-fully-credentialled run proves they still work rather than merely still exist.
-Do not set both variables at once: an offline run cannot satisfy a strict one,
-and the gate says so rather than guessing.
+The offline run needs nothing and should never fail. The strict run turns a
+skipped gate into a failure, because a gate that cannot fail is not a gate and
+"skipped" otherwise decays into "deleted".
 
-Each test module gets its own SQLite database (`testing/conftest.py`). Modules
-used to share `db_cache/session.db` and read each other's rows.
+The deploy gate is `testing/test_http_transport.py`, which completes a real MCP
+handshake and one live tool call against each server. A health check only proves
+the port is bound; a server whose MCP layer failed still answers it.
 
-```bash
-# Phase D smoke tests for the 7 v2 skills (12 invocations, real ticker data)
-.\.venv\Scripts\python.exe testing\skill_smoke_2026_05_22.py
-
-# RAG retrieval stress test (curated Q&A, P@5/MRR/p95 latency)
-.\.venv\Scripts\python.exe testing\test_rag_heavy_stress.py
-
-# MCP tool health smoke test
-.\.venv\Scripts\python.exe testing\test_tool_health.py MSFT
-
-# Individual unit tests
-.\.venv\Scripts\python.exe testing\test_falsifier_evaluator.py
-.\.venv\Scripts\python.exe testing\test_backtest_engine.py
-.\.venv\Scripts\python.exe testing\test_forward_signals.py
-```
-
-Test fixtures and run artifacts live in `testing/fixtures/`
-(gitignored — large analyst writeups are kept out of git).
-
-## Project structure
+## Repository layout
 
 ```
-.claude/skills/         15 Claude Code skills (callable workflows)
-agent/                  agent base classes + RAG layer + analyzers + daemons
-agent/rag/              sqlite-vec + sentence-transformers RAG layer
-agent/workflows/        LangGraph fallback hub-and-spoke graph
-daemons/                edgar_firehose, falsifier_watcher, news_watcher
-db_cache/               local SQLite — theses, events, rag_chunks, positions
-knowledge/              analogues.md (historical pattern catalog)
-scripts/                bootstrap_rag_corpus, start_searxng, nemo-launch
-state/                  schema.py + theses/positions/events stores
-testing/                test suite + fixtures (fixtures/ gitignored)
-tools/alpaca/           paper broker MCP server + AsyncBroker
-tools/financial_modeling_engine/  DCF/LBO/comps/options MCP server
-tools/news_agregator/   finnhub + fred MCP servers
-tools/slack_channel/    slack DM bridge plugin
-tools/web_search_server/ SEC + SearxNG + RAG MCP server
-nemo.bat                Double-click launcher (Windows)
-```
-
-## Operating discipline
-
-- **Paper-only by construction.** Real-money endpoints are not wired
-  up. Don't try to add them.
-- **Risk_Officer gates every order.** Call
-  `risk_check_proposed_trade` before `place_paper_order`. The
-  server-side gate inside `place_paper_order` will reject anyway, but
-  bypassing is a discipline failure.
-- **No fabricated data.** Every numerical claim in a synthesis must
-  cite a tool that produced it. If a tool fails, log `data_gap` —
-  don't make up the number.
-- **Falsifiers are required** for any thesis. A thesis without
-  falsifiers can't be stopped out rationally; it's a faith claim.
-
-See `CLAUDE.md` for the full IB analyst playbook and operating
-constraints.
-
-## Useful commands
-
-```bash
-# Check that all MCP servers + SearxNG are healthy
-# (run from within Claude Code)
-/check-nemo-health
-
-# Full deep research on a ticker
-/equity-deep-research MSFT
-
-# Quick valuation check standalone
-/valuation-check NVDA
-
-# Pre-trade red-team
-/red-team-thesis EOSE
-
-# After a position closes
-/postmortem AMD
-/post-mortem-attribution AMD
+tools/
+  web_search_server/      SEC/EDGAR reads, filing text extraction
+  financial_modeling_engine/  market data, DCF/LBO/WACC, backtests
+  news_agregator/         Finnhub and FRED
+  altdata_server/         congressional disclosures, job boards, contracts, policy
+  alpaca/ excel_server/ sentry_server/   not shipped in the image
+  mcp_http.py             shared streamable-HTTP transport, bearer auth
+deploy/                   compose stack, deployment and auth notes
+testing/                  offline suite plus gated live suites
 ```

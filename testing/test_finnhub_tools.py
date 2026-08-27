@@ -1,26 +1,36 @@
-"""
-Standalone test for the Finnhub MCP server.
-Spins up the server via MCPConnectionManager, calls each tool with AAPL,
-and verifies the envelope structure.
+"""Integration test for the Finnhub MCP server.
+
+Spins the server up over stdio via MCPConnectionManager, calls each of the 7
+tools with AAPL, and verifies the envelope shape plus the per-tool condensing
+contract (article caps, slimmed fields, condensed dicts).
+
+This was a script whose helpers happened to be named test_*, so pytest tried
+to resolve `result` and `tool_name` as fixtures and errored at collection --
+the live Finnhub pipeline had no real coverage. It is now a real test, gated
+on FINNHUB_API_KEY and skipped on SKIP_NETWORK_TESTS=1 because it spawns MCP
+subprocesses and calls the live API.
 
 Usage: python -m testing.test_finnhub_tools
 """
 import asyncio
+import os
 import sys
 import json
 from datetime import datetime, timedelta
 
-# Add project root to path
-sys.path.insert(0, ".")
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agent.MCP_manager import MCPConnectionManager
+from testing._gates import requires_finnhub
 
 
 SHOW_ENVELOPES = True  # Set to False to hide full JSON dumps
 
 
-async def test_envelope(result: dict, tool_name: str):
-  """Verify the standard envelope shape."""
+def _assert_envelope(result: dict, tool_name: str):
+  """Verify the standard envelope shape. Returns False for an error payload."""
   assert result.get("domain") == "market_intel", f"{tool_name}: missing domain"
   assert "ticker" in result, f"{tool_name}: missing ticker"
   assert "timestamp" in result, f"{tool_name}: missing timestamp"
@@ -42,7 +52,15 @@ def dump_envelope(result: dict, tool_name: str):
   print(f"  --- end {tool_name} ---\n")
 
 
-async def main():
+@pytest.mark.network
+@requires_finnhub
+async def test_all_finnhub_tools_return_valid_envelopes():
+  """Every Finnhub tool must answer with a well-formed, condensed envelope."""
+  failed = await _exercise_all_tools()
+  assert failed == 0, f"{failed} Finnhub tool(s) returned an error envelope"
+
+
+async def _exercise_all_tools():
   ticker = "AAPL"
   today = datetime.now().strftime("%Y-%m-%d")
   thirty_days_ago = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
@@ -68,7 +86,7 @@ async def main():
     result = await mcp.call_tool("get_company_news", {
       "ticker": ticker, "from_date": thirty_days_ago, "to_date": today
     })
-    if await test_envelope(result, "get_company_news"):
+    if _assert_envelope(result, "get_company_news"):
       articles = result["data"]
       if isinstance(articles, list):
         assert len(articles) <= 20, f"Expected <= 20 articles, got {len(articles)}"
@@ -90,7 +108,7 @@ async def main():
     # Test 2: get_market_news (slimmed articles)
     print("Testing get_market_news...")
     result = await mcp.call_tool("get_market_news", {"category": "general"})
-    if await test_envelope(result, "get_market_news"):
+    if _assert_envelope(result, "get_market_news"):
       articles = result["data"]
       if isinstance(articles, list):
         assert len(articles) <= 20, f"Expected <= 20 articles, got {len(articles)}"
@@ -108,7 +126,7 @@ async def main():
     # Test 3: get_insider_transactions (condensed)
     print("Testing get_insider_transactions...")
     result = await mcp.call_tool("get_insider_transactions", {"ticker": ticker})
-    if await test_envelope(result, "get_insider_transactions"):
+    if _assert_envelope(result, "get_insider_transactions"):
       data = result["data"]
       assert isinstance(data, dict), f"Expected condensed dict, got {type(data)}"
       # Verify condensed structure
@@ -118,15 +136,25 @@ async def main():
       assert data["signal"] in ("net_buying", "net_selling", "neutral"), f"Bad signal: {data['signal']}"
       assert isinstance(data["top_insiders"], list), "top_insiders should be a list"
       assert len(data["top_insiders"]) <= 5, "top_insiders should be capped at 5"
-      # Verify recency buckets have expected keys
+      # Verify recency buckets have expected keys. A bucket is None when
+      # Finnhub's feed stops before the window opens -- AMAT's stopped 56
+      # days short of "the last 30 days" on 2026-08-26 -- so the shape is
+      # asserted on the buckets that exist, and the covered window with it.
       for bucket in ["recent_30d", "recent_90d"]:
-        for k in ["bought", "sold", "net"]:
+        assert bucket in data, f"Missing bucket: {bucket}"
+        if data[bucket] is None:
+          continue
+        for k in ["bought", "sold", "net", "window"]:
           assert k in data[bucket], f"Missing {k} in {bucket}"
       print(f"  OK: condensed insider data")
       print(f"    signal={data['signal']}, net_shares={data['net_shares']:,}")
       print(f"    buys={data['buy_count']}, sells={data['sell_count']}")
       print(f"    top_insiders: {[i['name'] for i in data['top_insiders']]}")
-      print(f"    30d net={data['recent_30d']['net']:,}, 90d net={data['recent_90d']['net']:,}")
+      print(f"    as_of={data['as_of']}, feed lags {data['data_lag_days']} days")
+      for bucket in ["recent_30d", "recent_90d"]:
+        held = data[bucket]
+        print(f"    {bucket}: " + (f"net={held['net']:,} over {held['window']}"
+                                   if held else "not covered by the feed"))
       dump_envelope(result, "get_insider_transactions")
       passed += 1
     else:
@@ -137,7 +165,7 @@ async def main():
     result = await mcp.call_tool("get_earnings_calendar", {
       "from_date": today, "to_date": seven_days_out
     })
-    if await test_envelope(result, "get_earnings_calendar"):
+    if _assert_envelope(result, "get_earnings_calendar"):
       data = result["data"]
       assert isinstance(data, dict), f"Expected condensed dict, got {type(data)}"
       for key in ["total_companies", "by_date", "events"]:
@@ -157,7 +185,7 @@ async def main():
     # Test 5: get_analyst_recommendations (condensed)
     print("Testing get_analyst_recommendations...")
     result = await mcp.call_tool("get_analyst_recommendations", {"ticker": ticker})
-    if await test_envelope(result, "get_analyst_recommendations"):
+    if _assert_envelope(result, "get_analyst_recommendations"):
       data = result["data"]
       assert isinstance(data, dict), f"Expected condensed dict, got {type(data)}"
       for key in ["latest", "prior", "consensus", "trend", "total_analysts"]:
@@ -183,7 +211,7 @@ async def main():
     # Test 6: get_company_peers (unchanged)
     print("Testing get_company_peers...")
     result = await mcp.call_tool("get_company_peers", {"ticker": ticker})
-    if await test_envelope(result, "get_company_peers"):
+    if _assert_envelope(result, "get_company_peers"):
       peers = result["data"]
       print(f"  OK: peers = {peers if isinstance(peers, list) else 'N/A'}")
       dump_envelope(result, "get_company_peers")
@@ -194,7 +222,7 @@ async def main():
     # Test 7: get_basic_financials (condensed to IB-essential metrics)
     print("Testing get_basic_financials...")
     result = await mcp.call_tool("get_basic_financials", {"ticker": ticker})
-    if await test_envelope(result, "get_basic_financials"):
+    if _assert_envelope(result, "get_basic_financials"):
       data = result["data"]
       assert isinstance(data, dict), f"Expected condensed dict, got {type(data)}"
       assert "metric" in data, "Missing metric key"
@@ -215,9 +243,8 @@ async def main():
   print(f"Results: {passed} passed, {failed} failed out of 7 tools")
   print(f"{'='*40}")
 
-  return failed == 0
+  return failed
 
 
 if __name__ == "__main__":
-  success = asyncio.run(main())
-  sys.exit(0 if success else 1)
+  sys.exit(0 if asyncio.run(_exercise_all_tools()) == 0 else 1)

@@ -126,16 +126,27 @@ def test_not_found_means_dead(monkeypatch):
 
 @pytest.mark.parametrize(
   "exc",
-  [
-    _http_error(RateLimitError, 429),
-    _http_error(AuthenticationError, 401),
-  ],
-  ids=["rate_limit", "auth"],
+  [_http_error(RateLimitError, 429)],
+  ids=["rate_limit"],
 )
 def test_transient_errors_still_count_as_alive(monkeypatch, exc):
-  """429/401 say nothing about whether the model exists — keep it in the pool."""
+  """A 429 says the model is known and busy, not absent — keep it in the pool."""
   monkeypatch.setattr(ort, "OpenAI", _client_raising(exc))
   assert ort._verify_model_alive("vendor/model:free", "fake-key") is True
+
+
+def test_a_rejected_credential_is_not_a_live_model(monkeypatch):
+  """401 used to be grouped with 429 as "says nothing about the model". It is
+  not the same: a rate limit is a fact about the model, while a rejected key
+  means the probe never reached one. Grouped together, a bad key marked every
+  candidate alive and the pool was assembled entirely out of 401s -- observed
+  live, a rejected key still logged "Pool initialized with 5 models" without
+  one of them having been reached."""
+  monkeypatch.setattr(
+    ort, "OpenAI", _client_raising(_http_error(AuthenticationError, 401))
+  )
+  with pytest.raises(ort.CredentialRejected):
+    ort._verify_model_alive("vendor/model:free", "fake-key")
 
 
 def test_successful_ping_is_alive(monkeypatch):

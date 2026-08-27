@@ -218,7 +218,7 @@ async def step2_vendor_calls() -> dict:
     for name, args in [
         ("get_basic_financials",         (TICKER,)),
         ("get_analyst_recommendations",  (TICKER,)),
-        ("get_analyst_revisions_history", (TICKER, 12)),
+        ("get_analyst_rating_trend", (TICKER, 12)),
         ("get_forward_estimates",        (TICKER,)),
     ]:
         method = getattr(fh, name)

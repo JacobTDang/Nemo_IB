@@ -60,7 +60,7 @@ ticker + 4 peers from Step 2 of the core skill.
 
 ### 3. Run the backtest
 
-Call `mcp__nemo_financial__backtest_signal` with:
+Call `mcp__nemo-financial__backtest_signal` with:
 - The signal definition (dict)
 - The ticker universe (list)
 - Start date / end date

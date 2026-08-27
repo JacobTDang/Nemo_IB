@@ -3,7 +3,17 @@ integration."""
 import sys
 import os
 
+import pytest
+from dotenv import load_dotenv
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# tick() resolves watchlist tickers through edgartools, which now requires a
+# real SEC_EMAIL rather than a placeholder. pytest does not read .env, so this
+# module does -- the same thing testing/test_sec_series.py does for the same
+# reason. Module level rather than a fixture so the file still runs as a
+# script.
+load_dotenv()
 
 from daemons.edgar_firehose import (
     _parse_feed, filter_relevant, store_filing_as_event,
@@ -12,10 +22,34 @@ from daemons.edgar_firehose import (
 from state.schema import init_schema, get_connection
 
 
+SKIP_NETWORK = os.environ.get("SKIP_NETWORK_TESTS") == "1"
+
+
+def network(func):
+  """Apply the real `network` marker plus the offline skip.
+
+  Same helper as testing/test_sec_series.py. A bare skipif is not a registered
+  marker, so `-m network` would not select these.
+  """
+  func = pytest.mark.network(func)
+  return pytest.mark.skipif(SKIP_NETWORK, reason="live EDGAR test")(func)
+
+
 _results = {'pass': 0, 'fail': 0, 'failures': []}
 
 
 def _check(name, cond, hint=''):
+  """Fail the test when `condition` is false.
+
+  This helper used to increment a counter and print PASS/FAIL, and nothing
+  else. Under pytest -- which never calls main() -- no one read the counter,
+  so every test_* function in this file ran to completion, returned None and
+  was reported green no matter what the code did. A gate that cannot fail is
+  not a gate.
+
+  The counters and the printed lines are kept so the summary still reads the
+  same; the raise is what makes pytest see a wrong value.
+  """
   if cond:
     _results['pass'] += 1
     print(f"  PASS  {name}")
@@ -23,6 +57,7 @@ def _check(name, cond, hint=''):
     _results['fail'] += 1
     _results['failures'].append((name, hint))
     print(f"  FAIL  {name}  --  {hint}")
+    raise AssertionError(f"{name}: {hint}" if hint else name)
 
 
 def _section(t): print(f"\n=== {t} ===")
@@ -141,6 +176,7 @@ def test_store_filing_dedupe():
     conn.close()
 
 
+@network
 def test_tick_with_injected_feed():
   _section("4. Tick() with synthetic feed override")
   entries = _parse_feed(SYNTHETIC_ATOM)

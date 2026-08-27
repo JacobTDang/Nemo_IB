@@ -6,6 +6,7 @@ GDP growth, yield curve, and access to 800k+ FRED series.
 
 Entry point: python -m tools.news_agregator.fred_server server
 """
+from tools.response_meta import annotating
 from typing import Any, Dict, List, Optional
 import asyncio
 import json
@@ -53,6 +54,46 @@ SNAPSHOT_SERIES = {
   "NFCI": "National Financial Conditions Index",
   "UMCSENT": "UMich Consumer Sentiment",
 }
+
+# What each series is actually measured in. A basis point is one hundredth of
+# a percentage point, so a bps change is only meaningful for a percent series.
+# Applied blindly it produced "3m_change_bps": 6000.0 for a 60,000-job move in
+# nonfarm payrolls, and 800000.0 for a change in weekly jobless claims.
+SERIES_UNITS = {
+  # quoted in percent -- a change in basis points is meaningful
+  "DGS10": "percent", "DGS2": "percent", "DGS3MO": "percent",
+  "DGS6MO": "percent", "DGS1": "percent", "DGS3": "percent",
+  "DGS5": "percent", "DGS7": "percent", "DGS20": "percent",
+  "DGS30": "percent", "FEDFUNDS": "percent", "T10Y2Y": "percent",
+  "T10Y3M": "percent", "UNRATE": "percent", "A191RL1Q225SBEA": "percent",
+  "BAMLH0A0HYM2": "percent", "BAMLC0A0CM": "percent",
+  "BAMLC0A4CBBB": "percent", "BAA10Y": "percent",
+  # levels and indices -- a change is in the series' own units
+  "PAYEMS": "thousands_of_persons",
+  "ICSA": "persons",
+  "UMCSENT": "index",
+  "NFCI": "index",
+  "CPIAUCSL": "index",
+  "PCEPILFE": "index",
+  "M2SL": "billions_of_dollars",
+}
+
+
+def is_percent_series(series_id: str) -> bool:
+  """Whether a change in this series can honestly be called basis points."""
+  return SERIES_UNITS.get(series_id) == "percent"
+
+
+def change_field_name(series_id: str, horizon: str) -> str:
+  """`3m_change_bps` for a percent series, `3m_change` for anything else."""
+  return f"{horizon}_change_bps" if is_percent_series(series_id) else f"{horizon}_change"
+
+
+def change_value(series_id: str, latest: float, earlier: float) -> float:
+  """The change, in basis points for a percent series and raw units otherwise."""
+  delta = latest - earlier
+  return round(delta * 100, 1) if is_percent_series(series_id) else round(delta, 4)
+
 
 YIELD_CURVE_SERIES = {
   "DGS3MO": "3M",
@@ -157,6 +198,47 @@ def _compute_yoy_pct(observations: List[Dict]) -> Optional[float]:
   return round((latest - year_ago) / year_ago * 100, 2)
 
 
+def _observation_at_offset(valid, months_back: int):
+    """The observation closest to `months_back` before the latest one.
+
+    Selected by DATE. The previous code stepped back a fixed number of ROWS --
+    `valid[-13]` with a comment reading "monthly data" -- which is right for a
+    monthly series and wrong for every other frequency. DGS10 is daily, so its
+    "one year ago" was thirteen business days ago and the ten-year reported a
+    one-year change of +1bp where the real move was roughly +42bp. UNRATE is
+    monthly and looked correct, which is how the row offset survived.
+    """
+    from datetime import date
+
+    if not valid:
+        return None, None
+    try:
+        latest_date = date.fromisoformat(valid[-1]["date"])
+    except (KeyError, ValueError, TypeError):
+        return None, None
+
+    year = latest_date.year - (months_back // 12)
+    month = latest_date.month - (months_back % 12)
+    if month <= 0:
+        month += 12
+        year -= 1
+    day = min(latest_date.day, 28)
+    target = date(year, month, day)
+
+    best, best_gap = None, None
+    for observation in valid:
+        try:
+            observed = date.fromisoformat(observation["date"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        gap = abs((observed - target).days)
+        if best_gap is None or gap < best_gap:
+            best, best_gap = observation, gap
+    if best is None:
+        return None, None
+    return _parse_float(best["value"]), best.get("date")
+
+
 def _condense_snapshot(series_data: Dict[str, Dict]) -> Dict[str, Any]:
   """Condense snapshot series into latest + 3M-ago + 1Y-ago per series.
 
@@ -186,20 +268,25 @@ def _condense_snapshot(series_data: Dict[str, Dict]) -> Dict[str, Any]:
       latest = _get_observation_value(observations)
       # Find ~3 months ago and ~1 year ago values
       valid = [o for o in observations if o.get("value") not in (".", "", None)]
-      three_mo = _parse_float(valid[-4]["value"]) if len(valid) >= 4 else None
-      one_yr = _parse_float(valid[-13]["value"]) if len(valid) >= 13 else None
+      three_mo, three_mo_date = _observation_at_offset(valid, 3)
+      one_yr, one_yr_date = _observation_at_offset(valid, 12)
 
       entry = {
         "label": label,
         "current": latest,
         "as_of": _get_observation_date(observations),
       }
+      entry["unit"] = SERIES_UNITS.get(series_id, "unknown")
       if three_mo is not None and latest is not None:
         entry["3m_ago"] = three_mo
-        entry["3m_change_bps"] = round((latest - three_mo) * 100, 1)
+        entry["3m_ago_date"] = three_mo_date
+        entry[change_field_name(series_id, "3m")] = change_value(
+            series_id, latest, three_mo)
       if one_yr is not None and latest is not None:
         entry["1y_ago"] = one_yr
-        entry["1y_change_bps"] = round((latest - one_yr) * 100, 1)
+        entry["1y_ago_date"] = one_yr_date
+        entry[change_field_name(series_id, "1y")] = change_value(
+            series_id, latest, one_yr)
 
       condensed[series_id] = entry
 
@@ -249,23 +336,45 @@ def _condense_yield_curve(series_data: Dict[str, Dict]) -> Dict[str, Any]:
   return result
 
 
+# A month FRED published with no value is not a month FRED does not have.
+# UNRATE carries 2025-10-01 with value "." because no household survey was
+# conducted; dropping it silently left total_observations 4 beside returned 3.
+_FRED_NO_VALUE = (".", "", None)
+
+# Enough to see the shape of a gap without pasting a decade of market holidays.
+_MAX_UNAVAILABLE_DATES = 30
+
+
 def _condense_observations(raw: Dict[str, Any], cap: int = 60) -> Dict[str, Any]:
-  """Condense generic FRED observations: filter nulls, cap count."""
+  """Condense generic FRED observations.
+
+  Two different things used to arrive as one number. `returned` meant
+  "tail-truncated from 1302" on DGS10 and "one value was unavailable" on
+  UNRATE, and a caller could not tell a cut-off tail from a hole in the
+  middle. They are separated here: `truncated` is ours, `unavailable_*` is
+  FRED's, and the three counts reconcile.
+  """
   observations = raw.get("observations", [])
-  # Filter FRED's "." null markers
   valid = [
     {"date": o["date"], "value": _parse_float(o["value"])}
     for o in observations
-    if o.get("value") not in (".", "", None)
+    if o.get("value") not in _FRED_NO_VALUE
   ]
+  unavailable = [o["date"] for o in observations
+                 if o.get("value") in _FRED_NO_VALUE]
+
   # Cap at most recent
-  valid = valid[-cap:]
+  returned = valid[-cap:]
 
   return {
     "series_id": raw.get("series_id", "unknown"),
-    "total_observations": raw.get("count", len(valid)),
-    "returned": len(valid),
-    "observations": valid,
+    "total_observations": raw.get("count", len(observations)),
+    "observations_with_values": len(valid),
+    "unavailable_observations": len(unavailable),
+    "unavailable_dates": unavailable[:_MAX_UNAVAILABLE_DATES],
+    "returned": len(returned),
+    "truncated": len(returned) < len(valid),
+    "observations": returned,
   }
 
 
@@ -373,6 +482,7 @@ class FredServer:
       ]
 
     @self.server.call_tool()
+    @annotating("FRED")
     async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
       match name:
         case "get_macro_snapshot":
@@ -422,8 +532,27 @@ class FredServer:
         series_data[sid] = result
 
     condensed = _condense_snapshot(series_data)
+    # Each series carries its own observation date and FRED publishes them on
+    # different days, so a snapshot routinely mixes them. T10Y2Y at 0.47 sat
+    # beside a DGS10 and DGS2 whose difference is 0.46 -- a spread that is not
+    # the difference of the two yields shown, with no single as-of to say the
+    # components are from different days.
+    observation_dates = sorted({v.get("as_of") for v in condensed.values()
+                                if isinstance(v, dict) and v.get("as_of")})
     envelope = build_envelope(condensed, "macro_snapshot", "get_macro_snapshot",
                               api_calls_made=len(SNAPSHOT_SERIES), errors=errors)
+    envelope["as_of_range"] = (
+        {"earliest": observation_dates[0], "latest": observation_dates[-1]}
+        if observation_dates else None)
+    envelope["as_of_mixed"] = len(observation_dates) > 1
+    if envelope["as_of_mixed"]:
+      envelope.setdefault("warnings", []).append({
+          "code": "mixed_observation_dates",
+          "message": (
+              f"These series were last observed on {len(observation_dates)} "
+              f"different dates ({observation_dates[0]} to "
+              f"{observation_dates[-1]}). A spread shown here is not "
+              f"necessarily the difference of the levels shown beside it.")})
     return [TextContent(type="text", text=safe_json_dumps(envelope))]
 
   async def get_treasury_yields(self) -> List[TextContent]:
@@ -471,14 +600,20 @@ class FredServer:
       observations = raw.get("observations", [])
       valid = [o for o in observations if o.get("value") not in (".", "", None)]
       latest = _parse_float(valid[-1]["value"]) if valid else None
-      three_mo = _parse_float(valid[-4]["value"]) if len(valid) >= 4 else None
-      one_yr = _parse_float(valid[-13]["value"]) if len(valid) >= 13 else None
+      three_mo, _ = _observation_at_offset(valid, 3)
+      one_yr, _ = _observation_at_offset(valid, 12)
 
-      entry = {"label": label, "current_bps": latest, "as_of": _get_observation_date(observations)}
+      # FRED quotes these spreads in PERCENT. Publishing the raw value under a
+      # name promising basis points reported high-yield OAS as 2.69 when it is
+      # 269bp -- a hundredfold error for anything pricing debt off it.
+      entry = {"label": label,
+               "current_bps": round(latest * 100, 1) if latest is not None else None,
+               "current_percent": latest,
+               "as_of": _get_observation_date(observations)}
       if three_mo is not None and latest is not None:
-        entry["3m_change_bps"] = round((latest - three_mo) * 100, 1)
+        entry["3m_change_bps"] = change_value(sid, latest, three_mo)
       if one_yr is not None and latest is not None:
-        entry["1y_change_bps"] = round((latest - one_yr) * 100, 1)
+        entry["1y_change_bps"] = change_value(sid, latest, one_yr)
       condensed[sid] = entry
 
     envelope = build_envelope(condensed, "credit_spreads", "get_credit_spreads",

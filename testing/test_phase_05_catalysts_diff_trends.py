@@ -230,13 +230,28 @@ def test_diff_detects_new_risk_paragraph():
 
 
 def test_diff_detects_modified_supply_chain_paragraph():
+  """The fixtures are constants, so the answer is knowable -- assert it.
+
+  This used to print PASS on >= 1 and WARN on 0, and return None either way:
+  a diff that stopped detecting modifications entirely reported the same
+  green as one that worked. CURRENT_RISK and PRIOR_RISK are module constants,
+  so there is nothing conditional about the expected result. Measured: the
+  supply-chain paragraph, with its trailing "recent geopolitical events have
+  amplified this concentration risk", scores 0.694 against its prior version
+  -- inside the 0.5-0.85 modified band, and the only paragraph that is.
+  """
   result = diff_risk_factors(CURRENT_RISK, PRIOR_RISK)
-  # Supply chain paragraph has trailing "recent geopolitical events have amplified..."
-  # which makes it 0.5-0.85 similar — should appear in modified_risks
-  if result['modified_risks_count'] >= 1:
-    print(f"PASS: diff detected {result['modified_risks_count']} modified paragraph(s)")
-  else:
-    print(f"WARN: modified_risks_count = 0 (acceptable if similarity > 0.85)")
+  assert result['modified_risks_count'] == 1, (
+    f"expected exactly the supply-chain paragraph to read as modified, got "
+    f"{result['modified_risks_count']}: {result.get('modified_risks')}")
+  modified = result['modified_risks'][0]
+  assert 'supply chain' in modified['current'].lower(), (
+    f"the modified paragraph is not the supply-chain one: "
+    f"{modified['current'][:120]!r}")
+  assert 0.5 <= modified['similarity'] <= 0.85, (
+    f"similarity {modified['similarity']} is outside the modified band; at "
+    f"this score the paragraph should have been classified new or unchanged")
+  print(f"PASS: diff detected {result['modified_risks_count']} modified paragraph(s)")
 
 
 def test_diff_detects_no_removals_when_all_kept():

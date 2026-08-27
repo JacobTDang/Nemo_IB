@@ -15,8 +15,16 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from tools.response_meta import warning
 from .foreign_issuer import form_mismatch_note, not_covered_reason
 from .sec_series import NotCovered, fetch_concept_series
+from .shared_filings import (
+    Deadline,
+    ToolTimeout,
+    budget_seconds,
+    concept_series,
+    shared_filings,
+)
 
 _BASE = "us-gaap:LongTermDebtMaturitiesRepaymentsOfPrincipal"
 
@@ -33,25 +41,69 @@ MATURITY_CONCEPTS: Dict[str, tuple] = {
 }
 
 
+def _shared_filings(ticker: str, deadline: Deadline):
+    """`shared_filings`, bound to this module's `fetch_concept_series`.
+
+    Read here rather than passed in from the call site so the name stays a
+    module global a test can replace -- which is what the walk checks before
+    it stands down.
+    """
+    return shared_filings(ticker, deadline, fetch_concept_series)
+
+
+def _concept_series(ticker: str, concept: str, form: str, limit: int) -> list:
+    """One concept's series, reusing filings already parsed for this call.
+
+    With no shared walk open this is `fetch_concept_series` verbatim, which is
+    what keeps that name the seam the tests replace.
+    """
+    return concept_series(ticker, concept, form, limit, fetch_concept_series)
+
+
 def _bucket_value(ticker: str, concepts: tuple, form: str) -> Optional[float]:
     """First covered concept's consolidated value, or None if none is tagged.
 
     None means "not tagged". It is deliberately distinct from 0.0, which means
     the filer disclosed that nothing matures in that window — MSFT genuinely
     reports zero in years two and four.
+
+    Stopping at the first concept that answers is deliberate and stays that
+    way: a bucket is one number from one filing, so there is no abandoned-
+    element hazard here, and the rolling-year alternative is only worth
+    reading when the fixed-year one is silent.
     """
     for concept in concepts:
         try:
-            points = fetch_concept_series(ticker, concept, form=form, limit=1)
+            points = _concept_series(ticker, concept, form, 1)
+        # Only NotCovered is swallowed, and only to try the next concept.
+        # A network failure or an unknown ticker propagates: reporting an
+        # outage as "this filer does not disclose it" is the one answer
+        # worse than an error.
         except NotCovered:
-            continue
-        except Exception:  # noqa: BLE001 - try the next concept
             continue
         for point in points:
             fact = point.latest_undimensioned()
             if fact is not None:
                 return fact.value
     return None
+
+
+def _coverage_warnings(coverage: str) -> list:
+    """The incompleteness caveat, attached only when it is true.
+
+    It used to ride on every response from this tool, including MSFT's, whose
+    six buckets were verified against SEC and whose `coverage` field says
+    "full" in the same object. A warning that always fires trains a reader to
+    skip the array, so the genuinely incomplete answer it exists for stops
+    standing out. That is not a conservative default; it is the destruction of
+    the signal.
+    """
+    if coverage == "full":
+        return []
+    return [warning(
+        "incomplete_coverage",
+        "Coverage is incomplete for this filer. `not_covered` means the split "
+        "was not disclosed in tagged form, NEVER that no debt matures.")]
 
 
 def get_debt_maturity_schedule(ticker: str,
@@ -64,13 +116,59 @@ def get_debt_maturity_schedule(ticker: str,
 
     Never synthesises a schedule from total debt. If the filer did not disclose
     the split in tagged form, that is the answer.
+
+    All twelve concepts are read inside one filing walk. They all come from
+    the same single 10-K, and parsing it once per concept cost GS 12 parses of
+    one filing and 65.9 seconds — almost none of it parsing.
     """
     by_year: Dict[str, Optional[float]] = {}
     tried: List[str] = []
 
-    for bucket, concepts in MATURITY_CONCEPTS.items():
-        tried.extend(concepts)
-        by_year[bucket] = _bucket_value(ticker, concepts, form)
+    deadline = Deadline(budget_seconds(),
+                        f"get_debt_maturity_schedule({ticker})")
+    try:
+        with _shared_filings(ticker, deadline):
+            for bucket, concepts in MATURITY_CONCEPTS.items():
+                tried.extend(concepts)
+                try:
+                    by_year[bucket] = _bucket_value(ticker, concepts, form)
+                # The clock is not a fetch failure and must not be described
+                # as one: it is handled below, in its own words.
+                except ToolTimeout:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - surface it, never mask it
+                    return {
+                        "ticker": ticker,
+                        "success": False,
+                        "wrong_form": False,
+                        "coverage": "unknown",
+                        "warnings": _coverage_warnings("unknown"),
+                        "error": f"fetching debt-maturity concepts failed: {exc}",
+                        "by_year": {},
+                        "total": None,
+                        "buckets_found": 0,
+                        "concepts_tried": tried,
+                        "pct_due_within_one_year": None,
+                    }
+    except ToolTimeout as exc:
+        # No partial schedule. The buckets the clock never reached are
+        # indistinguishable from buckets the filer does not tag once they are
+        # written into `by_year`, and `total` would silently be a sum of
+        # whichever years happened to come first in the loop.
+        return {
+            "ticker": ticker,
+            "success": False,
+            "timed_out": True,
+            "wrong_form": False,
+            "coverage": "unknown",
+            "warnings": _coverage_warnings("unknown"),
+            "error": str(exc),
+            "by_year": {},
+            "total": None,
+            "buckets_found": 0,
+            "concepts_tried": tried,
+            "pct_due_within_one_year": None,
+        }
 
     found = [v for v in by_year.values() if v is not None]
     buckets_found = len(found)
@@ -85,6 +183,7 @@ def get_debt_maturity_schedule(ticker: str,
             "success": False,
             "wrong_form": bool(mismatch),
             "coverage": "not_covered",
+            "warnings": _coverage_warnings("not_covered"),
             "error": not_covered_reason(
                 ticker, form,
                 f"{ticker} does not tag long-term debt maturities in its "
@@ -101,10 +200,12 @@ def get_debt_maturity_schedule(ticker: str,
     near_term = by_year.get("year_1")
     pct_near = (near_term / total * 100.0) if (near_term is not None and total) else None
 
+    coverage = "full" if buckets_found == len(MATURITY_CONCEPTS) else "partial"
     return {
         "ticker": ticker,
         "success": True,
-        "coverage": "full" if buckets_found == len(MATURITY_CONCEPTS) else "partial",
+        "coverage": coverage,
+        "warnings": _coverage_warnings(coverage),
         "by_year": by_year,
         "total": total,
         "buckets_found": buckets_found,

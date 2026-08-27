@@ -2,7 +2,22 @@
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import pytest
+from dotenv import load_dotenv
+
+# These reach live EDGAR, which now requires a real SEC_EMAIL rather than a
+# placeholder. pytest does not read .env, so this module does -- the same
+# thing testing/test_sec_series.py does for the same reason.
+load_dotenv()
+
 from tools.web_search_server.sec_utils import get_margin_breakdown
+
+# Every test here calls live SEC EDGAR. Without this the offline run was not
+# offline: it spent real requests on EDGAR and could fail for network reasons
+# in a run that is supposed to be hermetic.
+pytestmark = [pytest.mark.network,
+              pytest.mark.skipif(os.environ.get("SKIP_NETWORK_TESTS") == "1",
+                                 reason="live EDGAR test")]
 
 
 def test_aapl_margin_breakdown():

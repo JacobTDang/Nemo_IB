@@ -21,6 +21,15 @@ Run via:
 """
 from __future__ import annotations
 
+import pytest
+
+# The embedder downloads its sentence-transformers weights from huggingface.co
+# on first use, so every test in this module reaches the network. The RAG stack
+# is not in the homelab image either -- `rag_search` and `rag_ingest` are
+# capability-gated and hidden there -- so an offline run has neither the model
+# nor the tools.
+pytestmark = pytest.mark.network
+
 import asyncio
 import json
 import os
@@ -48,6 +57,17 @@ _seeded_doc_ids: List[str] = []
 
 
 def _check(name: str, condition, hint: str = ''):
+  """Fail the test when `condition` is false.
+
+  This helper used to increment a counter and print PASS/FAIL, and nothing
+  else. Under pytest -- which never calls main() -- no one read the counter,
+  so every test_* function in this file ran to completion, returned None and
+  was reported green no matter what the code did. A gate that cannot fail is
+  not a gate.
+
+  The counters and the printed lines are kept so the summary still reads the
+  same; the raise is what makes pytest see a wrong value.
+  """
   if condition:
     _results['pass'] += 1
     print(f"  PASS  {name}")
@@ -55,6 +75,7 @@ def _check(name: str, condition, hint: str = ''):
     _results['fail'] += 1
     _results['failures'].append((name, hint))
     print(f"  FAIL  {name}  --  {hint}")
+    raise AssertionError(f"{name}: {hint}" if hint else name)
 
 
 def _section(title: str):

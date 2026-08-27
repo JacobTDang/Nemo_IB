@@ -1,4 +1,14 @@
+"""Batch verification script: extract compensation + governance for the whole
+test universe and report per-company alerts.
 
+Not a pytest module. It walks ~500 tickers against live SEC EDGAR with a 2s
+delay between each, so it is a manual sweep, not a suite test. It used to be
+named test_multi_company_verification.py, and its per-ticker helper took a
+`ticker` argument that pytest tried to resolve as a fixture, erroring at
+collection.
+
+Usage: .venv/bin/python testing/run_multi_company_verification.py
+"""
 import sys
 import os
 import importlib.util
@@ -28,7 +38,7 @@ except ImportError:
                  "JPM", "XOM", "WMT", "UNH", "MA", "PG", "JNJ", "HD", "MRK", "COST", "ABBV", 
                  "CVX", "CRM", "BAC", "PEP", "KO", "AMD", "NFLX", "ADBE", "DIS"] # Fallback
 
-def test_company(ticker):
+def verify_company(ticker):
     print(f"\n{'='*40} {ticker} {'='*40}")
     
     results = {
@@ -112,7 +122,7 @@ if __name__ == "__main__":
     
     for i, ticker in enumerate(test_set):
         print(f"\nProcessing {i+1}/{len(test_set)}...")
-        res = test_company(ticker)
+        res = verify_company(ticker)
         full_results_log.append(res)
         
         summary_stats['total'] += 1

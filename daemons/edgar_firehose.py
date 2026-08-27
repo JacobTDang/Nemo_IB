@@ -33,6 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from state.schema import init_schema, get_watchlist, get_connection
 from state.events_store import store_event, seen
+from tools.web_search_server.sec_series import _require_identity
 
 
 DEFAULT_INTERVAL_S = 45
@@ -56,9 +57,18 @@ ATOM_URL = (
   "https://www.sec.gov/cgi-bin/browse-edgar?"
   "action=getcurrent&type=&owner=include&count=40&output=atom"
 )
-HEADERS = {
-  'User-Agent': f"{os.getenv('NAME', 'analyst')} {os.getenv('SEC_EMAIL', 'analyst@example.com')}",
-}
+
+
+def _sec_headers() -> Dict[str, str]:
+  """SEC request headers, resolved on use.
+
+  Built here rather than at module level so this daemon imports without
+  credentials: a module-level resolution turns a missing SEC_EMAIL into an
+  import traceback in whatever imported the daemon, before its entrypoint can
+  report which variable is unset. `main` resolves it eagerly at boot for the
+  same reason the Groq credential is checked there.
+  """
+  return {'User-Agent': _require_identity()}
 
 
 _running = True
@@ -70,10 +80,11 @@ def _build_cik_to_ticker_map() -> Dict[str, str]:
   Uses edgartools' built-in ticker resolver. Falls back to skipping
   unresolvable tickers."""
   try:
-    from edgar import Company, set_identity
-    set_identity(HEADERS['User-Agent'])
+    from edgar import Company
   except ImportError:
     return {}
+  # Sets edgartools' identity as a side effect, and refuses to guess one.
+  _require_identity()
 
   cik_map: Dict[str, str] = {}
   for ticker in get_watchlist():
@@ -89,7 +100,7 @@ def _parse_feed(text: Optional[str] = None) -> List[Dict[str, Any]]:
   """Pull + parse the current-filings Atom feed. Returns list of normalized
   entries. If text is provided (for testing), uses that instead of HTTP."""
   if text is None:
-    feed = feedparser.parse(ATOM_URL, request_headers=HEADERS)
+    feed = feedparser.parse(ATOM_URL, request_headers=_sec_headers())
   else:
     feed = feedparser.parse(text)
   entries = []
@@ -224,6 +235,10 @@ def main():
   args = parser.parse_args()
 
   init_schema()
+  # Eager check at boot. Every tick is wrapped in `except Exception`, so a
+  # missing SEC_EMAIL would otherwise be a traceback printed once per interval
+  # forever while the daemon reported itself as running.
+  _sec_headers()
   _install_signal_handlers()
   print(f"[edgar_firehose] starting | interval={args.interval}s",
         file=sys.stderr, flush=True)

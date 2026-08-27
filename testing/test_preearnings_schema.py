@@ -482,3 +482,21 @@ def test_eval_accuracy_summary():
     assert summary["correct"] >= 2
     assert 0 < summary["accuracy_pct"] <= 100
     _clean()
+
+
+def test_collection_order_is_stable_when_timestamps_tie():
+    """Three writes in one second must still come back in the order made.
+
+    `ORDER BY collected_at` alone is non-deterministic when rows share a
+    timestamp, and rows written in a loop routinely do. The suite failed on
+    exactly this under parallel load: the docstring promises collection order,
+    so the query has to provide one rather than usually happening to.
+    """
+    for _ in range(15):
+        for name in ["job_postings", "capex_announcements", "policy_signals"]:
+            record_signal("ZZTIE", "2026-09-01", "demand", name, "neutral",
+                          _db=_TMP_DB)
+        rows = signals_for_ticker("ZZTIE", "2026-09-01", _db=_TMP_DB)
+        assert [r["signal_name"] for r in rows][:3] == [
+            "job_postings", "capex_announcements", "policy_signals"]
+        _clean()

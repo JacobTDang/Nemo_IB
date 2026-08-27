@@ -80,7 +80,11 @@ def signals_for_ticker(
         rows = conn.execute(
             """SELECT * FROM preearnings_signals
                WHERE ticker = ? AND earnings_date = ?
-               ORDER BY collected_at ASC""",
+               -- rowid breaks the tie. Rows written in a loop share a
+               -- collected_at, and `ORDER BY collected_at` alone then returns
+               -- them in whatever order the query planner picks, so the
+               -- collection order this docstring promises held only by luck.
+               ORDER BY collected_at ASC, rowid ASC""",
             (ticker.upper(), earnings_date),
         ).fetchall()
         return [dict(r) for r in rows]

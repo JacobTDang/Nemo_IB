@@ -27,6 +27,13 @@ from typing import Any, Dict, List, Optional
 
 from .foreign_issuer import form_mismatch_note, not_covered_reason
 from .sec_series import NotCovered, fetch_concept_series
+from .shared_filings import (
+    Deadline,
+    ToolTimeout,
+    budget_seconds,
+    concept_series,
+    shared_filings,
+)
 
 RPO_CONCEPTS = (
     "us-gaap:RevenueRemainingPerformanceObligation",
@@ -89,14 +96,48 @@ def _region_label(member: str) -> str:
     return " ".join(words)
 
 
+def _shared_filings(ticker: str, deadline: Deadline):
+    """`shared_filings`, bound to this module's `fetch_concept_series`.
+
+    Read here rather than passed in from the call site so the name stays a
+    module global a test can replace -- which is what the walk checks before
+    it stands down.
+    """
+    return shared_filings(ticker, deadline, fetch_concept_series)
+
+
+def _concept_series(ticker: str, concept: str, form: str, limit: int) -> list:
+    """One concept's series, reusing filings already parsed for this call.
+
+    With no shared walk open this is `fetch_concept_series` verbatim, which is
+    what keeps `_series_for` callable on its own -- the freshness tests call
+    it directly -- and keeps that name the seam they replace.
+    """
+    return concept_series(ticker, concept, form, limit, fetch_concept_series)
+
+
 def _series_for(ticker: str, concepts: tuple, form: str, limit: int):
-    """First covered concept's consolidated values, newest first."""
+    """The chain element reaching the most recent filing, newest first.
+
+    Every concept in the chain is evaluated rather than stopping at the first
+    that returns anything, because filers change elements between filings and
+    the abandoned element still answers from the older filing. NVDA tags
+    `us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax` only in its
+    FY2022 10-K and `us-gaap:Revenues` since; stopping at the first hit
+    resolved revenue for 2022 alone. Freshness decides, and ties keep chain
+    order so the more specific element still wins when a filer tags both.
+    """
+    best_rows: List[Dict[str, Any]] = []
+    best_concept: Optional[str] = None
+    best_end = ""
     for concept in concepts:
         try:
-            points = fetch_concept_series(ticker, concept, form=form, limit=limit)
+            points = _concept_series(ticker, concept, form, limit)
+        # Only NotCovered is swallowed, and only to try the next concept.
+        # A network failure or an unknown ticker propagates: reporting an
+        # outage as "this filer does not disclose it" is the one answer
+        # worse than an error.
         except NotCovered:
-            continue
-        except Exception:  # noqa: BLE001 - try the next concept
             continue
         rows = []
         for point in points:
@@ -104,9 +145,12 @@ def _series_for(ticker: str, concepts: tuple, form: str, limit: int):
             if fact is not None:
                 rows.append({"filing_date": point.filing_date,
                              "period": fact.period, "value": fact.value})
-        if rows:
-            return rows, concept
-    return [], None
+        if not rows:
+            continue
+        newest = max(r["filing_date"] for r in rows)
+        if newest > best_end:
+            best_rows, best_concept, best_end = rows, concept, newest
+    return best_rows, best_concept
 
 
 def get_contracted_revenue(ticker: str, limit: int = 3,
@@ -119,9 +163,31 @@ def get_contracted_revenue(ticker: str, limit: int = 3,
 
     A filer reporting only deferred revenue is a partial answer, not a failure;
     most non-enterprise filers never disclose RPO.
+
+    Both chains — six concepts — are read inside one filing walk. They are the
+    same `limit` 10-Ks, and parsing them once per concept cost GS 18 parses of
+    3 filings and 40.2 seconds.
     """
-    rpo, rpo_concept = _series_for(ticker, RPO_CONCEPTS, form, limit)
-    deferred, deferred_concept = _series_for(ticker, DEFERRED_CONCEPTS, form, limit)
+    deadline = Deadline(budget_seconds(), f"get_contracted_revenue({ticker})")
+    try:
+        with _shared_filings(ticker, deadline):
+            rpo, rpo_concept = _series_for(ticker, RPO_CONCEPTS, form, limit)
+            deferred, deferred_concept = _series_for(
+                ticker, DEFERRED_CONCEPTS, form, limit)
+    except ToolTimeout as exc:
+        return {
+            "ticker": ticker, "success": False, "timed_out": True,
+            "wrong_form": False, "error": str(exc),
+            "rpo": [], "deferred_revenue": [],
+            "rpo_concept_used": None, "deferred_concept_used": None,
+        }
+    except Exception as exc:  # noqa: BLE001 - surface the failure, never mask it
+        return {
+            "ticker": ticker, "success": False, "wrong_form": False,
+            "error": f"fetching contracted-revenue concepts failed: {exc}",
+            "rpo": [], "deferred_revenue": [],
+            "rpo_concept_used": None, "deferred_concept_used": None,
+        }
 
     if not rpo and not deferred:
         mismatch = form_mismatch_note(ticker, form)
@@ -155,14 +221,65 @@ def get_geographic_revenue(ticker: str, limit: int = 1,
 
     A single 10-K carries several years of comparative figures per region, so
     one filing is usually enough for a trend.
+
+    The chain is read inside one filing walk. Every element after the first
+    was re-parsing the same 10-K to ask it a second question, which cost GS 5
+    parses of one filing and 25.8 seconds.
+    """
+    deadline = Deadline(budget_seconds(), f"get_geographic_revenue({ticker})")
+    try:
+        with _shared_filings(ticker, deadline):
+            answer = _geographic_chain(ticker, limit, form)
+    except ToolTimeout as exc:
+        return {
+            "ticker": ticker, "success": False, "timed_out": True,
+            "wrong_form": False, "error": str(exc),
+            "by_region": [], "regions_found": [],
+        }
+    if answer is not None:
+        return answer
+
+    # "TSM does not disaggregate revenue by geography in its 10-K" was the
+    # answer here. TSMC has no 10-K, and its 20-F splits revenue four ways.
+    mismatch = form_mismatch_note(ticker, form)
+    return {
+        "ticker": ticker, "success": False,
+        "wrong_form": bool(mismatch),
+        "error": not_covered_reason(
+            ticker, form,
+            f"{ticker} does not disaggregate revenue by geography in its "
+            f"{form}."),
+        "by_region": [], "regions_found": [],
+    }
+
+
+def _geographic_chain(ticker: str, limit: int,
+                      form: str) -> Optional[Dict[str, Any]]:
+    """The first chain element that yields a geographic split, or None.
+
+    Split out so the walk above wraps the fetching and nothing else. None
+    means no element produced a breakdown; phrasing that as an answer needs
+    the filing index, and that lookup has no business inside the walk.
     """
     for concept in REVENUE_CONCEPTS:
         try:
-            points = fetch_concept_series(ticker, concept, form=form, limit=limit)
+            points = _concept_series(ticker, concept, form, limit)
+        # Only NotCovered is swallowed, and only to try the next concept.
+        # A network failure or an unknown ticker propagates: reporting an
+        # outage as "this filer does not disclose it" is the one answer
+        # worse than an error.
         except NotCovered:
             continue
-        except Exception:  # noqa: BLE001
-            continue
+        # The clock says nothing about the filer, so it is not turned into a
+        # message about one here. The caller reports it in its own words.
+        except ToolTimeout:
+            raise
+        except Exception as exc:  # noqa: BLE001 - surface it, never mask it
+            return {
+                "ticker": ticker, "success": False, "wrong_form": False,
+                "error": f"fetching geographic-revenue concepts failed: {exc}",
+                "by_region": [], "regions_found": [],
+            }
 
         by_region: Dict[str, List[Dict[str, Any]]] = {}
         consolidated: Optional[float] = None
@@ -228,19 +345,7 @@ def get_geographic_revenue(ticker: str, limit: int = 1,
             "members_overlap": nested,
             "note": note,
         }
-
-    # "TSM does not disaggregate revenue by geography in its 10-K" was the
-    # answer here. TSMC has no 10-K, and its 20-F splits revenue four ways.
-    mismatch = form_mismatch_note(ticker, form)
-    return {
-        "ticker": ticker, "success": False,
-        "wrong_form": bool(mismatch),
-        "error": not_covered_reason(
-            ticker, form,
-            f"{ticker} does not disaggregate revenue by geography in its "
-            f"{form}."),
-        "by_region": [], "regions_found": [],
-    }
+    return None
 
 
 def get_public_float(ticker: str, form: str = "10-K") -> Dict[str, Any]:
@@ -251,7 +356,14 @@ def get_public_float(ticker: str, form: str = "10-K") -> Dict[str, Any]:
     Reported on the cover page as of the filer's second-quarter close, so it
     lags -- the filing date is returned alongside it rather than implied.
     """
-    rows, _ = _series_for(ticker, (FLOAT_CONCEPT,), form, 1)
+    try:
+        rows, _ = _series_for(ticker, (FLOAT_CONCEPT,), form, 1)
+    except Exception as exc:  # noqa: BLE001 - surface the failure, never mask it
+        return {
+            "ticker": ticker, "success": False, "wrong_form": False,
+            "error": f"fetching {FLOAT_CONCEPT} failed: {exc}",
+            "public_float": None, "filing_date": None,
+        }
     if not rows:
         mismatch = form_mismatch_note(ticker, form)
         return {

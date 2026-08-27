@@ -32,6 +32,17 @@ _results = {'pass': 0, 'fail': 0, 'failures': []}
 
 
 def _check(name: str, condition: bool, hint: str = '') -> None:
+  """Fail the test when `condition` is false.
+
+  This helper used to increment a counter and print PASS/FAIL, and nothing
+  else. Under pytest -- which never calls main() -- no one read the counter,
+  so every test_* function in this file ran to completion, returned None and
+  was reported green no matter what the code did. A gate that cannot fail is
+  not a gate.
+
+  The counters and the printed lines are kept so the summary still reads the
+  same; the raise is what makes pytest see a wrong value.
+  """
   if condition:
     _results['pass'] += 1
     print(f"  PASS  {name}")
@@ -39,6 +50,7 @@ def _check(name: str, condition: bool, hint: str = '') -> None:
     _results['fail'] += 1
     _results['failures'].append((name, hint))
     print(f"  FAIL  {name}  --  {hint}")
+    raise AssertionError(f"{name}: {hint}" if hint else name)
 
 
 _TICKER_PREFIX = 'SRVTST_'
@@ -505,12 +517,49 @@ def test_tool_get_discovery_status():
          str(env['data'])[:80])
 
 
-def test_tool_active_falsifier_alerts_graceful():
-  print("\n== tool: sentry_active_falsifier_alerts handles missing table ==")
-  srv = SentryServer()
-  env = _read_envelope(srv.tool_active_falsifier_alerts({'limit': 5}))
-  _check("success (even if table missing)", env['success'] is True)
-  _check("alerts is list", isinstance(env['data'].get('alerts'), list))
+def test_tool_active_falsifier_alerts_reads_the_table():
+  """falsifier_alerts is in CREATE_SCHEMA now, so the tool queries a table
+  that always exists. This used to assert the opposite -- that a missing
+  table was reported as an empty result -- which is what kept the schema
+  gap invisible."""
+  print("\n== tool: sentry_active_falsifier_alerts reads falsifier_alerts ==")
+  conn = get_connection()
+  try:
+    conn.execute("DELETE FROM falsifier_alerts WHERE ticker LIKE ?",
+                 (f"{_TICKER_PREFIX}%",))
+    conn.execute(
+      """INSERT INTO falsifier_alerts
+           (thesis_id, ticker, falsifier_hash, falsifier_text,
+            evidence_id, score, reason, fired_at)
+         VALUES (?,?,?,?,?,?,?,?)""",
+      (-999, f'{_TICKER_PREFIX}FALS', 'hash1', 'margins compress below 40%',
+       f'{_EVENT_PREFIX}FALS', 0.9, 'matched',
+       datetime.now(timezone.utc).isoformat()))
+    conn.commit()
+  finally:
+    conn.close()
+  try:
+    srv = SentryServer()
+    env = _read_envelope(srv.tool_active_falsifier_alerts({'limit': 50}))
+    _check("success", env['success'] is True)
+    alerts = env['data'].get('alerts')
+    _check("alerts is list", isinstance(alerts, list))
+    mine = [a for a in alerts if a.get('evidence_id') == f'{_EVENT_PREFIX}FALS']
+    _check("seeded alert is returned", len(mine) == 1, f"got {len(mine)}")
+    if mine:
+      _check("falsifier_text round-trips",
+             mine[0]['falsifier_text'] == 'margins compress below 40%',
+             str(mine[0].get('falsifier_text')))
+    _check("no missing-table note", 'note' not in env['data'],
+           str(env['data'].get('note')))
+  finally:
+    conn = get_connection()
+    try:
+      conn.execute("DELETE FROM falsifier_alerts WHERE ticker LIKE ?",
+                   (f"{_TICKER_PREFIX}%",))
+      conn.commit()
+    finally:
+      conn.close()
 
 
 def test_tool_reset_stuck_queue():
@@ -572,7 +621,7 @@ def main() -> int:
   test_tool_get_watchlist()
   test_tool_get_active_theses()
   test_tool_get_discovery_status()
-  test_tool_active_falsifier_alerts_graceful()
+  test_tool_active_falsifier_alerts_reads_the_table()
   test_tool_reset_stuck_queue()
   _cleanup()
 

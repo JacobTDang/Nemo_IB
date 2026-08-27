@@ -364,16 +364,31 @@ COMMON MISTAKES TO AVOID:
         if tool_name == 'get_insider_transactions':
             if not isinstance(data, dict):
                 return f"[INSIDER ACTIVITY] {data}\n\n"
-            signal = data.get('signal', 'unknown').replace('_', ' ').upper()
+            if data.get('signal') is None:
+                # Finnhub returned no transactions, so every figure below
+                # would be a zero nobody measured. Say that instead of
+                # printing "Net shares: 0" into the analysis prompt.
+                return ("[INSIDER ACTIVITY] Finnhub returned no insider "
+                        "transactions for this symbol. No totals, no window "
+                        "and no signal -- this is not a reading of balanced "
+                        "insider activity.\n\n")
+            signal = data['signal'].replace('_', ' ').upper()
             lines = [
                 f"[INSIDER ACTIVITY] Signal: {signal}",
                 f"  Net shares: {data.get('net_shares', 0):,} (bought: {data.get('total_bought', 0):,}, sold: {data.get('total_sold', 0):,})",
                 f"  Transactions: {data.get('buy_count', 0)} buys, {data.get('sell_count', 0)} sells",
             ]
-            r30 = data.get('recent_30d', {})
-            r90 = data.get('recent_90d', {})
-            if r30.get('net', 0) != 0 or r90.get('net', 0) != 0:
-                lines.append(f"  Last 30d net: {r30.get('net', 0):,} | Last 90d net: {r90.get('net', 0):,}")
+            # A recency bucket the feed does not reach is None, not zero --
+            # see _covered_bucket in finnhub_server. Rendering it as "0" put
+            # the claim the condenser refuses to make straight back into the
+            # analysis prompt, and `None.get` would have raised on the way.
+            r30 = data.get('recent_30d') or {}
+            r90 = data.get('recent_90d') or {}
+            n30, n90 = r30.get('net'), r90.get('net')
+            if n30 or n90:
+                lines.append(
+                    f"  Last 30d net: {f'{n30:,}' if n30 is not None else 'not covered by the feed'}"
+                    f" | Last 90d net: {f'{n90:,}' if n90 is not None else 'not covered by the feed'}")
             for insider in data.get('top_insiders', []):
                 lines.append(f"  - {insider['name']}: {insider['net_shares']:,} shares ({insider['transaction_count']} txns)")
             return "\n".join(lines) + "\n\n"
@@ -570,7 +585,11 @@ COMMON MISTAKES TO AVOID:
         elif tool_name == 'get_insider_sentiment':
             if not isinstance(data, dict):
                 return f"[INSIDER SENTIMENT (MSPR)] {data}\n\n"
-            signal = data.get('signal', 'neutral').upper()
+            if data.get('signal') is None:
+                return ("[INSIDER SENTIMENT (MSPR)] Finnhub returned no "
+                        "monthly MSPR readings for this symbol. No average "
+                        "and no signal -- this is not a neutral reading.\n\n")
+            signal = data['signal'].upper()
             avg_mspr = data.get('avg_mspr')
             months = data.get('months', [])
             lines = [f"[INSIDER SENTIMENT (MSPR)] Signal: {signal} | Avg MSPR (6M): {avg_mspr}"]

@@ -18,6 +18,14 @@ Scenarios:
   F. Daily new-position cap hit → trade_rejected
   G. Happy path: all gates pass → trade_placed, eval+budget recorded
 
+Why the scenarios are named test_scenario_*
+-------------------------------------------
+They used to be named scenario_A_..., which pytest does not collect. The file
+sat in testing/ with a _check helper and twenty-four checks in it and pytest
+ran none of them -- the seven scenarios only executed if someone remembered to
+run the file as a script. Each scenario calls _cleanup() on entry, so they are
+order-independent and safe to collect individually.
+
 Run:
   .venv\\Scripts\\python.exe testing\\test_sentry_tick_e2e.py
 """
@@ -39,6 +47,17 @@ _TICKER_PREFIX = 'E2E_'
 
 
 def _check(name: str, condition: bool, hint: str = '') -> None:
+  """Fail the test when `condition` is false.
+
+  This helper used to increment a counter and print PASS/FAIL, and nothing
+  else. Under pytest -- which never calls main() -- no one read the counter,
+  so every test_* function in this file ran to completion, returned None and
+  was reported green no matter what the code did. A gate that cannot fail is
+  not a gate.
+
+  The counters and the printed lines are kept so the summary still reads the
+  same; the raise is what makes pytest see a wrong value.
+  """
   if condition:
     _results['pass'] += 1
     print(f"  PASS  {name}")
@@ -46,6 +65,7 @@ def _check(name: str, condition: bool, hint: str = '') -> None:
     _results['fail'] += 1
     _results['failures'].append((name, hint))
     print(f"  FAIL  {name}  --  {hint}")
+    raise AssertionError(f"{name}: {hint}" if hint else name)
 
 
 def _cleanup():
@@ -68,7 +88,7 @@ def _setup_candidate(ticker: str, score: float = 0.75) -> int:
 # ----------------------------------------------------------------------------
 # Scenario A: Cooldown skip
 # ----------------------------------------------------------------------------
-def scenario_A_cooldown_skip():
+def test_scenario_A_cooldown_skip():
   print("\n== Scenario A: cooldown skip ==")
   _cleanup()
   ticker = f"{_TICKER_PREFIX}COOL"
@@ -104,18 +124,27 @@ def scenario_A_cooldown_skip():
 # ----------------------------------------------------------------------------
 # Scenario B: Read-through inconclusive → research_synthesis
 # ----------------------------------------------------------------------------
-def scenario_B_inconclusive_readthrough():
+def test_scenario_B_inconclusive_readthrough():
   print("\n== Scenario B: read-through inconclusive ==")
   _cleanup()
   ticker = f"{_TICKER_PREFIX}INCONC"
   qid = _setup_candidate(ticker)
 
   # Skill runs /cross-company-readthrough, gets verdict='inconclusive', conf=0.40
-  # Simulates the skipping branch
+  # Simulates the skipping branch.
+  #
+  # contradiction_check_passed and factor_buckets are mandatory for
+  # researched/no_position -- _validate_audit_fields in state/sentry_eval_log.py
+  # raises ValueError without them. This call omitted both, so it had been
+  # simulating a record_eval that production would reject outright. The
+  # scenario never ran under pytest, so nothing said so. SKILL.md line 135
+  # shows the real skill body passing them; this now matches.
   sentry_eval_log.record_eval(
     ticker, decision='researched', triggered_by='event_score',
     verdict='no_position', confidence=0.40, sizing='no_position',
     skip_reason='cross-company-readthrough inconclusive',
+    contradiction_check_passed=True,
+    factor_buckets=['ai_capex_long'],
   )
   sentry_queue.mark_status(qid, 'completed')
 
@@ -132,7 +161,7 @@ def scenario_B_inconclusive_readthrough():
 # ----------------------------------------------------------------------------
 # Scenario C: Research budget exhausted
 # ----------------------------------------------------------------------------
-def scenario_C_research_budget_exhausted():
+def test_scenario_C_research_budget_exhausted():
   print("\n== Scenario C: research budget exhausted mid-tick ==")
   _cleanup()
   ticker = f"{_TICKER_PREFIX}BUDGET"
@@ -158,7 +187,7 @@ def scenario_C_research_budget_exhausted():
 # ----------------------------------------------------------------------------
 # Scenario D: Portfolio-fit rejects → research recorded, no trade
 # ----------------------------------------------------------------------------
-def scenario_D_portfolio_fit_reject():
+def test_scenario_D_portfolio_fit_reject():
   print("\n== Scenario D: portfolio-fit rejects ==")
   _cleanup()
   ticker = f"{_TICKER_PREFIX}FIT"
@@ -173,6 +202,7 @@ def scenario_D_portfolio_fit_reject():
     ticker, decision='researched', triggered_by='event_score',
     verdict='watchlist', confidence=0.70, sizing='watchlist',
     skip_reason='portfolio-fit reject: AI capex bucket at 28%',
+    contradiction_check_passed=True,
     factor_buckets=['ai_capex_long'],
   )
   sentry_queue.mark_status(qid, 'completed')
@@ -187,7 +217,7 @@ def scenario_D_portfolio_fit_reject():
 # ----------------------------------------------------------------------------
 # Scenario E: Risk_Officer rejects → trade_rejected card, no order placed
 # ----------------------------------------------------------------------------
-def scenario_E_risk_officer_rejects():
+def test_scenario_E_risk_officer_rejects():
   print("\n== Scenario E: Risk_Officer rejects the proposal ==")
   _cleanup()
   ticker = f"{_TICKER_PREFIX}RISK"
@@ -197,10 +227,17 @@ def scenario_E_risk_officer_rejects():
 
   # Simulate risk_check_proposed_trade returning approve=False
   # Skill records skipped eval; no place_paper_order call
+  # researched/buy is the strictest row the validator knows: all four
+  # discipline audit fields are required. See scenario B for why they were
+  # missing here.
   sentry_eval_log.record_eval(
     ticker, decision='researched', triggered_by='event_score',
     verdict='buy', confidence=0.68, sizing='cautious',
     skip_reason='risk_officer rejected: max position size exceeded',
+    analogue_considered='2018 memory downcycle',
+    terminal_sensitivity_ran=True,
+    contradiction_check_passed=True,
+    factor_buckets=['memory_cycle'],
   )
   sentry_queue.mark_status(qid, 'completed')
 
@@ -215,7 +252,7 @@ def scenario_E_risk_officer_rejects():
 # ----------------------------------------------------------------------------
 # Scenario F: Daily new-position cap hit → trade rejected
 # ----------------------------------------------------------------------------
-def scenario_F_new_position_cap_hit():
+def test_scenario_F_new_position_cap_hit():
   print("\n== Scenario F: daily new-position cap hit ==")
   _cleanup()
   ticker = f"{_TICKER_PREFIX}CAP"
@@ -237,6 +274,10 @@ def scenario_F_new_position_cap_hit():
     ticker, decision='researched', triggered_by='event_score',
     verdict='buy', confidence=0.75, sizing='cautious',
     skip_reason=f'budget cap: {reason}',
+    analogue_considered='none',
+    terminal_sensitivity_ran=True,
+    contradiction_check_passed=True,
+    factor_buckets=['ai_capex_long'],
   )
   sentry_queue.mark_status(qid, 'completed')
 
@@ -248,7 +289,7 @@ def scenario_F_new_position_cap_hit():
 # ----------------------------------------------------------------------------
 # Scenario G: Happy path — all gates pass, trade placed, full audit trail
 # ----------------------------------------------------------------------------
-def scenario_G_happy_path():
+def test_scenario_G_happy_path():
   print("\n== Scenario G: happy path — all gates pass ==")
   _cleanup()
   ticker = f"{_TICKER_PREFIX}HAPPY"
@@ -286,13 +327,13 @@ def scenario_G_happy_path():
 def main():
   init_schema()
   print("\n/sentry-tick decision-logic end-to-end simulation\n")
-  scenario_A_cooldown_skip()
-  scenario_B_inconclusive_readthrough()
-  scenario_C_research_budget_exhausted()
-  scenario_D_portfolio_fit_reject()
-  scenario_E_risk_officer_rejects()
-  scenario_F_new_position_cap_hit()
-  scenario_G_happy_path()
+  test_scenario_A_cooldown_skip()
+  test_scenario_B_inconclusive_readthrough()
+  test_scenario_C_research_budget_exhausted()
+  test_scenario_D_portfolio_fit_reject()
+  test_scenario_E_risk_officer_rejects()
+  test_scenario_F_new_position_cap_hit()
+  test_scenario_G_happy_path()
   _cleanup()
 
   print(f"\n== Summary ==\n  PASS: {_results['pass']}\n  FAIL: {_results['fail']}")

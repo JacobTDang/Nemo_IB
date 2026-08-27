@@ -20,27 +20,40 @@ def _online(monkeypatch):
     monkeypatch.delenv("SKIP_NETWORK_TESTS", raising=False)
 
 
-def test_missing_groq_key_is_reported(monkeypatch):
+def test_missing_key_is_reported(monkeypatch):
     from testing import _gates
     _online(monkeypatch)
-    monkeypatch.delenv("GROQ_API_KEY", raising=False)
-    assert _gates.service_missing("groq") is not None
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    assert _gates.service_missing("openrouter") is not None
 
 
-def test_present_groq_key_is_not_reported(monkeypatch):
+def test_present_key_is_not_reported(monkeypatch):
     from testing import _gates
     _online(monkeypatch)
-    monkeypatch.setenv("GROQ_API_KEY", "test-key-not-real")
-    assert _gates.service_missing("groq") is None
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key-not-real")
+    assert _gates.service_missing("openrouter") is None
 
 
 def test_empty_key_counts_as_missing(monkeypatch):
-    """GROQ_API_KEY is present in .env with an empty value. An empty string is
-    a missing credential, not a configured one."""
+    """A key present in .env with an empty value is a missing credential, not
+    a configured one. This was written against GROQ_API_KEY, which was empty
+    in .env for exactly this reason; Groq is gone and the rule is not."""
     from testing import _gates
     _online(monkeypatch)
-    monkeypatch.setenv("GROQ_API_KEY", "")
-    assert _gates.service_missing("groq") is not None
+    monkeypatch.setenv("OPENROUTER_API_KEY", "")
+    assert _gates.service_missing("openrouter") is not None
+
+
+def test_an_unknown_service_is_refused_rather_than_passed(monkeypatch):
+    """Removing the groq branch turned service_missing("groq") into a
+    ValueError rather than a silent None. A gate that quietly approves a
+    service nobody defined is not a gate."""
+    import pytest
+
+    from testing import _gates
+    _online(monkeypatch)
+    with pytest.raises(ValueError):
+        _gates.service_missing("groq")
 
 
 def test_offline_run_counts_as_missing(monkeypatch):
@@ -91,11 +104,11 @@ def _run_probe(env_extra):
     """
     probe = textwrap.dedent("""
         import pytest
-        from testing._gates import requires_groq
+        from testing._gates import requires_openrouter
 
-        pytestmark = requires_groq
+        pytestmark = requires_openrouter
 
-        def test_needs_groq():
+        def test_needs_openrouter():
             assert True
     """)
     testing_dir = pathlib.Path(__file__).resolve().parent
@@ -189,3 +202,29 @@ def test_openrouter_gate_sees_a_dotenv_key(monkeypatch):
     importlib.reload(gates)
     assert gates.service_missing("openrouter") is None, (
         "gate reports OpenRouter unavailable while .env configures it")
+
+
+def test_finnhub_gate_reports_missing_key(monkeypatch):
+    from testing import _gates
+    _online(monkeypatch)
+    monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
+    assert "FINNHUB_API_KEY" in _gates.service_missing("finnhub")
+
+
+def test_fred_gate_reports_missing_key(monkeypatch):
+    from testing import _gates
+    _online(monkeypatch)
+    monkeypatch.delenv("FRED_API_KEY", raising=False)
+    assert "FRED_API_KEY" in _gates.service_missing("fred")
+
+
+def test_finnhub_and_fred_gates_respect_the_offline_flag(monkeypatch):
+    """Both reach a live HTTP API, so an offline run must gate them even when
+    the credential is configured."""
+    from testing import _gates
+    monkeypatch.setenv("SKIP_NETWORK_TESTS", "1")
+    monkeypatch.setenv("FINNHUB_API_KEY", "test-key-not-real")
+    monkeypatch.setenv("FRED_API_KEY", "test-key-not-real")
+    for service in ("finnhub", "fred"):
+        reason = _gates.service_missing(service)
+        assert reason is not None and "SKIP_NETWORK_TESTS" in reason, service

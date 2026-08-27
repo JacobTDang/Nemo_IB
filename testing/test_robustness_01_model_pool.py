@@ -4,14 +4,33 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import agent.openrouter_template as ort
 from agent.openrouter_template import (
-  _pick_next_model, _demote_model, PRIMARY_REASONING_MODEL,
+  _pick_next_model, _demote_model,
 )
+
+def _primary_model():
+    """Resolved inside the test, not at import.
+
+    `PRIMARY_REASONING_MODEL` is a module attribute backed by a live probe, so
+    a module-level from-import made collecting this file cost a network round
+    trip -- and, once a rejected credential started refusing instead of
+    reporting every model alive, made the whole suite uncollectable over a key
+    that almost no test needs.
+    """
+    import pytest
+
+    from agent.openrouter_template import CredentialRejected, primary_reasoning_model
+    try:
+        return primary_reasoning_model()
+    except CredentialRejected as exc:
+        pytest.skip(f"OpenRouter credential rejected: {exc}")
+
 
 
 def test_pool_initialized():
+  _primary_model()          # skips when the credential was rejected
   assert len(ort._MODEL_POOL) >= 1, "pool must have at least one model"
-  assert PRIMARY_REASONING_MODEL == ort._MODEL_POOL[0]
-  print(f"PASS: pool has {len(ort._MODEL_POOL)} models, primary = {PRIMARY_REASONING_MODEL!r}")
+  assert _primary_model() == ort._MODEL_POOL[0]
+  print(f"PASS: pool has {len(ort._MODEL_POOL)} models, primary = {_primary_model()!r}")
 
 
 def test_lru_round_robin():

@@ -30,6 +30,7 @@ Plus aggregate:
 from __future__ import annotations
 
 import math
+import statistics
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -173,8 +174,61 @@ class BacktestResult:
   max_drawdown_pct: Optional[float]
   sharpe_simple:    Optional[float]    # mean / std of returns (annualized)
   trades:           List[Trade] = field(default_factory=list)
-  date_range:       Optional[str] = None
-  warning:          Optional[str] = None
+  date_range:       Optional[str] = None       # the window actually covered
+  requested_range:  Optional[str] = None       # the window the caller asked for
+  warning:          Optional[str] = None       # the backtest did not run
+  caveats:          List[str] = field(default_factory=list)  # it ran, read it carefully
+
+
+# No date given is still a choice of window, and it is this one.
+DEFAULT_PERIOD = '5y'
+
+# yfinance ignores `end` unless `start` is also set -- it falls back to a
+# one-month period. A floor earlier than any listing makes "everything up to
+# X" mean that, rather than "the month before X".
+_EARLIEST_START = '1900-01-01'
+
+# Below this, hit_rate and sharpe are anecdotes with decimal places. Four
+# trades produced "hit_rate_pct: 25.0, sharpe_simple_annualized: 0.357".
+MIN_TRADES_FOR_STATS = 10
+
+# A start honoured by the fetch can still be unmet by the data (a later IPO,
+# a delisting gap). More than this much missing is worth saying out loud.
+_COVERAGE_SLACK_DAYS = 7
+
+
+def _describe_requested_range(start_date: Optional[str],
+                              end_date: Optional[str]) -> str:
+  if start_date and end_date:
+    return f'{start_date} -> {end_date}'
+  if start_date:
+    return f'{start_date} -> latest'
+  if end_date:
+    return f'earliest available -> {end_date}'
+  return f'default: most recent {DEFAULT_PERIOD} (no start_date/end_date given)'
+
+
+def _coverage_caveats(start_date: Optional[str], end_date: Optional[str],
+                      first_bar: str, last_bar: str) -> List[str]:
+  """Say when the bars fall short of the window that was asked for."""
+  out: List[str] = []
+  for requested, actual, edge, sign in (
+    (start_date, first_bar, 'first', 1),
+    (end_date, last_bar, 'last', -1),
+  ):
+    if not requested:
+      continue
+    try:
+      gap = sign * (datetime.strptime(actual, '%Y-%m-%d')
+                    - datetime.strptime(requested[:10], '%Y-%m-%d')).days
+    except ValueError:
+      continue
+    if gap > _COVERAGE_SLACK_DAYS:
+      out.append(
+        f'requested {requested[:10]}; the {edge} bar available is {actual} '
+        f'({gap} days short). Every statistic below covers '
+        f'{first_bar} -> {last_bar} only.')
+  return out
 
 
 def backtest_signal(
@@ -195,7 +249,14 @@ def backtest_signal(
 
   Fetches price history via yfinance. If yfinance is unreachable, returns
   a result with `warning` set.
+
+  `start_date` and `end_date` are honoured independently. They used to be
+  honoured only together: either one alone fell through to a hardcoded
+  5-year period, so an 11-year request silently became a 5-year answer and
+  a request ending in 2020 silently became one covering 2021-2026.
   """
+  requested_range = _describe_requested_range(start_date, end_date)
+
   try:
     import yfinance as yf
   except ImportError:
@@ -203,24 +264,26 @@ def backtest_signal(
       ticker=ticker, signal_name=signal_name, n_trades=0,
       hit_rate=None, mean_return=None, median_return=None, best_trade=None,
       worst_trade=None, mean_hold_days=None, max_drawdown_pct=None,
-      sharpe_simple=None, warning='yfinance not installed',
+      sharpe_simple=None, requested_range=requested_range,
+      warning='yfinance not installed',
     )
 
   try:
     t = yf.Ticker(ticker)
-    kwargs = {}
-    if start_date and end_date:
-      kwargs['start'] = start_date
-      kwargs['end'] = end_date
+    if start_date or end_date:
+      kwargs = {'start': start_date or _EARLIEST_START}
+      if end_date:
+        kwargs['end'] = end_date
     else:
-      kwargs['period'] = '5y'
+      kwargs = {'period': DEFAULT_PERIOD}
     history = t.history(auto_adjust=True, **kwargs)
   except Exception as e:
     return BacktestResult(
       ticker=ticker, signal_name=signal_name, n_trades=0,
       hit_rate=None, mean_return=None, median_return=None, best_trade=None,
       worst_trade=None, mean_hold_days=None, max_drawdown_pct=None,
-      sharpe_simple=None, warning=f'history fetch failed: {type(e).__name__}: {e}',
+      sharpe_simple=None, requested_range=requested_range,
+      warning=f'history fetch failed: {type(e).__name__}: {e}',
     )
 
   if history is None or history.empty or len(history) < 200:
@@ -228,12 +291,14 @@ def backtest_signal(
       ticker=ticker, signal_name=signal_name, n_trades=0,
       hit_rate=None, mean_return=None, median_return=None, best_trade=None,
       worst_trade=None, mean_hold_days=None, max_drawdown_pct=None,
-      sharpe_simple=None, warning='insufficient history (<200 bars)',
+      sharpe_simple=None, requested_range=requested_range,
+      warning='insufficient history (<200 bars)',
     )
 
   indicators = compute_indicators(history)
   closes = indicators['close']
   date_index = [d.strftime('%Y-%m-%d') for d in history.index]
+  caveats = _coverage_caveats(start_date, end_date, date_index[0], date_index[-1])
 
   # Resolve signal evaluator
   if callable(signal):
@@ -287,14 +352,19 @@ def backtest_signal(
       worst_trade=None, mean_hold_days=None, max_drawdown_pct=None,
       sharpe_simple=None, trades=[],
       date_range=f'{date_index[0]} -> {date_index[-1]}',
+      requested_range=requested_range, caveats=caveats,
     )
 
   returns = [t.return_pct for t in trades]
   hold_days_list = [t.hold_days for t in trades]
   hit_rate = sum(1 for r in returns if r > 0) / len(returns) * 100
   mean_ret = sum(returns) / len(returns)
-  sorted_r = sorted(returns)
-  median_ret = sorted_r[len(sorted_r) // 2]
+  # statistics.median, not sorted[n//2]: on an even sample the latter returns
+  # the UPPER middle value, which always favours the higher number. BETA's two
+  # trades [+9.808, -26.218] reported a median of 9.808 against a true -8.205
+  # -- the winner shown, the loser hidden. Small samples are where a backtest
+  # is least trustworthy and most likely to be run.
+  median_ret = statistics.median(returns)
 
   # Sharpe-ish: mean return / std deviation, annualized by sqrt(252/hold_days)
   if len(returns) > 1:
@@ -305,6 +375,13 @@ def backtest_signal(
     sharpe = (mean / std) * math.sqrt(252 / max(avg_hold, 1)) if std > 0 else None
   else:
     sharpe = None
+
+  if len(trades) < MIN_TRADES_FOR_STATS:
+    caveats.append(
+      f'{len(trades)} trades is below the {MIN_TRADES_FOR_STATS}-trade floor '
+      f'for a meaningful hit rate or sharpe. Read hit_rate and sharpe_simple '
+      f'as a description of these {len(trades)} trades, not as an estimate of '
+      f'how the signal performs.')
 
   return BacktestResult(
     ticker=ticker,
@@ -320,6 +397,8 @@ def backtest_signal(
     sharpe_simple=round(sharpe, 3) if sharpe is not None else None,
     trades=trades,
     date_range=f'{date_index[0]} -> {date_index[-1]}',
+    requested_range=requested_range,
+    caveats=caveats,
   )
 
 

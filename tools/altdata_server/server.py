@@ -40,15 +40,18 @@ Optional env vars:
   CONGRESS_API_KEY   -- congress.gov API key (free; enhances get_policy_signals)
 """
 from __future__ import annotations
+from tools.response_meta import annotating, warning
 
 import asyncio
+import calendar
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from mcp.server import Server
@@ -57,6 +60,12 @@ from mcp.types import Tool, TextContent
 
 from tools.altdata_server.text_utils import (
     text_contains, count_matches, extract_dollar_amounts, parse_news_date,
+    # The same compiled pattern and units that produce the VALUES, borrowed so
+    # the classifier can find where each figure SITS in the text. A second copy
+    # here would be free to drift from the one doing the extraction, and a
+    # figure the two disagreed about would be summed without a category.
+    _AMOUNT_PATTERN as _AMOUNT_RE,
+    _UNIT_MULTIPLIERS as _AMOUNT_UNITS,
 )
 
 # ---------------------------------------------------------------------------
@@ -73,6 +82,13 @@ if not os.path.isfile(_VENV_PYTHON):
 
 
 _SUBPROCESS_TIMEOUT_S = 40.0
+
+# Greenhouse is tried twice -- ?content=true for departments, then the plain
+# listing -- and both run inside the stage-1 pool. The pool must outwait their
+# sum, or a board that is merely slow is reported as no provider at all.
+_GREENHOUSE_CONTENT_TIMEOUT_S = 10
+_GREENHOUSE_LISTING_TIMEOUT_S = 8
+_ATS_POOL_TIMEOUT_S = 20
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +295,324 @@ def _capex_signal(announcements: List[Dict]) -> str:
     return "neutral"
 
 
+
+# ---------------------------------------------------------------------------
+# What a dollar figure in a headline actually refers to
+# ---------------------------------------------------------------------------
+#
+# A headline number is not capital expenditure because it is large and sits
+# next to the word "expand". `get_capex_announcements("NVDA")` returned
+# $1.62 TRILLION against single-digit-billion actual capex, built from $750B of
+# customer deals, $500B of third-party capital raised by Apollo/BlackRock/KKR,
+# a $250B lease guarantee, a $105B financing backstop and a $10B joint venture.
+# Not one dollar of it was NVIDIA spending on property, plant or equipment.
+#
+# The error was structural: the old code took the LARGEST figure anywhere in an
+# article and scanned the WHOLE article for direction verbs, so any expansion
+# language in the piece attached itself to any number in the piece. Broadcom's
+# "expand U.S. facility after $30 billion chip deal with Apple" is the pure
+# case -- real expansion language, and a figure that is Apple paying Broadcom.
+#
+# So each figure is read in the clause that carries it, and a figure is capital
+# expenditure only on positive evidence: the company named, a spending (or
+# stopping) verb, and a physical asset, with nothing in the clause marking the
+# money as financed, guaranteed, mobilised from third parties, invested in
+# another company's equity, paid in by a customer, or restated as a running
+# programme total. Anything else is unplaced, and unplaced money is never
+# summed into a total labelled capex.
+
+# Clause boundaries. Sentence ends need the abbreviation guard: without it
+# "brings Taiwan Semiconductor Manufacturing Co.'s U.S. investment to $265
+# billion" splits at "Co." and the containment evidence is severed from the
+# figure it governs.
+_CLAUSE_SEPARATOR = re.compile(r"\s+[–—|;:]\s+|\s+-\s+")
+_SENTENCE_END = re.compile(r"[.!?]\s+(?=[A-Z“‘\"'])")
+_ABBREVIATIONS = frozenset([
+    "inc.", "corp.", "co.", "ltd.", "llc.", "plc.", "no.", "vs.", "etc.",
+    "mr.", "mrs.", "ms.", "dr.", "jr.", "sr.", "st.", "gen.", "sen.", "rep.",
+    "gov.", "prof.", "dept.", "est.", "approx.", "fig.",
+])
+_INITIALS = re.compile(r"(?:[A-Za-z]\.)+")
+
+
+def _is_abbreviation(token: str) -> bool:
+    t = token.strip("(\"'“”‘’,")
+    return t.lower() in _ABBREVIATIONS or bool(_INITIALS.fullmatch(t))
+
+
+def _clause_spans(text: str) -> List[Tuple[int, int]]:
+    """(start, end) of each clause in `text`, split on sentence and clause marks."""
+    cuts = {0, len(text)}
+    for m in _CLAUSE_SEPARATOR.finditer(text):
+        cuts.add(m.start())
+        cuts.add(m.end())
+    for m in _SENTENCE_END.finditer(text):
+        head = text[:m.start() + 1].split()
+        if head and _is_abbreviation(head[-1]):
+            continue
+        cuts.add(m.end())
+    ordered = sorted(c for c in cuts if 0 <= c <= len(text))
+    return [(a, b) for a, b in zip(ordered, ordered[1:])
+            if b > a and text[a:b].strip()]
+
+
+# Evidence that the money is NOT the company spending on its own assets,
+# in the order it is tested. Financing precedes cumulative because "expected to
+# total roughly $45 billion" is a tranche of a debt raise, not a programme
+# total; third-party capital precedes deals because "$500 billion private
+# capital deal" is both and is decided by the capital, not by the deal.
+_FIGURE_EXCLUSIONS: List[Tuple[str, frozenset]] = [
+    ("third_party_capital", frozenset([
+        "third-party capital", "third party capital", "private capital",
+        "outside capital", "external capital", "mobilize", "mobilise",
+        "mobilized", "mobilised", "mobilizing", "asset manager",
+        "asset management", "private credit", "sovereign wealth",
+        "co-invest", "co-investment", "limited partners",
+    ])),
+    ("financing", frozenset([
+        # "finance" and "notes" are deliberately not bare terms: "Yahoo
+        # Finance" is in the boilerplate of half this corpus and "the analyst
+        # notes" is a verb. Both would have taken real capex out of the total.
+        "financing", "to finance", "will finance", "financed", "refinance",
+        "refinancing", "raise", "raises", "raising", "raised", "borrow",
+        "borrows", "borrowing", "debt", "bond", "bonds", "senior notes",
+        "notes offering", "loan", "loans", "tranche", "tranches",
+        "credit facility", "revolver", "underwrite", "underwriting",
+        "securitization", "securitisation", "convertible", "leveraged",
+        "repayment",
+    ])),
+    ("guarantee", frozenset([
+        "guarantee", "guarantees", "guaranteed", "guaranty", "backstop",
+        "backstops", "backstopped", "backstopping", "contingent",
+        "lease obligation", "lease obligations", "indemnity",
+    ])),
+    ("equity_or_ma", frozenset([
+        "acquire", "acquires", "acquired", "acquiring", "acquisition",
+        "acquisitions", "merger", "merge", "merges", "takeover", "buyout",
+        "tender offer", "stake", "stakes", "equity investment",
+        "minority investment", "buyback", "buybacks", "repurchase",
+        "repurchases", "dividend", "dividends",
+    ])),
+    ("customer_or_partner_deal", frozenset([
+        "deal", "deals", "agreement", "agreements", "contract", "contracts",
+        "order", "orders", "bookings", "backlog", "supply", "supplies",
+        "purchase", "purchases", "customer", "customers", "signed", "signing",
+        "lands", "landed", "awarded", "revenue", "revenues", "sales",
+        "partnership", "partnerships", "joint venture", "subscription",
+    ])),
+    ("cumulative_total", frozenset([
+        "brings", "bringing", "brought", "total", "totals", "totaling",
+        "totalling", "to date", "so far", "cumulative", "combined",
+        "overall", "including an additional", "includes an additional",
+        "which includes", "up from", "on top of", "running total",
+    ])),
+]
+
+# "invest $1 billion in NAVER Corp" buys shares; "invest $20 billion in a new
+# Ohio factory" buys a factory. The difference is the object, and only the
+# first has a corporate suffix on it.
+_INVESTED_IN_ENTITY = re.compile(
+    r"\bin\s+(?:[A-Z][\w&.’'-]*\s+){0,3}"
+    r"(?:Corp|Corporation|Inc|Incorporated|Ltd|Limited|LLC|PLC|plc|AG|SA|NV|"
+    r"Holdings|Group|Technologies|Industries|Motors|Partners)\b"
+)
+
+# Universal spend verbs. A cancelled fab is still a capital-expenditure
+# announcement, so the stop verbs qualify a figure exactly as the spend verbs
+# do -- the direction of the news is a separate axis from what the money is.
+_CAPEX_SPEND_VERBS = frozenset([
+    "invest", "invests", "investing", "invested", "investment", "investments",
+    "spend", "spends", "spending", "spent", "outlay", "outlays",
+    "commit", "commits", "committing", "committed", "commitment",
+    "pledge", "pledges", "pledging", "pledged", "pour", "pours", "pouring",
+    "plow", "plowing", "plough", "ploughing", "earmark", "earmarks",
+    "earmarked", "build", "builds", "building", "built", "construct",
+    "constructs", "constructing", "construction", "expand", "expands",
+    "expanding", "expansion", "upgrade", "upgrades", "upgrading",
+    "modernize", "modernise", "modernizing", "retool", "retooling",
+    "break ground", "broke ground", "capex", "capital expenditure",
+    "capital spending", "capital investment",
+])
+_CAPEX_STOP_VERBS = frozenset([
+    "cancel", "cancels", "canceled", "cancelled", "cancelling", "cancellation",
+    "halt", "halts", "halted", "halting", "scrap", "scraps", "scrapped",
+    "shelve", "shelves", "shelved", "shelving", "mothball", "mothballed",
+    "suspend", "suspends", "suspended", "suspension", "delay", "delays",
+    "delayed", "abandon", "abandons", "abandoned", "scale back", "scaled back",
+    "wind down", "winding down", "write down", "write-down", "writedown",
+    "impairment",
+])
+# What the money has to be spent ON. Sector-agnostic on purpose: a refinery, a
+# distribution centre and a fab are the same kind of claim.
+_CAPEX_ASSET_NOUNS = frozenset([
+    "plant", "plants", "factory", "factories", "fab", "fabs", "foundry",
+    "foundries", "facility", "facilities", "data center", "data centre",
+    "datacenter", "datacentre", "campus", "site", "sites", "mill", "mills",
+    "refinery", "refineries", "mine", "mines", "smelter", "warehouse",
+    "warehouses", "distribution center", "distribution centre", "store",
+    "stores", "capacity", "manufacturing", "production line", "assembly line",
+    "gigafactory", "megafactory", "infrastructure", "equipment", "machinery",
+    "ai factory", "chipmaking", "fabrication", "network", "pipeline",
+    "terminal", "rail", "fleet",
+])
+# A figure has to belong to the company being asked about. The relevance filter
+# only asks whether the ARTICLE mentions it, which is how "Samsung and SK Hynix
+# to build four new chip plants as South Korea unveils $520 billion" survives a
+# TSMC query -- the body says "semiconductor" and the figure is Samsung's.
+_SELF_REFERENCE = frozenset([
+    "the company", "the firm", "the group", "the chipmaker", "the maker",
+    "the manufacturer", "the automaker", "the retailer", "the miner",
+    "the producer", "the operator",
+])
+# Naming the company is not being the company. "Nvidia supplier King Yuan
+# Electronics to invest up to $1.4 billion in US facility" is a live headline
+# that put a supplier's plant in NVIDIA's capex: the token, the verb and the
+# asset were all in the clause and all belonged to someone else. These words
+# turn the name in front of them into a modifier of the real spender.
+_THIRD_PARTY_ROLES = (
+    "supplier", "suppliers", "customer", "customers", "partner", "partners",
+    "rival", "rivals", "competitor", "competitors", "client", "clients",
+    "vendor", "vendors", "contractor", "contractors", "investor", "investors",
+    "backer", "backers", "spinoff", "backed", "owned", "funded", "led",
+    "linked", "adjacent", "related",
+)
+_ROLE_SUFFIX = re.compile(
+    r"(?:’s|'s)?\s*[- ]\s*(?:" + "|".join(_THIRD_PARTY_ROLES) + r")\b",
+    re.IGNORECASE)
+# The same story with the relationship on the other side: "the supplier to
+# chipmaker Nvidia said on Friday". The linking preposition is what makes the
+# name the OBJECT of the role -- "Apple partner Broadcom" has no "to", and
+# there Broadcom really is the one spending.
+_ROLE_PREFIX = re.compile(
+    r"\b(?:" + "|".join(_THIRD_PARTY_ROLES) + r")\s+(?:to|of|for)\s+"
+    r"(?:[a-z][\w-]*\s+){0,2}$",
+    re.IGNORECASE)
+# A capex announcement is announced. "Nvidia Weighs $3 Billion SB Energy
+# Investment" is a figure under consideration, and a total built from options
+# a company is thinking about is not a total of anything it has committed.
+_UNCOMMITTED = frozenset([
+    "weighs", "weighing", "weighed", "considers", "considering", "considered",
+    "mulls", "mulling", "mulled", "explores", "exploring", "eyes", "eyeing",
+    "in talks", "may invest", "could invest", "might invest", "may spend",
+    "could spend", "would invest", "would spend", "reportedly", "rumored",
+    "rumoured", "is said to", "potential", "potentially", "proposed",
+    "proposal", "seeks", "seeking", "weighing up", "studying",
+])
+
+
+def _names_a_third_party(clause: str, token: str) -> bool:
+    """True when the company is named as somebody else's supplier/partner/rival
+    rather than as the party doing the spending."""
+    at = clause.lower().find(token)
+    if at < 0:
+        return False
+    return bool(_ROLE_SUFFIX.match(clause, at + len(token))
+                or _ROLE_PREFIX.search(clause[:at]))
+
+
+def _classify_figure(clause: str, after: str,
+                     name_tokens: List[str]) -> Tuple[str, str]:
+    """What one dollar figure refers to, and the words that say so.
+
+    Returns (category, evidence). Never guesses: a figure with no positive
+    capex evidence comes back "unclassified" with the reason it failed, which
+    keeps it out of the total instead of into it.
+    """
+    for category, terms in _FIGURE_EXCLUSIONS:
+        hits = sorted(t for t in terms if text_contains(clause, t))
+        if hits:
+            return category, "; ".join(hits[:3])
+        # Equity has a second test no keyword covers: what the money went INTO.
+        if category == "equity_or_ma":
+            m = _INVESTED_IN_ENTITY.search(after[:90])
+            if m:
+                return category, f"invested {m.group(0)}"
+
+    named = [t for t in name_tokens if text_contains(clause, t)]
+    modifiers = [t for t in named if _names_a_third_party(clause, t)]
+    attribution = [t for t in named if t not in modifiers]
+    attribution += [p for p in _SELF_REFERENCE if text_contains(clause, p)]
+    hedges = sorted(t for t in _UNCOMMITTED if text_contains(clause, t))
+    verbs = sorted(t for t in (_CAPEX_SPEND_VERBS | _CAPEX_STOP_VERBS)
+                   if text_contains(clause, t))
+    assets = sorted(t for t in _CAPEX_ASSET_NOUNS if text_contains(clause, t))
+
+    if not attribution:
+        if modifiers:
+            return "unclassified", (
+                f"{modifiers[0]} appears only as a modifier of the party "
+                f"actually spending")
+        return "unclassified", (
+            "the clause carrying the figure does not name "
+            + (" / ".join(name_tokens) if name_tokens else "the company"))
+    if hedges:
+        return "unclassified", (
+            f"the spend is being weighed, not announced ({hedges[0]})")
+    if not verbs:
+        return "unclassified", "no spending or cancellation verb beside the figure"
+    if not assets:
+        return "unclassified", "nothing physical named for the money to be spent on"
+    return "capital_expenditure", (
+        f"{attribution[0]} + {verbs[0]} + {assets[0]}")
+
+
+def _figures_in_article(text: str, name_tokens: List[str]) -> List[Dict[str, Any]]:
+    """Every dollar figure in one article, each read in its own clause."""
+    spans = _clause_spans(text)
+    out: List[Dict[str, Any]] = []
+    for m in _AMOUNT_RE.finditer(text):
+        raw = m.group(1).replace(",", "")
+        try:
+            value = float(raw)
+        except ValueError:
+            continue
+        mult = _AMOUNT_UNITS.get(m.group(2).lower())
+        if not mult:
+            continue
+        clause = next((text[a:b] for a, b in spans if a <= m.start() < b), text)
+        after = text[m.end():min(len(text), m.end() + 120)]
+        category, evidence = _classify_figure(clause, after, name_tokens)
+        out.append({
+            "amount_usd": value * mult,
+            "category": category,
+            "evidence": evidence,
+            "context": clause.strip()[:220],
+        })
+    return out
+
+
+# The order a tie between two readings of the same figure is broken in. Capex
+# comes last on purpose: it is the claim that has to be earned, so a figure one
+# article calls a deal and another calls a plant is not capex.
+_CATEGORY_PRIORITY = [c for c, _ in _FIGURE_EXCLUSIONS] + ["capital_expenditure"]
+
+
+def _resolve_figure(readings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """One verdict for a figure several articles each described differently.
+
+    "unclassified" is an absence of evidence, not evidence of absence, so it
+    never outvotes an article that did say what the money was.
+    """
+    definite = [r for r in readings if r["category"] != "unclassified"]
+    if not definite:
+        return dict(readings[0])
+    counts: Dict[str, int] = {}
+    for r in definite:
+        counts[r["category"]] = counts.get(r["category"], 0) + 1
+    best = max(counts.values())
+    tied = sorted((c for c, n in counts.items() if n == best),
+                  key=_CATEGORY_PRIORITY.index)
+    return dict(next(r for r in definite if r["category"] == tied[0]))
+
+
+def _usd_short(amount: float) -> str:
+    """$265,000,000,000 -> '$265B'. Used in prose, never in a numeric field."""
+    for cutoff, suffix in ((1e12, "T"), (1e9, "B"), (1e6, "M")):
+        if abs(amount) >= cutoff:
+            return f"${amount / cutoff:.6g}{suffix}"
+    return f"${amount:,.0f}"
+
+
 # ---------------------------------------------------------------------------
 # Company name resolution (ticker → display name)
 # ---------------------------------------------------------------------------
@@ -320,7 +654,12 @@ def _resolve_ticker(ticker: str) -> Dict[str, str]:
         raise UnknownTicker(
             f"'{ticker}' is not a symbol yfinance can resolve (no longName or "
             f"shortName in its quote response). No lookup was attempted.")
-    return {"name": name, "sector": info.get("sector") or ""}
+    # `industry` rides along because the sector alone is too coarse for some
+    # questions. yfinance has no "Defense" sector -- every prime is
+    # "Industrials" -- and the legislation that matters to them is named at
+    # the industry level.
+    return {"name": name, "sector": info.get("sector") or "",
+            "industry": info.get("industry") or ""}
 
 
 def _lookup_failed(exc: LookupFailure, **payload: Any) -> Dict[str, Any]:
@@ -469,7 +808,8 @@ def _try_greenhouse_norm(slug: str, dept_filter: Optional[str]) -> Optional[Dict
     # departments; the plain listing omits the key entirely. The plain listing
     # is the fallback so a slow/oversized content response still yields a count
     # (with department_coverage saying the breakdown is missing).
-    for url, timeout in ((f"{base}?content=true", 10), (base, 8)):
+    for url, timeout in ((f"{base}?content=true", _GREENHOUSE_CONTENT_TIMEOUT_S),
+                         (base, _GREENHOUSE_LISTING_TIMEOUT_S)):
         try:
             resp = requests.get(url, timeout=timeout,
                                 headers={"User-Agent": "Mozilla/5.0"})
@@ -702,7 +1042,8 @@ def _fetch_job_postings(slug: str, ats: str,
             # attempt and its plain-listing fallback (10s + 8s worst case).
             # A tighter bound here would report "no provider answered" for a
             # board that was merely slow.
-            for future in as_completed([gh_f, lv_f], timeout=20):
+            for future in as_completed([gh_f, lv_f],
+                                       timeout=_ATS_POOL_TIMEOUT_S):
                 try:
                     result = future.result()
                     if result:
@@ -855,7 +1196,16 @@ def _fetch_taiwan_revenue_finmind(company_codes: List[str], months: int) -> Dict
             yoy_pct = None
             if prior_rev and prior_rev != 0:
                 yoy_pct = round((rev_raw - prior_rev) / abs(prior_rev) * 100, 2)
-            parsed.append({"year": yr, "month": mo, "date": r["date"],
+            # FinMind's `date` is the month the figure was ANNOUNCED, one ahead
+            # of the month it describes: TSMC's June 2026 revenue is stamped
+            # 2026-07-01. Passing that through as `date` put it next to
+            # year=2026 / month=6 disagreeing with both, and anything charted
+            # on it attributed every month's revenue to the following month.
+            # `date` is now the first day of the period; the announcement
+            # stamp is kept under a name that says what it is.
+            parsed.append({"year": yr, "month": mo,
+                           "date": f"{yr:04d}-{mo:02d}-01",
+                           "announced_date": r["date"],
                            "revenue_ntd_m": rev_ntd_m, "yoy_pct": yoy_pct})
         results[code] = {"company_code": code, "months_returned": len(parsed),
                          "months": parsed, "source": "finmind"}
@@ -912,22 +1262,53 @@ def _usa_filters(company_name: str, start: str, end: str,
     }
 
 
-def _usa_obligations_total(company_name: str, start: str, end: str,
-                            award_types: List[str]) -> float:
-    """Sum real obligation FLOWS over a window via spending_over_time.
+def _fiscal_bucket_month(fiscal_year: Any, month: Any) -> str:
+    """Calendar month for one spending_over_time bucket, as YYYY-MM-01.
+
+    The endpoint labels its buckets by FEDERAL FISCAL month, where month 1 is
+    October. `{"fiscal_year": "2026", "month": "9"}` is June 2026, not
+    September. Reading the label as a calendar month slides the whole series
+    three months and would put the data horizon in the wrong place.
+    """
+    fy, fm = int(fiscal_year), int(month)
+    return f"{fy - 1 if fm <= 3 else fy:04d}-{((fm + 8) % 12) + 1:02d}-01"
+
+
+def _usa_month_series(company_name: Optional[str], start: str, end: str,
+                       award_types: List[str]) -> List[Dict[str, Any]]:
+    """Obligation FLOW per calendar month over a window, oldest first.
 
     Unlike spending_by_award (which returns multi-year contract ceiling
-    values), spending_over_time returns the obligated amount per period.
-    The time_period filter bounds the window, so summing the buckets gives
-    the true period flow.
+    values), spending_over_time returns the obligated amount per period. The
+    time_period filter bounds the window, so the buckets are the true period
+    flow. `company_name` of None asks the same question of the whole federal
+    government, which is how data freshness is measured.
     """
     import requests
-    payload = {"group": "month",
-               "filters": _usa_filters(company_name, start, end, award_types)}
-    resp = requests.post(_SOT_URL, json=payload, timeout=_USA_TIMEOUT, headers=_USA_HEADERS)
+    filters = _usa_filters(company_name or "", start, end, award_types)
+    if not company_name:
+        filters.pop("recipient_search_text", None)
+    resp = requests.post(_SOT_URL, json={"group": "month", "filters": filters},
+                         timeout=_USA_TIMEOUT, headers=_USA_HEADERS)
     resp.raise_for_status()
-    results = resp.json().get("results", [])
-    return float(sum((r.get("aggregated_amount") or 0) for r in results))
+    series = []
+    for row in resp.json().get("results", []) or []:
+        bucket = row.get("time_period") or {}
+        if "fiscal_year" not in bucket or "month" not in bucket:
+            continue
+        series.append({
+            "month": _fiscal_bucket_month(bucket["fiscal_year"], bucket["month"]),
+            "obligations_usd": float(row.get("aggregated_amount") or 0),
+        })
+    series.sort(key=lambda r: r["month"])
+    return series
+
+
+def _usa_obligations_total(company_name: str, start: str, end: str,
+                            award_types: List[str]) -> float:
+    """Total obligation flow over a window."""
+    return float(sum(r["obligations_usd"] for r in
+                     _usa_month_series(company_name, start, end, award_types)))
 
 
 def _usa_top_agencies(company_name: str, start: str, end: str,
@@ -978,18 +1359,149 @@ def _gov_contracts_signal(trailing_total: float, prior_total: Optional[float],
     return "neutral"
 
 
+# ---------------------------------------------------------------- data horizon
+
+# A published month runs at roughly the level of its neighbours. Below this
+# share of the median month it is not a quiet month, it is a month the
+# agencies have not filed yet. 0.8 separates the two cleanly on the measured
+# series: October 2025 (a genuinely thin month at 32% of median) sits inside
+# the published run and does not move the horizon, because only an unbroken
+# run of thin months at the END of the series counts as unpublished.
+_HORIZON_COMPLETENESS = 0.8
+_USA_HORIZON_LOOKBACK_MONTHS = 18
+_USA_HORIZON_TTL_SECONDS = 6 * 3600
+# Above this share of the window sitting past the horizon, the window is
+# mostly unpublished and cannot carry a signal in either direction.
+_LAG_MOSTLY = 0.5
+
+_usa_horizon_cache: Dict[Tuple[str, ...], Tuple[float, Dict[str, Any]]] = {}
+
+
+def _shift_months(day, count: int) -> date:
+    """Calendar-exact month arithmetic, clamped to the length of the month.
+
+    timedelta(days=months * 365/12) drifts: three months before 2026-08-25 came
+    out as 2026-05-26. And a year before 2024-02-29 has to be 2023-02-28,
+    because 2023-02-29 does not exist.
+    """
+    anchor = day.date() if isinstance(day, datetime) else day
+    index = anchor.month - 1 + count
+    year, month = anchor.year + index // 12, index % 12 + 1
+    return date(year, month, min(anchor.day, calendar.monthrange(year, month)[1]))
+
+
+def _data_horizon_from_series(series: List[Dict[str, Any]],
+                               threshold: float = _HORIZON_COMPLETENESS
+                               ) -> Dict[str, Any]:
+    """The last date USASpending has actually published, from its own series.
+
+    Federal contract actions reach USASpending months in arrears -- the
+    Department of Defense above all, whose actions are withheld from public
+    FPDS release for 90 days. Measured government-wide on 2026-08-25, monthly
+    contract obligations held $50-100bn through 2026-05 and then fell to
+    $33.1bn, $39.9bn and $15.5bn. Lockheed's own months went from a $4.1bn
+    median to $147m, $27m and $16m over the same three.
+
+    Those months are unpublished, not empty, and the difference decides
+    whether a trailing total is a finding or a gap. So the horizon is measured
+    from the provider each time rather than assumed from a constant that would
+    silently go stale.
+    """
+    if not series:
+        raise ValueError("cannot measure a data horizon from an empty series")
+
+    amounts = sorted(row["obligations_usd"] for row in series)
+    middle = len(amounts) // 2
+    baseline = (amounts[middle] if len(amounts) % 2
+                else (amounts[middle - 1] + amounts[middle]) / 2)
+    floor = baseline * threshold
+
+    incomplete: List[str] = []
+    for row in reversed(series):
+        if row["obligations_usd"] >= floor:
+            break
+        incomplete.append(row["month"][:7])
+    incomplete.reverse()
+
+    last_published = (incomplete[0] if incomplete else None)
+    if last_published:
+        year, month = int(last_published[:4]), int(last_published[5:7])
+        published_through = _shift_months(date(year, month, 1), -1)
+    else:
+        last = series[-1]["month"]
+        published_through = date(int(last[:4]), int(last[5:7]), 1)
+    end_of_month = calendar.monthrange(published_through.year,
+                                       published_through.month)[1]
+    return {
+        "horizon": published_through.replace(day=end_of_month).strftime("%Y-%m-%d"),
+        "incomplete_months": incomplete,
+        "baseline_usd": baseline,
+        "measured_from": "spending_over_time, government-wide, by month",
+    }
+
+
+def _usa_data_horizon(award_types: List[str]) -> Dict[str, Any]:
+    """Measure how current USASpending's published data is, and cache it.
+
+    Government-wide rather than per company: one company's quiet quarter is
+    ambiguous, the whole federal government's is not. Keyed by award type
+    because the feeds differ -- measured 2026-08-25, grants (02/03/04/05) ran
+    current at $240bn for 2026-07 while contracts (A/B/C/D) stopped at
+    2026-05 -- so the probe measures exactly the universe being summed.
+
+    Cached for six hours: the answer changes daily at most, and the probe
+    would otherwise repeat on every call.
+    """
+    key = tuple(award_types)
+    cached = _usa_horizon_cache.get(key)
+    now = time.monotonic()
+    if cached and now - cached[0] < _USA_HORIZON_TTL_SECONDS:
+        return cached[1]
+
+    today = date.today()
+    series = _usa_month_series(
+        None, _shift_months(today, -_USA_HORIZON_LOOKBACK_MONTHS).strftime("%Y-%m-%d"),
+        today.strftime("%Y-%m-%d"), award_types)
+    horizon = _data_horizon_from_series(series)
+    _usa_horizon_cache[key] = (now, horizon)
+    return horizon
+
+
+def _window_lag_fraction(start: str, end: str, horizon: str) -> float:
+    """How much of [start, end] lies past the provider's published data."""
+    first, last = date.fromisoformat(start), date.fromisoformat(end)
+    edge = date.fromisoformat(horizon)
+    span = (last - first).days
+    if span <= 0:
+        return 0.0
+    return max(0.0, (last - max(first, edge)).days / span)
+
+
 def _gov_windows(today, months: int):
-    """Pure: (trailing_start, trailing_end, prior_start, prior_end) date strings.
-    Calendar-accurate spans (365/12 days per month, not 30) so '12 months' is a
-    true year for the YoY. USASpending time_period is inclusive on both ends,
-    so the prior window ends one day before the trailing window starts (no
-    boundary-day double count)."""
-    span = timedelta(days=round(months * 365 / 12))
-    t_start = today - span
-    return (t_start.strftime("%Y-%m-%d"),
-            today.strftime("%Y-%m-%d"),
-            (t_start - span).strftime("%Y-%m-%d"),
-            (t_start - timedelta(days=1)).strftime("%Y-%m-%d"))
+    """Pure: (trailing_start, trailing_end, compare_start, compare_end).
+
+    The comparison window is the SAME months one year earlier, which is what
+    `yoy_change_pct` claims to measure. It used to be the months immediately
+    before the trailing window: at months=3 the "prior" figure came out equal
+    to the months=6 trailing figure, which is how the substitution was caught.
+
+    A sequential comparison cannot be labelled year-over-year on this series.
+    Federal obligations peak enormously at the 30 September fiscal year end --
+    government-wide, 2025-09 was $148bn against a $60bn median month -- so a
+    window-against-previous-window change measures where in the fiscal year
+    the window happens to sit.
+
+    USASpending's time_period is inclusive on both ends, so the comparison
+    window stops the day before the trailing window's own start date shifted
+    back a year: at months=12 the two windows are adjacent, and the shared
+    boundary day would otherwise be counted in both.
+    """
+    anchor = today.date() if isinstance(today, datetime) else today
+    trailing_start = _shift_months(anchor, -months)
+    return (trailing_start.strftime("%Y-%m-%d"),
+            anchor.strftime("%Y-%m-%d"),
+            _shift_months(trailing_start, -12).strftime("%Y-%m-%d"),
+            (_shift_months(anchor, -12) - timedelta(days=1)).strftime("%Y-%m-%d"))
 
 
 def _fetch_government_contracts(ticker: str, company_name: str,
@@ -997,6 +1509,7 @@ def _fetch_government_contracts(ticker: str, company_name: str,
     base = {"ticker": ticker, "company_name": company_name or None,
             "period_months": months, "trailing_awards_usd": None,
             "prior_period_awards_usd": None, "yoy_change_pct": None,
+            "data_horizon": None, "window_lag_fraction": None,
             "signal": None, "top_agencies": [], "source": "usaspending.gov"}
 
     # An explicit company_name is the caller asserting the entity; only derive
@@ -1013,23 +1526,37 @@ def _fetch_government_contracts(ticker: str, company_name: str,
 
     award_types = _CONTRACT_AWARD_TYPES + (_GRANT_AWARD_TYPES if include_grants else [])
 
-    # Run the four independent USASpending queries concurrently.
+    # Run the independent USASpending queries concurrently.
     results: Dict[str, Any] = {}
     errors: List[str] = []
-    pool = ThreadPoolExecutor(max_workers=4)
+    degraded: List[str] = []
+    pool = ThreadPoolExecutor(max_workers=5)
     try:
         futures = {
             pool.submit(_usa_obligations_total, company_name, trailing_start, end, award_types): "trailing",
             pool.submit(_usa_obligations_total, company_name, prior_start, prior_end, award_types): "prior",
             pool.submit(_usa_top_agencies, company_name, trailing_start, end, award_types): "agencies",
             pool.submit(_usa_award_count, company_name, trailing_start, end, award_types): "count",
+            pool.submit(_usa_data_horizon, award_types): "horizon",
         }
         for future in as_completed(futures, timeout=_USA_TIMEOUT + 5):
             key = futures[future]
             try:
                 results[key] = future.result()
             except Exception as exc:
-                errors.append(f"{key}: {type(exc).__name__}: {str(exc)[:120]}")
+                detail = f"{key}: {type(exc).__name__}: {str(exc)[:120]}"
+                if key == "horizon":
+                    # A failed freshness probe narrows what can be said without
+                    # invalidating the totals, so it is named as a degradation
+                    # rather than counted against coverage -- but it is never
+                    # read as "no lag", which would be the silent guess this
+                    # measurement exists to remove.
+                    degraded.append(
+                        f"USASpending data-horizon probe failed ({detail}); "
+                        "whether this window falls inside the provider's "
+                        "reporting lag is unknown.")
+                else:
+                    errors.append(detail)
     except Exception as exc:
         errors.append(f"timeout waiting for USASpending: {type(exc).__name__}")
     finally:
@@ -1064,25 +1591,75 @@ def _fetch_government_contracts(ticker: str, company_name: str,
         for a in agencies[:5]
     ]
 
-    signal = _gov_contracts_signal(trailing_total, prior_total, yoy_pct)
+    # How much of the trailing window the provider has not published yet. An
+    # unpublished month reads exactly like a month with no awards, and the two
+    # are opposite findings.
+    measured = results.get("horizon")
+    horizon = measured["horizon"] if measured else None
+    lag_fraction = (round(_window_lag_fraction(trailing_start, end, horizon), 3)
+                    if horizon else None)
+    mostly_unpublished = lag_fraction is not None and lag_fraction >= _LAG_MOSTLY
+
+    warnings: List[Dict[str, Any]] = []
+    if lag_fraction:
+        share = f"{lag_fraction * 100:.0f}%"
+        if mostly_unpublished:
+            warnings.append(warning(
+                "reporting_lag",
+                f"USASpending has published contract obligations only through "
+                f"{horizon}, and {share} of the {months}-month window "
+                f"({trailing_start} to {end}) falls after that date. The "
+                f"trailing total measures what has been published, not what "
+                f"was awarded, so no signal is reported: this is a gap in the "
+                f"record rather than a change in the company's federal "
+                f"business.",
+                data_horizon=horizon,
+                window_lag_fraction=lag_fraction,
+                window=f"{trailing_start}..{end}"))
+        else:
+            warnings.append(warning(
+                "partial_reporting_lag",
+                f"USASpending has published contract obligations only through "
+                f"{horizon}. {share} of the trailing window falls after that "
+                f"date while the year-ago comparison window "
+                f"({prior_start} to {prior_end}) is fully published, so "
+                f"yoy_change_pct is biased downward by roughly that share of "
+                f"the period.",
+                data_horizon=horizon,
+                window_lag_fraction=lag_fraction,
+                window=f"{trailing_start}..{end}"))
+
+    signal = (None if mostly_unpublished
+              else _gov_contracts_signal(trailing_total, prior_total, yoy_pct))
 
     # prior/agencies/count are supporting detail: missing any of them narrows
     # the answer without invalidating the trailing total.
     return {
         "success": True,
-        "coverage": "partial" if errors else "full",
+        "coverage": "partial" if (errors or mostly_unpublished) else "full",
         "company_name": company_name,
         "ticker": ticker,
         "period_months": months,
+        "trailing_window": {"start": trailing_start, "end": end},
+        "comparison_window": {"start": prior_start, "end": prior_end},
         "trailing_awards_usd": round(trailing_total, 2),
         "trailing_award_count": award_count,
         "prior_period_awards_usd": round(prior_total, 2) if prior_total is not None else None,
         "yoy_change_pct": yoy_pct,
+        "data_horizon": horizon,
+        "window_lag_fraction": lag_fraction,
         "signal": signal,
         "top_agencies": top_agencies,
         "source": "usaspending.gov",
         "basis": ("Contract obligations (period flow) via spending_over_time — "
-                  "not multi-year contract ceiling values."),
+                  "not multi-year contract ceiling values. yoy_change_pct "
+                  "compares the trailing window against the same calendar "
+                  "months one year earlier, never against the window "
+                  "immediately before it: federal obligations peak at the "
+                  "30 September fiscal year end, so a sequential change "
+                  "measures the calendar."),
+        "warnings": warnings,
+        "degraded": degraded,
         "partial_errors": errors,
     }
 
@@ -1105,6 +1682,33 @@ SECTOR_BILL_KEYWORDS: Dict[str, List[str]] = {
     "Utilities":              ["grid infrastructure", "nuclear energy", "clean power"],
     "Defense":                ["NDAA", "defense authorization", "military procurement"],
 }
+
+# yfinance industry -> a keyword sector that its GICS sector cannot reach.
+#
+# "Defense" has always been in SECTOR_BILL_KEYWORDS and has never been
+# reachable: yfinance files every prime under sector "Industrials", so LMT was
+# researched on ["infrastructure", "reshoring", "defense procurement"] and came
+# back with the Restoring the Death Penalty in DC Act and the Native American
+# Housing Assistance Modernization Act. The NDAA -- the one bill that moves a
+# defense prime's revenue line -- was never searched for.
+#
+# Deliberately narrow. An override only belongs here when the provider's
+# taxonomy has no way to express the distinction, never as a second opinion
+# about a sector the provider named correctly.
+INDUSTRY_SECTOR_OVERRIDES: Dict[str, str] = {
+    "aerospace & defense": "Defense",
+}
+
+# See the comment on the request itself: GovTrack's cold path is ~18s.
+_GOVTRACK_TIMEOUT_S = 25
+_POLICY_SIGNALS_TIMEOUT_S = 60.0
+
+# Bills fetched per keyword, and rows carried in `bills`. `bill_count`
+# describes the whole matched set, `rows_returned` describes this page, and
+# `truncated` says when they differ -- the rule
+# testing/test_counts_survive_paging.py holds the SEC tools to, and which
+# get_congress_trades on this server already follows.
+_BILL_ROW_CAP = 10
 
 # Pro-industry vs anti-industry bill language. Complete words/conjugations only
 # (word-boundary matched) — partial stems like "fund"/"invest"/"ban" caused
@@ -1163,26 +1767,65 @@ def _score_bill_title(title: str, status: str) -> float:
     return (pos - neg) * weight
 
 
-def _govtrack_fetch_bills(keywords: List[str], congress: int,
-                           limit: int = 8) -> Tuple[List[Dict], List[str]]:
-    """(bills, errors). A keyword whose query failed is named in `errors`.
+def _fetch_keywords(fetch_one, keywords: List[str]
+                    ) -> Tuple[List[Dict], List[str], List[str]]:
+    """Run `fetch_one(keyword)` over every keyword, concurrently.
 
-    Swallowing the exception made "GovTrack is down" and "no bill mentions
-    semiconductors" the same answer.
+    (bills, errors, keywords_queried). Concurrent because the alternative was
+    a cap: both fetchers used `keywords[:3]` while the response reported the
+    whole mapping in `keywords_searched`, so for Industrials the response said
+    it had looked for "NDAA" and it never had. Four sequential 10s requests
+    across two congresses do not fit the handler's 30s budget; four concurrent
+    ones do.
+
+    A keyword whose query failed is named in `errors`. Swallowing the
+    exception made "GovTrack is down" and "no bill mentions semiconductors"
+    the same answer.
     """
-    import requests
-    bills = []
-    errors: List[str] = []
-    seen_ids: set = set()
+    from concurrent.futures import ThreadPoolExecutor
 
-    for kw in keywords[:3]:
+    if not keywords:
+        return [], [], []
+    with ThreadPoolExecutor(max_workers=min(len(keywords), 6)) as pool:
+        results = list(pool.map(fetch_one, keywords))
+
+    bills: List[Dict] = []
+    errors: List[str] = []
+    seen: set = set()
+    # Merged in keyword order rather than completion order so the same inputs
+    # produce the same list.
+    for rows, errs in results:
+        errors += errs
+        for row in rows:
+            key = row.get("link") or row.get("title")
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            bills.append(row)
+    return bills, errors, list(keywords)
+
+
+def _govtrack_fetch_bills(keywords: List[str], congress: int,
+                           limit: int = 8) -> Tuple[List[Dict], List[str], List[str]]:
+    """(bills, errors, keywords_queried) from GovTrack, one query per keyword."""
+    import requests
+
+    def one(kw: str) -> Tuple[List[Dict], List[str]]:
+        rows: List[Dict] = []
         try:
             resp = requests.get(
                 "https://www.govtrack.us/api/v2/bill/",
                 params={"q": kw, "congress": congress,
                         "order_by": "-introduced_date", "limit": limit},
                 headers={"User-Agent": "Mozilla/5.0"},
-                timeout=10,
+                # Measured 2026-08-26: a cold GovTrack query answers in ~18s
+                # and the same query 0.6s once warm. At the old 10s every
+                # first call of a session timed out, and the tool reported
+                # `provider_unavailable` about a provider that was up. The
+                # queries run concurrently, so this bounds one round rather
+                # than the sum of them.
+                timeout=_GOVTRACK_TIMEOUT_S,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -1190,38 +1833,40 @@ def _govtrack_fetch_bills(keywords: List[str], congress: int,
                 # GovTrack bill objects have no "id" field; dedup on the unique
                 # link (fall back to title). The old "id" key was always None,
                 # which silently dropped every bill.
-                bid = obj.get("link") or obj.get("title")
-                if bid and bid not in seen_ids:
-                    seen_ids.add(bid)
-                    bills.append({
-                        "title": obj.get("title", ""),
-                        "short_title": obj.get("short_title", ""),
-                        "status": obj.get("current_status", "introduced"),
-                        "introduced_date": obj.get("introduced_date", ""),
-                        # current_status_date = latest activity; best recency signal
-                        "activity_date": obj.get("current_status_date")
-                                         or obj.get("introduced_date", ""),
-                        "link": obj.get("link", ""),
-                        "congress": congress,
-                        "source": "govtrack",
-                    })
+                rows.append({
+                    "title": obj.get("title", ""),
+                    "short_title": obj.get("short_title", ""),
+                    "status": obj.get("current_status", "introduced"),
+                    "introduced_date": obj.get("introduced_date", ""),
+                    # current_status_date = latest activity; best recency signal
+                    "activity_date": obj.get("current_status_date")
+                                     or obj.get("introduced_date", ""),
+                    "link": obj.get("link", ""),
+                    "congress": congress,
+                    "source": "govtrack",
+                    # Which query surfaced this bill. GovTrack's `q` searches
+                    # full text, so a bill can arrive on a keyword its title
+                    # never mentions -- naming the keyword is what lets a
+                    # reader discount the Native American Housing Assistance
+                    # Modernization Act arriving on "infrastructure".
+                    "matched_keyword": kw,
+                })
         except Exception as exc:  # noqa: BLE001 - recorded, not hidden
-            errors.append(f"govtrack {kw!r} (congress {congress}): "
-                          f"{type(exc).__name__}: {str(exc)[:120]}")
-            continue
-    return bills, errors
+            return rows, [f"govtrack {kw!r} (congress {congress}): "
+                          f"{type(exc).__name__}: {str(exc)[:120]}"]
+        return rows, []
+
+    return _fetch_keywords(one, keywords)
 
 
 def _congress_api_fetch_bills(keywords: List[str], congress: int,
                                api_key: str,
-                               limit: int = 10) -> Tuple[List[Dict], List[str]]:
-    """(bills, errors) — same contract as _govtrack_fetch_bills."""
+                               limit: int = 10) -> Tuple[List[Dict], List[str], List[str]]:
+    """(bills, errors, keywords_queried) — same contract as _govtrack_fetch_bills."""
     import requests
-    bills = []
-    errors: List[str] = []
-    seen_titles: set = set()
 
-    for kw in keywords[:3]:
+    def one(kw: str) -> Tuple[List[Dict], List[str]]:
+        rows: List[Dict] = []
         try:
             resp = requests.get(
                 "https://api.congress.gov/v3/bill",
@@ -1234,9 +1879,6 @@ def _congress_api_fetch_bills(keywords: List[str], congress: int,
             data = resp.json()
             for b in data.get("bills", []):
                 title = b.get("title", "")
-                if title in seen_titles:
-                    continue
-                seen_titles.add(title)
                 latest = b.get("latestAction", {})
                 action_text = (latest.get("text") or "").lower()
                 if "became public law" in action_text:
@@ -1247,7 +1889,7 @@ def _congress_api_fetch_bills(keywords: List[str], congress: int,
                     status = "referred"
                 else:
                     status = "introduced"
-                bills.append({
+                rows.append({
                     "title": title,
                     "short_title": "",
                     "status": status,
@@ -1256,12 +1898,14 @@ def _congress_api_fetch_bills(keywords: List[str], congress: int,
                     "link": "",
                     "congress": congress,
                     "source": "congress.gov",
+                    "matched_keyword": kw,
                 })
         except Exception as exc:  # noqa: BLE001 - recorded, not hidden
-            errors.append(f"congress.gov {kw!r} (congress {congress}): "
-                          f"{type(exc).__name__}: {str(exc)[:120]}")
-            continue
-    return bills, errors
+            return rows, [f"congress.gov {kw!r} (congress {congress}): "
+                          f"{type(exc).__name__}: {str(exc)[:120]}"]
+        return rows, []
+
+    return _fetch_keywords(one, keywords)
 
 
 def _fetch_policy_signals(ticker: str, sector: str,
@@ -1272,16 +1916,32 @@ def _fetch_policy_signals(ticker: str, sector: str,
     unknown ticker, a sector with no keyword mapping (which silently answered
     with the technology/semiconductor/defense default), and GovTrack being
     unreachable. Each is now named.
+
+    Three labels were wrong on top of that, all found on LMT. The sector was
+    auto-detected as "Industrials" because that is what yfinance calls a
+    defense prime, so the Defense keyword set was unreachable. The response
+    reported four keywords in `keywords_searched` while the fetcher used three,
+    dropping "NDAA". And `bill_count: 21` shipped beside ten bills with no
+    truncation flag, so the `total_score` behind the verdict was summed over
+    rows the caller could not see.
     """
+    sector_source = "caller"
+    sector_reported = sector or None
     base = {"ticker": ticker, "sector": sector or None,
+            "sector_reported_by_provider": sector_reported,
+            "sector_source": sector_source,
             "lookback_days": lookback_days, "bill_count": None,
+            "rows_returned": None, "truncated": None,
             "bills": [], "signal": None}
 
     if not sector:
         try:
-            sector = _resolve_ticker(ticker)["sector"]
+            resolved = _resolve_ticker(ticker)
         except LookupFailure as exc:
             return _lookup_failed(exc, **base)
+        sector = resolved["sector"]
+        sector_reported = sector or None
+        industry = resolved.get("industry") or ""
         if not sector:
             return {
                 **base, "success": False, "coverage": "not_covered",
@@ -1291,7 +1951,16 @@ def _fetch_policy_signals(ticker: str, sector: str,
                           f"`sector` to search legislation."),
                 "sectors_supported": sorted(SECTOR_BILL_KEYWORDS),
             }
-        base["sector"] = sector
+        override = INDUSTRY_SECTOR_OVERRIDES.get(industry.strip().lower())
+        if override:
+            sector_source = (f"industry {industry!r} overrides provider sector "
+                             f"{sector!r}")
+            sector = override
+        else:
+            sector_source = f"provider sector for {ticker}"
+        base.update({"sector": sector,
+                     "sector_reported_by_provider": sector_reported,
+                     "sector_source": sector_source})
 
     keywords = SECTOR_BILL_KEYWORDS.get(sector)
     if not keywords:
@@ -1321,29 +1990,40 @@ def _fetch_policy_signals(ticker: str, sector: str,
             "answer is from GovTrack alone.")
 
     fetch_errors: List[str] = []
+    # Only keywords actually put to the provider reach `keywords_searched`.
+    # Echoing the mapping there was the lie: it claimed a search for the NDAA
+    # that never happened.
+    queried: List[str] = []
     if api_key:
-        bills, errs = _congress_api_fetch_bills(keywords, current_congress, api_key)
+        bills, errs, kws = _congress_api_fetch_bills(keywords, current_congress, api_key)
         fetch_errors += errs
+        queried += kws
         if not bills:
-            bills, errs = _congress_api_fetch_bills(keywords, prior_congress, api_key)
+            bills, errs, kws = _congress_api_fetch_bills(keywords, prior_congress, api_key)
             fetch_errors += errs
+            queried += kws
     else:
-        bills, errs = _govtrack_fetch_bills(keywords, current_congress)
+        bills, errs, kws = _govtrack_fetch_bills(keywords, current_congress)
         fetch_errors += errs
+        queried += kws
         if len(bills) < 3:
-            more, errs = _govtrack_fetch_bills(keywords, prior_congress)
+            more, errs, kws = _govtrack_fetch_bills(keywords, prior_congress)
             bills += more
             fetch_errors += errs
+            queried += kws
+    keywords_searched = list(dict.fromkeys(queried))
+    base["sector"] = sector
 
     if not bills and fetch_errors:
         # Every query the provider was asked errored. An empty bill list here
         # means the provider is unreachable, not that Congress is idle.
         return {
-            **base, "sector": sector, "success": False,
+            **base, "success": False,
             "coverage": "not_covered", "reason": "provider_unavailable",
             "error": (f"{source} returned no usable response for any of "
-                      f"{keywords[:3]}: " + "; ".join(fetch_errors)),
-            "keywords_searched": keywords, "source": source,
+                      f"{keywords_searched}: " + "; ".join(fetch_errors)),
+            "keywords_searched": keywords_searched,
+            "keywords_mapped": keywords, "source": source,
             "degraded": degraded,
         }
 
@@ -1363,12 +2043,18 @@ def _fetch_policy_signals(ticker: str, sector: str,
             "success": True,
             "coverage": coverage,
             "ticker": ticker, "sector": sector,
-            "keywords_searched": keywords,
+            "sector_reported_by_provider": sector_reported,
+            "sector_source": sector_source,
+            "lookback_days": lookback_days,
+            "keywords_searched": keywords_searched,
+            "keywords_mapped": keywords,
             "bill_count": 0,
+            "rows_returned": 0,
+            "truncated": False,
             "bills": [],
             "signal": "neutral",
             "signal_basis": (f"{source} returned no bill matching "
-                             f"{keywords[:3]} with activity in the last "
+                             f"{keywords_searched} with activity in the last "
                              f"{lookback_days} days"),
             "source": source,
             "degraded": degraded,
@@ -1383,23 +2069,38 @@ def _fetch_policy_signals(ticker: str, sector: str,
 
     if total_score > 0.5:
         signal = "bullish"
-        basis = "net positive legislative activity in sector"
+        direction = "net positive"
     elif total_score < -0.5:
         signal = "bearish"
-        basis = "net negative legislative activity (restrictions/controls) in sector"
+        direction = "net negative (restrictions/controls)"
     else:
         signal = "neutral"
-        basis = "legislative activity is mixed or low probability"
+        direction = "mixed or low probability"
 
-    # Sort by abs score
-    bills_out = sorted(bills, key=lambda b: -abs(b["score"]))[:10]
+    # Sort by abs score, then truncate -- counted first, so `bill_count`
+    # describes the matched set and not the page.
+    bills_out = sorted(bills, key=lambda b: -abs(b["score"]))[:_BILL_ROW_CAP]
+
+    basis = (
+        f"{direction}: title-word polarity weighted by enactment probability, "
+        f"summed over all {len(bills)} bills matching {keywords_searched} "
+        f"with activity in the last {lookback_days} days, total_score "
+        f"{round(total_score, 3)}. Each bill names the keyword that surfaced "
+        f"it in `matched_keyword`; the provider searches full text, so a bill "
+        f"can match on a keyword its title never uses.")
 
     return {
         "success": True,
         "coverage": coverage,
         "ticker": ticker, "sector": sector,
-        "keywords_searched": keywords,
+        "sector_reported_by_provider": sector_reported,
+        "sector_source": sector_source,
+        "lookback_days": lookback_days,
+        "keywords_searched": keywords_searched,
+        "keywords_mapped": keywords,
         "bill_count": len(bills),
+        "rows_returned": len(bills_out),
+        "truncated": len(bills_out) < len(bills),
         "total_score": round(total_score, 3),
         "signal": signal,
         "signal_basis": basis,
@@ -1413,6 +2114,15 @@ def _fetch_policy_signals(ticker: str, sector: str,
 # ---------------------------------------------------------------------------
 # Capex announcements via DuckDuckGo news
 # ---------------------------------------------------------------------------
+
+# Rows carried in the payload. `announcement_count` describes the whole set,
+# `rows_returned` describes this page, and `truncated` says when they differ --
+# the rule test_counts_survive_paging.py holds the SEC tools to.
+_CAPEX_ROW_CAP = 8
+# Distinct figures carried in `figures`. Kept above the row cap because the
+# figures are what the total is built from and what a caller audits it with.
+_CAPEX_FIGURE_CAP = 20
+
 
 def _fetch_capex_announcements(ticker: str, company_name: str,
                                  lookback_days: int) -> Dict[str, Any]:
@@ -1433,7 +2143,7 @@ def _fetch_capex_announcements(ticker: str, company_name: str,
             return _lookup_failed(exc, ticker=ticker, company_name=None,
                                   lookback_days=lookback_days,
                                   announcement_count=None,
-                                  total_announced_usd=None,
+                                  capex_total_usd=None,
                                   signal="data_gap", announcements=[])
 
     # Sector-agnostic queries: the first two capture capex events in ANY sector
@@ -1508,32 +2218,158 @@ def _fetch_capex_announcements(ticker: str, company_name: str,
                       f"that no capital investment was announced."),
             "ticker": ticker, "company_name": company_name,
             "lookback_days": lookback_days, "announcement_count": 0,
-            "total_announced_usd": 0, "signal": "data_gap",
+            "rows_returned": 0, "truncated": False,
+            # Withheld, not zero, for the reason the error above gives.
+            "capex_total_usd": None,
+            "capex_total_basis": ("no total: no article was returned, and an "
+                                  "empty news search is not a finding that no "
+                                  "capital expenditure was announced."),
+            "capex_figure_count": 0, "largest_capex_usd": None,
+            "containment_detected": False, "cumulative_program_usd": None,
+            "figure_count": 0, "figures": [], "amounts_by_category": {},
+            "signal": "data_gap",
+            "signal_basis": "no article to read a spending direction from",
             "queries_tried": queries,
             "partial_errors": query_errors,
             "announcements": [],
         }
 
-    announcements = []
+    # Read every dollar figure in its own clause. One row per article (the
+    # count/page contract of test_counts_survive_paging.py), one entry per
+    # DISTINCT figure in `figures` -- a figure restated by five outlets is one
+    # announcement, and it is now one announcement of a stated KIND.
+    readings_by_amount: Dict[float, List[Dict[str, Any]]] = {}
+    articles_by_amount: Dict[float, int] = {}
+    per_article: List[Tuple[Dict, str, List[Dict[str, Any]]]] = []
+
     for r in all_articles:
         title = r.get("title", "")
         body = r.get("body", "")
-        combined = title + " " + body
-        amounts = _extract_dollar_amounts(combined)
-        max_amount = max(amounts) if amounts else 0
+        # The pipe is a clause boundary: without it a headline runs into the
+        # first sentence of the body and the two get read as one claim.
+        combined = f"{title} | {body}"
+        figures = _figures_in_article(combined, name_tokens)
+        per_article.append((r, combined, figures))
+        for amt in {f["amount_usd"] for f in figures}:
+            articles_by_amount[amt] = articles_by_amount.get(amt, 0) + 1
+        for f in figures:
+            readings_by_amount.setdefault(f["amount_usd"], []).append(
+                dict(f, title=title[:120], url=r.get("url", ""),
+                     date=r.get("date", "")))
+
+    resolved: Dict[float, Dict[str, Any]] = {
+        amt: dict(_resolve_figure(readings), mentions=articles_by_amount[amt])
+        for amt, readings in readings_by_amount.items()
+    }
+
+    announcements = []
+    for r, combined, figures in per_article:
+        amounts = {f["amount_usd"] for f in figures}
+        capex_here = [a for a in amounts
+                      if resolved[a]["category"] == "capital_expenditure"]
+        largest = max(amounts) if amounts else None
+        body = r.get("body", "")
         announcements.append({
-            "title": title[:120],
+            "title": r.get("title", "")[:120],
             "date": r.get("date", ""),
             "url": r.get("url", ""),
-            "max_amount_usd": max_amount,
+            "largest_figure_usd": largest,
+            "figure_category": resolved[largest]["category"] if amounts else None,
+            "capex_amount_usd": max(capex_here) if capex_here else None,
+            "mentions": articles_by_amount[largest] if amounts else None,
             "direction": _classify_capex_text(combined),
             "snippet": body[:200] if body else "",
         })
 
-    announcements.sort(key=lambda x: -x["max_amount_usd"])
+    # A total is only checkable if the rows it was built from survive the page
+    # cap. Sorting purely by size buried Broadcom's $1.5B plant upgrade -- the
+    # one figure in its whole corpus that WAS capex -- under six larger
+    # headlines about bookings and debt.
+    announcements.sort(key=lambda a: (a["capex_amount_usd"] is None,
+                                      -(a["capex_amount_usd"] or 0),
+                                      -(a["largest_figure_usd"] or 0)))
 
-    total_usd = sum(a["max_amount_usd"] for a in announcements)
-    signal = _capex_signal(announcements)
+    by_category: Dict[str, Dict[str, Any]] = {}
+    for amt, fig in sorted(resolved.items(), key=lambda kv: -kv[0]):
+        slot = by_category.setdefault(
+            fig["category"], {"figure_count": 0, "total_usd": 0.0, "amounts_usd": []})
+        slot["figure_count"] += 1
+        slot["total_usd"] += amt
+        slot["amounts_usd"].append(amt)
+
+    capex_amounts = sorted(
+        (a for a, f in resolved.items() if f["category"] == "capital_expenditure"),
+        reverse=True)
+    cumulative_amounts = sorted(
+        (a for a, f in resolved.items() if f["category"] == "cumulative_total"),
+        reverse=True)
+    cumulative_program = cumulative_amounts[0] if cumulative_amounts else None
+    # "brings TSMC's U.S. investment to $265 billion" is the programme the
+    # $100B announced that week sits INSIDE. Adding the two reported $365B for
+    # $100B of news.
+    containment = bool(cumulative_program) and any(
+        a < cumulative_program for a in capex_amounts)
+
+    other_slots = [(cat, slot) for cat, slot in by_category.items()
+                   if cat != "capital_expenditure"]
+    other = ", ".join(
+        f"{cat} {_usd_short(slot['total_usd'])} across {slot['figure_count']} figure(s)"
+        for cat, slot in other_slots)
+
+    if capex_amounts:
+        capex_total: Optional[float] = sum(capex_amounts)
+        capex_basis = (
+            f"sum of {len(capex_amounts)} distinct figure(s) the text attributes to "
+            f"{company_name} spending on physical assets, drawn from "
+            f"{len(all_articles)} article(s)."
+            + (f" Figures in other categories are excluded, not missed: {other}."
+               if other_slots else
+               " Every dollar figure found was capital expenditure.")
+        )
+        if containment:
+            capex_basis += (
+                f" A cumulative programme figure of {_usd_short(cumulative_program)} "
+                f"appears in the same corpus and is NOT added, because it already "
+                f"contains the announcement(s) counted above."
+            )
+    else:
+        capex_total = None
+        capex_basis = (
+            f"no total. Not one of {len(resolved)} dollar figure(s) across "
+            f"{len(all_articles)} article(s) is attributable to {company_name} "
+            f"spending on physical assets"
+            + (f": {other}." if other_slots else ".")
+            + " A news corpus cannot show that no capital expenditure was "
+              "announced, so this is a withheld total and never a zero."
+        )
+
+    if capex_amounts:
+        signal = _capex_signal([
+            {"direction": _classify_capex_text(resolved[a]["context"]),
+             "max_amount_usd": a}
+            for a in capex_amounts])
+        signal_basis = (
+            f"derived from {len(capex_amounts)} capital-expenditure figure(s) only "
+            f"({', '.join(_usd_short(a) for a in capex_amounts)})"
+            + (f"; {other} did not contribute."
+               if other_slots else "; no figure of another kind was found.")
+        )
+    else:
+        signal = "data_gap"
+        signal_basis = (
+            f"withheld. {len(resolved)} dollar figure(s) were found and none is "
+            f"capital expenditure"
+            + (f" ({other})" if other_slots else "")
+            + ", so there is nothing to read a spending direction from. A "
+              "verdict drawn from customer deals or financing would be a "
+              "verdict about the opposite of capex."
+        )
+
+    rows = announcements[:_CAPEX_ROW_CAP]
+    figures_out = [
+        dict(resolved[a], amount_usd=a)
+        for a in sorted(resolved, reverse=True)[:_CAPEX_FIGURE_CAP]
+    ]
 
     return {
         "success": True,
@@ -1541,11 +2377,22 @@ def _fetch_capex_announcements(ticker: str, company_name: str,
         "ticker": ticker, "company_name": company_name,
         "lookback_days": lookback_days,
         "announcement_count": len(announcements),
-        "total_announced_usd": total_usd,
+        "rows_returned": len(rows),
+        "truncated": len(rows) < len(announcements),
+        "capex_total_usd": capex_total,
+        "capex_total_basis": capex_basis,
+        "capex_figure_count": len(capex_amounts),
+        "largest_capex_usd": capex_amounts[0] if capex_amounts else None,
+        "containment_detected": containment,
+        "cumulative_program_usd": cumulative_program,
+        "figure_count": len(resolved),
+        "figures": figures_out,
+        "amounts_by_category": by_category,
         "signal": signal,
+        "signal_basis": signal_basis,
         "queries_tried": queries,
         "partial_errors": query_errors,
-        "announcements": announcements[:8],
+        "announcements": rows,
     }
 
 
@@ -1570,7 +2417,11 @@ class AltDataServer:
                         "Monthly revenue for Taiwan-listed companies via FinMind "
                         "(TWSE feed). Key codes: TSMC=2330, Foxconn=2317, "
                         "MediaTek=2454, ASE Group=3711. "
-                        "Returns NTD millions per month + YoY%. Every requested code "
+                        "Returns NTD millions per month + YoY%. `date` is the first "
+                        "day of the month the revenue DESCRIBES and always agrees "
+                        "with `year`/`month`; FinMind's announcement stamp (a month "
+                        "later) is kept separately as `announced_date`. "
+                        "Every requested code "
                         "failing returns success=false, coverage='not_covered'; some "
                         "failing returns coverage='partial' with codes_failed listed. "
                         "An unset FINMIND_TOKEN is named in 'degraded' (anonymous tier, "
@@ -1636,10 +2487,23 @@ class AltDataServer:
                         "Federal contract (and optional grant) obligations to a company "
                         "via USASpending.gov — free, no auth required. Uses spending_over_time "
                         "for true period FLOW (not multi-year contract ceiling values). "
-                        "Returns trailing-period obligations, prior-period obligations, YoY change, "
-                        "top awarding agencies, and award count. "
+                        "Returns trailing-period obligations, the SAME calendar months "
+                        "one year earlier, the YoY change between them, top awarding "
+                        "agencies, and award count. The comparison is never the window "
+                        "immediately before the trailing one: federal obligations peak "
+                        "at the 30 September fiscal year end, so a sequential change "
+                        "would measure the calendar. "
                         "Signal: YoY > +15% = bullish; YoY < -15% = bearish; "
                         "< $10M total = not_applicable (consumer/B2C company). "
+                        "Agencies publish contract actions months in arrears (DoD "
+                        "actions are withheld from public FPDS for 90 days), so every "
+                        "response carries 'data_horizon' — the last date USASpending "
+                        "has actually published, measured government-wide at call "
+                        "time — and 'window_lag_fraction'. When most of the window "
+                        "falls past that horizon no signal is returned at all: it is "
+                        "coverage='partial' plus a 'reporting_lag' warning, because "
+                        "an unpublished quarter is a gap in the record rather than a "
+                        "collapse in the company's federal business. "
                         "A ticker the quote provider cannot resolve returns success=false "
                         "(USASpending answers '$0 of federal business' for any string, so "
                         "an unknown company would otherwise read as a real zero). If the "
@@ -1682,9 +2546,17 @@ class AltDataServer:
                         "Sector is auto-detected from yfinance if not provided; an "
                         "unresolvable ticker, a ticker with no sector, or a sector with "
                         "no keyword mapping returns success=false rather than answering "
-                        "from another sector's keywords. Without CONGRESS_API_KEY the "
+                        "from another sector's keywords. yfinance has no Defense sector, "
+                        "so an 'Aerospace & Defense' industry is mapped to it and "
+                        "'sector_source' says so alongside "
+                        "'sector_reported_by_provider'. Without CONGRESS_API_KEY the "
                         "answer is GovTrack-only: coverage='partial' and the missing key "
                         "is named in 'degraded'. "
+                        "Bills are found by full-text keyword search, so a bill can match "
+                        "on a keyword its title never uses -- every row names its "
+                        "'matched_keyword' and 'signal_basis' states what was summed. "
+                        "'bill_count' counts the whole matched set, 'rows_returned' the "
+                        "page returned, and 'truncated' says when they differ. "
                         "Most relevant for: semiconductors (CHIPS Act), defense (NDAA), "
                         "pharma (drug pricing), energy (IRA credits), fintech (crypto regs)."
                     ),
@@ -1712,14 +2584,30 @@ class AltDataServer:
                     description=(
                         "Search recent news for capital investment announcements "
                         "(factories, data centers, R&D facilities, major equipment). "
-                        "Extracts dollar amounts, classifies direction, and returns "
-                        "bullish / bearish / neutral / data_gap signal. "
-                        "bullish: new investment announced; bearish: cancellation/delay/cut. "
-                        "Any announcement >= $1B → strong bullish signal. "
+                        "EVERY dollar figure is classified before it is used: "
+                        "capital_expenditure / customer_or_partner_deal / financing / "
+                        "guarantee / third_party_capital / equity_or_ma / "
+                        "cumulative_total / unclassified, each in `figures` with the "
+                        "words that placed it. A customer deal is REVENUE and a "
+                        "financing is DEBT — opposite signals to capex about the same "
+                        "company — so read the category, never the raw number. "
+                        "capex_total_usd sums ONLY distinct capital_expenditure "
+                        "figures; it is null (never 0) when no figure can be "
+                        "attributed to the company spending on physical assets, which "
+                        "is the common case for a company whose news is about demand. "
+                        "capex_total_basis names every figure excluded and why. "
+                        "containment_detected / cumulative_program_usd flag a running "
+                        "programme total ('brings its US investment to $265bn') that "
+                        "already contains the announcement, so the two are not added. "
+                        "signal (bullish / bearish / neutral / data_gap) is derived "
+                        "from capital_expenditure figures alone and is data_gap when "
+                        "there are none. "
                         "Returns success=false with reason='unknown_ticker' for a symbol "
                         "the quote provider cannot resolve, and reason='no_results' when "
                         "no article matched — a news corpus cannot assert that no capex "
                         "was announced, so that is never reported as a zero. "
+                        "announcement_count counts every matching article; rows_returned "
+                        "and truncated describe the announcements list. "
                         "Uses DuckDuckGo news (ddgs). Best for: semiconductors, industrials, "
                         "energy, cloud hyperscalers."
                     ),
@@ -1740,9 +2628,134 @@ class AltDataServer:
                         },
                     },
                 ),
+                Tool(
+                    name="get_congress_trades",
+                    description=(
+                        "Congressional stock trades from official STOCK Act "
+                        "disclosures (House Clerk PTRs + Senate eFD), served from "
+                        "a local store. These are TRANSACTIONS, NOT HOLDINGS: "
+                        "Congress does not publish current positions. Amounts are "
+                        "BRACKETS — every row carries amount_min and amount_max and "
+                        "there is no midpoint. Members file up to 45 days after "
+                        "trading, so transaction_date and filed_date differ. ALWAYS "
+                        "read 'coverage': when coverage.complete is false the answer "
+                        "is drawn from an incomplete record and an absent ticker does "
+                        "NOT mean it was not traded. Populate the store with "
+                        "`python -m tools.altdata_server.congress_sync --house 2026 "
+                        "--senate`."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "ticker": {"type": "string",
+                                       "description": "Filter to one ticker. Bonds and funds have no ticker."},
+                            "member": {"type": "string",
+                                       "description": "Filter by member name, matched loosely. The members matched are returned."},
+                            "chamber": {"type": "string", "enum": ["house", "senate"]},
+                            "since": {"type": "string",
+                                      "description": "Earliest transaction date, YYYY-MM-DD."},
+                            "until": {"type": "string",
+                                      "description": "Latest transaction date, YYYY-MM-DD."},
+                            "limit": {"type": "integer", "default": 200},
+                        },
+                    },
+                ),
+                Tool(
+                    name="get_congress_leaderboard",
+                    description=(
+                        "Aggregate congressional trading activity from the local "
+                        "store: most-traded tickers or most-active members. Totals "
+                        "are bracketed sums (sum of lower bounds, sum of upper "
+                        "bounds), never midpoints. Rows with no ticker are excluded "
+                        "from the ticker leaderboard rather than grouped, since "
+                        "bonds and private funds have no symbol. Read 'coverage'."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "kind": {"type": "string", "enum": ["tickers", "members"],
+                                     "default": "tickers"},
+                            "since": {"type": "string",
+                                      "description": "Earliest transaction date, YYYY-MM-DD."},
+                            "chamber": {"type": "string", "enum": ["house", "senate"]},
+                            "limit": {"type": "integer", "default": 25},
+                        },
+                    },
+                ),
+                Tool(
+                    name="get_congress_holdings",
+                    description=(
+                        "Congressional ASSET HOLDINGS from annual financial "
+                        "disclosures — the closest thing to positions that exists, "
+                        "and the only place holdings are published at all. READ THIS "
+                        "BEFORE USING: an annual report covers assets held at some "
+                        "point DURING the calendar year it names, valued in brackets, "
+                        "and is filed months after that year ends. A row is NOT a "
+                        "current position — the member may have exited before filing, "
+                        "and trades disclosed since are not reflected in it. Values "
+                        "are brackets with no midpoint. Holdings the filer could not "
+                        "price (state pensions, family trusts) carry no bounds and are "
+                        "counted in unpriced_count rather than summed as zero. Roughly "
+                        "a third of rows are Excepted Investment Funds whose underlying "
+                        "holdings are legally not itemised. Senate only at present; "
+                        "House annual reports are PDFs and are not yet ingested."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "ticker": {"type": "string",
+                                       "description": "Who disclosed holding this ticker."},
+                            "member": {"type": "string",
+                                       "description": "One member's disclosed holdings, matched loosely."},
+                            "limit": {"type": "integer", "default": 200},
+                        },
+                    },
+                ),
+                Tool(
+                    name="get_congress_coverage",
+                    description=(
+                        "What the congressional disclosure store actually holds: "
+                        "filings ingested, how many parsed, and how many could not "
+                        "be read because they were filed on paper and scanned. Call "
+                        "this before treating any empty congressional result as an "
+                        "absence rather than a gap."
+                    ),
+                    inputSchema={"type": "object", "properties": {}},
+                ),
             ]
 
         @self.server.call_tool()
+        @annotating(
+            "altdata",
+            per_tool={
+                "get_taiwan_monthly_revenue": "FinMind (TWSE)",
+                "get_job_postings_count": "Greenhouse / Lever / Workday boards",
+                "get_government_contracts": "USAspending.gov",
+                "get_policy_signals": "GovTrack / Congress.gov",
+                "get_capex_announcements": "company newsroom / press releases",
+                "get_congress_trades": "US House Clerk / Senate eFD",
+                "get_congress_holdings": "US Senate eFD",
+                "get_congress_leaderboard": "US House Clerk / Senate eFD",
+                "get_congress_coverage": "Nemo congressional store",
+            },
+warnings_per_tool={
+                "get_congress_holdings": [
+                    warning("not_current_positions",
+                            "Annual disclosures cover assets held at some "
+                            "point DURING the year they name and are filed "
+                            "months after it ends. A row is not a current "
+                            "position."),
+                    warning("senate_only",
+                            "Holdings are Senate-only. House annual reports "
+                            "are PDFs that are not yet ingested, so absence "
+                            "here is not absence of a holding."),
+                ],
+                "get_congress_trades": [
+                    warning("disclosure_lag",
+                            "Members file up to 45 days after trading, so "
+                            "transaction_date and filed_date differ."),
+                ],
+            })
         async def call_tool(name: str, args: Dict[str, Any]):
             if name == "get_taiwan_monthly_revenue":
                 return await parent.taiwan_monthly_revenue(args)
@@ -1754,12 +2767,126 @@ class AltDataServer:
                 return await parent.policy_signals(args)
             if name == "get_capex_announcements":
                 return await parent.capex_announcements(args)
+            if name == "get_congress_trades":
+                return await parent.congress_trades(args)
+            if name == "get_congress_leaderboard":
+                return await parent.congress_leaderboard(args)
+            if name == "get_congress_holdings":
+                return await parent.congress_holdings(args)
+            if name == "get_congress_coverage":
+                return await parent.congress_coverage(args)
             return _err(name, f"unknown tool: {name}")
 
     # -----------------------------------------------------------------------
     # Existing tool handlers
     # -----------------------------------------------------------------------
 
+
+    # ------------------------------------------------------------------
+    # Congressional disclosures, served from the local store.
+    #
+    # These read rather than fetch. Parsing a House PTR is an HTTP round trip
+    # plus a PDF parse, which on demand bought about twenty filings per call
+    # and made every answer partial. Ingestion belongs to congress_sync.
+    # ------------------------------------------------------------------
+
+    _EMPTY_STORE = (
+        "The congressional disclosure store is empty, so this is not a "
+        "statement about what was traded. Populate it with: "
+        "python -m tools.altdata_server.congress_sync --house 2026 --senate"
+    )
+
+    @staticmethod
+    def _mark_empty(result: Dict[str, Any]) -> Dict[str, Any]:
+        """An empty store must never read as an empty record."""
+        if not result.get("coverage", {}).get("total"):
+            result["store_empty"] = True
+            result["note"] = f"{AltDataServer._EMPTY_STORE} {result.get('note', '')}"
+        return result
+
+    async def congress_trades(self, args: Dict[str, Any]) -> List[TextContent]:
+        from . import congress_queries as queries
+
+        try:
+            if args.get("member"):
+                # The ticker narrows the query, not the page. Filtering the
+                # returned rows afterwards left `totals` and `per_member`
+                # describing every trade the member made in anything, beside a
+                # `transaction_count` describing one symbol.
+                result = await asyncio.to_thread(
+                    queries.member_activity, args["member"],
+                    since=args.get("since"), limit=int(args.get("limit", 200)),
+                    ticker=args.get("ticker"))
+            else:
+                result = await asyncio.to_thread(
+                    queries.ticker_activity, args.get("ticker", ""),
+                    since=args.get("since"), until=args.get("until"),
+                    chamber=args.get("chamber"), limit=int(args.get("limit", 200)))
+        except Exception as exc:  # noqa: BLE001 - surfaced, never masked
+            return _err("get_congress_trades",
+                        f"{type(exc).__name__}: {str(exc)[:200]}")
+        return _dispatch("get_congress_trades", self._mark_empty(result))
+
+    async def congress_leaderboard(self, args: Dict[str, Any]) -> List[TextContent]:
+        from . import congress_queries as queries
+
+        kind = args.get("kind", "tickers")
+        try:
+            if kind == "members":
+                result = await asyncio.to_thread(
+                    queries.most_active_members, since=args.get("since"),
+                    limit=int(args.get("limit", 25)))
+            else:
+                result = await asyncio.to_thread(
+                    queries.most_traded_tickers, since=args.get("since"),
+                    chamber=args.get("chamber"), limit=int(args.get("limit", 25)))
+        except Exception as exc:  # noqa: BLE001 - surfaced, never masked
+            return _err("get_congress_leaderboard",
+                        f"{type(exc).__name__}: {str(exc)[:200]}")
+        return _dispatch("get_congress_leaderboard", self._mark_empty(result))
+
+    async def congress_holdings(self, args: Dict[str, Any]) -> List[TextContent]:
+        from . import congress_queries as queries
+
+        if not args.get("ticker") and not args.get("member"):
+            return _err("get_congress_holdings",
+                        "pass a ticker or a member; holdings are only meaningful "
+                        "scoped to one or the other")
+        try:
+            if args.get("member"):
+                result = await asyncio.to_thread(
+                    queries.member_holdings, args["member"],
+                    limit=int(args.get("limit", 200)))
+            else:
+                result = await asyncio.to_thread(
+                    queries.ticker_holdings, args["ticker"],
+                    limit=int(args.get("limit", 200)))
+        except Exception as exc:  # noqa: BLE001 - surfaced, never masked
+            return _err("get_congress_holdings",
+                        f"{type(exc).__name__}: {str(exc)[:200]}")
+        return _dispatch("get_congress_holdings", self._mark_empty(result))
+
+    async def congress_coverage(self, args: Dict[str, Any]) -> List[TextContent]:
+        from . import congress_store as cstore
+
+        try:
+            overall = await asyncio.to_thread(cstore.coverage)
+            per_chamber = {c: await asyncio.to_thread(cstore.coverage, c)
+                           for c in ("house", "senate")}
+        except Exception as exc:  # noqa: BLE001 - surfaced, never masked
+            return _err("get_congress_coverage",
+                        f"{type(exc).__name__}: {str(exc)[:200]}")
+
+        note = ("filings_parsed against total is the only basis for reading an "
+                "empty congressional result as an absence rather than a gap. "
+                "'scanned' filings were filed on paper and carry no extractable "
+                "text; they will not become readable on a retry.")
+        if not overall["total"]:
+            note = f"{self._EMPTY_STORE} {note}"
+        overall["by_chamber"] = per_chamber
+        overall["note"] = note
+        overall["database"] = cstore.current_db_path()
+        return _dispatch("get_congress_coverage", overall)
 
     async def taiwan_monthly_revenue(self, args: Dict[str, Any]) -> List[TextContent]:
         codes = args.get("company_codes", [])
@@ -1833,10 +2960,17 @@ class AltDataServer:
                 asyncio.to_thread(
                     _fetch_policy_signals, ticker, sector, lookback_days,
                 ),
-                timeout=30.0,
+                # Two rounds at most -- the current congress, then the prior
+                # one if the current returned almost nothing -- and each round
+                # queries every keyword concurrently, so the budget is two
+                # cold GovTrack requests plus parsing rather than one per
+                # keyword.
+                timeout=_POLICY_SIGNALS_TIMEOUT_S,
             )
         except asyncio.TimeoutError:
-            return _err("get_policy_signals", "GovTrack/Congress.gov timed out after 30s", ticker)
+            return _err("get_policy_signals",
+                        f"GovTrack/Congress.gov timed out after "
+                        f"{_POLICY_SIGNALS_TIMEOUT_S:.0f}s", ticker)
         except Exception as exc:
             return _err("get_policy_signals",
                         f"{type(exc).__name__}: {str(exc)[:200]}", ticker)

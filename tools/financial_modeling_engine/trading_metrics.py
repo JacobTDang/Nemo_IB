@@ -30,7 +30,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from .utils import fetch_daily_bars
+from .utils import PRICE_BASIS, fetch_daily_bars
 
 _EASTERN = ZoneInfo("America/New_York")
 _US_EQUITY_CLOSE_HOUR = 16
@@ -230,6 +230,11 @@ def get_trading_metrics(ticker: str, period: str = '1y',
         "error": None,
         "period_requested": period,
         "bars_returned": len(bars),
+        # Same bars as get_price_history, so the same basis. ADV and ATR are
+        # same-day ratios and survive the adjustment intact; `last_close` is a
+        # price like any other here, and an unlabelled price beside labelled
+        # ones reads as a third basis.
+        "price_basis": PRICE_BASIS,
         "as_of": pd.Timestamp(bars.index[-1]).strftime("%Y-%m-%d"),
         "last_close": round(float(bars["Close"].iloc[-1]), 4),
         "latest_bar_is_partial_session": partial,

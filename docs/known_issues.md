@@ -59,17 +59,67 @@ Branch `preearnings-pipeline`, written at merge time. 314 tests passing.
    The skill records `data_gap` and the `na` weight redistributes, so
    the pipeline degrades gracefully, but trends coverage is unreliable.
 
-9. **`get_earnings_transcripts` returns 8-K releases, not call
-   transcripts** — for CHWY it produced pairs_found=0 because the
-   "transcripts" were press releases. Call-sentiment signals are
-   effectively press-release-sentiment for companies without free
-   transcript sources.
+9. **RESOLVED: `get_earnings_transcripts` returned 8-K releases, not
+   call transcripts** — for CHWY it produced pairs_found=0 because the
+   "transcripts" were press releases. The tools are now named for what
+   they read: `get_earnings_releases` and
+   `extract_earnings_release_sentiment`, both provider-stamped
+   `SEC EDGAR (8-K Item 2.02, EX-99.1)` rather than the "Finnhub" they
+   used to report. There is still no free source of analyst Q&A, so
+   tone signals remain press-release tone; the difference is that the
+   name says so. The tonal comparison also carries the span it actually
+   covers (`tone_shift.span_label` / `span_days`) — it was labelled
+   `yoy_shift` whatever the gap, and on WMT that was one quarter
+   (2026-08-20 vs 2026-05-21) while on AMAT it was nine months.
 
 10. **Stale vendor calendar dates** — Finnhub's earnings calendar showed
     GME reporting 6-08 when news proved it reported 6-02 (dropped from
     the betting slate). Mitigation shipped: news-digest sub-agents carry
     a `calendar_conflicts` field so digests can contradict the calendar;
     the skill must treat a confirmed conflict as disqualifying.
+
+11. **`get_analyst_rating_trend` is rating buckets, not estimate
+    revisions** — it was named `get_analyst_revisions_history`, which a
+    pre-earnings workflow read as "are estimates being taken up". It has
+    only ever served Finnhub `/stock/recommendation`
+    (strongBuy/buy/hold/sell counts). Verified live 2026-08-26 on this
+    key: `/stock/eps-estimate`, `/stock/revenue-estimate`,
+    `/stock/upgrade-downgrade` and `/stock/price-target` all answer
+    `403 You don't have access to this resource`, so there is no
+    estimate-revision feed to switch to and the name was changed
+    instead. `/stock/recommendation` also serves only ~4 monthly
+    snapshots regardless of `lookback_months`; the shortfall is now a
+    `history_shorter_than_requested` warning, and deltas the history
+    cannot support are named in `momentum_unavailable` rather than
+    silently absent. The signal classifier reads the change in
+    net_bullish as a **share** of covering analysts (±5pp / ±10pp),
+    because the old ±2-rating band called 65-of-68 analysts falling to
+    63-of-68 a downgrade, and called AMAT "upgrading" off +3 net bullish
+    of which +2 was new coverage — the day before it gapped -6.57%.
+
+12. **`get_policy_signals` searched three of its keywords and reported
+    four** — for LMT the dropped one was "NDAA". The sector also
+    auto-detected as "Industrials" (yfinance has no Defense sector), so
+    the Defense keyword set was unreachable. Fixed: every mapped keyword
+    is queried (concurrently, to fit the handler budget),
+    `keywords_searched` names only what was actually put to the
+    provider, `INDUSTRY_SECTOR_OVERRIDES` maps industry
+    "Aerospace & Defense" to sector Defense with `sector_source` saying
+    so, and the bill list carries `rows_returned` / `truncated` beside
+    `bill_count` (which was 21 next to ten rows). Bills are found by
+    full-text keyword search, so each row names its `matched_keyword`
+    and `signal_basis` states what was summed.
+
+13. **`get_supply_chain` had no direction field** — TSM (foundry) and
+    AMD (competitor) sat in one flat list with identical schema, so a
+    read-through workflow had nothing machine-readable to chain. Each
+    row now carries `relationship` (supplier / customer / competitor /
+    partner / unknown) plus the `relationship_basis` cue that decided
+    it, and the payload carries grouped `suppliers` / `customers` /
+    `competitors` / `partners` ticker lists. Mentions adjacent to a URL
+    are excluded and counted in `excluded_mentions` — NVDA's follow-us
+    footer was matching `facebook` and reporting META as a related
+    company.
 
 ### Improvement backlog (ordered)
 
@@ -778,12 +828,40 @@ degraded sweep can never be read as coverage.
   not a rule: the frame carries a `decimals` column that would settle it and
   `ConceptFact` does not keep it. Same class as the AMT `NetIncomeLoss` case
   under the reconciliation sweep's defect 5.
-- **`get_ebitda_margin` cannot serve a filer that tags no operating income.**
-  Eleven of the 32 — every bank, both REITs in the basket, XOM, CVX, GE, BIIB,
-  FOXA and LEN — return a "missing EBITDA components" error where they used to
-  return an EBITDA built on pre-tax income reached by prefix match (JPM:
-  72,595,000,000; GS: a fact worth $1). The error is correct and the coverage
-  gap is real: there is no consolidated operating income in those filings.
+- **`get_ebitda_margin` cannot serve a filer that tags no operating income,
+  and the gap cannot be closed.** Eleven of the 32 — JPM, BAC, WFC, GS, O,
+  BIIB, XOM, CVX, GE, FOXA, LEN — tag no `us-gaap:OperatingIncomeLoss`, where
+  they used to return an EBITDA built on pre-tax income reached by prefix match
+  (JPM: 72,595,000,000; XOM: 45,969,000,000; GS:
+  `gs:GeographicReportingInformationPercentageOfOperatingIncomeLoss`, a
+  geographic percentage worth 1.00 reported as dollars). Every alternative was
+  measured against the live filings on 2026-08-24 and each was rejected:
+  - `us-gaap:OperatingIncomeLossIncludingEquityMethodInvestments` and
+    `us-gaap:GrossProfit` are tagged by none of the eleven, and none of them
+    presents an operating income subtotal on the face of the statement.
+  - `...BeforeIncomeTaxes...` is pre-tax income. It is the defect, not the fix.
+  - Revenue less `us-gaap:CostsAndExpenses` is not operating income either, and
+    the filings disagree about why, so no single rule survives all of them. O
+    tags its financing interest as `us-gaap:InterestExpenseOperating`
+    (1,134,879,000) inside its expense total. BIIB nests
+    `us-gaap:NonoperatingIncomeExpense` (-305,600,000) inside its, where the
+    sign the presentation applies is not recoverable from the fact value. XOM's
+    non-operating income sits inside `us-gaap:Revenues` with no element of its
+    own to remove it by. GE settles it: 45,855 - 37,342 + 1,487 reconciles to
+    GE's tagged pre-tax income of 10,000,000,000 exactly, and the 8,513,000,000
+    in the middle is still struck after `ge:InterestAndOtherFinancialCharges`
+    (843,000,000) and a non-operating pension credit (-788,000,000). A
+    build-up that reconciles is not a build-up that is right.
+  - O tags no FFO or AFFO concept anywhere in its 10-K — 672 distinct concepts,
+    none of them NAREIT. The REIT measure lives in the earnings release.
+  - For the four banks the measure itself does not apply: interest is a bank's
+    raw material, revenue is struck as `us-gaap:RevenuesNetOfInterestExpense`
+    (already net of the interest EBITDA exists to add back), and adding it back
+    would report funding cost as profit.
+  Coverage is 21/32 before and after. What changed is the refusal: each of the
+  eleven now returns `coverage: "not_covered"` with `concepts_tried` and a
+  reason naming either the bank case or the missing element, and the tool
+  description says which filer types are not served.
 - **`get_margin_breakdown` gross profit is unavailable for AMT, GE, HON and
   RIOT.** Each tags `us-gaap:GrossProfit` only on a dimension, or not for an
   annual period. The tool used to report the dimensioned segment figure as

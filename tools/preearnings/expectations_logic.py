@@ -1,12 +1,13 @@
 """Deterministic expectations logic (Phase C): guidance archaeology + dynamic
 KPI identification.
 
-The orchestration (reading transcripts via get_earnings_transcripts, extracting
-guided/actual pairs, counting analyst Q&A mentions, spawning a KPI sub-agent per
-metric) lives in the pre-earnings skill. This module is the pure core.
+The orchestration (reading the quarterly 8-K press releases via
+get_earnings_releases, extracting guided/actual pairs, counting metric
+mentions, spawning a KPI sub-agent per metric) lives in the pre-earnings skill.
+This module is the pure core.
 
 No company/ticker/KPI is hardcoded — the KPIs that matter are derived from the
-company's own segment materiality and the metrics analysts actually ask about.
+company's own segment materiality and the metrics management leads with.
 """
 from __future__ import annotations
 

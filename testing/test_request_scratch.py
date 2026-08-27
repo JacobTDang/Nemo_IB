@@ -58,8 +58,16 @@ def test_each_request_gets_its_own_directory():
 
 
 def test_removal_is_idempotent():
-    """A tool that cleans up after itself must not break the context manager."""
+    """A tool that cleans up after itself must not break the context manager.
+
+    The gate here is the absence of an exception on __exit__ -- rmtree without
+    ignore_errors raises FileNotFoundError over a directory that is already
+    gone, and that propagates out of the `with` and fails this test. The
+    post-condition is asserted too, so "did not raise" cannot be satisfied by
+    a __exit__ that stopped removing anything at all.
+    """
     import shutil
     with request_scratch() as scratch:
         shutil.rmtree(scratch)
     # exiting the block over an already-removed directory must not raise
+    assert not scratch.exists(), f"{scratch} survived the context manager"

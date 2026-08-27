@@ -13,7 +13,13 @@ Two paths are written at runtime:
 | `/app/db_cache` | tool cache and session schema | slow, but unbounded |
 
 Both are mounted as size-capped tmpfs, so they live in RAM, cannot grow past
-their cap, and are freed when the container exits. Measured with the mounts in
+their cap, and are freed when the container exits.
+
+One path is deliberately **not** disposable. The congressional disclosure store
+at `/app/data/congress.db` sits on the named volume `congress-data`, because
+rebuilding it means re-fetching and re-parsing thousands of PDFs from the House
+Clerk -- slow, and rude to a public service. Putting it in the tmpfs above would
+make the pipeline unusable, since every restart would start from nothing. Measured with the mounts in
 place: the image layer stays untouched apart from the `/etc/resolv.conf` and
 `/etc/hosts` that Docker manages itself.
 
@@ -42,11 +48,17 @@ claude mcp add --transport http nemo-altdata   http://<host>:8814/mcp/
 
 | Server | Port | Module | Tools |
 |---|---|---|---|
-| SEC EDGAR | 8810 | `tools.web_search_server.web_search` | 42 of 45 |
-| Market data and modelling | 8811 | `tools.financial_modeling_engine.analysis_tools` | 19 |
+| SEC EDGAR | 8810 | `tools.web_search_server.web_search` | 48 of 50 |
+| Market data and modelling | 8811 | `tools.financial_modeling_engine.analysis_tools` | 20 |
 | Finnhub | 8812 | `tools.news_agregator.finnhub_server` | 14 |
 | FRED macro | 8813 | `tools.news_agregator.fred_server` | 5 |
-| Alt data | 8814 | `tools.altdata_server.server` | 5 |
+| Alt data | 8814 | `tools.altdata_server.server` | 9 |
+
+96 tools served. The SEC server declares 50 and serves 48: `rag_search` and
+`rag_ingest` are capability-gated and hidden without the RAG stack, which the
+image does not install. Counts here are measured, not maintained -- run
+`python -m tools.manifest` inside a container to reproduce them, and note it
+reports what *that* environment can serve rather than a fixed number.
 
 **Register the URL with its trailing slash.** `Mount` only matches `/mcp/`, so
 posting to `/mcp` answers `307` and every single call pays an extra round trip.
@@ -67,11 +79,11 @@ the actual gate is `testing/test_http_transport.py`, which completes a real
 handshake and one live tool call against each server.
 
 ## Building
-## Building
 
 ```bash
 docker build -t nemo-data:local .                                  # native, local testing
-docker buildx build --platform linux/amd64 -t nemo-data:amd64 .    # for Proxmox
+docker buildx build --platform linux/amd64 -t nemo-data:amd64 --load .   # for Proxmox
+NEMO_IMAGE=nemo-data:amd64 NEMO_TARGET_ARCH=amd64 docker compose up -d
 ```
 
 The image copies only the servers it serves, which means **a new top-level
@@ -86,19 +98,106 @@ not run there.
 
 ## Secrets
 
-`FINNHUB_API_KEY`, `FRED_API_KEY`, `SEC_EMAIL`, `NAME`. No LLM credentials:
-every server here imports and runs with `GROQ_API_KEY` and `OPENROUTER_API_KEY`
-unset, verified.
+`FINNHUB_API_KEY`, `FRED_API_KEY`, `SEC_EMAIL`, `NAME`. No LLM credentials of
+any kind: every server here imports and runs with none set, verified.
 
 `CONGRESS_API_KEY` and `FINMIND_TOKEN` are optional and currently unset, so
 `get_policy_signals`, `get_government_contracts`, and
 `get_taiwan_monthly_revenue` will degrade.
 
+## Getting secrets onto the host
+
+Nothing secret is in the image, and that is verifiable rather than assumed:
+`env_file` is read by compose on the host at **run** time, the Dockerfile has no
+`ARG` and never references `.env`, and `.dockerignore` excludes it so a careless
+`COPY . .` cannot bake one into a layer. To check a specific key:
+
+```bash
+docker run --rm -e SEEK="$(grep '^FINNHUB_API_KEY=' .env | cut -d= -f2- | head -c 16)" \
+  --entrypoint sh nemo-data:local -c 'grep -rlF "$SEEK" /app /etc /root /usr/local || echo CLEAN'
+```
+
+Search `/app /etc /root /usr/local`, never `/`: grepping `/` matches the
+process's own `/proc/self/cmdline` and reports a leak that is not there. Check
+the needle is non-empty first, too -- `grep -rl ""` matches every file in the
+image.
+
+So the secrets have to reach the host separately. Over the tailnet:
+
+```bash
+scp .env you@100.x.y.z:/srv/nemo/.env          # never over the public internet
+ssh you@100.x.y.z 'chmod 600 /srv/nemo/.env'
+```
+
+**The bearer token is generated, not chosen.** 32 random bytes, once, on the
+host that will run the stack:
+
+```bash
+openssl rand -hex 32
+```
+
+Where it lives is a real trade-off:
+
+- **In the shell** (`NEMO_MCP_TOKEN=... docker compose up -d`) keeps it out of
+  every file on disk. Interpolation happens at `up`, so containers keep their
+  copy across a reboot -- but any later `docker compose up` or `restart` needs
+  the variable present again, and forgetting it stops the stack rather than
+  publishing it unauthenticated.
+- **In `.env`** alongside the API keys survives unattended restarts and is one
+  fewer thing to remember. It is also one more secret in a file, though that
+  file already holds every API key, so the marginal exposure is small.
+
+For a homelab that should come back up on its own, `.env` with `chmod 600` is
+the pragmatic choice. The client end is not free either: `claude mcp add
+--header "Authorization: Bearer ..."` writes the token to `~/.claude.json` in
+plaintext, so that file is a secret on every machine you register from.
+
+## Blockers hit while building this, and how they present
+
+Each of these failed *after* a green test suite, so none of them is caught by
+running the tests.
+
+**`uv.lock` drifting from `pyproject.toml`.** The Dockerfile installs with
+`uv sync --frozen`, which refuses a lockfile that disagrees with the project
+file, so the build dies at the dependency step. It happens whenever a package
+moves between dependency groups -- `pdfplumber` joining the `server` group for
+the House PTR parser did it. `uv lock --check` says so in one line; run it
+before building.
+
+**A lazily-imported package missing from the `server` group.** The build-time
+import check imports each server, so it only sees module-level imports. A
+package imported inside a function -- `pdfplumber` in `fetch_house_ptr`,
+`bs4` in `parse_senate_ptr` -- is invisible to it, the image builds clean, and
+the ImportError arrives on the first real tool call in production.
+`testing/test_server_dependencies_are_declared.py` walks every shipped file and
+requires each third-party import to be declared, which is what closes this.
+
+**A new top-level module under `tools/` not added to the `COPY` line.** Covered
+in Building above; it is silently absent at runtime rather than a build error.
+
+**The congressional store ships empty.** The volume persists but the image
+contains no data, and the tools answer "no trades" for everything until it is
+filled. They say so explicitly -- `store_empty: true` and the command to run --
+rather than presenting an empty store as an empty record. After first boot:
+
+```bash
+docker compose run --rm congress-sync --house 2024 2025 2026 --senate --senate-annual
+```
+
+Roughly 40 minutes of throttled requests for a full backfill. Safe to re-run and
+safe to cron; nothing already parsed is fetched twice.
+
 ## Known gaps in this image
 
+- Congressional **holdings are Senate-only**. House annual reports are PDFs whose
+  columns must be read geometrically from the header rectangles rather than from
+  the extracted text, and that parser is not built. The tool description states
+  the limit, so the gap is visible to a caller rather than silent.
 - `analyze_exposures` and `get_thesis_evolution` read book state. The entrypoint
-  creates the schema so they return an empty result rather than failing, but a
-  data-source host holds no positions, so empty is the truthful answer.
+  creates the schema so the queries run rather than failing on a missing table.
+  A data-source host holds no positions, so `analyze_exposures` answering with
+  an empty book is the truthful answer. `get_thesis_evolution` names one thesis,
+  and a book that does not hold it refuses rather than returning a null row.
 - Employee count is not available from XBRL: no filer examined tags it, so it
   would need cover-page text extraction.
 

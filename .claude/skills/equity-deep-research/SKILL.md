@@ -205,9 +205,16 @@ Output:
 NEW required step. If adjusted numbers are materially better than
 GAAP / cash numbers, the analysis must explain why.
 
-Tools: `get_financial_statements` (compute cash conversion = OCF / net
-income), `get_basic_financials` (Finnhub ratios),
-`get_historical_fcf` (FCF vs reported earnings divergence).
+Tools: `get_accruals_quality` (net income against operating cash flow over
+several periods, with the accrual ratio -- this is the divergence check),
+`get_working_capital_trends` (DSO/DIO/DPO: receivables growing faster than
+revenue is the same story earlier), `get_historical_fcf` (OCF, capex and FCF
+per period), `get_basic_financials` (Finnhub ratios).
+
+`get_accruals_quality` returns `coverage` and refuses rather than guessing;
+`get_historical_fcf` returns `free_cash_flow: null` with
+`coverage: "not_covered"` for filers tagging no capex element (banks do not).
+Neither absence means zero.
 
 Required checks:
 - Cash conversion (OCF / NI)
@@ -272,7 +279,7 @@ Output:
 ## Step 10 — Filing and call change detection
 
 Tools: `diff_10k(ticker, item='1A')` and `diff_10k(ticker, item='7')`,
-`extract_call_sentiment(ticker, quarters=4)`, `extract_mda`,
+`extract_earnings_release_sentiment(ticker, quarters=4)`, `extract_mda`,
 `extract_risk_factors`.
 
 Filing diff checks:
@@ -347,7 +354,8 @@ Fold the result into the synthesis. Do not duplicate the work inline.
 
 Tools: `get_earnings_calendar(ticker)`, `extract_forward_signals`
 (forward guidance / capex / roadmap language),
-`get_analyst_revisions_history` (sell-side estimate trajectory).
+`get_analyst_rating_trend` (sell-side RATING trajectory — rating buckets
+over time, not estimate revisions; no estimate-revision feed exists here).
 
 Catalyst types to consider:
 - earnings / guidance / investor day
@@ -736,7 +744,7 @@ row in `state.theses` and assign an ID; out of scope here.)
 - Use compact inline source tags:
   - `[tool_name: ticker/date]` (e.g., `[get_market_data: EOSE/2026-05-21]`)
   - `[filing: 10-K Item 1A FY2025]`
-  - `[call_sentiment: last 4 quarters]`
+  - `[release_sentiment: last 4 quarters]`
   - `[valuation: peer_comps/2026-05-22]`
 - If a number cannot be tied to a tool or source, remove it.
 - Record failed tools or unavailable data under `data_gap`.

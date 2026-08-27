@@ -16,11 +16,16 @@ sell-side revision trajectory + beat/miss history. Disjoint from
 
 ## Workflow
 
-### 1. Revision history
+### 1. Rating trajectory
 
-`get_analyst_revisions_history(ticker)`. Record upward / downward
-revisions (30d, 90d), net revision count, trajectory (rising / flat
-/ falling).
+`get_analyst_rating_trend(ticker)`. This is the sell-side RATING
+distribution over time (strong buy / buy / hold / sell), not estimate
+revisions — no free feed of EPS or revenue revisions is available on
+this deployment, so rating drift is the proxy and must be labelled as
+one. Record `net_bullish_pct` per month, the 3-month change in that
+share, `momentum.3mo_total_analysts_delta` (a rise in coverage moves
+net_bullish without anyone revising anything), and the `signal`
+trajectory (upgrading / neutral / downgrading).
 
 ### 2. Beat/miss history
 
@@ -106,9 +111,16 @@ Key catalyst forcing the revision: [earnings / guidance / pre-announcement / sec
   FALLING and signal is qualitative only. Trajectory is sticky.
 - Don't assume dispersion = analyst disagreement. May mean sparse
   coverage. Cross-reference with `analysts covering` count.
-- If `get_analyst_revisions_history` returns < 5 data points in last
-  90d, mark `data_gap: insufficient_revision_data`. Penny stocks and
-  micro-caps have weak sell-side coverage; skill becomes uninformative.
+- Finnhub serves only ~4 monthly rating snapshots, so a request for
+  more comes back short with a `history_shorter_than_requested`
+  warning — that is the ceiling, not a coverage gap. A real gap is
+  `get_analyst_rating_trend` returning `signal: null` or fewer than 4
+  periods; mark `data_gap: insufficient_rating_history` then. Penny
+  stocks and micro-caps have weak sell-side coverage; skill becomes
+  uninformative.
+- Do not report rating drift as an estimate revision. If the thesis
+  needs the estimate number itself, `get_forward_estimates` is the
+  only consensus source here and it is a snapshot, not a history.
 - "Sell-side behind" is high-confidence ONLY when 3+ independent
   data points support the directional read. One data point isn't
   enough.

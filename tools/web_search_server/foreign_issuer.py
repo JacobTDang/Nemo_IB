@@ -55,6 +55,13 @@ from .sec_series import (
     currency_of,
     fetch_concept_series,
 )
+from .shared_filings import (
+    Deadline,
+    ToolTimeout,
+    budget_seconds,
+    concept_series,
+    shared_filings,
+)
 
 # Ordered by how commonly they appear, which is also the order a mismatch
 # message reads best in.
@@ -105,24 +112,46 @@ def _normalise_concept(value: Any) -> str:
     return str(value or "").strip().replace("_", ":", 1)
 
 
+class AnnualIndexUnavailable(RuntimeError):
+    """EDGAR could not be asked which annual forms this filer uses.
+
+    Distinct from an empty index, which means the filer files none of them.
+    Kept separate so the caller reports an outage instead of a fact about the
+    company.
+    """
+
+
 def _fetch_annual_filing_index(ticker: str) -> Dict[str, str]:
     """{form: date of its most recent filing} across 10-K, 20-F and 40-F.
 
     Costs the submissions index and nothing more -- no XBRL parse -- because
     `form_mismatch_note` runs on every failure path in the SEC layer and a
     filing download per annotation would not be affordable.
+
+    A form the filer never used comes back as an empty list, not an exception.
+    So an exception never meant "a form this filer never used" -- it meant the
+    lookup broke -- and swallowing it answered a rate limit with "NVDA has no
+    annual report on EDGAR".
     """
     from edgar import Company
 
     _require_identity()
-    company = Company(ticker)
+    try:
+        company = Company(ticker)
+    except Exception as exc:  # noqa: BLE001 - reported, never masked
+        raise AnnualIndexUnavailable(
+            f"could not look up {ticker} on EDGAR: "
+            f"{type(exc).__name__}: {exc}") from exc
+
     index: Dict[str, str] = {}
     for form in ANNUAL_FORMS:
         _throttle()
         try:
             filings = company.get_filings(form=form, amendments=False).head(1)
-        except Exception:  # noqa: BLE001 - a form this filer never used
-            continue
+        except Exception as exc:  # noqa: BLE001 - reported, never masked
+            raise AnnualIndexUnavailable(
+                f"could not list {form} filings for {ticker}: "
+                f"{type(exc).__name__}: {exc}") from exc
         for filing in filings:
             index[form] = str(filing.filing_date)
     return index
@@ -134,6 +163,8 @@ def _annual_filing_index(ticker: str) -> Dict[str, str]:
         cached = _index_cache.get(key)
     if cached is not None:
         return cached
+    # Raises rather than returning {} when EDGAR could not be reached, so a
+    # failed lookup is never memoised and replayed as an answer.
     index = _fetch_annual_filing_index(key)
     with _index_lock:
         _index_cache[key] = index
@@ -240,7 +271,17 @@ def get_foreign_filer_profile(ticker: str) -> Dict[str, Any]:
     issuer reports interim results on 6-K, and 6-K exhibits carry no XBRL, so
     no quarterly tagged figure exists for it anywhere.
     """
-    form, index = _latest_annual_form(ticker)
+    try:
+        form, index = _latest_annual_form(ticker)
+    except AnnualIndexUnavailable as exc:
+        return {
+            "ticker": ticker,
+            "success": False,
+            "is_foreign_private_issuer": None,
+            "error": f"EDGAR lookup failed for {ticker}: {exc}",
+            "annual_form": None,
+            "annual_filing_date": None,
+        }
     if form is None:
         return {
             "ticker": ticker,
@@ -428,6 +469,25 @@ def not_covered_reason(ticker: str, form_type: str, fallback: str) -> str:
         return fallback
 
 
+def _shared_filings(ticker: str, deadline: Deadline):
+    """`shared_filings`, bound to this module's `fetch_concept_series`.
+
+    Read here rather than passed in from the call site so the name stays a
+    module global a test can replace -- which is what the walk checks before
+    it stands down.
+    """
+    return shared_filings(ticker, deadline, fetch_concept_series)
+
+
+def _concept_series(ticker: str, concept: str, form: str, limit: int) -> list:
+    """One concept's series, reusing filings already parsed for this call.
+
+    With no shared walk open this is `fetch_concept_series` verbatim, which is
+    what keeps that name the seam the tests replace.
+    """
+    return concept_series(ticker, concept, form, limit, fetch_concept_series)
+
+
 def _revenue_chains(taxonomy: Optional[str]) -> Tuple[Tuple[str, ...], ...]:
     """Both concept chains, best guess first.
 
@@ -461,7 +521,15 @@ def get_annual_revenue(ticker: str, limit: int = 3,
     a geography, so taking the concept's presence as an answer reports
     NT$352bn against a real NT$3,809bn.
     """
-    form, index = _latest_annual_form(ticker)
+    try:
+        form, index = _latest_annual_form(ticker)
+    except AnnualIndexUnavailable as exc:
+        return {
+            "ticker": ticker, "success": False,
+            "error": f"EDGAR lookup failed for {ticker}: {exc}",
+            "latest_revenue": None, "currency": None, "form": None,
+            "series": [], "concept_used": None, "concepts_tried": [],
+        }
     if form is None:
         return {
             "ticker": ticker, "success": False,
@@ -481,16 +549,78 @@ def get_annual_revenue(ticker: str, limit: int = 3,
             taxonomy_hint = None
 
     tried: List[str] = []
+    deadline = Deadline(budget_seconds(), f"get_annual_revenue({ticker})")
+    try:
+        with _shared_filings(ticker, deadline):
+            answer = _revenue_chain_walk(ticker, form, index, taxonomy_hint,
+                                         limit, tried)
+    except ToolTimeout as exc:
+        return {
+            "ticker": ticker,
+            "success": False,
+            "timed_out": True,
+            "form": form,
+            "annual_filing_date": index.get(form),
+            "error": str(exc),
+            "latest_revenue": None, "currency": None, "series": [],
+            "concept_used": None, "concepts_tried": tried,
+        }
+    if answer is not None:
+        return answer
+
+    return {
+        "ticker": ticker,
+        "success": False,
+        "form": form,
+        "annual_filing_date": index[form],
+        "error": (f"{ticker}: no consolidated revenue concept found in the last "
+                  f"{limit} {form} filings. Both the IFRS and US-GAAP chains "
+                  f"were tried and neither produced an undimensioned fact. "
+                  f"This filer tags revenue under an element not in either "
+                  f"chain, or only with dimensions."),
+        "latest_revenue": None, "currency": None, "series": [],
+        "concept_used": None, "concepts_tried": tried,
+    }
+
+
+def _revenue_chain_walk(ticker: str, form: str, index: Dict[str, str],
+                        taxonomy_hint: Optional[str], limit: int,
+                        tried: List[str]) -> Optional[Dict[str, Any]]:
+    """The first chain element answering in the most recent filing, or None.
+
+    Split out so the shared filing walk above wraps the fetching and nothing
+    else. Up to seven elements are asked of the same `limit` filings; parsing
+    them once per element cost GS 21 parses of 3 filings and 46.4 seconds.
+
+    `tried` is appended to rather than returned because the caller needs it
+    whichever way this ends -- including when the clock stops the walk, where
+    "which elements were asked" is the only honest thing left to report.
+    """
     for taxonomy, concepts in _revenue_chains(taxonomy_hint):
         for concept in concepts:
             tried.append(concept)
             try:
-                points = fetch_concept_series(ticker, concept, form=form,
-                                              limit=limit)
+                points = _concept_series(ticker, concept, form, limit)
+            # Only NotCovered is swallowed, and only to try the next concept.
+            # A network failure or an unknown ticker propagates: reporting an
+            # outage as "this filer does not disclose it" is the one answer
+            # worse than an error.
             except NotCovered:
                 continue
-            except Exception:  # noqa: BLE001 - try the next concept
-                continue
+            # The clock says nothing about the filer, so it is not turned into
+            # a message about one here. The caller reports it in its own words.
+            except ToolTimeout:
+                raise
+            except Exception as exc:  # noqa: BLE001 - surface it, never mask it
+                return {
+                    "ticker": ticker,
+                    "success": False,
+                    "form": form,
+                    "annual_filing_date": index.get(form),
+                    "error": f"fetching revenue concepts failed: {exc}",
+                    "latest_revenue": None, "currency": None, "series": [],
+                    "concept_used": None, "concepts_tried": tried,
+                }
 
             series: List[Dict[str, Any]] = []
             covers_latest_filing = False
@@ -544,17 +674,4 @@ def get_annual_revenue(ticker: str, limit: int = 3,
                     f"period only -- never a live conversion, and null does not "
                     f"mean the company is small."),
             }
-
-    return {
-        "ticker": ticker,
-        "success": False,
-        "form": form,
-        "annual_filing_date": index[form],
-        "error": (f"{ticker}: no consolidated revenue concept found in the last "
-                  f"{limit} {form} filings. Both the IFRS and US-GAAP chains "
-                  f"were tried and neither produced an undimensioned fact. "
-                  f"This filer tags revenue under an element not in either "
-                  f"chain, or only with dimensions."),
-        "latest_revenue": None, "currency": None, "series": [],
-        "concept_used": None, "concepts_tried": tried,
-    }
+    return None

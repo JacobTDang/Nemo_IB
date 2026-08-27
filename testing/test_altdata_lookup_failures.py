@@ -22,6 +22,8 @@ import sys
 from datetime import datetime
 
 import pytest
+
+from testing._gates import skip_if_provider_unavailable
 import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -348,12 +350,26 @@ def test_resolver_outage_is_not_reported_as_an_unknown_ticker(monkeypatch):
     assert exc.value.reason == "resolver_unavailable"
 
 
-def test_known_ticker_resolves_to_name_and_sector(monkeypatch):
+def test_known_ticker_resolves_to_name_sector_and_industry(monkeypatch):
+    """The industry rides along because the sector alone cannot express
+    "defense prime": yfinance files every one of them under Industrials, and
+    get_policy_signals needs the finer label to reach its Defense keywords."""
+    _fake_yfinance(monkeypatch, info={"longName": "NVIDIA Corporation",
+                                      "sector": "Technology",
+                                      "industry": "Semiconductors"})
+
+    assert alt._resolve_ticker("NVDA") == {"name": "NVIDIA Corporation",
+                                           "sector": "Technology",
+                                           "industry": "Semiconductors"}
+
+
+def test_a_missing_industry_resolves_to_an_empty_string(monkeypatch):
+    """Not every quote response carries one, and None would break the
+    override lookup that reads it."""
     _fake_yfinance(monkeypatch, info={"longName": "NVIDIA Corporation",
                                       "sector": "Technology"})
 
-    assert alt._resolve_ticker("NVDA") == {"name": "NVIDIA Corporation",
-                                           "sector": "Technology"}
+    assert alt._resolve_ticker("NVDA")["industry"] == ""
 
 
 # ---------------------------------------------------------------------------
@@ -587,12 +603,25 @@ def test_policy_missing_congress_key_is_named_as_a_degradation(monkeypatch):
 
 
 def test_policy_partial_keyword_failure_is_reported(monkeypatch):
+    """One keyword timing out must not read as "Congress passed nothing".
+
+    The keyword queries run concurrently now -- searching every mapped keyword
+    sequentially does not fit the handler's 30s budget -- so the counter this
+    fake picks its victim with is taken under a lock. Without it two threads
+    can both read n=0 and the "exactly one failure" the test is about becomes
+    a race.
+    """
     _no_congress_key(monkeypatch)
+    import threading
+
     calls = {"n": 0}
+    lock = threading.Lock()
 
     def flaky(url, **k):
-        calls["n"] += 1
-        if calls["n"] == 1:
+        with lock:
+            calls["n"] += 1
+            first = calls["n"] == 1
+        if first:
             raise requests.exceptions.Timeout("read timeout")
         return _Response({"objects": [_bill()]}, 200)
 
@@ -741,6 +770,9 @@ def test_policy_live_known_sector_still_returns_bills(monkeypatch):
 
     out = alt._fetch_policy_signals("NVDA", "Technology", 180)
 
+    # GovTrack going down does not make this tool wrong. It reports the outage
+    # distinctly, and asserting through it would test GovTrack's uptime.
+    skip_if_provider_unavailable(out, "GovTrack")
     assert out["success"] is True, out.get("error")
     assert out["bill_count"] > 0
     assert out["coverage"] == "partial"  # GovTrack only without the API key

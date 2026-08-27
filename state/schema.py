@@ -350,6 +350,26 @@ CREATE_SCHEMA = [
         created_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     )""",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_pe_layers_natural ON preearnings_research_layers(ticker, earnings_date, component)",
+
+    # --- Falsifier watcher: fired-alert ledger ---
+    # Idempotency table: (thesis_id, falsifier_hash, evidence_id) -> already_fired.
+    # daemons/falsifier_watcher.py writes it; tools/sentry_server/server.py and
+    # state/sentry_eval_log.py read it. It used to be created lazily by the
+    # daemon alone, so any process that had not started the watcher first hit
+    # "no such table" -- which the readers hid behind empty results.
+    """CREATE TABLE IF NOT EXISTS falsifier_alerts(
+        alert_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        thesis_id       INTEGER NOT NULL,
+        ticker          TEXT,
+        falsifier_hash  TEXT,
+        falsifier_text  TEXT,
+        evidence_id     TEXT,
+        score           REAL,
+        reason          TEXT,
+        fired_at        TIMESTAMP,
+        UNIQUE(thesis_id, falsifier_hash, evidence_id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_falsifier_alerts_thesis ON falsifier_alerts(thesis_id, fired_at)",
 ]
 
 

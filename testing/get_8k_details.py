@@ -1,12 +1,25 @@
 
+"""Print the recent 8-K events for a ticker, one date at a time.
+
+Usage:
+  ./.venv/bin/python testing/get_8k_details.py [TICKER]
+
+The module this needs is named 8K_and_DEF14A_utils, and a name starting with a
+digit is not a Python identifier, so `from ... import` is a SyntaxError rather
+than an ImportError -- this file did not parse at all. (It also spelled the
+name with a lowercase k, which no filesystem here would have matched either.)
+importlib takes the name as a string, which is how every other caller in the
+repo reaches this module; see testing/test_8k_event_text_is_bounded.py.
+"""
+import importlib
 import sys
 import os
-import json
 
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from tools.web_search_server.8k_and_DEF14A_utils import SECFilingParser
+SECFilingParser = importlib.import_module(
+    "tools.web_search_server.8K_and_DEF14A_utils").SECFilingParser
 
 def get_detailed_8k(ticker):
     parser = SECFilingParser()

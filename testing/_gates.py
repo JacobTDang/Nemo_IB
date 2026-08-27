@@ -80,11 +80,6 @@ _OFFLINE_REASON = (
 def service_missing(name: str) -> str | None:
     _load_env_once()
     """Return a human-readable reason the service is unavailable, or None."""
-    if name == "groq":
-        if _offline():
-            return _OFFLINE_REASON.format(service="the Groq API")
-        return None if _env_key("GROQ_API_KEY") else (
-            "GROQ_API_KEY is unset or empty; set it in .env to run this test")
     if name == "openrouter":
         if _offline():
             return _OFFLINE_REASON.format(service="the OpenRouter API")
@@ -101,8 +96,23 @@ def service_missing(name: str) -> str | None:
             "CLAUDE.md is absent. It is gitignored, so this lint only runs on a "
             "machine that has the local playbook")
     if name == "sec":
+        # Every other service gate refuses when the run declares itself
+        # offline; this one did not, so SKIP_NETWORK_TESTS=1 still made live
+        # EDGAR calls and the "offline, no network" suite was neither.
+        if _offline():
+            return _OFFLINE_REASON.format(service="SEC EDGAR")
         return None if _env_key("SEC_EMAIL") else (
             "SEC_EMAIL is unset; SEC fair access requires a real contact identity")
+    if name == "finnhub":
+        if _offline():
+            return _OFFLINE_REASON.format(service="the Finnhub API")
+        return None if _env_key("FINNHUB_API_KEY") else (
+            "FINNHUB_API_KEY is unset or empty; set it in .env to run this test")
+    if name == "fred":
+        if _offline():
+            return _OFFLINE_REASON.format(service="the FRED API")
+        return None if _env_key("FRED_API_KEY") else (
+            "FRED_API_KEY is unset or empty; set it in .env to run this test")
     raise ValueError(f"unknown service gate: {name!r}")
 
 
@@ -118,8 +128,31 @@ def _gate(name: str):
     return pytest.mark.skipif(True, reason=reason)
 
 
-requires_groq = _gate("groq")
 requires_openrouter = _gate("openrouter")
 requires_searxng = _gate("searxng")
 requires_playbook = _gate("playbook")
 requires_sec = _gate("sec")
+requires_finnhub = _gate("finnhub")
+requires_fred = _gate("fred")
+
+
+def skip_if_provider_unavailable(result: dict, provider: str = "") -> None:
+    """Skip when the upstream refused to answer at all.
+
+    A live test asserting "GovTrack returns bills for Technology" tests
+    GovTrack, not us. When the provider is genuinely down -- and these servers
+    report that distinctly, with coverage "not_covered" and reason
+    "provider_unavailable" -- the assertion is unanswerable, and failing it
+    reports our tool as broken when the tool did exactly the right thing.
+
+    Deliberately narrow: only the server's own "no provider answered" signal
+    skips. A provider that answered with nothing still fails the test, which is
+    what the test is for.
+    """
+    if not isinstance(result, dict):
+        return
+    if result.get("reason") != "provider_unavailable":
+        return
+    detail = str(result.get("error") or "")[:300]
+    pytest.skip(f"{provider or 'the upstream provider'} did not answer, so "
+                f"this assertion is unanswerable: {detail}")

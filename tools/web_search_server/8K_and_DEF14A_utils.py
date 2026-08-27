@@ -19,7 +19,6 @@ from io import StringIO
 import pandas as pd
 import logging
 import re
-import os
 import numpy as np
 
 try:
@@ -36,8 +35,12 @@ if not logger.handlers:
     logger.setLevel(logging.WARNING)
 
 # Configuration
-NAME = os.getenv('NAME', 'Investment Analyst')
-SEC_EMAIL = os.getenv('SEC_EMAIL', 'analyst@example.com')
+# SEC identity is resolved on use by sec_series._require_identity rather than
+# defaulted here: a placeholder contact address misrepresents the caller to
+# the SEC on every request, and does it silently. Absolute import because
+# testing/run_multi_company_verification.py loads this file by path (the
+# module name starts with a digit), which leaves it without a parent package.
+from tools.web_search_server.sec_series import _require_identity
 
 # Regex constants
 _ITEM_NUM_RE = re.compile(r'(\d+\.\d+)')
@@ -928,15 +931,73 @@ def run_truth_tests(executives: List[Dict[str, Any]], board_members: List[Dict[s
 # MAIN PARSER CLASS
 # =============================================================================
 
+# An 8-K body is unbounded and most of it is not evidence of anything. Carried
+# whole, one filing per event, `extract_8k_events("NVDA", limit=8)` measured
+# 73,716 characters on 2026-08-26 with 50,507 of them raw filing text -- past
+# the tool-result budget, so a caller asking for eight events received none.
+# The earlier total_events/events_returned/truncated work bounded the count;
+# this bounds what a single event costs, which is what actually broke.
+EVENT_TEXT_CAP = 1500
+
+# The first item heading. An 8-K opens with its SEC cover page -- registrant,
+# address, Rule 425 checkboxes, the 12(b) securities table -- and that runs
+# 2,313 characters on AMAT's 2026-03-13 filing before "Item 5.07" appears.
+_FIRST_ITEM_HEADING = re.compile(r'\bItem\s+\d\.\d\d\b')
+
+
+def bound_filing_text(text: str, cap: int = EVENT_TEXT_CAP) -> Dict[str, Any]:
+    """A bounded excerpt of a filing body, plus what was left behind.
+
+    Head-truncating would be the obvious bound and it keeps the wrong end.
+    The cover page is identical across every 8-K a company ever files, so
+    `text[:1500]` returns the registrant's mailing address and stops before
+    the first item section -- the one part that makes the classification
+    checkable. The excerpt therefore starts at the first item heading when
+    there is one, and `text_excerpt_from_char` says where that was so the
+    offset is not something a reader has to infer.
+
+    A body shorter than the cap is returned whole and is not marked
+    truncated: a flag that fires on every event tells a reader nothing. An
+    empty body -- AMAT's 2025-10-23 8-K came back with no extractable text at
+    all -- reports `text_length_chars: 0`, which distinguishes a fetch that
+    returned nothing from a very short filing.
+    """
+    text = text or ''
+    if len(text) <= cap:
+        return {
+            'text': text,
+            'text_length_chars': len(text),
+            'text_chars_returned': len(text),
+            'text_excerpt_from_char': 0,
+            'text_truncated': False,
+        }
+
+    match = _FIRST_ITEM_HEADING.search(text)
+    start = match.start() if match else 0
+    excerpt = text[start:start + cap]
+    return {
+        'text': excerpt,
+        'text_length_chars': len(text),
+        'text_chars_returned': len(excerpt),
+        'text_excerpt_from_char': start,
+        'text_truncated': True,
+    }
+
+
 class SECFilingParser:
     def __init__(self, name: Optional[str] = None, email: Optional[str] = None) -> None:
-        self.name, self.email = name or NAME, email or SEC_EMAIL
+        self.name, self.email = name, email
         self.event_classifier = DynamicEventClassifier()
         self.name_extractor = DynamicNameExtractor()
         self.validator = FilingGroundedValidator()
 
     def _set_identity(self) -> None:
-        set_identity(f"{self.name} {self.email}")
+        # An explicit name/email pair passed to the constructor wins; anything
+        # else has to come from the environment, which refuses to guess.
+        if self.name and self.email:
+            set_identity(f"{self.name} {self.email}")
+        else:
+            _require_identity()
 
     def _generate_quality_report(self, results: List[Dict[str, Any]], truth_tests_passed: bool, truth_alerts: List[str]) -> Dict[str, Any]:
         if not results:
@@ -1106,8 +1167,9 @@ class SECFilingParser:
         return actions
 
     def extract_8k_events(self, ticker: str, limit: int = 10) -> Dict[str, Any]:
+        self._set_identity()
+
         try:
-            self._set_identity()
             company = Company(ticker)
             filings = company.get_filings(form='8-K')
             if not filings: return {'ticker': ticker, 'success': False, 'error': 'No 8-K found'}
@@ -1136,8 +1198,11 @@ class SECFilingParser:
                     'items_source': source,
                     'confidence': cls.confidence,
                     'evidence': asdict(cls.evidence) if cls.evidence else None,
-                    'text': text  # Full 8-K text (no truncation)
+                    # Where the rest of a truncated body lives. A bound with
+                    # no pointer past it makes the dropped text unreachable.
+                    'filing_url': getattr(filing, 'filing_url', None),
                 }
+                event_dict.update(bound_filing_text(text))
 
                 # 5.02-specific structured extraction. Adds an `officer_actions`
                 # list when the filing names departing/appointed officers in
@@ -1153,18 +1218,28 @@ class SECFilingParser:
             truth_passed, truth_alerts = True, []
             quality = self._generate_quality_report(list(events_by_date.values()), truth_passed, truth_alerts)
 
+            # One 8-K is one event date, so the filing count IS the event
+            # count -- available for free without parsing every filing.
+            # Reporting the parsed page as `total_events` said "3 events" for
+            # a company with 100.
+            total_events = len(filings)
+            returned = len(events_by_date)
+
             return {
                 'ticker': ticker,
                 'events_by_date': events_by_date,
-                'total_events': len(events_by_date),
+                'total_events': total_events,
+                'events_returned': returned,
+                'truncated': total_events > returned,
                 'success': True,
                 'quality_report': quality
             }
         except Exception as e: return {'ticker': ticker, 'success': False, 'error': str(e)}
 
     def extract_proxy_compensation(self, ticker: str) -> Dict[str, Any]:
+        self._set_identity()
+
         try:
-            self._set_identity()
             filings = Company(ticker).get_filings(form='DEF 14A')
             if not filings: return {'ticker': ticker, 'executives': [], 'candidates': [], 'success': False, 'error': 'No DEF 14A found'}
             latest = filings[0]
@@ -1232,7 +1307,7 @@ class SECFilingParser:
             # Strip SEC's `<?xml ... ?>` processing instruction so lxml's
             # string parser accepts the input. Same fix as in
             # _extract_board_from_tables — see that method's comment for
-            # the full rationale (html5lib 1.1 is broken on Py>=3.10).
+            # why the strip is load-bearing rather than cosmetic.
             clean_html = html
             if clean_html.lstrip().startswith('<?xml') and '?>' in clean_html:
                 clean_html = clean_html.split('?>', 1)[1].lstrip()
@@ -1597,10 +1672,25 @@ class SECFilingParser:
         return out
 
     def extract_governance_data(self, ticker: str, debug: bool = False) -> Dict[str, Any]:
+        self._set_identity()
+
         try:
-            self._set_identity()
             filings = Company(ticker).get_filings(form='DEF 14A')
-            if not filings: return {'ticker': ticker, 'board_members': [], 'candidates': [], 'success': False}
+            if not filings:
+                # success:False with no error at all -- a caller could not log
+                # it, act on it, or tell it from any other failure. Foreign
+                # private issuers are the common case: proxy statements are a
+                # domestic filing, so TSM has none by definition rather than
+                # by omission.
+                return {
+                    'ticker': ticker, 'board_members': [], 'candidates': [],
+                    'success': False,
+                    'error': (f'No DEF 14A (proxy statement) on EDGAR for '
+                              f'{ticker}. Foreign private issuers file none: '
+                              f'proxy statements are a domestic requirement, '
+                              f'and board data for such a filer is in its '
+                              f'20-F or 40-F instead.'),
+                }
             latest = filings[0]
             html, text = safe_get_html(latest), safe_get_text(latest)
 
@@ -1994,18 +2084,26 @@ class SECFilingParser:
         if not html: return best_members, None
         try:
             # SEC HTML often starts with `<?xml version="1.0" encoding="..."?>`
-            # which makes lxml's string parser raise "Unicode strings with
-            # encoding declaration are not supported." The html5lib fallback
-            # is unusable on Python >=3.10 (its 1.1 release imports the
-            # removed `collections.Mapping`). Strip the declaration so the
-            # default lxml path works on a clean string.
+            # and lxml's string parser still refuses that: "Unicode strings
+            # with encoding declaration are not supported."
+            #
+            # pd.read_html's default flavor is the pair ("lxml", "bs4"), tried
+            # in order, so without this strip the lxml attempt raises, pandas
+            # silently falls back to bs4, and every SEC table is parsed by the
+            # weaker parser. Stripping the declaration keeps the lxml path
+            # usable. It is not cosmetic -- the two parsers disagree on the
+            # malformed tables SEC filings are full of.
             clean_html = html
             if clean_html.lstrip().startswith('<?xml') and '?>' in clean_html:
                 clean_html = clean_html.split('?>', 1)[1].lstrip()
             try:
                 dfs = pd.read_html(StringIO(clean_html))
             except Exception:
-                # bs4 flavor works without lxml or html5lib if either is missing
+                # Reachable when lxml is not installed: pandas raises
+                # ImportError out of _parser_dispatch before its internal
+                # per-flavor loop (which only catches ValueError) can fall
+                # back. Asking for bs4 explicitly still works -- that flavor
+                # needs bs4 + html5lib, not lxml.
                 dfs = pd.read_html(StringIO(clean_html), flavor='bs4')
 
             for table_idx, df in enumerate(dfs):

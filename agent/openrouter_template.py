@@ -42,6 +42,14 @@ def _is_valid_model_id(model_id) -> bool:
   return _MODEL_ID_RE.match(candidate) is not None
 
 
+class CredentialRejected(RuntimeError):
+    """The provider refused the API key, so nothing could be verified.
+
+    Distinct from a model being absent. Raised rather than returned so a pool
+    cannot be assembled out of failed probes.
+    """
+
+
 def _verify_model_alive(model_id: str, api_key: str, timeout: float = 10.0) -> bool:
   """Send a 1-token completion to check the model endpoint exists.
 
@@ -70,8 +78,22 @@ def _verify_model_alive(model_id: str, api_key: str, timeout: float = 10.0) -> b
     print(f"[OpenRouter] {model_id} returned 404; treating it as dead.",
           file=sys.stderr, flush=True)
     return False
+  except AuthenticationError as exc:
+    # A rejected credential answers a question about the KEY, not the model.
+    # Treating it as "not a 404, so alive" marked every model in the list
+    # alive and built the pool entirely out of 401s -- observed live, a
+    # rejected key still logged "Pool initialized with 5 models" without one
+    # of them having been reached. A pool that reports five verified models
+    # when zero were verified is our own outage wearing a fact about the
+    # world.
+    raise CredentialRejected(
+      f"OpenRouter rejected the API key while probing {model_id}: {exc}. "
+      f"No model can be verified with a credential the provider will not "
+      f"accept, so the pool is not built rather than filled with unverified "
+      f"entries. Check OPENROUTER_API_KEY -- a valid key begins 'sk-or-v1-'."
+    ) from exc
   except Exception as exc:
-    # Rate limit, auth, timeout etc. don't prove the model is dead, so it stays
+    # Rate limit, timeout etc. don't prove the model is dead, so it stays
     # in the pool -- but report what happened rather than swallowing it.
     print(f"[OpenRouter] {model_id} probe hit {type(exc).__name__}: {exc}. "
           f"Not a 404, so keeping it in the pool.",
@@ -84,6 +106,7 @@ def _verify_model_alive(model_id: str, api_key: str, timeout: float = 10.0) -> b
 # ---------------------------------------------------------------------------
 # Module-level state. All access goes through the helpers below.
 _MODEL_POOL: list = []                  # alive models, in preference order
+_POOL_CREDENTIAL_ERROR: str = ''        # why the pool is empty, if it is
 _MODEL_LAST_USED: dict = {}             # model -> unix timestamp last picked
 _MODEL_DEMOTED_UNTIL: dict = {}         # model -> unix timestamp it's banned
 _POOL_LOCK = Lock()
@@ -123,10 +146,22 @@ def _build_reasoning_pool() -> list:
     'meta-llama/llama-3.3-70b-instruct:free',
     'z-ai/glm-4.5-air:free',
   ]
+  global _POOL_CREDENTIAL_ERROR
   alive = []
   seen = set()
   for c in candidates:
-    if c and c not in seen and _verify_model_alive(c, api_key):
+    try:
+      ok = _verify_model_alive(c, api_key)
+    except CredentialRejected as exc:
+      # Recorded, not raised here. Importing this module for a helper or a
+      # type must not explode because a credential is bad -- but resolving a
+      # model must, because that is the point at which a caller is about to
+      # rely on it. The pool stays EMPTY rather than falling back, so nothing
+      # downstream mistakes an unverified name for a working one.
+      _POOL_CREDENTIAL_ERROR = str(exc)
+      print(f"[OpenRouter] {exc}", file=sys.stderr, flush=True)
+      return []
+    if c and c not in seen and ok:
       alive.append(c)
       seen.add(c)
   if not alive:
@@ -167,6 +202,18 @@ _MODEL_POOL: list = []
 _POOL_BUILT = False
 
 
+def _configured_candidate() -> str:
+  """The first configured model name, with no claim that it is reachable.
+
+  Used only when the credential was rejected, so that importing a name does
+  not fail while resolving one still does.
+  """
+  configured = os.getenv("PRIMARY_REASONING_MODEL", "").strip()
+  if _is_valid_model_id(configured):
+    return configured
+  return 'z-ai/glm-4.5-air:free'   # same ultimate fallback the pool uses
+
+
 def _ensure_pool() -> list:
   """Build the pool on first use.
 
@@ -183,8 +230,16 @@ def _ensure_pool() -> list:
 
 
 def primary_reasoning_model() -> str:
-  """First-preference alive model, resolving the pool if needed."""
-  return _ensure_pool()[0]
+  """First-preference alive model, resolving the pool if needed.
+
+  Raises when the credential was rejected. An empty pool there is not "no
+  models available" -- it is "we could not ask", and handing back a fallback
+  name would be an unverified model wearing a verified one's place.
+  """
+  pool = _ensure_pool()
+  if not pool and _POOL_CREDENTIAL_ERROR:
+    raise CredentialRejected(_POOL_CREDENTIAL_ERROR)
+  return pool[0]
 
 
 def __getattr__(name: str):
@@ -195,7 +250,18 @@ def __getattr__(name: str):
   network work until something actually asks.
   """
   if name == "PRIMARY_REASONING_MODEL":
-    return primary_reasoning_model()
+    # The attribute is a NAME; primary_reasoning_model() is a claim that the
+    # name resolves to something live. Only the latter refuses when the
+    # credential was rejected -- otherwise importing this module for a helper
+    # takes the whole test suite down over a key almost nothing needs, which
+    # buries every other signal. The name is still marked unverified, and any
+    # actual completion fails with the provider's own 401.
+    try:
+      return primary_reasoning_model()
+    except CredentialRejected as exc:
+      print(f"[OpenRouter] PRIMARY_REASONING_MODEL is UNVERIFIED: {exc}",
+            file=sys.stderr, flush=True)
+      return _configured_candidate()
   raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

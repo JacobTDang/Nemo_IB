@@ -1024,11 +1024,12 @@ class TestIntegrationWorkflows:
 
         assert len(sector_metrics['tech']) == 2, sector_metrics
 
-        # Every filer that did not produce a margin must name the component it
-        # is missing, so a coverage gap can never be read as a data point.
+        # Every filer that did not produce a margin must name the element it
+        # looked for, so a coverage gap can never be read as a data point.
         for ticker, error in refusals:
             assert error, ticker
-            assert ('Missing EBITDA components' in error
+            assert ('us-gaap:OperatingIncomeLoss' in error
+                    or 'us-gaap:DepreciationDepletionAndAmortization' in error
                     or 'No revenue concept found' in error), (ticker, error)
 
 

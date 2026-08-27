@@ -232,6 +232,10 @@ server = [
   "mcp==1.25.0",
   "numpy==2.3.5",
   "pandas==2.3.3",
+  # House Periodic Transaction Reports are PDFs; get_congress_trades cannot
+  # read them without this. Imported lazily, so its absence would not fail the
+  # build -- only the first call in production.
+  "pdfplumber==0.11.8",
   "requests==2.32.5",
   "trafilatura==2.0.0",
   "yfinance==1.0",

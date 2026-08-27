@@ -6,17 +6,26 @@
 #
 # Every service shares one image and differs only in its command and port.
 #
-# Bind to the tailnet address rather than every interface once Tailscale is in
-# place: replace "8810:8080" with "<tailnet-ip>:8810:8080" so nothing is exposed
-# to the untrusted LAN. The bearer token is defence in depth behind that, not a
-# substitute for it.
+# NEMO_BIND_ADDR is the address the ports publish on. It defaults to 127.0.0.1,
+# so a missing variable fails closed -- reachable only from the host itself --
+# rather than publishing five servers to an untrusted LAN. On the homelab set it
+# to the machine's Tailscale address:
+#
+#   NEMO_BIND_ADDR=100.x.y.z docker compose up -d
+#
+# Never set it to 0.0.0.0. The bearer token is defence in depth behind the
+# network boundary, not a substitute for one: on a flat home network that is
+# every phone, TV and IoT device.
 #
 # Build for the target architecture before deploying. Proxmox VE is x86-64
 # only, so an image built on Apple Silicon without --platform will not run:
 #   docker buildx build --platform linux/amd64 -t nemo-data:amd64 -f ../Dockerfile ..
 
 x-server: &server
-  image: nemo-data:local
+  # Overridable so the homelab can deploy the amd64 build the notes above
+  # describe. Pinned to one tag, following those instructions produced an
+  # image this file would never use.
+  image: ${NEMO_IMAGE:-nemo-data:local}
   env_file: ../.env
   restart: unless-stopped
   # Docker writes container logs to the HOST disk, outside the tmpfs that
@@ -37,16 +46,43 @@ x-server: &server
     MCP_LOG_RESPONSES: ${MCP_LOG_RESPONSES:-0}
     MCP_LOG_RESPONSE_CHARS: ${MCP_LOG_RESPONSE_CHARS:-4000}
     # Per-server token, supplied by the shell rather than written here so it
-    # never lands in a file. A server with no token refuses to start, so a
-    # forgotten variable fails loudly instead of publishing every tool.
+    # never lands in a file.
     #   export NEMO_MCP_TOKEN=$(openssl rand -hex 32)
-    MCP_AUTH_TOKEN: ${NEMO_MCP_TOKEN:?set NEMO_MCP_TOKEN before bringing the stack up}
+    #
+    # No `:?` here. Compose interpolates the whole file before it merges
+    # anything, so a required-variable marker in this anchor fires for every
+    # service in the file -- including congress-sync, a batch job that binds no
+    # port, serves nothing and has no use for a bearer token, and which could
+    # not be run at all without one.
+    #
+    # The guarantee is unchanged and lives where it belongs: resolve_auth_token()
+    # in tools/mcp_http.py refuses to start a server whose token is unset,
+    # rather than silently publishing every tool. That is tested, and it fails
+    # at container start instead of at compose parse.
+    MCP_AUTH_TOKEN: ${NEMO_MCP_TOKEN:-}
+    # Prune the filing cache below the 512m tmpfs above, well before it fills.
+    NEMO_FILING_CACHE_CAP_MB: ${NEMO_FILING_CACHE_CAP_MB:-360}
+    NEMO_FILING_CACHE_INTERVAL_S: ${NEMO_FILING_CACHE_INTERVAL_S:-300}
+    # Persistent, on the named volume rather than the tmpfs above.
+    NEMO_CONGRESS_DB: /app/data/congress.db
   # Both writable paths are RAM-backed and capped. edgartools caches every
   # filing it fetches -- 2MB after a single one, unbounded across tickers --
   # and a long-lived container no longer gets --rm to clean up after it.
+  #
+  # The cap alone was not enough: nothing ever removed a cached filing, so the
+  # mount reached 100% in the running stack and every SEC read failed with
+  # [Errno 28] No space left on device. Each server now prunes least-recently-
+  # used filings on an interval (tools/filing_cache.py), and the cap below
+  # leaves headroom for the single largest filing seen so far (89MB).
   tmpfs:
     - /root/.edgar:rw,size=512m
     - /app/db_cache:rw,size=128m
+  # The congressional disclosure store is NOT disposable and must not live in
+  # the tmpfs above. Rebuilding it means re-fetching and re-parsing thousands
+  # of PDFs from the House Clerk, which is both slow and rude to a public
+  # service; losing it on every restart would make the pipeline unusable.
+  volumes:
+    - congress-data:/app/data
   healthcheck:
     # No curl in the runtime stage; python is what the image has.
     # /health only proves the port is bound and the app started. A server whose
@@ -64,28 +100,82 @@ services:
     <<: *server
     container_name: nemo-sec
     command: python -m tools.web_search_server.web_search http
-    ports: ["8810:8080"]
+    ports: ["${NEMO_BIND_ADDR:-127.0.0.1}:8810:8080"]
 
   financial:
     <<: *server
     container_name: nemo-financial
     command: python -m tools.financial_modeling_engine.analysis_tools http
-    ports: ["8811:8080"]
+    ports: ["${NEMO_BIND_ADDR:-127.0.0.1}:8811:8080"]
 
   finnhub:
     <<: *server
     container_name: nemo-finnhub
     command: python -m tools.news_agregator.finnhub_server http
-    ports: ["8812:8080"]
+    ports: ["${NEMO_BIND_ADDR:-127.0.0.1}:8812:8080"]
 
   fred:
     <<: *server
     container_name: nemo-fred
     command: python -m tools.news_agregator.fred_server http
-    ports: ["8813:8080"]
+    ports: ["${NEMO_BIND_ADDR:-127.0.0.1}:8813:8080"]
 
   altdata:
     <<: *server
     container_name: nemo-altdata
     command: python -m tools.altdata_server.server http
-    ports: ["8814:8080"]
+    ports: ["${NEMO_BIND_ADDR:-127.0.0.1}:8814:8080"]
+
+  # Ingestion, not a server. Under a profile so `docker compose up` never
+  # starts it: it is a batch job that finishes, and a restart:unless-stopped
+  # batch job is a loop that re-reads the House Clerk forever.
+  #
+  #   docker compose run --rm congress-sync                  # incremental
+  #   docker compose run --rm congress-sync --house 2024 2025 2026 --senate
+  #   docker compose run --rm congress-sync --status
+  #
+  # Safe to re-run and safe to cron: filings already parsed are never
+  # refetched, so a nightly run costs one index fetch plus whatever is new.
+  #   0 6 * * * cd /srv/nemo/deploy && docker compose run --rm congress-sync
+  # Ingestion, not a server. Under a profile so `docker compose up` never
+  # starts it: it is a batch job that finishes, and a restart:unless-stopped
+  # batch job is a loop that re-reads the House Clerk forever.
+  #
+  #   docker compose run --rm congress-sync                  # incremental
+  #   docker compose run --rm congress-sync --house 2024 2025 2026 --senate
+  #   docker compose run --rm congress-sync --status
+  #
+  # Safe to re-run and safe to cron: filings already parsed are never
+  # refetched, so a nightly run costs one index fetch plus whatever is new.
+  #   0 6 * * * cd /srv/nemo/deploy && docker compose run --rm congress-sync
+  #
+  # Deliberately NOT built from the *server anchor. That anchor requires
+  # NEMO_MCP_TOKEN, and compose interpolates the whole file before merging, so
+  # an inherited `:?` cannot be overridden -- this job binds no port, serves
+  # nothing, has no use for a bearer token, and still refused to run without
+  # one.
+  congress-sync:
+    image: ${NEMO_IMAGE:-nemo-data:local}
+    env_file: ../.env
+    profiles: ["sync"]
+    restart: "no"
+    entrypoint: ["python", "-m", "tools.altdata_server.congress_sync"]
+    command: ["--house", "2026", "--senate", "--days", "90"]
+    environment:
+      NEMO_CONGRESS_DB: /app/data/congress.db
+    volumes:
+      - congress-data:/app/data
+    tmpfs:
+      - /root/.edgar:rw,size=512m
+      - /app/db_cache:rw,size=128m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  # Survives `docker compose down` and container replacement. Back it up the
+  # way you would any database: the contents are reconstructible from the
+  # public record, but only at the cost of re-reading every filing.
+  congress-data:

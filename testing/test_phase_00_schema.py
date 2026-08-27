@@ -178,3 +178,52 @@ def test_sqlite_vec_present_creates_embeddings_table(tmp_path):
     assert 'rag_chunk_embeddings' in names
   finally:
     conn.close()
+
+
+def test_init_creates_falsifier_alerts(tmp_path, monkeypatch):
+  """falsifier_alerts must come from CREATE_SCHEMA, not a daemon.
+
+  Two components read this table -- daemons/falsifier_watcher.py and
+  tools/sentry_server.py (plus the sentry eval-log bypass check) -- but only
+  the daemon created it, lazily, on its own startup. Any process that had not
+  run the watcher first hit "no such table". The sentry tool papered over that
+  by returning an empty list with a note, so the gap stayed invisible.
+  """
+  monkeypatch.setenv("NEMO_DB_PATH", str(tmp_path / "fresh.db"))
+  init_schema()
+  conn = get_connection()
+  try:
+    names = {r['name'] for r in conn.execute(
+      "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()}
+    assert 'falsifier_alerts' in names, \
+      "falsifier_alerts missing from CREATE_SCHEMA -- only the daemon creates it"
+    cols = {r['name'] for r in
+            conn.execute("PRAGMA table_info(falsifier_alerts)").fetchall()}
+    assert {'alert_id', 'thesis_id', 'ticker', 'falsifier_hash', 'falsifier_text',
+            'evidence_id', 'score', 'reason', 'fired_at'} <= cols, f"columns: {cols}"
+    idx = {r['name'] for r in
+           conn.execute("PRAGMA index_list(falsifier_alerts)").fetchall()}
+    assert 'idx_falsifier_alerts_thesis' in idx, f"indexes: {idx}"
+  finally:
+    conn.close()
+
+
+def test_falsifier_alerts_dedupe_constraint(tmp_path, monkeypatch):
+  """The daemon's idempotency depends on this UNIQUE triple; it has to
+  survive the move into CREATE_SCHEMA."""
+  monkeypatch.setenv("NEMO_DB_PATH", str(tmp_path / "fresh.db"))
+  init_schema()
+  conn = get_connection()
+  try:
+    row = ("INSERT INTO falsifier_alerts"
+           "(thesis_id, ticker, falsifier_hash, evidence_id, fired_at)"
+           " VALUES (1, 'X', 'h', 'e', '2026-01-01')")
+    conn.execute(row)
+    conn.commit()
+    conn.execute(row.replace("INSERT INTO", "INSERT OR IGNORE INTO"))
+    conn.commit()
+    count = conn.execute("SELECT COUNT(*) c FROM falsifier_alerts").fetchone()['c']
+    assert count == 1, f"UNIQUE(thesis_id, falsifier_hash, evidence_id) lost: {count} rows"
+  finally:
+    conn.close()

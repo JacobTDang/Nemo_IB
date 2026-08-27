@@ -75,3 +75,61 @@ def pytest_pyfunc_call(pyfuncitem):
             f"unavailable: {marker.kwargs['reason']}",
             pytrace=False,
         )
+
+
+# --- the offline suite has to actually be offline ---------------------------
+#
+# `SKIP_NETWORK_TESTS=1 pytest testing/` is documented as "offline: no
+# credentials, no network", and the gates are what make it so. An audit of one
+# run found 13 tests reaching api.stlouisfed.org, data.sec.gov, finnhub.io,
+# openrouter.ai and api.usaspending.gov anyway -- tests that pass while the
+# upstream is healthy and fail, slowly, when it is not. They were also the
+# reason a long session earned real SEC 429s.
+#
+# Gating them one by one fixes the thirteen that exist today. Refusing the
+# connection fixes the class: a test that reaches out under SKIP_NETWORK_TESTS
+# now fails immediately, naming itself and the host, instead of quietly
+# depending on the weather.
+#
+# Set NEMO_ALLOW_OFFLINE_NETWORK=1 to audit rather than enforce.
+
+_OFFLINE_LOCAL = {"localhost", "127.0.0.1", "::1", "0.0.0.0", ""}
+
+
+class OfflineNetworkAttempt(RuntimeError):
+    """A test reached the network during an offline run."""
+
+
+def pytest_collection_modifyitems(session, config, items):
+    if os.environ.get("SKIP_NETWORK_TESTS", "0") != "1":
+        return
+
+    # pyproject.toml declares the marker as "live-network tests skippable via
+    # SKIP_NETWORK_TESTS=1". Nothing implemented the skip, so all 39 tests
+    # carrying it ran anyway -- which is how the offline suite came to depend
+    # on five upstreams being healthy. Declaring a marker registers its name;
+    # it does not give it behaviour.
+    skip_network = pytest.mark.skip(
+        reason="SKIP_NETWORK_TESTS=1: marked @pytest.mark.network")
+    for item in items:
+        if item.get_closest_marker("network") is not None:
+            item.add_marker(skip_network)
+
+    if os.environ.get("NEMO_ALLOW_OFFLINE_NETWORK", "0") == "1":
+        return
+
+    import socket
+
+    real_getaddrinfo = socket.getaddrinfo
+
+    def guarded(host, port, *args, **kwargs):
+        if host not in _OFFLINE_LOCAL and host is not None:
+            raise OfflineNetworkAttempt(
+                f"this test tried to resolve {host!r} while "
+                f"SKIP_NETWORK_TESTS=1. The offline suite must not reach the "
+                f"network: gate it with one of the decorators in "
+                f"testing/_gates.py, or stub the fetch. Set "
+                f"NEMO_ALLOW_OFFLINE_NETWORK=1 to audit instead of enforce.")
+        return real_getaddrinfo(host, port, *args, **kwargs)
+
+    socket.getaddrinfo = guarded

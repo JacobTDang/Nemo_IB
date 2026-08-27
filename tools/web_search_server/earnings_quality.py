@@ -29,6 +29,18 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .foreign_issuer import form_mismatch_note, not_covered_reason
 from .sec_series import NotCovered, _period_rank, fetch_concept_series
+# Aliased to the names this module has always used for them: they are what
+# test_slow_tool_bounds reaches for, and renaming them here would move a test's
+# subject without moving the test.
+from .shared_filings import (
+    ACTIVE as _ACTIVE,
+    DEFAULT_BUDGET_SECONDS,
+    Deadline as _Deadline,
+    ToolTimeout,
+    budget_seconds as _budget_seconds,
+    concept_series,
+    shared_filings,
+)
 
 NET_INCOME_CONCEPTS = (
     "us-gaap:NetIncomeLoss",
@@ -114,6 +126,36 @@ LEASE_IMPUTED_INTEREST_CONCEPTS = (
 _MODERATE_ACCRUAL_PCT = 5.0
 
 
+# ===================================================== one walk, many concepts
+#
+# Every tool here reads a *set* of concepts: `get_working_capital_trends` asks
+# for 19, `get_operating_leases` for 18, `get_accruals_quality` for 5. `_series`
+# evaluates all of them rather than stopping at the first hit, for the reason
+# its own docstring gives, and that is not the thing to change.
+#
+# What was expensive is that each concept went through its own
+# `fetch_concept_series`, which re-walks EDGAR from scratch. That machinery now
+# lives in `shared_filings`, because three sibling modules had the same defect
+# and a second copy of it is how the two go out of step. Its module docstring
+# carries the measurements and the reasoning.
+
+
+def _shared_filings(ticker: str, deadline: _Deadline):
+    """`shared_filings`, bound to this module's `fetch_concept_series`.
+
+    Read here rather than passed in from each call site so the name stays a
+    module global that a test can replace -- which is what the walk checks
+    before it stands down.
+    """
+    return shared_filings(ticker, deadline, fetch_concept_series)
+
+
+def _concept_series(ticker: str, concept: str, form: str,
+                    limit: int) -> List[Any]:
+    """One concept's series, reusing filings already parsed for this call."""
+    return concept_series(ticker, concept, form, limit, fetch_concept_series)
+
+
 def _period_bounds(period: str) -> Tuple[str, int]:
     """(period end date, span in days) for a fact's period label.
 
@@ -177,14 +219,20 @@ def _series(ticker: str, concepts: Sequence[str], form: str,
 
     Only NotCovered is swallowed, and only to try the next concept. A network
     failure or an unknown ticker propagates: reporting an outage as "this filer
-    does not disclose it" is the one answer worse than an error.
+    does not disclose it" is the one answer worse than an error. ToolTimeout is
+    not swallowed either, for the same reason: a chain abandoned to the clock
+    is not a chain the filer does not tag.
+
+    Every concept still costs a lookup, but under `_shared_filings` the
+    lookups share one parse of each filing instead of re-walking EDGAR per
+    concept. The evaluation order and the freshness rule are untouched.
     """
     best_rows: Dict[str, Dict[str, Any]] = {}
     best_concept: Optional[str] = None
     best_end = ""
     for concept in concepts:
         try:
-            points = fetch_concept_series(ticker, concept, form=form, limit=limit)
+            points = _concept_series(ticker, concept, form, limit)
         except NotCovered:
             continue
         rows = _by_period(points)
@@ -240,10 +288,16 @@ def get_accruals_quality(ticker: str, limit: int = 2,
     periods of history.
     """
     tried = _flat((NET_INCOME_CONCEPTS, OCF_CONCEPTS, ASSETS_CONCEPTS))
+    deadline = _Deadline(_budget_seconds(), f"get_accruals_quality({ticker})")
     try:
-        ni_rows, ni_concept = _series(ticker, NET_INCOME_CONCEPTS, form, limit)
-        ocf_rows, ocf_concept = _series(ticker, OCF_CONCEPTS, form, limit)
-        asset_rows, asset_concept = _series(ticker, ASSETS_CONCEPTS, form, limit)
+        with _shared_filings(ticker, deadline):
+            ni_rows, ni_concept = _series(ticker, NET_INCOME_CONCEPTS, form, limit)
+            ocf_rows, ocf_concept = _series(ticker, OCF_CONCEPTS, form, limit)
+            asset_rows, asset_concept = _series(ticker, ASSETS_CONCEPTS, form, limit)
+    except ToolTimeout as exc:
+        return {"ticker": ticker, "success": False, "timed_out": True,
+                "error": str(exc), "periods": [], "latest": None,
+                "trend": None, "flag": None, "concepts_tried": tried}
     except Exception as exc:  # noqa: BLE001 - surface the failure, never mask it
         return {"ticker": ticker, "success": False,
                 "error": f"fetching earnings-quality concepts failed: {exc}",
@@ -360,13 +414,20 @@ def get_working_capital_trends(ticker: str, limit: int = 2,
     """
     tried = _flat((REVENUE_CONCEPTS, COST_OF_REVENUE_CONCEPTS,
                    RECEIVABLES_CONCEPTS, INVENTORY_CONCEPTS, PAYABLES_CONCEPTS))
+    deadline = _Deadline(_budget_seconds(),
+                         f"get_working_capital_trends({ticker})")
     try:
-        rev_rows, rev_concept = _series(ticker, REVENUE_CONCEPTS, form, limit)
-        cogs_rows, cogs_concept = _series(
-            ticker, COST_OF_REVENUE_CONCEPTS, form, limit)
-        ar_rows, ar_concept = _series(ticker, RECEIVABLES_CONCEPTS, form, limit)
-        inv_rows, inv_concept = _series(ticker, INVENTORY_CONCEPTS, form, limit)
-        ap_rows, ap_concept = _series(ticker, PAYABLES_CONCEPTS, form, limit)
+        with _shared_filings(ticker, deadline):
+            rev_rows, rev_concept = _series(ticker, REVENUE_CONCEPTS, form, limit)
+            cogs_rows, cogs_concept = _series(
+                ticker, COST_OF_REVENUE_CONCEPTS, form, limit)
+            ar_rows, ar_concept = _series(ticker, RECEIVABLES_CONCEPTS, form, limit)
+            inv_rows, inv_concept = _series(ticker, INVENTORY_CONCEPTS, form, limit)
+            ap_rows, ap_concept = _series(ticker, PAYABLES_CONCEPTS, form, limit)
+    except ToolTimeout as exc:
+        return {"ticker": ticker, "success": False, "timed_out": True,
+                "error": str(exc), "periods": [], "latest": None,
+                "concepts_tried": tried}
     except Exception as exc:  # noqa: BLE001
         return {"ticker": ticker, "success": False,
                 "error": f"fetching working-capital concepts failed: {exc}",
@@ -497,22 +558,29 @@ def get_operating_leases(ticker: str, limit: int = 1,
                       LEASE_PAYMENTS_TOTAL_CONCEPTS,
                       LEASE_IMPUTED_INTEREST_CONCEPTS)
     tried = _flat(tuple(balance_chains) + tuple(LEASE_MATURITY_CONCEPTS.values()))
+    deadline = _Deadline(_budget_seconds(), f"get_operating_leases({ticker})")
     try:
-        total_rows, _ = _series(ticker, LEASE_LIABILITY_CONCEPTS, form, limit)
-        current_rows, _ = _series(
-            ticker, LEASE_LIABILITY_CURRENT_CONCEPTS, form, limit)
-        noncurrent_rows, _ = _series(
-            ticker, LEASE_LIABILITY_NONCURRENT_CONCEPTS, form, limit)
-        rou_rows, _ = _series(ticker, ROU_ASSET_CONCEPTS, form, limit)
-        payments_rows, _ = _series(
-            ticker, LEASE_PAYMENTS_TOTAL_CONCEPTS, form, limit)
-        interest_rows, _ = _series(
-            ticker, LEASE_IMPUTED_INTEREST_CONCEPTS, form, limit)
-        schedule: Dict[str, Optional[float]] = {}
-        for bucket, concepts in LEASE_MATURITY_CONCEPTS.items():
-            rows, _ = _series(ticker, concepts, form, 1)
-            # None means untagged; 0.0 means the filer disclosed nothing due.
-            schedule[bucket] = _latest_value(rows)
+        with _shared_filings(ticker, deadline):
+            total_rows, _ = _series(ticker, LEASE_LIABILITY_CONCEPTS, form, limit)
+            current_rows, _ = _series(
+                ticker, LEASE_LIABILITY_CURRENT_CONCEPTS, form, limit)
+            noncurrent_rows, _ = _series(
+                ticker, LEASE_LIABILITY_NONCURRENT_CONCEPTS, form, limit)
+            rou_rows, _ = _series(ticker, ROU_ASSET_CONCEPTS, form, limit)
+            payments_rows, _ = _series(
+                ticker, LEASE_PAYMENTS_TOTAL_CONCEPTS, form, limit)
+            interest_rows, _ = _series(
+                ticker, LEASE_IMPUTED_INTEREST_CONCEPTS, form, limit)
+            schedule: Dict[str, Optional[float]] = {}
+            for bucket, concepts in LEASE_MATURITY_CONCEPTS.items():
+                rows, _ = _series(ticker, concepts, form, 1)
+                # None means untagged; 0.0 means the filer disclosed nothing due.
+                schedule[bucket] = _latest_value(rows)
+    except ToolTimeout as exc:
+        return {"ticker": ticker, "success": False, "timed_out": True,
+                "error": str(exc), "lease_liability": None,
+                "maturity_schedule": {}, "periods": [],
+                "concepts_tried": tried}
     except Exception as exc:  # noqa: BLE001
         return {"ticker": ticker, "success": False,
                 "error": f"fetching operating-lease concepts failed: {exc}",

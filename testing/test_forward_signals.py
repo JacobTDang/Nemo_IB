@@ -27,6 +27,8 @@ import os
 import sys
 import traceback
 
+import pytest
+
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
@@ -36,6 +38,7 @@ from tools.web_search_server.sec_utils import (
     _dedupe_signals,
     extract_forward_signals,
 )
+from testing._gates import requires_sec
 
 # ---------------------------------------------------------------------------
 # Test harness
@@ -47,6 +50,17 @@ _FAILURES: list = []
 
 
 def _check(name: str, condition: bool, hint: str = "") -> None:
+    """Fail the test when `condition` is false.
+
+    This helper used to increment a counter and print PASS/FAIL, and nothing
+    else. Under pytest -- which never calls main() -- no one read the counter,
+    so every test_* function in this file ran to completion, returned None and
+    was reported green no matter what the code did. A gate that cannot fail is
+    not a gate.
+
+    The counters and the printed lines are kept so the summary still reads the
+    same; the raise is what makes pytest see a wrong value.
+    """
     global _PASS, _FAIL
     if condition:
         _PASS += 1
@@ -56,6 +70,7 @@ def _check(name: str, condition: bool, hint: str = "") -> None:
         msg = f"  FAIL  {name}" + (f"  ({hint})" if hint else "")
         print(msg)
         _FAILURES.append(msg)
+        raise AssertionError(f"{name}: {hint}" if hint else name)
 
 
 def _section(title: str) -> None:
@@ -178,7 +193,21 @@ def test_dedup() -> None:
 # 3. Real MSFT end-to-end
 # ---------------------------------------------------------------------------
 
-def test_real_msft() -> dict:
+@requires_sec
+def test_real_msft() -> None:
+    """Live EDGAR. Gated, because under SKIP_NETWORK_TESTS=1 it cannot pass.
+
+    This one reaches data.sec.gov and was never gated, so on an offline run
+    the fetch was refused, `success` came back False and the "MSFT call
+    returned success=True" check reported FAIL -- into a counter nobody read.
+    Every offline run has been failing this test invisibly. requires_sec is
+    the repo's own mechanism for it: it skips offline and, under
+    NEMO_REQUIRE_SERVICES=1, fails instead of skipping.
+
+    It also used to `return result`, which pytest warns about
+    (PytestReturnNotNoneWarning) and which nothing consumed -- main() drops
+    the value. The returns are now bare.
+    """
     _section("3. Real-MSFT extract_forward_signals (requires SEC connectivity)")
 
     try:
@@ -187,12 +216,12 @@ def test_real_msft() -> dict:
         traceback.print_exc()
         _check("extract_forward_signals('MSFT') did not raise", False,
                f"{type(exc).__name__}: {exc}")
-        return {}
+        return
 
     _check("MSFT result is a dict", isinstance(result, dict),
            f"type={type(result).__name__}")
     if not isinstance(result, dict):
-        return {}
+        return
 
     if not result.get("success"):
         # SEC connectivity failure is rare but possible -- log + report and
@@ -200,7 +229,7 @@ def test_real_msft() -> dict:
         print(f"    [skip-data-assertions] success=False error={result.get('error')}")
         _check("MSFT call returned success=True (may be flaky on SEC outage)",
                False, f"error={result.get('error')}")
-        return result
+        return
 
     sig_count = result.get("signal_count", 0)
     by_cat = result.get("by_category", {})
@@ -227,7 +256,6 @@ def test_real_msft() -> dict:
            "(capex_plan | capacity_addition | multi_year_commitment | backlog_orderbook)",
            forward_infra >= 1,
            f"sum={forward_infra} by_cat={by_cat}")
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -338,30 +366,32 @@ async def test_mcp_roundtrip() -> None:
 # ---------------------------------------------------------------------------
 
 def test_rag_count() -> None:
+    """Count the chunks the real-MSFT run ingested -- or say why we cannot.
+
+    All three of this test's give-up paths used to print "[skip] ..." and
+    `return`, which pytest reports as a pass. On this machine every run took
+    the n == 0 path, so the test never executed a single check and still
+    counted toward the green total. pytest.skip is the same decision said out
+    loud: the run shows up as skipped, with the reason attached.
+    """
     _section("5. RAG bonus -- count forward_signal chunks")
 
     try:
         from agent.rag.store import count_chunks
     except Exception as exc:
-        print(f"    [skip] count_chunks unavailable: {exc}")
-        return
+        pytest.skip(f"agent.rag.store.count_chunks is unavailable: {exc}")
 
     try:
         n = count_chunks(filter={"doc_type": "forward_signal"})
     except Exception as exc:
-        print(f"    [skip] count_chunks raised: {exc}")
-        return
+        pytest.skip(f"count_chunks raised, so the count is unknown: {exc}")
 
     print(f"    rag_chunks with doc_type='forward_signal': {n}")
-    # If the real-MSFT test ingested anything we should see > 0. If RAG
-    # ingest is offline (model missing, vec extension missing), n stays 0
-    # and we report PASS-but-skip rather than failing.
-    if n > 0:
-        _check("forward_signal chunks present in RAG store",
-               n > 0, f"count={n}")
-    else:
-        print("    [skip] RAG ingest produced 0 chunks (likely model/vec offline) -- "
-              "skipping rather than failing")
+    if n == 0:
+        pytest.skip("RAG holds no forward_signal chunks. test_real_msft is the "
+                    "only thing that ingests them and it is SEC-gated, so with "
+                    "no live run there is nothing here to count.")
+    _check("forward_signal chunks present in RAG store", n > 0, f"count={n}")
 
 
 # ---------------------------------------------------------------------------

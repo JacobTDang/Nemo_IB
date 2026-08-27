@@ -31,7 +31,7 @@ from state.theses import (
 )
 from state.events_store import store_event
 from daemons.falsifier_watcher import (
-    evaluate_thesis, tick, _ensure_alerts_table, _already_alerted,
+    evaluate_thesis, tick, _already_alerted,
     _falsifier_hash,
 )
 
@@ -44,6 +44,17 @@ _results = {'pass': 0, 'fail': 0, 'failures': []}
 
 
 def _check(name: str, condition, hint: str = ''):
+  """Fail the test when `condition` is false.
+
+  This helper used to increment a counter and print PASS/FAIL, and nothing
+  else. Under pytest -- which never calls main() -- no one read the counter,
+  so every test_* function in this file ran to completion, returned None and
+  was reported green no matter what the code did. A gate that cannot fail is
+  not a gate.
+
+  The counters and the printed lines are kept so the summary still reads the
+  same; the raise is what makes pytest see a wrong value.
+  """
   if condition:
     _results['pass'] += 1
     print(f"  PASS  {name}")
@@ -51,6 +62,7 @@ def _check(name: str, condition, hint: str = ''):
     _results['fail'] += 1
     _results['failures'].append((name, hint))
     print(f"  FAIL  {name}  --  {hint}")
+    raise AssertionError(f"{name}: {hint}" if hint else name)
 
 
 def _section(title: str):
@@ -361,7 +373,6 @@ def test_alert_table_persistence():
 def main():
   print("\nFalsifier Watcher — end-to-end stress tests\n")
   init_schema()
-  _ensure_alerts_table()
 
   # Always clean any leftover test data BEFORE running so prior failed
   # runs don't pollute results
