@@ -628,3 +628,62 @@ def test_rerunning_a_scan_with_a_different_answer_says_so(store, monkeypatch):
     assert stored == {"AAA"}, "the earlier decision was overwritten"
     assert second.get("superseded"), (
         "the store kept a different decision and the result did not mention it")
+
+
+# --- the contract between the recorder and the estimator --------------------
+#
+# spread.py excludes split sessions by looking them up in corporate_action --
+# not by guessing from the size of the move, which is the right design. It
+# therefore depends entirely on the recorder having written them. Nothing did:
+# record_actions was never wired into run_all, so the table stayed empty and
+# the protection never fired once. With as-traded storage a 10-for-1 is a
+# genuine -89.9% print between two adjacent bars, and EDGE compares only
+# adjacent bars.
+
+
+def test_the_estimator_sees_the_splits_the_recorder_writes(store, monkeypatch):
+    from research import spread as sp
+    import pandas as pd
+
+    sessions = []
+    d = date(2026, 1, 1)
+    while len(sessions) < 60:
+        if d.weekday() < 5:
+            sessions.append(d.isoformat())
+        d += timedelta(days=1)
+    ex = sessions[40]
+
+    def frame(*a, **k):
+        rows = [s for s in sessions
+                if (not k.get("start") or s >= k["start"])
+                and (not k.get("end") or s < k["end"])]
+        data = {}
+        for t in k["tickers"].split():
+            closes = [100.0 if s < ex else 10.0 for s in rows]
+            data[(t, "Open")] = closes
+            data[(t, "High")] = [c * 1.01 for c in closes]
+            data[(t, "Low")] = [c * 0.99 for c in closes]
+            data[(t, "Close")] = closes
+            data[(t, "Volume")] = [5e6] * len(rows)
+            data[(t, "Stock Splits")] = [10.0 if s == ex else 0.0 for s in rows]
+            data[(t, "Dividends")] = [0.0] * len(rows)
+        f = pd.DataFrame(data, index=pd.to_datetime(rows))
+        f.columns = pd.MultiIndex.from_tuples(f.columns)
+        return f
+
+    import yfinance
+    monkeypatch.setattr(yfinance, "download", frame)
+    daily_job.bootstrap_history(["X"], as_of=sessions[-1])
+
+    splits = [a for a in pit_store.corporate_actions_as_of("X", sessions[-1])
+              if a["action_type"] == "split"]
+    assert [(a["ex_date"], a["value"]) for a in splits] == [(ex, 10.0)], (
+        "the recorder did not write the split the estimator needs")
+
+    est = sp.estimate_spread("X", sessions[-1], window=55)
+    assert est["splits_excluded"] == 1, (
+        "the split session was fed to EDGE, which only ever compares adjacent "
+        "bars")
+    # And the result is a spread rather than a measurement of the split.
+    bound = est["spread_upper"]
+    assert bound is None or bound < 0.5, f"spread_upper came back {bound}"
