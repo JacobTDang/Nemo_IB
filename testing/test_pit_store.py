@@ -123,9 +123,11 @@ def test_consensus_is_read_as_it_stood_not_as_it_ended(store):
     """The field that cannot be reconstructed. An estimate revised upward in
     April must not leak into a March simulation."""
     store.record_consensus("2026-03-01", "AAPL", "2026Q2",
-                           eps_estimate=1.10, analyst_count=8)
+                           eps_estimate=1.10, analyst_count=8,
+                           recorded_at="2026-03-01T21:00:00Z")
     store.record_consensus("2026-04-01", "AAPL", "2026Q2",
-                           eps_estimate=1.45, analyst_count=11)
+                           eps_estimate=1.45, analyst_count=11,
+                           recorded_at="2026-04-01T21:00:00Z")
 
     march = store.consensus_as_of("AAPL", "2026Q2", as_of="2026-03-15")
     assert march["eps_estimate"] == 1.10
@@ -136,7 +138,8 @@ def test_consensus_is_read_as_it_stood_not_as_it_ended(store):
 
 
 def test_consensus_before_any_snapshot_is_none_not_zero(store):
-    store.record_consensus("2026-03-01", "AAPL", "2026Q2", eps_estimate=1.10)
+    store.record_consensus("2026-03-01", "AAPL", "2026Q2", eps_estimate=1.10,
+                           recorded_at="2026-03-01T21:00:00Z")
     assert store.consensus_as_of("AAPL", "2026Q2", as_of="2026-02-01") is None
 
 
@@ -383,3 +386,39 @@ def test_membership_is_the_last_one_recorded_not_an_exact_date(store):
     assert [m["ticker"] for m in store.universe_as_of("2026-03-05")] == ["AAPL"]
     assert store.universe_as_of("2026-03-01") == [], (
         "membership was visible before it was ever recorded")
+
+
+def test_a_consensus_recorded_later_is_invisible_to_an_earlier_reader(store):
+    """Every other reader here filters on `recorded_at` as well as on the date
+    the row describes; this one filtered only on the date it describes. A
+    snapshot written today for a past date would have been visible to that past
+    date -- which is the lookahead the column exists to stop, and the estimate
+    is the single field it matters most for."""
+    store.record_consensus("2026-03-01", "AAPL", "2026Q2", eps_estimate=1.10,
+                           recorded_at="2026-05-20T21:00:00Z")
+
+    assert store.consensus_as_of("AAPL", "2026Q2", as_of="2026-03-15") is None
+    assert store.consensus_as_of("AAPL", "2026Q2",
+                                 as_of="2026-05-21")["eps_estimate"] == 1.10
+
+
+def test_the_vendor_actual_is_readable_on_its_own(store):
+    """SUE_af needs the estimate as it stood before the print and the actual
+    that landed after it. They are different rows on different dates, so one
+    lookup cannot serve both."""
+    store.record_consensus("2026-03-01", "MSFT", "2026Q2", eps_estimate=4.02,
+                           recorded_at="2026-03-01T21:00:00Z")
+    store.record_consensus("2026-04-25", "MSFT", "2026Q2", eps_estimate=4.02,
+                           eps_actual=4.14, recorded_at="2026-04-25T21:00:00Z")
+
+    assert store.actual_as_of("MSFT", "2026Q2", as_of="2026-04-01") is None
+    assert store.actual_as_of("MSFT", "2026Q2", as_of="2026-04-26") == 4.14
+    # ...and the pre-print estimate is still readable at its own date.
+    assert store.consensus_as_of("MSFT", "2026Q2",
+                                 as_of="2026-04-01")["eps_estimate"] == 4.02
+
+
+def test_an_actual_recorded_later_is_invisible_too(store):
+    store.record_consensus("2026-04-25", "MSFT", "2026Q2", eps_actual=4.14,
+                           recorded_at="2026-06-01T21:00:00Z")
+    assert store.actual_as_of("MSFT", "2026Q2", as_of="2026-05-01") is None

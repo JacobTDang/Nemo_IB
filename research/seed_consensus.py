@@ -1,0 +1,172 @@
+"""The consensus history that cannot be recorded backwards.
+
+The analyst surprise needs eight quarters of what the street expected before
+each print. Finnhub serves four and no more -- verified at limit=12 and
+limit=30 alike -- so the recorder fills the rest one day at a time and `sue_af`
+refuses for two years while it does.
+
+The four it does serve carry both legs: a vendor estimate and a vendor actual,
+quoted on one basis. Whether they are usable turns on one question. If that
+estimate is revised after the print it has converged toward the actual, which
+shrinks every surprise and every sigma -- inflating the signal, the direction
+that flatters a strategy and the reason to be suspicious of it.
+
+It is frozen, and this project could check rather than assume. Ten estimates
+were recorded off the forward calendar on 2026-08-26, before those companies
+reported. After they reported, the surprises endpoint returns them identical to
+four decimal places: NVDA 2.1283, CRWD 0.2984, OKTA 0.9841, DY 4.8221, MOV
+0.3560, PLAB 0.4114, BJ 1.1951, DG 2.0559, HPQ 0.6639, CRM 3.3057. Ten of ten,
+against our own point-in-time recording rather than against the vendor's word.
+
+So seeding is sound and still has to be visible. A seeded row is a
+reconstruction stamped at a date nobody was watching, and it carries
+`source='seeded'` so that anything reading it can tell, exclude it, or report
+how much of an answer rests on it. That is the same bargain `replay` makes with
+prices: state the assumption in the data rather than in a comment.
+
+The dates come from the filings, not from the vendor. Finnhub's `year` and
+`quarter` are the filer's own, but its `period` is a calendar bucket: it
+reports NVDA's fiscal 2027 Q2 as 2027-06-30, a quarter that ended 2026-07-26
+and was announced a month after that. Stamping at the bucket puts the estimate
+a year in the future where nothing can read it, which is what happened the
+first time this ran -- NVDA, COST, WMT, CRM and ORCL all came back "no
+consensus was recorded before that print" from a store that had just seeded
+them. So each quarter is matched to the XBRL series on fiscal identity and
+stamped at the filer's own period end and filing date.
+
+One imprecision remains and is worth naming: the estimate is stamped at period
+end, definitively before the print, while the figure itself is the final
+pre-print consensus rather than whatever stood on that particular day. For a
+surprise that is the right number; only its date is approximate.
+"""
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, Sequence
+
+from research import pit_store
+
+SOURCE = "seeded"
+
+
+def _fetch_surprises(ticker: str) -> List[Dict[str, Any]]:
+    import asyncio
+    import json
+
+    from tools.news_agregator.finnhub_server import FinnhubServer
+
+    raw = asyncio.run(FinnhubServer().get_earnings_surprises(ticker))
+    payload = json.loads(raw[0].text)
+    if payload.get("data", {}).get("error"):
+        raise RuntimeError(f"{ticker}: {payload['data']['error']}")
+    return (payload.get("data") or {}).get("quarters") or []
+
+
+def _stamp(day: str) -> str:
+    return f"{day}T21:00:00Z"
+
+
+def _filing_dates(ticker: str,
+                  as_of: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    """The filer's own period end and filing date, per fiscal period."""
+    from research import sue
+
+    series = sue.eps_series(ticker, as_of=as_of)
+    if not series.get("success"):
+        return {}
+    return {q["fiscal_period"]: {"period_end": q.get("period_end"),
+                                 "known_at": (q.get("known_at") or "")[:10]}
+            for q in series["quarters"]}
+
+
+def seed(tickers: Sequence[str],
+         as_of: Optional[str] = None) -> Dict[str, Any]:
+    """Reconstruct up to four quarters of both legs for each name.
+
+    The estimate is stamped at the filer's own period end, which is before the
+    print by construction. The actual is stamped at the filing date, because it
+    had not happened at period end and a reconstruction may not reconstruct the
+    future.
+
+    Never overwrites: a quarter already in the record was watched, and a real
+    observation outranks a reconstruction of it.
+    """
+    written = 0
+    incomplete = 0
+    undated = 0
+    failed: List[str] = []
+    seen = 0
+
+    for ticker in tickers:
+        try:
+            rows = _fetch_surprises(ticker)
+            dates = _filing_dates(ticker, as_of=as_of)
+        except Exception as exc:  # noqa: BLE001 - counted and reported
+            failed.append(f"{ticker}: {type(exc).__name__}: {exc}")
+            continue
+
+        for row in rows:
+            seen += 1
+            year, quarter = row.get("year"), row.get("quarter")
+            estimate, actual = row.get("estimate_eps"), row.get("actual_eps")
+            if not (year and quarter):
+                incomplete += 1
+                continue
+            if estimate is None or actual is None:
+                # Half a pair cannot make a surprise, and writing one leg would
+                # look like coverage this does not have.
+                incomplete += 1
+                continue
+
+            fiscal = f"{year}Q{quarter}"
+            filed = dates.get(fiscal) or {}
+            period_end, known_at = filed.get("period_end"), filed.get("known_at")
+            if not period_end or not known_at:
+                # No filer dates, nothing to stamp it at. Guessing is what put
+                # an estimate a year into the future the first time round.
+                undated += 1
+                continue
+
+            before = pit_store.consensus_as_of(ticker, fiscal,
+                                               as_of="9999-12-31")
+            if before is not None:
+                continue
+
+            pit_store.record_consensus(
+                period_end, ticker, fiscal, eps_estimate=estimate,
+                recorded_at=_stamp(period_end), source=SOURCE)
+            pit_store.record_consensus(
+                known_at, ticker, fiscal, eps_estimate=estimate,
+                eps_actual=actual, recorded_at=_stamp(known_at), source=SOURCE)
+            written += 2
+
+    return {"tickers": len(tickers), "quarters_seen": seen,
+            "written": written, "incomplete": incomplete, "undated": undated,
+            "failed": failed}
+
+
+# ------------------------------------------------------------- entry point
+
+def main(argv: Optional[List[str]] = None) -> int:
+    import argparse
+    import json
+
+    parser = argparse.ArgumentParser(
+        prog="seed_consensus",
+        description="Reconstruct up to four quarters of consensus history per "
+                    "name from the vendor's own surprise record.")
+    parser.add_argument("--tickers", nargs="*", default=None,
+                        help="names to seed (default: today's eligible universe)")
+    args = parser.parse_args(argv)
+
+    names = args.tickers
+    if not names:
+        from research import daily_job
+        names = daily_job.eligible_tickers()
+
+    result = seed(names)
+    print(json.dumps(result, indent=2, default=str))
+    return 1 if result["failed"] and not result["written"] else 0
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised via main()
+    raise SystemExit(main())

@@ -109,6 +109,11 @@ CREATE TABLE IF NOT EXISTS consensus_snapshot (
     -- within one basis or it manufactures a gap that is not there.
     eps_actual    REAL,
     analyst_count INTEGER,
+    -- 'recorded' if we were watching that day, 'seeded' if it was
+    -- reconstructed afterwards from the vendor's own history. The two are not
+    -- the same evidence and nothing downstream may treat them as though they
+    -- were.
+    source        TEXT NOT NULL DEFAULT 'recorded',
     recorded_at   TEXT NOT NULL,
     PRIMARY KEY (as_of_date, ticker, fiscal_period)
 );
@@ -208,6 +213,7 @@ def connect() -> sqlite3.Connection:
 # or a store created yesterday silently lacks it.
 _MIGRATIONS = (
     ("consensus_snapshot", "eps_actual", "REAL"),
+    ("consensus_snapshot", "source", "TEXT NOT NULL DEFAULT 'recorded'"),
 )
 
 
@@ -523,7 +529,8 @@ def record_consensus(as_of_date: str, ticker: str, fiscal_period: str,
                      eps_estimate: Optional[float] = None,
                      analyst_count: Optional[int] = None,
                      eps_actual: Optional[float] = None,
-                     recorded_at: Optional[str] = None) -> None:
+                     recorded_at: Optional[str] = None,
+                     source: str = "recorded") -> None:
     """One day's view of what the street expects.
 
     This is the series with a clock on it. Finnhub returns four quarters at
@@ -536,10 +543,10 @@ def record_consensus(as_of_date: str, ticker: str, fiscal_period: str,
         conn.execute(
             """INSERT OR IGNORE INTO consensus_snapshot
                (as_of_date, ticker, fiscal_period, eps_estimate, eps_actual,
-                analyst_count, recorded_at)
-               VALUES (?,?,?,?,?,?,?)""",
+                analyst_count, recorded_at, source)
+               VALUES (?,?,?,?,?,?,?,?)""",
             (as_of_date, ticker, fiscal_period, eps_estimate, eps_actual,
-             analyst_count, recorded_at or _now()))
+             analyst_count, recorded_at or _now(), source))
 
 
 def consensus_as_of(ticker: str, fiscal_period: str,
@@ -549,14 +556,42 @@ def consensus_as_of(ticker: str, fiscal_period: str,
     None, not zero and not the earliest available: before the first snapshot we
     did not know what the street expected, and any number here would be one we
     made up.
+
+    Filtered on `recorded_at` as well as on the date the row describes, like
+    every other reader here. Without it a snapshot written today for a past
+    date is visible to that past date -- the lookahead the column exists to
+    stop, on the one field where it matters most, because a consensus revised
+    after the print is the answer to the question being asked.
     """
     with connect() as conn:
         row = conn.execute(
             """SELECT * FROM consensus_snapshot
                WHERE ticker = ? AND fiscal_period = ? AND as_of_date <= ?
+                 AND date(recorded_at) <= ?
                ORDER BY as_of_date DESC LIMIT 1""",
-            (ticker, fiscal_period, as_of)).fetchone()
+            (ticker, fiscal_period, as_of, as_of)).fetchone()
     return dict(row) if row else None
+
+
+def actual_as_of(ticker: str, fiscal_period: str,
+                 as_of: str) -> Optional[float]:
+    """The vendor's own reported figure for a quarter, as known on `as_of`.
+
+    Separate from `consensus_as_of` because the two legs of an analyst surprise
+    live on different dates: the estimate is what stood before the print and the
+    actual is what landed after it, so one lookup cannot serve both. Reading
+    both from this table is what keeps them on one basis -- a street estimate
+    is non-GAAP and the 10-Q is not, and Finnhub's MSFT 2026Q2 actual is 4.14
+    against 5.16 in the filing.
+    """
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT eps_actual FROM consensus_snapshot
+               WHERE ticker = ? AND fiscal_period = ? AND as_of_date <= ?
+                 AND date(recorded_at) <= ? AND eps_actual IS NOT NULL
+               ORDER BY as_of_date DESC LIMIT 1""",
+            (ticker, fiscal_period, as_of, as_of)).fetchone()
+    return float(row["eps_actual"]) if row else None
 
 
 # --------------------------------------------------------- 13D events

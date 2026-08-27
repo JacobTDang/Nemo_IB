@@ -718,7 +718,9 @@ def test_the_analyst_variant_will_not_mix_gaap_with_a_street_estimate(filer,
     result = sue.sue_af("TEST", as_of="2026-01-01", fiscal_period="2025Q3")
 
     assert result["success"] is False
-    assert "non-GAAP" in result["error"]
+    # Nothing recorded and nothing supplied, so there is no figure on the
+    # estimates' own basis and the filing's is not a substitute for it.
+    assert "vendor actual" in result["error"] or "consensus" in result["error"]
     assert result["sue"] is None
 
 
@@ -740,9 +742,13 @@ def _seed_consensus(store, series, days_before=3):  # noqa: D401
         # number standing in for it.
         actuals[period] = round(quarter["eps"] - 0.03, 2)
         seeded[period] = round(actuals[period] - miss, 2)
-        store.record_consensus(_plus(quarter["known_at"], -days_before),
-                               "TEST", period, eps_estimate=seeded[period],
-                               analyst_count=9)
+        # Stamped at the date it describes, as the recorder does. Left to
+        # default it would be written "now" and be invisible to every past
+        # date the test then reads.
+        stamp = _plus(quarter["known_at"], -days_before)
+        store.record_consensus(stamp, "TEST", period,
+                               eps_estimate=seeded[period], analyst_count=9,
+                               recorded_at=f"{stamp}T21:00:00Z")
     return seeded, actuals
 
 
@@ -776,9 +782,10 @@ def test_the_analyst_leg_never_reads_a_consensus_set_after_the_print(filer,
     series = sue.eps_series("TEST", as_of="2026-01-01")
     seeded, actuals = _seed_consensus(store, series)
     for quarter in series["quarters"]:
-        store.record_consensus(_plus(quarter["known_at"], 1), "TEST",
-                               quarter["fiscal_period"],
-                               eps_estimate=quarter["eps"], analyst_count=9)
+        after = _plus(quarter["known_at"], 1)
+        store.record_consensus(after, "TEST", quarter["fiscal_period"],
+                               eps_estimate=quarter["eps"], analyst_count=9,
+                               recorded_at=f"{after}T21:00:00Z")
 
     result = sue.sue_af("TEST", as_of="2026-01-01", fiscal_period="2025Q3",
                         actuals=actuals)
@@ -1044,3 +1051,141 @@ def test_two_penny_figures_assert_nothing_either_way(filer):
 
     assert series["basis_changes"] == []
     assert series["basis_unresolved"] == []
+
+
+# --- the analyst leg, wired to the record that now holds both halves --------
+#
+# sue_af took `actuals` as a caller-supplied dict because the column it needed
+# did not exist when it was written. It does now: the daily job records the
+# vendor's own reported figure beside the vendor's own estimate, in the same
+# table, which is what keeps the two on one basis by construction rather than
+# by the caller remembering to.
+
+def _seed_pair(store, series, days_before=5):
+    """An estimate before each print and the vendor's actual after it.
+
+    The beats vary, because eight identical surprises leave no dispersion and
+    sue_af rightly refuses to divide by zero.
+    """
+    misses = [0.01, 0.04, -0.02, 0.06, 0.00, 0.03, -0.01, 0.05, 0.02, 0.07]
+    for index, quarter in enumerate(series["quarters"]):
+        period = quarter["fiscal_period"]
+        # Deliberately not the XBRL figure: the vendor quotes a different one.
+        actual = round(quarter["eps"] - 0.03, 2)
+        estimate = round(actual - misses[index % len(misses)], 2)
+        before = _plus(quarter["known_at"], -days_before)
+        after = _plus(quarter["known_at"], 1)
+        store.record_consensus(before, "TEST", period, eps_estimate=estimate,
+                               analyst_count=9,
+                               recorded_at=f"{before}T21:00:00Z")
+        store.record_consensus(after, "TEST", period, eps_estimate=estimate,
+                               eps_actual=actual, analyst_count=9,
+                               recorded_at=f"{after}T21:00:00Z")
+
+
+def test_the_analyst_leg_reads_the_recorded_actual_without_being_handed_one(
+        filer, store):
+    filer(concept_payload(STEADY))
+    series = sue.eps_series("TEST", as_of="2026-01-01")
+    _seed_pair(store, series)
+
+    result = sue.sue_af("TEST", as_of="2026-01-01", fiscal_period="2025Q3")
+
+    assert result["success"] is True, result["error"]
+    assert result["sue"] is not None
+    assert result["surprise"] is not None
+    # The pair came from one table, so the surprise is estimate-to-actual and
+    # not a definitional gap between a street number and a filing.
+    assert abs(result["surprise"]) < 0.10
+
+
+def test_it_uses_the_vendors_actual_not_the_filings(filer, store):
+    """The whole reason the parameter existed. A street estimate is non-GAAP
+    and the 10-Q is not, and subtracting one from the other measures the
+    definition rather than the surprise."""
+    filer(concept_payload(STEADY))
+    series = sue.eps_series("TEST", as_of="2026-01-01")
+    _seed_pair(store, series)
+    quarters = {q["fiscal_period"]: q for q in series["quarters"]}
+
+    result = sue.sue_af("TEST", as_of="2026-01-01", fiscal_period="2025Q3")
+
+    filing_eps = quarters["2025Q3"]["eps"]
+    vendor_actual = round(filing_eps - 0.03, 2)
+    # consensus + surprise reconstructs the VENDOR's actual, not the filing's.
+    assert result["consensus"] + result["surprise"] == pytest.approx(
+        vendor_actual, abs=1e-6)
+    assert result["consensus"] + result["surprise"] != pytest.approx(
+        filing_eps, abs=1e-6)
+
+
+def test_a_quarter_with_no_recorded_actual_drops_out_of_the_window(filer, store):
+    """Not filled in from the filing, and not treated as zero."""
+    filer(concept_payload(STEADY))
+    series = sue.eps_series("TEST", as_of="2026-01-01")
+    _seed_pair(store, series)
+    with pit_store.connect() as conn:
+        conn.execute("UPDATE consensus_snapshot SET eps_actual = NULL "
+                     "WHERE fiscal_period = ?", ("2025Q1",))
+
+    result = sue.sue_af("TEST", as_of="2026-01-01", fiscal_period="2025Q3")
+    assert "2025Q1" not in result["sigma_periods"]
+
+
+def test_an_actual_recorded_after_the_read_date_is_invisible(filer, store):
+    filer(concept_payload(STEADY))
+    series = sue.eps_series("TEST", as_of="2026-01-01")
+    _seed_pair(store, series)
+    with pit_store.connect() as conn:
+        conn.execute("UPDATE consensus_snapshot SET recorded_at = ? "
+                     "WHERE eps_actual IS NOT NULL", ("2026-06-01T21:00:00Z",))
+
+    result = sue.sue_af("TEST", as_of="2026-01-01", fiscal_period="2025Q3")
+    assert result["success"] is False
+    assert result["sue"] is None
+
+
+def test_a_supplied_actuals_dict_still_wins(filer, store):
+    """Kept as an override for a backfill or a test, but no longer the only
+    way in."""
+    filer(concept_payload(STEADY))
+    series = sue.eps_series("TEST", as_of="2026-01-01")
+    _seed_pair(store, series)
+    quarters = {q["fiscal_period"]: q for q in series["quarters"]}
+    supplied = {p: round(q["eps"] - 0.50, 2) for p, q in quarters.items()}
+
+    result = sue.sue_af("TEST", as_of="2026-01-01", fiscal_period="2025Q3",
+                        actuals=supplied)
+    assert result["consensus"] == pytest.approx(
+        supplied["2025Q3"] - result["surprise"], abs=1e-6)
+
+
+def test_the_analyst_leg_says_how_much_of_it_was_reconstructed(filer, store):
+    """A seeded quarter is a reconstruction stamped at a date nobody was
+    watching. It is sound -- the vendor freezes its estimate at the print, and
+    ten of ten checks against this project's own recording confirm it -- but an
+    answer resting on four reconstructions and two observations is not the same
+    evidence as six observations, and the caller has to be able to see which
+    it got."""
+    filer(concept_payload(STEADY))
+    series = sue.eps_series("TEST", as_of="2026-01-01")
+    _seed_pair(store, series)
+    with pit_store.connect() as conn:
+        conn.execute("UPDATE consensus_snapshot SET source = 'seeded' "
+                     "WHERE fiscal_period IN ('2025Q1','2024Q4','2024Q3')")
+
+    result = sue.sue_af("TEST", as_of="2026-01-01", fiscal_period="2025Q3")
+
+    assert result["success"] is True, result["error"]
+    assert result["seeded_quarters"] == 3
+    assert result["recorded_quarters"] == \
+        result["sigma_quarters"] - result["seeded_quarters"]
+
+
+def test_an_answer_from_only_recorded_quarters_says_so(filer, store):
+    filer(concept_payload(STEADY))
+    series = sue.eps_series("TEST", as_of="2026-01-01")
+    _seed_pair(store, series)
+
+    result = sue.sue_af("TEST", as_of="2026-01-01", fiscal_period="2025Q3")
+    assert result["seeded_quarters"] == 0

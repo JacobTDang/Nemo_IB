@@ -1260,10 +1260,12 @@ def sue_af(ticker: str, as_of: Optional[str] = None,
     gap that varies quarter to quarter and is, for MSFT, a dollar -- larger
     than the surprises themselves and pointing wherever the one-offs point.
 
-    So `actuals` is required: {fiscal_period: reported EPS on the same basis
-    the estimates are quoted on}, which is what the vendor's own `actual_eps`
-    field carries. Until the daily job records that alongside the estimate,
-    this refuses rather than mixing the two.
+    So the reported figure comes from the same table as the estimate, which is
+    what keeps the pair on one basis by construction rather than by a caller
+    remembering to. The daily job records the vendor's own `actual_eps` beside
+    its estimate; `actuals` remains as an override for a backfill or a test,
+    and where neither exists for a quarter, that quarter drops out of the
+    window rather than being filled in from the filing.
 
     Fiscal identity does line up, which was worth checking: Finnhub's `year`
     and `quarter` are the filer's own -- AAPL's June 2026 quarter is 2026Q3
@@ -1277,6 +1279,12 @@ def sue_af(ticker: str, as_of: Optional[str] = None,
     result["consensus"] = None
     result["surprise"] = None
     result["surprises_available"] = 0
+    # How much of the answer rests on quarters nobody was watching. Seeding is
+    # sound -- the vendor freezes its estimate at the print -- but a window of
+    # four reconstructions and two observations is not the same evidence as six
+    # observations, and only the caller can decide whether that matters.
+    result["seeded_quarters"] = 0
+    result["recorded_quarters"] = 0
     if not series["success"]:
         result["error"] = series["error"]
         result["concepts_tried"] = series["concepts_tried"]
@@ -1319,25 +1327,25 @@ def sue_af(ticker: str, as_of: Optional[str] = None,
     result["sigma_periods"] = [_period_key(*k) for k in covered]
     result["sigma_quarters"] = len(covered)
 
-    if actuals is None:
-        result["error"] = (
-            f"{name} {period}: no actual on the same basis as the estimates "
-            f"was supplied. A street estimate is a non-GAAP figure and XBRL "
-            f"carries only the GAAP one -- Finnhub reports MSFT's 2026Q2 "
-            f"actual as 4.14 against the 5.16 in the 10-Q -- so subtracting "
-            f"one from the other measures the definition, not the surprise. "
-            f"Pass `actuals` keyed on fiscal period, or record the vendor's "
-            f"own actual alongside the estimate. The point-in-time consensus "
-            f"record holds {len(covered)} of the {SIGMA_QUARTERS} trailing "
-            f"prints for this name.")
-        return result
+    def actual_for(fiscal: str) -> Optional[float]:
+        """The vendor's own figure: supplied, or read from the record.
+
+        Never the filing's. A street estimate is non-GAAP and XBRL carries only
+        the GAAP number -- Finnhub reports MSFT's 2026Q2 actual as 4.14 against
+        the 5.16 in the 10-Q -- so subtracting one from the other measures the
+        definition rather than the surprise, by about a dollar, in whichever
+        direction that quarter's one-offs happened to point.
+        """
+        if actuals is not None and fiscal in actuals:
+            return actuals[fiscal]
+        return pit_store.actual_as_of(name, fiscal, as_of)
 
     def surprise_for(step_key) -> Optional[Tuple[float, float]]:
         pair = consensus_for(step_key)
         if pair is None:
             return None
         quarter, estimate = pair
-        actual = actuals.get(quarter["fiscal_period"])
+        actual = actual_for(quarter["fiscal_period"])
         if actual is None:
             return None
         # Both numbers were quoted in the share basis of their day; the series
@@ -1346,27 +1354,34 @@ def sue_af(ticker: str, as_of: Optional[str] = None,
         return (actual - estimate,
                 (actual - estimate) * quarter["basis_factor"])
 
-    trailing, used = [], []
+    trailing, used, seeded = [], [], 0
     for step_key in window:
         pair = surprise_for(step_key)
         if pair is None:
             continue
         trailing.append(pair[1])
-        used.append(_period_key(*step_key))
+        fiscal = _period_key(*step_key)
+        used.append(fiscal)
+        snapshot = pit_store.consensus_as_of(name, fiscal, as_of=as_of)
+        if snapshot and snapshot.get("source") == "seeded":
+            seeded += 1
     result["surprises_available"] = len(trailing)
     result["sigma_periods"] = used
     result["sigma_quarters"] = len(trailing)
+    result["seeded_quarters"] = seeded
+    result["recorded_quarters"] = len(trailing) - seeded
 
     head = surprise_for(key)
     if head is None:
         result["error"] = (
             f"{name} {period}: no consensus was recorded before that print, or "
-            f"no actual was supplied for it. The analyst leg reads only the "
-            f"point-in-time record, which accrues forward from the day the "
-            f"recorder started.")
+            f"no vendor actual was recorded after it. The analyst leg reads "
+            f"only the point-in-time record, which accrues forward from the "
+            f"day the recorder started; it holds {len(covered)} of the "
+            f"{SIGMA_QUARTERS} trailing prints for this name.")
         return result
     result["surprise"] = head[0]
-    result["consensus"] = actuals[period] - head[0]
+    result["consensus"] = actual_for(period) - head[0]
 
     if len(trailing) < MIN_SIGMA_QUARTERS:
         result["error"] = (
