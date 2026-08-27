@@ -22,15 +22,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-from dotenv import load_dotenv
-
-from research import pit_store
-
-# Cron has no shell profile. Every other entry point here inherits credentials
-# from the shell a human ran it in; a nightly job inherits nothing, so it reads
-# the same repo-root .env the container mounts.
-_DOTENV_PATH = Path(__file__).resolve().parent.parent / ".env"
-load_dotenv(dotenv_path=_DOTENV_PATH)
+from research import _DOTENV_PATH, pit_store  # noqa: F401 - .env on import
 
 # --- screen ---------------------------------------------------------------
 # The floor is where spread starts eating the drift; the price floor is

@@ -143,6 +143,34 @@ CREATE TABLE IF NOT EXISTS activist_filing (
 CREATE INDEX IF NOT EXISTS idx_activist_ticker
     ON activist_filing(subject_ticker, filing_date);
 
+CREATE TABLE IF NOT EXISTS paper_order (
+    as_of_date       TEXT NOT NULL,
+    ticker           TEXT NOT NULL,
+    accepted         INTEGER NOT NULL,
+    -- Rejections are kept beside acceptances deliberately. A scan that quietly
+    -- stops finding candidates is indistinguishable from a market with nothing
+    -- in it, and the difference lives entirely in these reasons.
+    reason           TEXT,
+    side             TEXT,
+    fiscal_period    TEXT,
+    sue              REAL,
+    expected_edge_bps REAL,
+    cost_bps         REAL,
+    net_edge_bps     REAL,
+    target_dollars   REAL,
+    participation    REAL,
+    spread           REAL,
+    spread_resolved  INTEGER,
+    rank             INTEGER,
+    regime           TEXT,
+    gross_target     REAL,
+    -- The session the order is FOR. No fill price: that session has not
+    -- happened when the row is written, which is the entire point.
+    intended_session TEXT,
+    recorded_at      TEXT NOT NULL,
+    PRIMARY KEY (as_of_date, ticker)
+);
+
 CREATE TABLE IF NOT EXISTS run_log (
     run_id       INTEGER PRIMARY KEY AUTOINCREMENT,
     job          TEXT NOT NULL,
@@ -668,6 +696,60 @@ def known_activist_accessions(ticker: str) -> set:
 # ---------------------------------------------------------------- run log
 
 _ACTIVE_RUN: Dict[str, Any] = {}
+
+
+def record_paper_orders(as_of_date: str, candidates: Iterable[Dict[str, Any]],
+                        rejected: Iterable[Dict[str, Any]] = (),
+                        regime: Optional[str] = None,
+                        gross_target: Optional[float] = None,
+                        recorded_at: Optional[str] = None) -> int:
+    """File one scan. Idempotent within a day: a rerun must not double a book.
+
+    Accepted and rejected go into the same table because they answer the same
+    question at different times -- "what did this scan see, and what did it do
+    about it" -- and separating them is how a rejection quietly stops being
+    part of the record.
+    """
+    stamp = recorded_at or _now()
+    rows = [(c, 1) for c in candidates] + [(r, 0) for r in rejected]
+    written = 0
+    with connect() as conn:
+        for row, accepted in rows:
+            cur = conn.execute(
+                """INSERT OR IGNORE INTO paper_order
+                   (as_of_date, ticker, accepted, reason, side, fiscal_period,
+                    sue, expected_edge_bps, cost_bps, net_edge_bps,
+                    target_dollars, participation, spread, spread_resolved,
+                    rank, regime, gross_target, intended_session, recorded_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (as_of_date, row["ticker"], accepted, row.get("reason"),
+                 row.get("side"), row.get("fiscal_period"), row.get("sue"),
+                 row.get("expected_edge_bps"), row.get("cost_bps"),
+                 row.get("net_edge_bps"), row.get("target_dollars"),
+                 row.get("participation"), row.get("spread"),
+                 1 if row.get("spread_resolved") else 0, row.get("rank"),
+                 regime, gross_target, row.get("intended_session"), stamp))
+            written += cur.rowcount or 0
+    return written
+
+
+def paper_orders_as_of(as_of: str, accepted_only: bool = False
+                       ) -> List[Dict[str, Any]]:
+    """Orders decided on or before `as_of`, as they were decided.
+
+    `recorded_at` is filtered like everywhere else: a scan run today is not
+    something last week's reader knew.
+    """
+    sql = """SELECT * FROM paper_order
+             WHERE as_of_date <= ? AND date(recorded_at) <= ?"""
+    params: tuple = (as_of, as_of)
+    if accepted_only:
+        sql += " AND accepted = 1"
+    sql += " ORDER BY as_of_date, rank IS NULL, rank, ticker"
+    with connect() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [{**dict(r), "accepted": bool(r["accepted"]),
+             "spread_resolved": bool(r["spread_resolved"])} for r in rows]
 
 
 def start_run(job: str, as_of_date: Optional[str] = None) -> int:
