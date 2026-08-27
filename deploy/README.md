@@ -236,12 +236,18 @@ Cron lines, in the order they should run:
  0 23 * * 1-5   cd /srv/nemo/deploy && docker compose run --rm research-scan
 */20 13-23 * * 1-5  cd /srv/nemo/deploy && docker compose run --rm research-watch
  0  7 * * 6     cd /srv/nemo/deploy && docker compose run --rm research-score
+ 0  9 * * 6     cd /srv/nemo/deploy && docker compose run --rm research-announce
  0  8 1 * *     cd /srv/nemo/deploy && docker compose run --rm research-seed
  0  6 * * *     cd /srv/nemo/deploy && docker compose run --rm congress-sync
 ```
 
 Order matters between the first two: the scan reads the universe and the prices
 the recorder wrote that evening, so a scan that runs first sees yesterday.
+
+`research-announce` reads Item 2.02 filings for the announcement date and the
+hour it landed, which is what decides whether the reaction is that session or
+the next. It must run before `research-seed`, which dates each reconstructed
+actual by the release where one is on record.
 
 `research-watch` reports the detection latency accumulated so far on every
 pass, not just what it recorded this time -- catching a filing quickly is the

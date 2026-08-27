@@ -201,6 +201,7 @@ docker compose run --rm research-daily               # every night after
 | `research-scan` | ranks candidates net of trading cost, files the intended orders | `0 23 * * 1-5` |
 | `research-watch` | sweeps EDGAR for Schedule 13D stakes taken **in** a company | `*/20 13-23 * * 1-5` |
 | `research-score` | scores filed orders whose holding period has closed | `0 7 * * 6` |
+| `research-announce` | earnings dates and the hour they landed, from Item 2.02 filings | `0 9 * * 6` |
 | `research-seed` | reconstructs the four quarters of consensus the vendor still serves | `0 8 1 * *` |
 | `congress-sync` | ingests congressional disclosures for the `altdata` server | `0 6 * * *` |
 
@@ -240,8 +241,9 @@ bar_revision       where a vendor's later disagreement goes, so the original
 corporate_action   splits and dividends, dated to their own ex-date
 universe_snapshot  who was eligible each day, and why the rest were not
 consensus_snapshot what the street expected, and what the vendor reported
-announcement       fiscal identity and whether the print was before the open
-                   or after the close, which decides the reaction session
+announcement       fiscal identity, the date the market learned, and whether
+                   it landed before the open or after the close -- from the
+                   Item 2.02 filing and the SEC acceptance time, not a vendor
 paper_order        decisions, with the session they were for and no fill price
 activist_filing    13D events with four timestamps, latency derived at read
 run_log            every run, so a day the job did not run is visible
@@ -257,12 +259,21 @@ one number would make them look comparable. The analyst surprise needs eight
 quarters of recorded consensus; seeding supplies four and the recorder adds one
 a quarter, so it refuses until it has them and says how many it holds.
 
+A replay over 652 decision dates has now tested one hypothesis and refuted it.
+The market learns a quarter's figure at the earnings release, a median of eight
+days before the 10-Q, so entering off the filing should miss most of the drift.
+The same signal entered at the release returned t=+1.12 over 74 trades and at
+the 10-Q t=+2.47 over 71 — later did better, which is the opposite of the
+prediction and most likely a small sample rather than a finding, since the two
+arms do not trade the same events.
+
 Nothing here decides how much of the drift a surprise is worth. That
 coefficient is declared, reported uncalibrated on every scan, and the point of
 recording orders and scoring them later is to replace it with one measured from
 this book's own outcomes. A replay over 652 decision dates does not yet support
-it: mean +51.3bp against a median of −71.3bp and t = +0.80, which the
-calibration gate refuses on both counts.
+it. The gate now also knows how many variants were compared, and applies a
+Bonferroni correction, because one of three passing at t>2 is about what
+chance produces and a gate that cannot see the search ratifies it.
 
 ## Tests
 

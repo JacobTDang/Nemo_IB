@@ -324,6 +324,36 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # Earnings announcement dates and times, from Item 2.02 filings. The store
+  # dates a quarter by its 10-Q because that is where the XBRL lives; the
+  # market learned the figure at the release, a median of eight days earlier
+  # and up to a month for banks and retailers. The hour comes from the SEC
+  # acceptance time, read in New York, and decides which session reacted.
+  #
+  #   docker compose run --rm research-announce
+  #   docker compose run --rm research-announce --tickers JPM WMT TGT
+  #
+  # Safe to re-run and cheap after the first pass. Weekly is plenty:
+  #   0 9 * * 6 cd /srv/nemo/deploy && docker compose run --rm research-announce
+  research-announce:
+    image: ${NEMO_IMAGE:-nemo-data:local}
+    env_file: ../.env
+    profiles: ["sync"]
+    restart: "no"
+    entrypoint: ["python", "-m", "research.announcements"]
+    environment:
+      NEMO_PIT_DB: /app/data/pit.db
+    volumes:
+      - research-data:/app/data
+    tmpfs:
+      - /root/.edgar:rw,size=512m
+      - /app/db_cache:rw,size=128m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 volumes:
   # Survives `docker compose down` and container replacement. Back it up the
   # way you would any database: the contents are reconstructible from the
