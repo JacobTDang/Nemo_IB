@@ -745,12 +745,17 @@ def filed_periods(as_of: str) -> set:
     the same name is proposed every session until the window closes -- forty-
     five nights of the same position live, and one earnings event counted as
     forty-five independent trades in any study of it.
+
+    Strictly before `as_of`, not up to it. A re-run of today is recomputing
+    today's decision, and counting what today already filed would leave every
+    re-scan empty -- and silently disable the supersede report, which exists to
+    compare exactly those two answers.
     """
     with connect() as conn:
         rows = conn.execute(
             """SELECT DISTINCT ticker, fiscal_period FROM paper_order
                WHERE accepted = 1 AND fiscal_period IS NOT NULL
-                 AND as_of_date <= ? AND date(recorded_at) <= ?""",
+                 AND as_of_date < ? AND date(recorded_at) <= ?""",
             (as_of, as_of)).fetchall()
     return {(r["ticker"], r["fiscal_period"]) for r in rows}
 

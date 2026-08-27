@@ -778,3 +778,20 @@ def test_the_signal_source_can_be_supplied(liquid_universe, monkeypatch):
     out = scanner.scan(as_of="2026-03-03",
                        signal_for=lambda t, a: _signal(t, 3.0))
     assert [c["ticker"] for c in out["candidates"]] == ["AAA"]
+
+
+def test_a_same_day_rerun_still_sees_its_own_candidates(liquid_universe,
+                                                        monkeypatch):
+    """Already-acted means a print acted on before today. A re-run of today is
+    recomputing today's decision, not a later one, so excluding what this same
+    day already filed would leave every re-scan empty -- and would quietly
+    disable the supersede report, which exists precisely to compare the two."""
+    _reported(liquid_universe, "AAA", "2026Q1", "2026-03-02")
+    monkeypatch.setattr(scanner, "_signal_for",
+                        lambda t, a: _signal(t, 3.0, period="2026Q1"))
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0010))
+
+    scanner.record_scan(as_of="2026-03-03")
+    again = scanner.scan(as_of="2026-03-03")
+
+    assert [c["ticker"] for c in again["candidates"]] == ["AAA"]
