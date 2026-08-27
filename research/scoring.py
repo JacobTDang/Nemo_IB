@@ -152,15 +152,31 @@ def _stub(order: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _summarise(scored: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """The realised numbers, and an honest label on the coefficient.
+    """The realised numbers, and three reasons a coefficient may not be quoted.
 
     `drift_bps_per_sue` is gross of cost on purpose. Cost is a property of how
-    the position was traded; drift is a property of the surprise, and mixing
-    them gives a coefficient that changes with the size of the book.
+    a position was traded; drift is a property of the surprise, and mixing them
+    gives a coefficient that moves with the size of the book.
+
+    Sample size used to be the only gate, and a live replay walked straight
+    through it: 223 trades, mean net +52.7bp, median -70.9bp, hit rate 48%. The
+    mean was a handful of large winners and the typical trade lost money.
+    Adopting 33.7bp per SUE off that would have replaced a stated assumption of
+    15 with something 2.2x larger and made every net edge in the scanner
+    inherit it. So the mean now has to survive the sample it came from:
+
+      enough trades, because a handful is not a coefficient;
+
+      a median on the same side as the mean, because a mean carried by its tail
+      describes a lottery rather than an edge;
+
+      and a t-statistic clear of two, because a sign that cannot be told from
+      chance is not a measurement.
     """
     if not scored:
         return {"sample": 0, "hit_rate": None, "mean_net_bps": None,
-                "mean_gross_bps": None, "drift_bps_per_sue": None,
+                "median_net_bps": None, "mean_gross_bps": None,
+                "t_stat": None, "drift_bps_per_sue": None,
                 "calibrated": False,
                 "calibration_note": "no finished trades to measure"}
 
@@ -171,21 +187,42 @@ def _summarise(scored: List[Dict[str, Any]]) -> Dict[str, Any]:
     per_sue = [g / s for g, s in usable] if usable else []
 
     sample = len(scored)
-    enough = sample >= MIN_CALIBRATION_SAMPLE
+    mean_net = statistics.fmean(nets)
+    median_net = statistics.median(nets)
+    if sample > 1:
+        sd = statistics.stdev(nets)
+        t_stat = (mean_net / (sd / (sample ** 0.5))) if sd else None
+    else:
+        t_stat = None
+
+    failures = []
+    if sample < MIN_CALIBRATION_SAMPLE:
+        failures.append(
+            f"sample of {sample} is under the {MIN_CALIBRATION_SAMPLE} this "
+            f"will quote a coefficient from")
+    if (mean_net > 0) != (median_net > 0):
+        failures.append(
+            f"the mean ({mean_net:+.1f}bp) and the median ({median_net:+.1f}bp) "
+            f"fall on opposite sides of zero, so the average is carried by its "
+            f"tail rather than by the typical trade")
+    if t_stat is None or abs(t_stat) < 2.0:
+        shown = "undefined" if t_stat is None else f"{t_stat:+.2f}"
+        failures.append(
+            f"t={shown} does not clear 2, so the sign of this mean is not "
+            f"distinguishable from chance at this sample size")
+
     return {
         "sample": sample,
         "hit_rate": sum(1 for n in nets if n > 0) / sample,
-        "mean_net_bps": statistics.fmean(nets),
+        "mean_net_bps": mean_net,
+        "median_net_bps": median_net,
         "mean_gross_bps": statistics.fmean(grosses),
+        "t_stat": t_stat,
         "drift_bps_per_sue": statistics.fmean(per_sue) if per_sue else None,
-        "calibrated": enough,
-        "calibration_note": (
-            f"{sample} finished trades"
-            if enough else
-            f"sample of {sample} is under the {MIN_CALIBRATION_SAMPLE} this "
-            f"will quote a coefficient from; replacing a declared assumption "
-            f"with a handful of trades is trading a stated guess for an "
-            f"unstated one"),
+        "calibrated": not failures,
+        "calibration_note": (f"{sample} finished trades, median and mean agree, "
+                             f"t={t_stat:+.2f}" if not failures
+                             else "; ".join(failures)),
     }
 
 

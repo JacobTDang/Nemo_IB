@@ -245,3 +245,55 @@ def test_a_horizon_longer_than_the_record_stays_pending(store):
     out = scoring.score_orders(as_of=DAYS[30], horizon_days=60)
     assert out["scored"] == []
     assert out["pending"]
+
+
+# --- a coefficient the sample does not support ------------------------------
+#
+# A live replay over 652 decision dates returned mean net +52.7bp against a
+# median of -70.9bp, a 48% hit rate, and -153.8bp in the largest-surprise
+# bucket. The mean is a few big winners; the typical trade lost money. Quoting
+# 33.7bp per SUE off that would have replaced a declared assumption of 15 with
+# a number 2.2x larger and made every net edge in the scanner follow it.
+#
+# Sample size was the only thing being checked, and 223 trades passed it.
+
+
+def _scored(nets, sues=None):
+    sues = sues or [2.0] * len(nets)
+    return [{"ticker": f"T{i}", "sue": s, "net_bps": n, "gross_bps": n,
+             "cost_bps": 0.0}
+            for i, (n, s) in enumerate(zip(nets, sues))]
+
+
+def test_a_mean_and_median_that_disagree_in_sign_is_not_calibrated():
+    """One trade in twenty carrying the whole average is a tail, not an edge."""
+    nets = [-70.0] * 40 + [3000.0] * 5
+    out = scoring._summarise(_scored(nets))
+
+    assert out["sample"] >= scoring.MIN_CALIBRATION_SAMPLE
+    assert out["mean_net_bps"] > 0 and out["median_net_bps"] < 0
+    assert out["calibrated"] is False
+    assert "median" in out["calibration_note"].lower()
+
+
+def test_a_consistent_sample_does_calibrate():
+    out = scoring._summarise(_scored([20.0, 30.0, 25.0, 15.0, -5.0] * 8))
+    assert out["calibrated"] is True
+    assert out["median_net_bps"] > 0
+
+
+def test_the_summary_reports_dispersion_not_just_a_mean():
+    out = scoring._summarise(_scored([-70.0] * 40 + [3000.0] * 5))
+    assert out["median_net_bps"] is not None
+    assert out["t_stat"] is not None
+    assert out["hit_rate"] < 0.5
+
+
+def test_a_mean_that_cannot_clear_its_own_noise_is_not_calibrated():
+    """Positive mean, positive median, and a t-statistic under two: the sign
+    is not distinguishable from chance at this sample size."""
+    nets = [500.0, -480.0, 20.0, 10.0, 5.0] * 8
+    out = scoring._summarise(_scored(nets))
+    assert out["t_stat"] < 2.0
+    assert out["calibrated"] is False
+    assert "t=" in out["calibration_note"] or "noise" in out["calibration_note"]
