@@ -297,3 +297,69 @@ def test_a_mean_that_cannot_clear_its_own_noise_is_not_calibrated():
     assert out["t_stat"] < 2.0
     assert out["calibrated"] is False
     assert "t=" in out["calibration_note"] or "noise" in out["calibration_note"]
+
+
+# --- an order resting on a closed exchange ----------------------------------
+#
+# The scanner names the next weekday as the intended session, which about ten
+# times a year is a holiday. Those orders were scored as never filled -- a real
+# order would have rested and filled on the next open. Live, the replay
+# discarded five trades this way, all of them on Presidents Day, Memorial Day
+# and Thanksgiving.
+#
+# The distinction that matters is the same one the recorder makes: if the
+# reference instrument has no session either, the exchange was shut and the
+# order rolls. If it traded and this name did not, the name is the problem and
+# the order genuinely never filled.
+
+def test_an_order_for_a_closed_exchange_fills_on_the_next_open(store):
+    from research import spread
+    _order(store, session=DAYS[1], cost_bps=0.0)
+    # Neither the name nor the reference trades on DAYS[1]: the market is shut.
+    days = [DAYS[0]] + DAYS[2:9]
+    _bars(store, "AAA", [100.0, 100.0, 100.0, 100.0, 100.0, 110.0, 110.0, 110.0],
+          days=days, recorded_at=f"{DAYS[8]}T21:00:00Z")
+    _bars(store, spread.REFERENCE_TICKER, [50.0] * len(days), days=days,
+          recorded_at=f"{DAYS[8]}T21:00:00Z")
+
+    out = scoring.score_orders(as_of=DAYS[20], horizon_days=4)
+
+    assert out["unfilled"] == [], out["unfilled"]
+    row = out["scored"][0]
+    assert row["entry_session"] == DAYS[2], (
+        "the order did not roll to the next open")
+    assert row["gross_bps"] == pytest.approx(1000.0)
+
+
+def test_a_name_that_halted_while_the_market_traded_never_filled(store):
+    """The other side of the same test. The reference traded that day, so the
+    exchange was open and this name simply was not available."""
+    from research import spread
+    _order(store, session=DAYS[1], cost_bps=0.0)
+    _bars(store, "AAA", [100.0], days=[DAYS[0]],
+          recorded_at=f"{DAYS[0]}T21:00:00Z")
+    _bars(store, "AAA", [80.0] * 7, days=DAYS[5:12],
+          recorded_at=f"{DAYS[11]}T21:00:00Z")
+    _bars(store, spread.REFERENCE_TICKER, [50.0] * 12, days=DAYS[:12],
+          recorded_at=f"{DAYS[11]}T21:00:00Z")
+
+    out = scoring.score_orders(as_of=DAYS[20], horizon_days=4)
+
+    assert out["scored"] == []
+    assert "did not trade" in out["unfilled"][0]["reason"].lower()
+
+
+def test_an_order_rolls_only_as_far_as_the_next_session(store):
+    """Not to whenever the name next appears. Rolling indefinitely is how a
+    study buys a week after the news it was reacting to."""
+    from research import spread
+    _order(store, session=DAYS[1], cost_bps=0.0)
+    _bars(store, "AAA", [100.0] * 8, days=DAYS[4:12],
+          recorded_at=f"{DAYS[11]}T21:00:00Z")
+    # The exchange was open the whole time.
+    _bars(store, spread.REFERENCE_TICKER, [50.0] * 12, days=DAYS[:12],
+          recorded_at=f"{DAYS[11]}T21:00:00Z")
+
+    out = scoring.score_orders(as_of=DAYS[20], horizon_days=4)
+    assert out["scored"] == []
+    assert out["unfilled"]

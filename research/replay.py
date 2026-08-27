@@ -254,6 +254,12 @@ def _score(orders: List[Dict[str, Any]],
                  + timedelta(days=horizon_days * 3)).isoformat()
         bars = pit_store.adjusted_bars(order["ticker"], as_of)
         forward = [b for b in bars if b["trade_date"] >= entry_session]
+        if forward and forward[0]["trade_date"] != entry_session \
+                and scoring._exchange_shut(entry_session, as_of):
+            # A holiday. The order rests and fills at the next open, one
+            # session only -- five of these were discarded in a live replay,
+            # all on Presidents Day, Memorial Day and Thanksgiving.
+            entry_session = forward[0]["trade_date"]
         if not forward or forward[0]["trade_date"] != entry_session:
             skip(order, f"{order['ticker']} did not trade on {entry_session}, "
                         f"so the order never filled")

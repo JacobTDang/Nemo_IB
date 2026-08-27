@@ -37,7 +37,7 @@ from __future__ import annotations
 import statistics
 from typing import Any, Dict, List, Optional
 
-from research import pit_store
+from research import pit_store, spread
 
 # How many scored trades before the realised coefficient is worth quoting. One
 # trade is not a coefficient, and replacing a declared assumption with a
@@ -80,10 +80,18 @@ def score_orders(as_of: Optional[str] = None,
 
         entry = next((b for b in forward if b["trade_date"] == entry_session),
                      None)
+        if entry is None and forward and _exchange_shut(entry_session, as_of):
+            # The scanner names the next weekday, which about ten times a year
+            # is a holiday. A real order rests and fills on the next open, so
+            # this rolls one session -- and one only. Rolling until the name
+            # next appears is how a study buys a week after the news.
+            entry = forward[0]
+            entry_session = entry["trade_date"]
         if entry is None:
             # Two different nothings. If the horizon has not elapsed yet the
             # session may simply not have been recorded; if it has, the name
-            # did not trade and the order never filled.
+            # did not trade while the exchange was open, and the order never
+            # filled.
             later = [b for b in bars if b["trade_date"] > entry_session]
             if len(later) < horizon_days:
                 pending.append({**_stub(order),
@@ -112,6 +120,19 @@ def score_orders(as_of: Optional[str] = None,
     return {"as_of": as_of, "horizon_days": horizon_days,
             "scored": scored, "pending": pending, "unfilled": unfilled,
             **_summarise(scored)}
+
+
+def _exchange_shut(session: str, as_of: str) -> bool:
+    """Whether the market was closed that day, as the recorder decides it.
+
+    The reference instrument trades every session there is. If it has no bar
+    either, the exchange was shut and an order resting on that date fills at
+    the next open. If it traded and this name did not, the name is the problem.
+    """
+    reference = pit_store.bars_as_of(spread.REFERENCE_TICKER, as_of)
+    if not reference:
+        return False
+    return not any(b["trade_date"] == session for b in reference)
 
 
 def fill(order: Dict[str, Any], entry: Dict[str, Any],
