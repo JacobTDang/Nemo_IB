@@ -338,7 +338,17 @@ def adjusted_bars(ticker: str, as_of: str,
             ref = closes[max(prior)]
             factor = (ref - float(action["value"])) / ref
             if factor <= 0:
-                continue
+                # Real, and not adjustable this way. A fund distributing most
+                # of its NAV pays more than the shares are worth the day
+                # before, and the ratio method has no answer for it. Skipping
+                # quietly would return a total-return series that silently
+                # ignores the largest cash flow in it.
+                raise ValueError(
+                    f"{ticker}: dividend {action['value']} on {ex} is not "
+                    f"smaller than the {ref} close before it, so a price-ratio "
+                    f"adjustment cannot represent it. Read this series with "
+                    f"total_return=False, or handle the distribution "
+                    f"explicitly")
         by_date[ex] = by_date.get(ex, 1.0) * factor
 
     # Descending, so the backward walk consumes them in the order it meets
@@ -392,6 +402,15 @@ def record_corporate_action(ticker: str, ex_date: str, action_type: str,
     adjustment in force on any past date be rebuilt. A vendor's adjusted close
     only tells you about today.
     """
+    if not (value > 0):
+        # A zero split ratio divides by zero at read time and a negative one
+        # flips the sign of every price before it. A dividend of zero is not an
+        # event. Neither can be applied, so neither is recorded.
+        raise ValueError(
+            f"{action_type} value must be positive; got {value!r} for "
+            f"{ticker} on {ex_date}. An unapplicable action recorded now is a "
+            f"read that fails or silently skips it every time after")
+
     with connect() as conn:
         conn.execute(
             """INSERT OR IGNORE INTO corporate_action

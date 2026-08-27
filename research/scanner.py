@@ -278,7 +278,17 @@ def scan(as_of: Optional[str] = None) -> Dict[str, Any]:
     resolved_count = 0
 
     for ticker in universe:
-        signal = _signal_for(ticker, as_of)
+        try:
+            signal = _signal_for(ticker, as_of)
+        except Exception as exc:  # noqa: BLE001 - recorded, not masked
+            # EDGAR times out on one name and the other four hundred are fine.
+            # Letting it propagate loses a whole night's decisions to a single
+            # upstream hiccup, and the run log would show a crash rather than
+            # the one ticker that caused it.
+            rejected.append({"ticker": ticker, "sue": None,
+                             "reason": f"signal unavailable: "
+                                       f"{type(exc).__name__}: {exc}"})
+            continue
         problem = _signal_problem(signal, as_of)
         if problem:
             rejected.append({"ticker": ticker, "reason": problem,
@@ -291,8 +301,14 @@ def scan(as_of: Optional[str] = None) -> Dict[str, Any]:
         # Size first, because the cost depends on it: impact is a function of
         # the order against the flow, so a cost quoted without a size is a
         # cost for some other trade.
-        fit = spread.participation_rate(ticker, as_of, per_name,
-                                        window=spread.RESOLVING_WINDOW)
+        try:
+            fit = spread.participation_rate(ticker, as_of, per_name,
+                                            window=spread.RESOLVING_WINDOW)
+        except Exception as exc:  # noqa: BLE001 - recorded, not masked
+            rejected.append({"ticker": ticker, "sue": value,
+                             "reason": f"sizing unavailable: "
+                                       f"{type(exc).__name__}: {exc}"})
+            continue
         if fit.get("reason"):
             rejected.append({"ticker": ticker, "reason": fit["reason"],
                              "sue": value})
@@ -303,7 +319,13 @@ def scan(as_of: Optional[str] = None) -> Dict[str, Any]:
                              "reason": "no tradeable size at this liquidity"})
             continue
 
-        cost = _cost_for(ticker, as_of, target)
+        try:
+            cost = _cost_for(ticker, as_of, target)
+        except Exception as exc:  # noqa: BLE001 - recorded, not masked
+            rejected.append({"ticker": ticker, "sue": value,
+                             "reason": f"cost unavailable: "
+                                       f"{type(exc).__name__}: {exc}"})
+            continue
         if cost.get("cost") is None:
             rejected.append({"ticker": ticker, "sue": value,
                              "reason": cost.get("reason")

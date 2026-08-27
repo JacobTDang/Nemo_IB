@@ -346,6 +346,10 @@ def coverage_status(covered: int, requested: int) -> str:
     ticker out of five thousand wrote rows and is not a working day, and only
     the ratio shows that.
     """
+    if requested == 0:
+        # Asked for nothing and got nothing. That is a complete run over an
+        # empty list, not an upstream that refused.
+        return "ok"
     if covered == 0:
         return "failed"
     return "ok" if covered >= requested else "partial"
@@ -564,6 +568,15 @@ def record_consensus_snapshots(as_of: Optional[str] = None,
 # registrant list inside a cycle.
 MAX_NIGHTLY_TICKERS = 3000
 
+# And a floor under the rotation. `MAX_NIGHTLY_TICKERS - len(eligible)` reaches
+# zero the moment the eligible set fills the cap, and the ask then contains
+# nothing but existing members -- so a new listing is never fetched, never
+# gains history and never becomes eligible. That is the same starvation the
+# rotation exists to prevent, arriving a few weeks in rather than on day one,
+# and the real eligible universe is a few thousand names so it arrives in
+# ordinary operation. The cap is a target; this is the guarantee.
+MIN_NEWCOMER_SLOTS = 500
+
 
 def nightly_tickers(as_of: str, registrants: List[str]) -> List[str]:
     """Everyone eligible, plus this night's slice of everyone else.
@@ -579,8 +592,8 @@ def nightly_tickers(as_of: str, registrants: List[str]) -> List[str]:
     known = set(keep)
     rest = [t for t in registrants if t not in known]
 
-    room = MAX_NIGHTLY_TICKERS - len(keep)
-    if room <= 0 or not rest:
+    room = max(MIN_NEWCOMER_SLOTS, MAX_NIGHTLY_TICKERS - len(keep))
+    if not rest:
         return keep
 
     # Ordinal of the date, so consecutive nights take consecutive slices and
