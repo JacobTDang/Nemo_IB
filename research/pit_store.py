@@ -108,6 +108,36 @@ CREATE TABLE IF NOT EXISTS consensus_snapshot (
     PRIMARY KEY (as_of_date, ticker, fiscal_period)
 );
 
+-- Schedule 13D events. `subject_ticker` is the company a stake was taken IN,
+-- never one that took a stake in someone else: both sides live in the same
+-- EDGAR folder and conflating them invents activist campaigns.
+--
+-- Four timestamps, none of them redundant. `filing_date` is the event's own
+-- date; `accepted_at` is when SEC accepted it, which is when it became public;
+-- `detected_at` is when we saw it, and the gap between those two is the only
+-- thing this watcher is actually judged on; `recorded_at` is the store's
+-- as-of discipline, so a filing learned years late stays invisible to a query
+-- standing before we learned it.
+CREATE TABLE IF NOT EXISTS activist_filing (
+    accession        TEXT NOT NULL,
+    subject_ticker   TEXT NOT NULL,
+    subject_cik      TEXT,
+    subject_name     TEXT,
+    filer_name       TEXT,
+    filer_cik        TEXT,
+    form             TEXT NOT NULL,
+    is_amendment     INTEGER NOT NULL,
+    filing_date      TEXT NOT NULL,
+    accepted_at      TEXT,
+    detected_at      TEXT NOT NULL,
+    subject_verified INTEGER NOT NULL,
+    url              TEXT,
+    recorded_at      TEXT NOT NULL,
+    PRIMARY KEY (accession, subject_ticker)
+);
+CREATE INDEX IF NOT EXISTS idx_activist_ticker
+    ON activist_filing(subject_ticker, filing_date);
+
 CREATE TABLE IF NOT EXISTS run_log (
     run_id       INTEGER PRIMARY KEY AUTOINCREMENT,
     job          TEXT NOT NULL,
@@ -359,6 +389,160 @@ def consensus_as_of(ticker: str, fiscal_period: str,
                ORDER BY as_of_date DESC LIMIT 1""",
             (ticker, fiscal_period, as_of)).fetchone()
     return dict(row) if row else None
+
+
+# --------------------------------------------------------- 13D events
+
+# Past this, a filing was history when we first looked at it rather than
+# something we caught. The distinction protects the only number that says
+# whether the watcher works: a folder read for the first time hands back every
+# 13D ever filed on that company, and averaging a 2019 filing "detected" in
+# 2026 into the latency would bury a real two-minute catch under five years of
+# nothing. Generous on purpose -- a watcher down over a long weekend was still
+# late rather than back-filling, and that lateness should count against it.
+BACKFILL_AFTER_SECONDS = 7 * 24 * 3600
+
+
+def iso_utc(value: Any) -> Optional[str]:
+    """Canonical `...Z` UTC, or None. Anything else raises.
+
+    EDGAR's `acceptanceDateTime` carries a `Z` that is genuinely UTC and not
+    decorative -- checked against the acceptance-hour distribution of INTC's
+    1000 most recent filings, which is empty from 03h to 09h UTC, exactly the
+    complement of the 06:00-22:00 ET window in which EDGAR accepts filings.
+    Read as Eastern instead, every latency in this table would be four hours
+    wrong and still look plausible.
+
+    A naive datetime is taken as UTC for the same reason: the only naive value
+    that reaches here comes from that field, via a pyarrow timestamp column
+    that drops the zone while keeping the instant. An unparseable string is
+    refused rather than nulled, because a null here reads as "SEC never told
+    us" and that is a different fact from "we could not read what it said".
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        moment = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError(
+                f"unparseable timestamp {value!r}: {exc}. Refused rather than "
+                f"stored as null, which would claim SEC gave no acceptance "
+                f"time when in fact we failed to read one.") from exc
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc).replace(
+        microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def record_activist_filings(entries: Iterable[Dict[str, Any]],
+                            detected_at: Optional[str] = None,
+                            recorded_at: Optional[str] = None) -> int:
+    """Append 13D events. Returns the count newly written.
+
+    A filing already recorded is left exactly as it was, `detected_at`
+    included. When we first saw something is the one field that cannot be
+    re-derived afterwards, and a watcher on a timer re-reads the same folder
+    every pass -- so the natural bug is for the tenth pass to overwrite the
+    first pass's detection time with its own and quietly report a latency of
+    zero forever.
+
+    An entry whose header says the company is not the subject is refused
+    outright. Whatever classifies filings today may be replaced tomorrow, and
+    every classifier writes through here; a row asserting that Intel's stake in
+    Vuzix is a stake in Intel cannot be true no matter what produced it.
+    """
+    detected = iso_utc(detected_at) or _now()
+    stamp = iso_utc(recorded_at) or detected
+    written = 0
+    with connect() as conn:
+        for e in entries:
+            if e.get("is_subject") is False:
+                raise ValueError(
+                    f"refusing to record {e.get('accession')} as a stake in "
+                    f"{e.get('subject_ticker')}: the filing header names "
+                    f"{e.get('subject_name')!r} as the subject company. This "
+                    f"is a filing {e.get('subject_ticker')} made about someone "
+                    f"else, and recording it would invent an activist.")
+            cur = conn.execute(
+                """INSERT OR IGNORE INTO activist_filing
+                   (accession, subject_ticker, subject_cik, subject_name,
+                    filer_name, filer_cik, form, is_amendment, filing_date,
+                    accepted_at, detected_at, subject_verified, url,
+                    recorded_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (e["accession"], e["subject_ticker"], e.get("subject_cik"),
+                 e.get("subject_name"), e.get("filer_name"), e.get("filer_cik"),
+                 e["form"], 1 if e.get("is_amendment") else 0,
+                 e["filing_date"], iso_utc(e.get("accepted_at")),
+                 iso_utc(e.get("detected_at")) or detected,
+                 1 if e.get("subject_verified") else 0, e.get("url"), stamp))
+            written += cur.rowcount
+    return written
+
+
+def _latency(row: sqlite3.Row) -> Optional[float]:
+    if not row["accepted_at"] or not row["detected_at"]:
+        return None
+    accepted = datetime.fromisoformat(row["accepted_at"].replace("Z", "+00:00"))
+    detected = datetime.fromisoformat(row["detected_at"].replace("Z", "+00:00"))
+    return (detected - accepted).total_seconds()
+
+
+def activist_filings_as_of(as_of: str,
+                           ticker: Optional[str] = None) -> List[Dict[str, Any]]:
+    """13D events as they were known on `as_of`, newest filing first.
+
+    Both clauses again: `filing_date <= as_of` keeps out filings that had not
+    happened, `recorded_at <= as_of` keeps out ones we had not yet seen. The
+    second is what stops a study of 13D reactions from standing in 2019 holding
+    a list we only assembled in 2026.
+
+    `latency_seconds` and `is_backfill` are derived here rather than stored.
+    They are arithmetic on two recorded facts, and a stored copy is a number
+    that can end up disagreeing with the columns it came from. Both are None
+    when the acceptance time is unknown -- an unknown latency is not a fast one.
+    """
+    sql = ("SELECT * FROM activist_filing "
+           "WHERE filing_date <= ? AND date(recorded_at) <= ?")
+    params: List[Any] = [as_of, as_of]
+    if ticker:
+        sql += " AND subject_ticker = ?"
+        params.append(ticker)
+    sql += " ORDER BY filing_date DESC, accession"
+
+    out = []
+    with connect() as conn:
+        for row in conn.execute(sql, params).fetchall():
+            latency = _latency(row)
+            out.append({
+                **dict(row),
+                "is_amendment": bool(row["is_amendment"]),
+                "subject_verified": bool(row["subject_verified"]),
+                "latency_seconds": latency,
+                "is_backfill": None if latency is None
+                else latency > BACKFILL_AFTER_SECONDS,
+            })
+    return out
+
+
+def known_activist_accessions(ticker: str) -> set:
+    """Every accession already recorded for `ticker`, regardless of date.
+
+    Deliberately not an as-of read. This answers "have we already reported
+    this?", which is a question about our own bookkeeping and not about what a
+    simulation standing on some past date was entitled to know. Filtering it by
+    `recorded_at` would make the watcher re-announce old filings.
+    """
+    with connect() as conn:
+        return {r["accession"] for r in conn.execute(
+            "SELECT accession FROM activist_filing WHERE subject_ticker = ?",
+            (ticker,)).fetchall()}
 
 
 # ---------------------------------------------------------------- run log

@@ -1657,6 +1657,60 @@ def _schedule13_party(filing, attribute: str):
   return (None, None)
 
 
+def schedule13_file_number_is_subject_side(filing) -> bool:
+  """The free half of the subject/filer split, straight from the index.
+
+  A CIK's folder holds both sides of a Schedule 13 relationship: filings where
+  the company is the SUBJECT and filings it made about OTHER issuers. EDGAR
+  gives the SUBJECT an `005-` file number -- present and constant in the
+  subject's own folder, blank on the filings it made about others. Verified
+  against header ground truth on INTC: 28 of 28 in agreement.
+
+  The submissions index already carries the file number, so this classifies a
+  whole folder without fetching a single document. That matters twice over: it
+  is what lets counts be taken over the entire set rather than a page, and it
+  is what keeps a watcher polling a real watchlist from spending a document
+  fetch on every row EDGAR has already told us to ignore.
+  """
+  return bool(str(getattr(filing, 'file_number', '') or '').strip())
+
+
+def classify_schedule13(filing, company_cik: str) -> Dict[str, Any]:
+  """Which side of a Schedule 13 filing `company_cik` is on.
+
+  Two sources, deliberately ordered. The file number is free and was right 28
+  of 28 times on INTC, so it goes first and a filing it rejects costs nothing
+  further. The filing header is the authority, and it is consulted only for
+  rows that survive the proxy -- reading it is an SEC document fetch.
+
+  Where they disagree the header wins and `header_disagrees` says so, because
+  the alternative is a drifting heuristic quietly seeding a store with stakes
+  nobody took. Where the header will not parse, `subject_verified` is False and
+  the proxy stands: a row dropped for being unreadable is an absence created by
+  our own failure, and it would be indistinguishable from a company nobody has
+  ever filed on.
+  """
+  if not schedule13_file_number_is_subject_side(filing):
+    return {'side': 'filer', 'is_subject': False, 'subject_verified': False,
+            'subject_name': None, 'subject_cik': None,
+            'filer_name': None, 'filer_cik': None, 'header_disagrees': False}
+
+  filer_name, filer_cik = _schedule13_party(filing, 'filers')
+  subject_name, subject_cik = _schedule13_party(filing, 'subject_companies')
+  subject_verified = subject_cik is not None
+  is_subject = (subject_cik == str(company_cik)) if subject_verified else None
+  return {
+    'side':             'filer' if is_subject is False else 'subject',
+    'is_subject':       is_subject,
+    'subject_verified': subject_verified,
+    'subject_name':     subject_name,
+    'subject_cik':      subject_cik,
+    'filer_name':       filer_name,
+    'filer_cik':        filer_cik,
+    'header_disagrees': is_subject is False,
+  }
+
+
 def get_schedule_13d_filings(ticker: str, limit: int = 15,
                              include_passive: bool = True) -> Dict[str, Any]:
   """Return SC 13D (activist) and SC 13G (passive) filings naming the
@@ -1715,17 +1769,15 @@ def get_schedule_13d_filings(ticker: str, limit: int = 15,
     # where the company is the SUBJECT, and filings it made about OTHER
     # issuers. Counting both answered "are there activists in Intel?" with 124
     # when 71 of the first 100 rows were Intel filing on MariaDB, Mobileye,
-    # Joby and Vuzix. EDGAR gives the subject an `005-` file number, present
-    # and constant in the subject's own folder and blank on the filings it
-    # made about others -- verified against header ground truth on INTC, 28 of
-    # 28 in agreement.
+    # Joby and Vuzix. `schedule13_file_number_is_subject_side` is the rule, and
+    # it lives in one place because research/activist_watch.py applies it too.
     subject_side = []
     for f in filings:
       try:
         accession = f.accession_number
       except Exception:
         continue
-      if not str(getattr(f, 'file_number', '') or '').strip():
+      if not schedule13_file_number_is_subject_side(f):
         filed_by_company.add(accession)
         continue
       whole_set.setdefault(accession, form.startswith('SC 13D'))
@@ -1738,10 +1790,12 @@ def get_schedule_13d_filings(ticker: str, limit: int = 15,
       # The page already pays for a document fetch, so its rows are verified
       # against the filing header, which is the authority. The file number is
       # only a free proxy, used for the set.
-      filer_name, filer_cik = _schedule13_party(f, 'filers')
-      subject_name, subject_cik = _schedule13_party(f, 'subject_companies')
-      subject_verified = subject_cik is not None
-      is_subject = (subject_cik == company_cik) if subject_verified else None
+      verdict = classify_schedule13(f, company_cik)
+      filer_name, filer_cik = verdict['filer_name'], verdict['filer_cik']
+      subject_name = verdict['subject_name']
+      subject_cik = verdict['subject_cik']
+      subject_verified = verdict['subject_verified']
+      is_subject = verdict['is_subject']
       if is_subject is False:
         # The header is the authority: this is a stake the company took in
         # someone else. Note where it contradicts the file-number proxy, so a

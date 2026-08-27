@@ -186,7 +186,7 @@ def last_run(job: str) -> Optional[Dict[str, Any]]:
     return dict(row) if row else None
 
 
-def _coverage_status(covered: int, requested: int) -> str:
+def coverage_status(covered: int, requested: int) -> str:
     """Nothing is a failure, everything is ok, and the middle says so.
 
     Reported separately from `rows_written` on purpose: a run that reached one
@@ -228,7 +228,7 @@ def record_daily_bars(tickers: List[str],
         written += pit_store.record_bars(ticker, rows,
                                          recorded_at=_stamp(as_of))
 
-    status = _coverage_status(covered, len(tickers))
+    status = coverage_status(covered, len(tickers))
     pit_store.finish_run(
         rows_written=written, status=status,
         error=None if status == "ok"
@@ -267,7 +267,7 @@ def bootstrap_history(tickers: List[str], lookback_days: int = 730,
         written += pit_store.record_bars(ticker, rows,
                                          recorded_at=_stamp(as_of))
 
-    status = _coverage_status(covered, len(tickers))
+    status = coverage_status(covered, len(tickers))
     pit_store.finish_run(rows_written=written, status=status,
                          error=None if status == "ok"
                          else f"{covered} of {len(tickers)} returned history")
@@ -417,7 +417,7 @@ def record_actions(tickers: List[str],
                 ticker, event["ex_date"], event["action_type"], event["value"])
             written += 1
 
-    status = _coverage_status(covered, len(tickers))
+    status = coverage_status(covered, len(tickers))
     pit_store.finish_run(rows_written=written, status=status,
                          error=None if status == "ok"
                          else f"{failures} of {len(tickers)} lookups failed")
