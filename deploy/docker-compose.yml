@@ -264,6 +264,31 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # Scoring: what the filed orders actually did, and what that implies about
+  # the one coefficient the scanner admits it assumed. Reads only; changes
+  # nothing. Weekly is plenty -- a twenty-session horizon means today's answer
+  # is mostly last month's trades.
+  #
+  #   docker compose run --rm research-score
+  #   docker compose run --rm research-score --horizon-days 40
+  #
+  #   0 7 * * 6 cd /srv/nemo/deploy && docker compose run --rm research-score
+  research-score:
+    image: ${NEMO_IMAGE:-nemo-data:local}
+    env_file: ../.env
+    profiles: ["sync"]
+    restart: "no"
+    entrypoint: ["python", "-m", "research.scoring"]
+    environment:
+      NEMO_PIT_DB: /app/data/pit.db
+    volumes:
+      - research-data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 volumes:
   # Survives `docker compose down` and container replacement. Back it up the
   # way you would any database: the contents are reconstructible from the
