@@ -415,9 +415,29 @@ def record_scan(as_of: Optional[str] = None) -> Dict[str, Any]:
     actually did, which is the only test of any of this. Idempotent within a
     day for the same reason the bar recorder is: a second run must not double
     the book.
+
+    A re-run whose answer has changed -- a threshold moved at lunchtime, say --
+    keeps the filed decision and reports `superseded`. Silently returning
+    candidates the record does not contain is how someone ends up reading one
+    book and holding another.
     """
     as_of = as_of or _today()
     result = scan(as_of)
+
+    # What this day already decided, if anything. Filing is append-only, so a
+    # re-run cannot change it -- and should not, because the filed decision is
+    # the one that would have been acted on. What it must not do is return a
+    # different answer without mentioning that the record holds another one.
+    already = {o["ticker"] for o in
+               pit_store.paper_orders_as_of(as_of, accepted_only=True)
+               if o["as_of_date"] == as_of}
+    proposed = {c["ticker"] for c in result["candidates"]}
+    if already and already != proposed:
+        result["superseded"] = {
+            "filed": sorted(already), "proposed": sorted(proposed),
+            "note": (f"{as_of} was already decided and that decision stands; "
+                     f"these candidates were not filed")}
+
     pit_store.start_run("scan", as_of_date=as_of)
     try:
         written = pit_store.record_paper_orders(

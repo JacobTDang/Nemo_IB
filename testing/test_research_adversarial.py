@@ -519,3 +519,112 @@ def test_a_genuine_outage_is_still_loud(store, monkeypatch):
 
     result = daily_job.record_daily_bars(["AAA"], as_of="2026-11-26")
     assert result["status"] == "failed"
+
+
+# --- two writers ------------------------------------------------------------
+#
+# The recorder takes minutes over a real universe and the scanner reads the
+# same file half an hour later. Those windows overlap the moment a run goes
+# long or someone re-scans by hand.
+#
+# This holds today for a reason worth writing down: python's sqlite3 connects
+# with timeout=5.0, so a blocked writer waits rather than raising, and writes
+# here are per-call transactions that clear in milliseconds. Both facts are
+# defaults nobody chose deliberately, which is exactly the kind of thing a
+# later `connect(..., timeout=0)` or a long-held transaction would undo
+# silently. These two pin the behaviour rather than the mechanism.
+
+
+def test_a_second_writer_waits_rather_than_dying(store, tmp_path):
+    import sqlite3
+    import threading
+
+    blocker = pit_store.connect()
+    blocker.execute("BEGIN IMMEDIATE")
+    blocker.execute(
+        "INSERT INTO daily_bar (trade_date, ticker, close, recorded_at) "
+        "VALUES ('2026-03-03','LOCK',1.0,'2026-03-03T21:00:00Z')")
+
+    outcome = {}
+
+    def writer():
+        try:
+            pit_store.record_bars("OTHER", [_bar("2026-03-03", 10.0)],
+                                  recorded_at="2026-03-03T21:00:00Z")
+            outcome["ok"] = True
+        except sqlite3.OperationalError as exc:
+            outcome["error"] = str(exc)
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+    thread.join(timeout=0.4)
+    blocker.commit()
+    blocker.close()
+    thread.join(timeout=5)
+
+    assert "error" not in outcome, (
+        f"the second writer gave up instead of waiting: {outcome.get('error')}")
+    assert outcome.get("ok")
+
+
+def test_a_reader_is_not_blocked_by_a_writer(store):
+    """WAL, in other words. Without it the scanner's reads stall behind the
+    recorder's whole transaction."""
+    blocker = pit_store.connect()
+    blocker.execute("BEGIN IMMEDIATE")
+    blocker.execute(
+        "INSERT INTO daily_bar (trade_date, ticker, close, recorded_at) "
+        "VALUES ('2026-03-03','LOCK',1.0,'2026-03-03T21:00:00Z')")
+    try:
+        assert pit_store.bars_as_of("ANY", "2026-03-03") == []
+    finally:
+        blocker.commit()
+        blocker.close()
+
+
+# --- a decision re-made ------------------------------------------------------
+
+def test_rerunning_a_scan_with_a_different_answer_says_so(store, monkeypatch):
+    """Filing is INSERT OR IGNORE, so the first decision of a day stands -- as
+    it should, since it is the one that would have been acted on. But `scan()`
+    returns the new answer while the store keeps the old one, and nothing in
+    between says they disagree. A parameter changed at lunchtime and re-run
+    would leave the operator reading candidates the record does not contain.
+    """
+    from research import scanner as sc
+
+    for t in ("AAA", "BBB"):
+        store.record_bars(t, [_bar(f"2026-02-{d:02d}", 100.0)
+                              for d in range(1, 29)],
+                          recorded_at="2026-02-28T21:00:00Z")
+    store.record_bars(sc.REGIME_TICKER,
+                      [_bar(f"2026-02-{d:02d}", 100.0) for d in range(1, 29)],
+                      recorded_at="2026-02-28T21:00:00Z")
+    store.record_universe("2026-03-02", [
+        {"ticker": "AAA", "cik": "1", "eligible": True},
+        {"ticker": "BBB", "cik": "2", "eligible": True}])
+
+    def sig(t, as_of, _v={"AAA": 3.0, "BBB": 0.2}):
+        return {"ticker": t, "success": True, "sue": _v[t],
+                "known_at": "2026-03-02", "sigma_quarters": 8,
+                "sigma_periods": ["2026Q1"], "basis_changes": [],
+                "fiscal_period": "2026Q1"}
+
+    monkeypatch.setattr(sc, "_signal_for", sig)
+    monkeypatch.setattr(sc, "_cost_for", lambda t, a, d: {
+        "cost": 0.0001, "cost_floor": 0.00002, "reason": None,
+        "spread": 0.00005, "resolved": True})
+
+    first = sc.record_scan(as_of="2026-03-03")
+    assert [c["ticker"] for c in first["candidates"]] == ["AAA"]
+
+    # Threshold relaxed at lunchtime; BBB now qualifies.
+    monkeypatch.setattr(sc, "MIN_ABS_SUE", 0.1)
+    second = sc.record_scan(as_of="2026-03-03")
+
+    assert [c["ticker"] for c in second["candidates"]] == ["AAA", "BBB"]
+    stored = {o["ticker"] for o in
+              pit_store.paper_orders_as_of("2026-03-03", accepted_only=True)}
+    assert stored == {"AAA"}, "the earlier decision was overwritten"
+    assert second.get("superseded"), (
+        "the store kept a different decision and the result did not mention it")
