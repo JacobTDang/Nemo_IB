@@ -289,6 +289,41 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # Consensus seeding. The analyst surprise needs eight quarters of what the
+  # street expected before each print; Finnhub serves four and no more, so the
+  # recorder fills the rest one day at a time. Seeding those four takes the
+  # wait from about two years to about nine months.
+  #
+  # Rows land marked source='seeded' -- a reconstruction stamped at a date
+  # nobody was watching -- and sue_af reports how many of its quarters are
+  # reconstructions rather than observations.
+  #
+  #   docker compose run --rm research-seed
+  #   docker compose run --rm research-seed --tickers MSFT AAPL NVDA
+  #
+  # Safe to re-run: a quarter already in the record is never overwritten,
+  # because a real observation outranks a reconstruction of it. Monthly is
+  # plenty -- it only picks up names newly in the universe.
+  #   0 8 1 * * cd /srv/nemo/deploy && docker compose run --rm research-seed
+  research-seed:
+    image: ${NEMO_IMAGE:-nemo-data:local}
+    env_file: ../.env
+    profiles: ["sync"]
+    restart: "no"
+    entrypoint: ["python", "-m", "research.seed_consensus"]
+    environment:
+      NEMO_PIT_DB: /app/data/pit.db
+    volumes:
+      - research-data:/app/data
+    tmpfs:
+      - /root/.edgar:rw,size=512m
+      - /app/db_cache:rw,size=128m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 volumes:
   # Survives `docker compose down` and container replacement. Back it up the
   # way you would any database: the contents are reconstructible from the

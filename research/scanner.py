@@ -67,6 +67,14 @@ MIN_ABS_SUE = 1.0
 MAX_ABS_SUE = 6.0
 MIN_SIGMA_QUARTERS = sue.MIN_SIGMA_QUARTERS
 
+# Which surprise to rank on. "ts" is the time-series variant, computed from
+# filings, and it works today. "af" is the analyst one, which the replication
+# literature finds carries the stronger surviving effect and which needs about
+# nine months more recorded consensus before it answers for anything.
+# "af_or_ts" prefers it and falls back -- convenient, and it builds a book half
+# from one signal and half from the other, which is not a study of either.
+SIGNAL_VARIANT = "ts"
+
 # The drift is a few weeks long and then it is gone. A surprise from last
 # quarter is not a reason to buy today, and nothing in the signal itself says
 # so -- `sue_ts` will happily return a six-month-old quarter as "the most
@@ -111,7 +119,23 @@ def _next_session(as_of: str) -> str:
 # --- seams, so the decision logic can be tested without a network -----------
 
 def _signal_for(ticker: str, as_of: str) -> Dict[str, Any]:
-    return sue.sue_ts(ticker, as_of=as_of)
+    """The surprise, from whichever variant `SIGNAL_VARIANT` names.
+
+    Each answer carries the variant that produced it, so a book cannot end up
+    mixing the two without saying so.
+    """
+    if SIGNAL_VARIANT == "ts":
+        return {**sue.sue_ts(ticker, as_of=as_of), "variant": "ts"}
+    if SIGNAL_VARIANT == "af":
+        return {**sue.sue_af(ticker, as_of=as_of), "variant": "af"}
+    if SIGNAL_VARIANT == "af_or_ts":
+        analyst = sue.sue_af(ticker, as_of=as_of)
+        if analyst.get("success"):
+            return {**analyst, "variant": "af"}
+        return {**sue.sue_ts(ticker, as_of=as_of), "variant": "ts"}
+    raise ValueError(
+        f"SIGNAL_VARIANT must be 'ts', 'af' or 'af_or_ts'; got "
+        f"{SIGNAL_VARIANT!r}")
 
 
 def _cost_for(ticker: str, as_of: str, position_dollars: float) -> Dict[str, Any]:
@@ -429,6 +453,7 @@ def scan(as_of: Optional[str] = None,
             "ticker": ticker, "side": side, "sue": value,
             "fiscal_period": signal.get("fiscal_period"),
             "known_at": signal.get("known_at"),
+            "variant": signal.get("variant"),
             "expected_edge_bps": expected_bps, "cost_bps": cost_bps,
             "cost_bps_low": floor_bps,
             "net_edge_bps": net_bps, "target_dollars": target,

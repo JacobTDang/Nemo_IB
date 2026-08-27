@@ -795,3 +795,61 @@ def test_a_same_day_rerun_still_sees_its_own_candidates(liquid_universe,
     again = scanner.scan(as_of="2026-03-03")
 
     assert [c["ticker"] for c in again["candidates"]] == ["AAA"]
+
+
+# --- which surprise the scan runs on ----------------------------------------
+#
+# The time-series variant works today. The analyst one needs about nine months
+# more of recorded consensus and, per the replication literature, carries the
+# stronger surviving effect. The switch between them should be one line rather
+# than a rewrite, and which one produced a candidate has to be on the record --
+# a book built half from one and half from the other is not a study of either.
+
+def test_the_default_variant_is_the_one_that_works_today(liquid_universe):
+    assert scanner.SIGNAL_VARIANT == "ts"
+
+
+def test_the_analyst_variant_can_be_selected(liquid_universe, monkeypatch):
+    from research import sue
+
+    called = {}
+
+    def fake_af(t, as_of=None, **kw):
+        called["af"] = t
+        return _signal(t, 3.0)
+
+    monkeypatch.setattr(sue, "sue_af", fake_af)
+    monkeypatch.setattr(sue, "sue_ts",
+                        lambda t, as_of=None, **kw: pytest.fail(
+                            "the time-series variant was used"))
+    monkeypatch.setattr(scanner, "SIGNAL_VARIANT", "af")
+
+    assert scanner._signal_for("AAA", "2026-03-03")["success"] is True
+    assert called["af"] == "AAA"
+
+
+def test_the_fallback_variant_prefers_the_analyst_one(liquid_universe,
+                                                      monkeypatch):
+    from research import sue
+
+    monkeypatch.setattr(sue, "sue_af", lambda t, as_of=None, **kw: {
+        "ticker": t, "success": False, "sue": None,
+        "error": "not enough recorded consensus"})
+    monkeypatch.setattr(sue, "sue_ts",
+                        lambda t, as_of=None, **kw: _signal(t, 2.0))
+    monkeypatch.setattr(scanner, "SIGNAL_VARIANT", "af_or_ts")
+
+    out = scanner._signal_for("AAA", "2026-03-03")
+    assert out["success"] is True
+    assert out["variant"] == "ts"
+
+
+def test_a_candidate_records_which_surprise_it_came_from(liquid_universe,
+                                                         monkeypatch):
+    _reported(liquid_universe, "AAA", "2026Q1", "2026-03-02")
+    monkeypatch.setattr(scanner, "_signal_for",
+                        lambda t, a: {**_signal(t, 3.0), "variant": "ts"})
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0010))
+
+    out = scanner.scan(as_of="2026-03-03")
+    assert out["candidates"][0]["variant"] == "ts"
