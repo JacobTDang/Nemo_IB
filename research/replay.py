@@ -58,6 +58,12 @@ CAVEATS = (
     "not measured at all",
     "prices are stamped at their own session, which assumes a day's prices "
     "were known that evening; true of prices, and the only thing assumed",
+    "the timing hypothesis was tested and not supported: the same "
+    "cross-sectional signal entered at the earnings release returned t=+1.12 "
+    "over 74 trades, and entered at the 10-Q a median of eight days later "
+    "returned t=+2.47 over 71. Entering later did better, which is the "
+    "opposite of what the drift literature predicts and is most likely a small "
+    "sample rather than a finding -- the two arms do not trade the same events",
     "entry timing: the surprise is computed from XBRL, which does not exist "
     "until the 10-Q is filed -- a median of 8 days after the earnings 8-K, "
     "mean 12.1, range 0 to 45, measured across 60 filings from 20 large caps. "

@@ -363,3 +363,58 @@ def test_an_order_rolls_only_as_far_as_the_next_session(store):
     out = scoring.score_orders(as_of=DAYS[20], horizon_days=4)
     assert out["scored"] == []
     assert out["unfilled"]
+
+
+# --- a t-statistic found by searching is not a t-statistic ------------------
+#
+# Three variants were replayed on the same 82 names: the time-series signal,
+# the cross-sectional one entered at the earnings release, and the same one
+# entered at the 10-Q. The third came back t=+2.47 on 71 trades and cleared
+# every gate, which would have replaced a declared 40bp with 340.
+#
+# One of three passing at t>2 is roughly what chance produces. The gate cannot
+# tell a pre-registered test from the best of a search unless it is told how
+# many were tried, so it has to be told -- and a threshold that ignores the
+# search is a threshold that ratifies it.
+
+def _at_t(n, target_t, spread=300.0):
+    """A sample whose t-statistic is exactly `target_t`, so a test can sit
+    between two thresholds on purpose."""
+    import math
+    import statistics
+
+    base = [spread if i % 2 else -spread for i in range(n)]
+    mean = target_t * statistics.stdev(base) / math.sqrt(n)
+    return [b + mean for b in base]
+
+
+def test_a_result_picked_from_several_needs_a_higher_bar():
+    """Bonferroni is blunt and honest: three comparisons means the bar for any
+    one of them moves out, from 2.00 to 2.39. A t of 2.20 sits between."""
+    nets = _at_t(40, 2.20)
+    alone = scoring._summarise(_scored(nets))
+    searched = scoring._summarise(_scored(nets), comparisons=3)
+
+    assert alone["calibrated"] is True
+    assert searched["calibrated"] is False
+    assert "3 comparisons" in searched["calibration_note"]
+
+
+def test_one_comparison_is_the_default_and_changes_nothing():
+    nets = _at_t(40, 2.20)
+    assert scoring._summarise(_scored(nets)) == \
+        scoring._summarise(_scored(nets), comparisons=1)
+
+
+def test_the_threshold_actually_used_is_reported():
+    """A reader has to be able to see which bar the number cleared."""
+    out = scoring._summarise(_scored([50.0] * 40), comparisons=4)
+    assert out["t_threshold"] > 2.0
+    assert out["comparisons"] == 4
+
+
+def test_a_strong_enough_result_survives_the_correction():
+    """The bar moves; it does not become unreachable."""
+    out = scoring._summarise(_scored(_at_t(60, 3.10)), comparisons=3)
+    assert out["calibrated"] is True
+    assert out["t_threshold"] == pytest.approx(2.394, abs=0.01)

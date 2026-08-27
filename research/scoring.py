@@ -172,7 +172,8 @@ def _stub(order: Dict[str, Any]) -> Dict[str, Any]:
             "target_dollars": order["target_dollars"]}
 
 
-def _summarise(scored: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _summarise(scored: List[Dict[str, Any]],
+               comparisons: int = 1) -> Dict[str, Any]:
     """The realised numbers, and three reasons a coefficient may not be quoted.
 
     `drift_bps_per_sue` is gross of cost on purpose. Cost is a property of how
@@ -193,11 +194,22 @@ def _summarise(scored: List[Dict[str, Any]]) -> Dict[str, Any]:
 
       and a t-statistic clear of two, because a sign that cannot be told from
       chance is not a measurement.
+
+    `comparisons` moves that last bar out when the result was chosen from
+    several. Three variants were replayed on the same names -- the time-series
+    signal, the cross-sectional one entered at the earnings release, and the
+    same one entered at the 10-Q -- and the third came back t=+2.47 on 71
+    trades, clearing every gate and offering to replace a declared 40bp with
+    340. One of three passing at t>2 is about what chance produces. A gate that
+    cannot see the search ratifies it, so it is told the count and applies a
+    Bonferroni correction: blunt, conservative, and honest about which bar the
+    number actually cleared.
     """
     if not scored:
         return {"sample": 0, "hit_rate": None, "mean_net_bps": None,
                 "median_net_bps": None, "mean_gross_bps": None,
-                "t_stat": None, "drift_bps_per_sue": None,
+                "t_stat": None, "t_threshold": None,
+                "comparisons": comparisons, "drift_bps_per_sue": None,
                 "calibrated": False,
                 "calibration_note": "no finished trades to measure"}
 
@@ -226,11 +238,21 @@ def _summarise(scored: List[Dict[str, Any]]) -> Dict[str, Any]:
             f"the mean ({mean_net:+.1f}bp) and the median ({median_net:+.1f}bp) "
             f"fall on opposite sides of zero, so the average is carried by its "
             f"tail rather than by the typical trade")
-    if t_stat is None or abs(t_stat) < 2.0:
+    # Bonferroni on the two-sided normal quantile: one comparison keeps the
+    # familiar 2.0, and each additional one moves the bar out.
+    if comparisons > 1:
+        from statistics import NormalDist
+        threshold = NormalDist().inv_cdf(1 - 0.05 / (2 * comparisons))
+    else:
+        threshold = 2.0
+
+    if t_stat is None or abs(t_stat) < threshold:
         shown = "undefined" if t_stat is None else f"{t_stat:+.2f}"
+        extra = (f" at the bar for {comparisons} comparisons"
+                 if comparisons > 1 else "")
         failures.append(
-            f"t={shown} does not clear 2, so the sign of this mean is not "
-            f"distinguishable from chance at this sample size")
+            f"t={shown} does not clear {threshold:.2f}{extra}, so the sign of "
+            f"this mean is not distinguishable from chance at this sample size")
 
     return {
         "sample": sample,
@@ -239,10 +261,13 @@ def _summarise(scored: List[Dict[str, Any]]) -> Dict[str, Any]:
         "median_net_bps": median_net,
         "mean_gross_bps": statistics.fmean(grosses),
         "t_stat": t_stat,
+        "t_threshold": threshold,
+        "comparisons": comparisons,
         "drift_bps_per_sue": statistics.fmean(per_sue) if per_sue else None,
         "calibrated": not failures,
         "calibration_note": (f"{sample} finished trades, median and mean agree, "
-                             f"t={t_stat:+.2f}" if not failures
+                             f"t={t_stat:+.2f} against a bar of "
+                             f"{threshold:.2f}" if not failures
                              else "; ".join(failures)),
     }
 
