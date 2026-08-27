@@ -216,3 +216,66 @@ def test_the_sec_gating_is_described_accurately(readme):
     declared = len(web_search._ALL_TOOLS)
     assert f"declares {declared}" in section
     assert f"serves {declared - len(gated)}" in section
+
+
+# --- the deploy page, against the compose file it describes -----------------
+#
+# Same failure as the tool counts, one file over: a schedule or a service name
+# written by hand beside the file that actually defines it. deploy/README.md
+# already carried a paragraph two versions out of date, contradicting the
+# paragraph directly above it, and nothing could catch that by reading.
+
+DEPLOY = README.parent / "deploy" / "README.md"
+COMPOSE = README.parent / "deploy" / "docker-compose.yml"
+
+CRON = re.compile(
+    r"^\s*([0-9*/]+ +[0-9*/-]+ +[0-9*]+ +[0-9*]+ +[0-9*-]+)\s+"
+    r"cd /srv/nemo/deploy && docker compose run --rm ([a-z-]+)\s*$", re.M)
+
+
+@pytest.fixture(scope="module")
+def deploy_doc():
+    return DEPLOY.read_text()
+
+
+@pytest.fixture(scope="module")
+def compose():
+    return COMPOSE.read_text()
+
+
+def test_every_schedule_on_the_page_is_the_one_in_the_compose_file(deploy_doc,
+                                                                   compose):
+    found = CRON.findall(deploy_doc)
+    assert found, "the deploy page no longer lists any schedules"
+    for schedule, service in found:
+        normalised = " ".join(schedule.split())
+        assert f"{normalised} cd /srv/nemo/deploy && docker compose run --rm " \
+               f"{service}" in compose, (
+            f"the page schedules {service} at '{normalised}'; the compose file "
+            f"does not")
+
+
+def test_every_service_the_page_names_exists(deploy_doc, compose):
+    named = set(re.findall(r"docker compose run --rm ([a-z-]+)", deploy_doc))
+    assert named, "the page names no services"
+    for service in named:
+        assert re.search(rf"^  {service}:$", compose, re.M), (
+            f"the page tells you to run `{service}`, which is not a service")
+
+
+def test_every_scheduled_service_is_on_the_page(compose, deploy_doc):
+    """The other direction. A job added to the stack and left undocumented is
+    one nobody schedules, and a recorder nobody schedules records nothing."""
+    scheduled = set(re.findall(
+        r"docker compose run --rm ([a-z-]+)\s*$", compose, re.M))
+    documented = set(re.findall(r"docker compose run --rm ([a-z-]+)",
+                                deploy_doc))
+    missing = scheduled - documented
+    assert not missing, f"scheduled but not documented: {sorted(missing)}"
+
+
+def test_every_named_volume_the_page_mentions_exists(deploy_doc, compose):
+    for volume in re.findall(r"`(research-data|congress-data)`", deploy_doc):
+        assert re.search(rf"^  {volume}:$", compose, re.M), (
+            f"the page names the volume `{volume}`, which compose does not "
+            f"declare")
