@@ -738,6 +738,23 @@ def reporters_since(since: str, as_of: str) -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+def filed_periods(as_of: str) -> set:
+    """Every (ticker, fiscal period) an order has already been filed for.
+
+    One print is one trade. The signal stays fresh for weeks, so without this
+    the same name is proposed every session until the window closes -- forty-
+    five nights of the same position live, and one earnings event counted as
+    forty-five independent trades in any study of it.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT DISTINCT ticker, fiscal_period FROM paper_order
+               WHERE accepted = 1 AND fiscal_period IS NOT NULL
+                 AND as_of_date <= ? AND date(recorded_at) <= ?""",
+            (as_of, as_of)).fetchall()
+    return {(r["ticker"], r["fiscal_period"]) for r in rows}
+
+
 def has_consensus_history(as_of: str) -> bool:
     """Whether the consensus recorder had written anything by `as_of`.
 

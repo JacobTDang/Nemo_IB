@@ -706,3 +706,75 @@ def test_the_scan_reports_which_costs_were_measured(liquid_universe,
     assert result["costs_measured"] == 0
     assert result["costs_floored"] == 1
     assert result["costs_total"] == 1
+
+
+# --- one print, one trade ---------------------------------------------------
+#
+# The signal stays fresh for 45 days, so a name that reported on Monday is a
+# candidate again on Tuesday, and every session after that until the window
+# closes. Nothing stopped it: the scanner has no notion of having already acted
+# on a print. In production that is the same position proposed forty-five
+# nights running; in a study it is one earnings event counted as forty-five
+# independent trades, which is how a sample gets a t-statistic it has not
+# earned.
+
+def test_a_print_already_acted_on_is_not_proposed_again(liquid_universe,
+                                                        monkeypatch):
+    _reported(liquid_universe, "AAA", "2026Q1", "2026-03-02")
+    monkeypatch.setattr(scanner, "_signal_for",
+                        lambda t, a: _signal(t, 3.0, period="2026Q1"))
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0010))
+
+    first = scanner.record_scan(as_of="2026-03-03")
+    assert [c["ticker"] for c in first["candidates"]] == ["AAA"]
+
+    second = scanner.scan(as_of="2026-03-04")
+    assert second["candidates"] == [], (
+        "the same print was proposed again the next session")
+    reason = next(r["reason"] for r in second["rejected"]
+                  if r["ticker"] == "AAA")
+    assert "already" in reason.lower()
+
+
+def test_the_next_quarter_is_a_new_print(liquid_universe, monkeypatch):
+    """The rule is one trade per print, not one trade per name ever."""
+    _reported(liquid_universe, "AAA", "2026Q1", "2026-03-02")
+    monkeypatch.setattr(scanner, "_signal_for",
+                        lambda t, a: _signal(t, 3.0, period="2026Q1"))
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0010))
+    scanner.record_scan(as_of="2026-03-03")
+
+    _reported(liquid_universe, "AAA", "2026Q2", "2026-06-02")
+    monkeypatch.setattr(scanner, "_signal_for",
+                        lambda t, a: _signal(t, 3.0, period="2026Q2",
+                                             known_at="2026-06-02"))
+    later = scanner.scan(as_of="2026-06-03")
+    assert [c["ticker"] for c in later["candidates"]] == ["AAA"]
+
+
+def test_a_caller_can_supply_what_has_already_been_acted_on(liquid_universe,
+                                                            monkeypatch):
+    """Replay does not file into the live book, so it keeps its own set."""
+    _reported(liquid_universe, "AAA", "2026Q1", "2026-03-02")
+    monkeypatch.setattr(scanner, "_signal_for",
+                        lambda t, a: _signal(t, 3.0, period="2026Q1"))
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0010))
+
+    out = scanner.scan(as_of="2026-03-03",
+                       already_acted={("AAA", "2026Q1")})
+    assert out["candidates"] == []
+
+
+def test_the_signal_source_can_be_supplied(liquid_universe, monkeypatch):
+    """Replay precomputes every quarter in one EDGAR pass per name and needs
+    the scan to use that table. Reaching in and rebinding the module's own seam
+    works until something else rebinds it back; a parameter cannot be undone by
+    ordering."""
+    _reported(liquid_universe, "AAA", "2026Q1", "2026-03-02")
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0010))
+    monkeypatch.setattr(scanner, "_signal_for",
+                        lambda t, a: pytest.fail("the default seam was used"))
+
+    out = scanner.scan(as_of="2026-03-03",
+                       signal_for=lambda t, a: _signal(t, 3.0))
+    assert [c["ticker"] for c in out["candidates"]] == ["AAA"]

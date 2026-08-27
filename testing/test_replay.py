@@ -284,3 +284,59 @@ def test_a_name_with_no_signals_refuses_rather_than_returning_none(store):
     out = replay._signal_for("AAA", DAYS[30])
     assert out["success"] is False
     assert out["error"]
+
+
+def test_a_replay_says_which_orders_it_could_not_score(store, monkeypatch):
+    """The live scorer files unfilled orders with a reason; replay skipped them
+    with a bare `continue`. A sample that quietly drops the trades it could not
+    price is a sample selected on something, and nothing says on what."""
+    import yfinance
+    monkeypatch.setattr(yfinance, "download",
+                        lambda *a, **k: _frame(k["tickers"].split(), DAYS[:40]))
+    replay.build_store(["AAA"], start=DAYS[0], end=DAYS[39])
+
+    orders = [
+        # Intended for a session the name never traded.
+        {"ticker": "AAA", "side": "long", "sue": 2.0, "cost_bps": 5.0,
+         "as_of_date": DAYS[10], "intended_session": "2026-07-04"},
+        # Intended so late the horizon cannot complete.
+        {"ticker": "AAA", "side": "long", "sue": 2.0, "cost_bps": 5.0,
+         "as_of_date": DAYS[37], "intended_session": DAYS[38]},
+    ]
+
+    out = replay._score(orders, horizon_days=5)
+
+    assert out["scored"] == []
+    assert len(out["skipped"]) == 2
+    reasons = " ".join(r["reason"] for r in out["skipped"]).lower()
+    assert "did not trade" in reasons
+    assert "horizon" in reasons or "sessions" in reasons
+
+
+def test_a_replay_counts_one_print_once(store, monkeypatch):
+    """Replayed decisions never enter the filed book, so the scanner cannot
+    read the already-acted set from the store the way it does live. Without
+    replay keeping its own, a single earnings event becomes one order per
+    decision date for as long as the signal stays fresh -- a sample of
+    overlapping trades presented as independent ones."""
+    import yfinance
+    monkeypatch.setattr(yfinance, "download",
+                        lambda *a, **k: _frame(k["tickers"].split(), DAYS[:110]))
+    monkeypatch.setattr(replay.daily_job, "_fetch_sec_tickers",
+                        lambda: [{"ticker": "AAA", "cik": "1", "name": "A"}])
+    replay.build_store(["AAA"], start=DAYS[0], end=DAYS[109])
+    replay.record_prints([{"ticker": "AAA", "fiscal_period": "2026Q1",
+                           "known_at": DAYS[70], "eps": 1.0}])
+    replay.load_signals({"AAA": [
+        {"fiscal_period": "2026Q1", "known_at": DAYS[70], "sue": 3.0,
+         "sigma_quarters": 8, "sigma_periods": ["2026Q1"],
+         "basis_changes": []}]})
+    monkeypatch.setattr(replay.scanner, "_cost_for", lambda t, a, d: {
+        "cost": 0.0002, "cost_floor": 0.00002, "reason": None,
+        "spread": 0.0001, "resolved": True, "resolution": "measured"})
+
+    out = replay.run([DAYS[71], DAYS[72], DAYS[75], DAYS[80]],
+                     horizon_days=5, tickers=["AAA"])
+
+    assert out["orders"] == 1, (
+        f"one print produced {out['orders']} orders across four dates")

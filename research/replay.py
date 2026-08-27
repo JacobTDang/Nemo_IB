@@ -199,14 +199,24 @@ def run(dates: Sequence[str], horizon_days: int = 20,
     measuring something other than the thing that will run tomorrow.
     """
     orders: List[Dict[str, Any]] = []
+    # One print is one trade. Replayed decisions never enter the filed book, so
+    # the scanner cannot read this from the store the way it does live -- and
+    # without it a single earnings event becomes one order per decision date
+    # for as long as the signal stays fresh, which is a sample of overlapping
+    # trades masquerading as independent ones.
+    acted: set = set()
     for as_of in dates:
         if tickers:
             _refresh_universe_for(tickers, as_of)
         else:
             daily_job.refresh_universe(as_of=as_of)
-        result = scanner.scan(as_of=as_of)
+        result = scanner.scan(as_of=as_of, already_acted=acted,
+                              signal_for=_signal_for)
         for candidate in result["candidates"]:
             orders.append({**candidate, "as_of_date": as_of})
+            period = candidate.get("fiscal_period")
+            if period:
+                acted.add((candidate["ticker"], period))
 
     scored = _score(orders, horizon_days)
     return {"dates": len(dates), "orders": len(orders), **scored,
@@ -226,9 +236,17 @@ def _score(orders: List[Dict[str, Any]],
     from research import scoring
 
     scored: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+
+    def skip(order, reason):
+        skipped.append({"ticker": order.get("ticker"),
+                        "as_of_date": order.get("as_of_date"),
+                        "reason": reason})
+
     for order in orders:
         entry_session = order.get("intended_session")
         if not entry_session:
+            skip(order, "no intended session on the order")
             continue
         # Standing far enough past the horizon to see the whole hold; the
         # replay store's own stamps still stop it seeing anything else.
@@ -237,16 +255,22 @@ def _score(orders: List[Dict[str, Any]],
         bars = pit_store.adjusted_bars(order["ticker"], as_of)
         forward = [b for b in bars if b["trade_date"] >= entry_session]
         if not forward or forward[0]["trade_date"] != entry_session:
+            skip(order, f"{order['ticker']} did not trade on {entry_session}, "
+                        f"so the order never filled")
             continue
         if len(forward) <= horizon_days:
+            skip(order, f"only {max(0, len(forward) - 1)} of {horizon_days} "
+                        f"sessions elapsed, so the horizon never completed")
             continue
 
         row = scoring.fill(order, forward[0], forward[horizon_days])
         if row is None:
+            skip(order, "a price on the path is missing")
             continue
         scored.append({**row, "as_of_date": order["as_of_date"]})
 
-    return {"scored": scored, **scoring._summarise(scored)}
+    return {"scored": scored, "skipped": skipped,
+            **scoring._summarise(scored)}
 
 
 def summarise(scored: List[Dict[str, Any]],

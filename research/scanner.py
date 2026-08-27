@@ -263,14 +263,27 @@ def _signal_problem(signal: Dict[str, Any], as_of: str) -> Optional[str]:
     return None
 
 
-def scan(as_of: Optional[str] = None) -> Dict[str, Any]:
+def scan(as_of: Optional[str] = None,
+         already_acted: Optional[set] = None,
+         signal_for=None) -> Dict[str, Any]:
     """Today's candidates, ranked net of cost, with every rejection kept.
 
     Rejections are half the output. A scanner that quietly stops finding
     anything looks exactly like a market with nothing in it, and the difference
     only shows up in the reasons.
+
+    One print is one trade. `already_acted` defaults to every (ticker, period)
+    the filed book already holds; replay passes its own, because a replayed
+    decision never enters that book.
+
+    `signal_for` defaults to a live EDGAR lookup. Replay supplies a table it
+    built in one pass per name -- as a parameter rather than by rebinding the
+    module's seam, which works only until something rebinds it back.
     """
     as_of = as_of or _today()
+    signal_for = signal_for or _signal_for
+    if already_acted is None:
+        already_acted = pit_store.filed_periods(as_of)
     scale, regime = _regime_scale(as_of)
     gross = GROSS_TARGET * scale
     per_name = gross / MAX_NAMES
@@ -314,7 +327,7 @@ def scan(as_of: Optional[str] = None) -> Dict[str, Any]:
 
     for ticker in considered:
         try:
-            signal = _signal_for(ticker, as_of)
+            signal = signal_for(ticker, as_of)
         except Exception as exc:  # noqa: BLE001 - recorded, not masked
             # EDGAR times out on one name and the other four hundred are fine.
             # Letting it propagate loses a whole night's decisions to a single
@@ -328,6 +341,15 @@ def scan(as_of: Optional[str] = None) -> Dict[str, Any]:
         if problem:
             rejected.append({"ticker": ticker, "reason": problem,
                              "sue": (signal or {}).get("sue")})
+            continue
+
+        period = signal.get("fiscal_period")
+        if period and (ticker, period) in already_acted:
+            rejected.append({
+                "ticker": ticker, "sue": signal.get("sue"),
+                "reason": (f"already acted on {ticker} {period}; the signal "
+                           f"stays fresh for {MAX_SIGNAL_AGE_DAYS} days and "
+                           f"one print is one trade")})
             continue
 
         value = signal["sue"]
