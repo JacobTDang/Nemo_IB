@@ -91,6 +91,19 @@ MAX_SIGNAL_AGE_DAYS = 45
 DRIFT_BPS_PER_SUE = 15.0
 DRIFT_CALIBRATED = False
 
+# The same assumption for the cross-sectional variant, and deliberately a
+# separate number. That signal is a rank, not a sigma -- `sue_cs` reports
+# `rank_on: percentile` precisely because neither z it can compute means what a
+# standard deviation means in a distribution with those tails. Pricing a rank
+# with the surprise coefficient would make the two variants look comparable
+# when they measure different things. Basis points at a full tail, scaling
+# linearly with distance from the median.
+DRIFT_BPS_PER_TAIL = 40.0
+
+# How far into a tail a name has to be. At the median it reported in line with
+# its peers, which is not news however large the beat was in isolation.
+MIN_TAIL_DISTANCE = 0.8
+
 # --- regime -----------------------------------------------------------------
 
 # The index, used only for its own realised volatility. It is in the store
@@ -133,8 +146,11 @@ def _signal_for(ticker: str, as_of: str) -> Dict[str, Any]:
         if analyst.get("success"):
             return {**analyst, "variant": "af"}
         return {**sue.sue_ts(ticker, as_of=as_of), "variant": "ts"}
+    if SIGNAL_VARIANT == "cs":
+        from research import sue_cs
+        return {**sue_cs.surprise_rank(ticker, as_of=as_of), "variant": "cs"}
     raise ValueError(
-        f"SIGNAL_VARIANT must be 'ts', 'af' or 'af_or_ts'; got "
+        f"SIGNAL_VARIANT must be 'ts', 'af', 'af_or_ts' or 'cs'; got "
         f"{SIGNAL_VARIANT!r}")
 
 
@@ -248,6 +264,30 @@ def _basis_change_in_window(signal: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _tail_distance(percentile: Optional[float]) -> Optional[float]:
+    """How far into a tail a rank sits, on 0 at the median to 1 at either end.
+
+    Direction is carried separately by the sign of `percentile - 0.5`, so this
+    is a magnitude and reads like |SUE| does.
+    """
+    if percentile is None:
+        return None
+    return abs(percentile - 0.5) * 2.0
+
+
+def _cross_sectional_problem(signal: Dict[str, Any]) -> Optional[str]:
+    distance = _tail_distance(signal.get("percentile"))
+    if distance is None:
+        return "no percentile computed"
+    if distance < MIN_TAIL_DISTANCE:
+        return (f"percentile {signal['percentile']:.2f} is "
+                f"{distance:.2f} into a tail, under the "
+                f"{MIN_TAIL_DISTANCE} required; a name near the middle of its "
+                f"cohort reported in line with its peers, which is not news "
+                f"however large the beat looks on its own")
+    return None
+
+
 def _signal_problem(signal: Dict[str, Any], as_of: str) -> Optional[str]:
     if not signal or not signal.get("success"):
         return (signal or {}).get("error") or "no signal"
@@ -262,6 +302,11 @@ def _signal_problem(signal: Dict[str, Any], as_of: str) -> Optional[str]:
     if age > MAX_SIGNAL_AGE_DAYS:
         return (f"stale: filed {known_at}, {age} days before {as_of}, past the "
                 f"{MAX_SIGNAL_AGE_DAYS}-day window the drift lives in")
+
+    if signal.get("variant") == "cs":
+        # A rank has no sigma window and no basis to change; its own gate is
+        # the tail distance.
+        return _cross_sectional_problem(signal)
 
     quarters = signal.get("sigma_quarters") or 0
     if quarters < MIN_SIGMA_QUARTERS:
@@ -376,7 +421,12 @@ def scan(as_of: Optional[str] = None,
                            f"one print is one trade")})
             continue
 
-        value = signal["sue"]
+        if signal.get("variant") == "cs":
+            value = signal["percentile"] - 0.5
+            strength = _tail_distance(signal["percentile"])
+        else:
+            value = signal["sue"]
+            strength = abs(value)
         side = "long" if value > 0 else "short"
 
         # Size first, because the cost depends on it: impact is a function of
@@ -413,7 +463,9 @@ def scan(as_of: Optional[str] = None,
                              or "cost could not be measured"})
             continue
 
-        expected_bps = abs(value) * DRIFT_BPS_PER_SUE
+        expected_bps = strength * (DRIFT_BPS_PER_TAIL
+                                   if signal.get("variant") == "cs"
+                                   else DRIFT_BPS_PER_SUE)
         cost_bps = cost["cost"] * 10_000
         floor_bps = (cost.get("cost_floor") or cost["cost"]) * 10_000
         net_bps = expected_bps - cost_bps
@@ -493,10 +545,14 @@ def scan(as_of: Optional[str] = None,
         "costs_measured": measured_count,
         "costs_floored": floored_count,
         "assumptions": {
+            "variant": SIGNAL_VARIANT,
             "drift_bps_per_sue": DRIFT_BPS_PER_SUE,
+            "drift_bps_per_tail": DRIFT_BPS_PER_TAIL,
             "calibrated": DRIFT_CALIBRATED,
-            "note": ("drift per unit of SUE is assumed, not measured here; "
-                     "every net edge is proportional to it"),
+            "note": ("drift is assumed, not measured here, and every net edge "
+                     "is proportional to it. The two coefficients price "
+                     "different quantities -- a sigma and a rank -- and are "
+                     "deliberately not the same number"),
         },
     }
 

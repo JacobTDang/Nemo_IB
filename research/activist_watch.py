@@ -380,6 +380,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     A pass that finds nothing exits 0. Most of them find nothing; paging on
     that is how the one that matters gets ignored.
+
+    Every run also reports the latency accumulated so far, because catching a
+    filing quickly is the whole reason for the timer and a job that never says
+    how quickly cannot be judged.
     """
     import argparse
     import json
@@ -396,6 +400,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     result = watch_pass(as_of=args.as_of, max_tickers=args.max_tickers)
+
+    # What it recorded is half the answer. The other half is how late it was,
+    # which is the only figure that says whether a twenty-minute timer is
+    # buying anything over a nightly one -- and it was computed here and never
+    # reported. It is a property of the record rather than of this pass, so a
+    # pass that could not reach EDGAR has not lost it.
+    result["latency"] = latency_report(as_of=args.as_of)
+
     print(json.dumps(result, indent=2, default=str))
     return 1 if result.get("status") == "failed" else 0
 

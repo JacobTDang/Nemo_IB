@@ -660,6 +660,19 @@ def record_consensus_snapshots(as_of: Optional[str] = None,
             recorded_at=_stamp(as_of))
         written += 1
 
+        # The announcement itself, once it has happened. `timing` is what makes
+        # the table worth having: bmo or amc decides which session is the
+        # reaction, and AMAT's 13 August print after the close belongs to the
+        # 14th -- dating it to the announcement gives -2.48% instead of -6.57%.
+        # Written only with an actual beside it, because a company on next
+        # week's calendar has not announced, and a reaction date recorded
+        # before the reaction is a date that means nothing.
+        if row.get("eps_actual") is not None and row.get("date"):
+            pit_store.record_announcement(
+                row["ticker"], row["fiscal_period"], row["date"],
+                timing=row.get("timing") or "unknown",
+                recorded_at=_stamp(as_of))
+
     status = "ok" if rows else "failed"
     pit_store.finish_run(rows_written=written, status=status,
                          error=None if rows else "calendar returned no rows")

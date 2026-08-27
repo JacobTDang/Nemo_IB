@@ -589,7 +589,7 @@ def test_each_pass_leaves_its_own_run_log_entry(store, monkeypatch):
 # anyone reading it -- a once-a-night pass measures that gap in hours no matter
 # how fast the code is.
 
-def test_the_watcher_has_an_entry_point(monkeypatch):
+def test_the_watcher_has_an_entry_point(store, monkeypatch):
     from research import activist_watch as aw
 
     seen = {}
@@ -600,7 +600,7 @@ def test_the_watcher_has_an_entry_point(monkeypatch):
     assert "as_of" in seen
 
 
-def test_a_failed_pass_exits_non_zero(monkeypatch):
+def test_a_failed_pass_exits_non_zero(store, monkeypatch):
     from research import activist_watch as aw
 
     monkeypatch.setattr(aw, "watch_pass",
@@ -609,7 +609,7 @@ def test_a_failed_pass_exits_non_zero(monkeypatch):
     assert aw.main([]) == 1
 
 
-def test_a_pass_that_finds_nothing_exits_zero(monkeypatch):
+def test_a_pass_that_finds_nothing_exits_zero(store, monkeypatch):
     """Most passes find nothing. That is not a failure and must not page."""
     from research import activist_watch as aw
 
@@ -618,7 +618,7 @@ def test_a_pass_that_finds_nothing_exits_zero(monkeypatch):
     assert aw.main([]) == 0
 
 
-def test_the_ticker_cap_reaches_the_pass(monkeypatch):
+def test_the_ticker_cap_reaches_the_pass(store, monkeypatch):
     from research import activist_watch as aw
 
     seen = {}
@@ -628,3 +628,65 @@ def test_the_ticker_cap_reaches_the_pass(monkeypatch):
     aw.main(["--max-tickers", "50", "--as-of", "2026-03-03"])
     assert seen["max_tickers"] == 50
     assert seen["as_of"] == "2026-03-03"
+
+
+# --- the number the watcher exists to produce -------------------------------
+#
+# It runs every twenty minutes to measure how fast a 13D is caught, computes
+# that in latency_report, and no job ever called it. The pass reported what it
+# recorded and never what it was late by -- which is the one figure that says
+# whether running it on a short timer is buying anything.
+
+def test_a_pass_reports_the_latency_it_has_accumulated(store, monkeypatch):
+    from research import activist_watch as aw
+
+    monkeypatch.setattr(aw, "watch_pass",
+                        lambda **kw: {"status": "ok", "recorded": 0})
+    monkeypatch.setattr(aw, "latency_report", lambda **kw: {
+        "events": 12, "live_detections": 9, "backfilled": 3,
+        "unknown_latency": 0, "median_latency_seconds": 480.0,
+        "worst_latency_seconds": 3600.0})
+
+    printed = {}
+    monkeypatch.setattr("builtins.print",
+                        lambda *a, **k: printed.setdefault("out", a[0]))
+
+    assert aw.main([]) == 0
+    assert "latency" in printed["out"]
+    assert "480" in printed["out"]
+
+
+def test_the_latency_is_not_invented_when_there_is_none(store, monkeypatch):
+    """A watcher that has caught nothing has no latency, and a zero there would
+    read as instant."""
+    from research import activist_watch as aw
+
+    monkeypatch.setattr(aw, "watch_pass",
+                        lambda **kw: {"status": "ok", "recorded": 0})
+
+    printed = {}
+    monkeypatch.setattr("builtins.print",
+                        lambda *a, **k: printed.setdefault("out", a[0]))
+    aw.main([])
+
+    import json
+    body = json.loads(printed["out"])
+    assert body["latency"]["median_latency_seconds"] is None
+    assert body["latency"]["live_detections"] == 0
+
+
+def test_a_failed_pass_still_reports_what_it_knew(store, monkeypatch):
+    """The latency is a property of the record, not of this pass, so a pass
+    that could not reach EDGAR has not lost it."""
+    from research import activist_watch as aw
+
+    monkeypatch.setattr(aw, "watch_pass",
+                        lambda **kw: {"status": "failed",
+                                      "error": "EDGAR returned 503"})
+    printed = {}
+    monkeypatch.setattr("builtins.print",
+                        lambda *a, **k: printed.setdefault("out", a[0]))
+
+    assert aw.main([]) == 1
+    import json
+    assert "latency" in json.loads(printed["out"])

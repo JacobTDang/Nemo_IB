@@ -856,3 +856,115 @@ def test_a_candidate_records_which_surprise_it_came_from(liquid_universe,
 
     out = scanner.scan(as_of="2026-03-03")
     assert out["candidates"][0]["variant"] == "ts"
+
+
+# --- the cross-sectional variant --------------------------------------------
+#
+# sue_cs works today; the time-series one needs filings and the analyst one
+# needs nine more months of recorded consensus. It was not selectable, because
+# it returns a percentile and the scanner prices edge as |SUE| x drift, and a
+# percentile is not a sigma -- the module says so itself, having found that
+# neither of its z-scores means what a sigma means.
+#
+# So it gets its own gate and its own coefficient rather than a SUE-shaped
+# number invented to fit the existing one.
+
+def _cs_signal(percentile, ticker="AAA"):
+    return {"ticker": ticker, "success": True, "error": None,
+            "fiscal_period": "2026Q1", "known_at": "2026-03-02",
+            "percentile": percentile, "cohort_size": 20,
+            "surprise": 0.2, "scaled_surprise": 0.002,
+            "variant": "cs", "sue": None}
+
+
+def test_the_cross_sectional_variant_can_be_selected(liquid_universe,
+                                                     monkeypatch):
+    from research import sue_cs
+
+    monkeypatch.setattr(sue_cs, "surprise_rank",
+                        lambda t, as_of=None, **kw: _cs_signal(0.95, t))
+    monkeypatch.setattr(scanner, "SIGNAL_VARIANT", "cs")
+
+    out = scanner._signal_for("AAA", "2026-03-03")
+    assert out["variant"] == "cs"
+    assert out["percentile"] == 0.95
+
+
+def test_a_middling_rank_is_not_a_trade(liquid_universe, monkeypatch):
+    """The signal is being in a tail. A name at the median of its cohort
+    reported in line with its peers, which is not news."""
+    _reported(liquid_universe, "AAA", "2026Q1", "2026-03-02")
+    monkeypatch.setattr(scanner, "SIGNAL_VARIANT", "cs")
+    monkeypatch.setattr(scanner, "_signal_for",
+                        lambda t, a: _cs_signal(0.55, t))
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0010))
+
+    out = scanner.scan(as_of="2026-03-03")
+    assert out["candidates"] == []
+    assert "percentile" in out["rejected"][0]["reason"].lower()
+
+
+def test_the_top_of_the_cohort_is_a_long(liquid_universe, monkeypatch):
+    _reported(liquid_universe, "AAA", "2026Q1", "2026-03-02")
+    monkeypatch.setattr(scanner, "SIGNAL_VARIANT", "cs")
+    monkeypatch.setattr(scanner, "_signal_for",
+                        lambda t, a: _cs_signal(0.97, t))
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0010))
+
+    c = scanner.scan(as_of="2026-03-03")["candidates"][0]
+    assert c["side"] == "long"
+    assert c["variant"] == "cs"
+
+
+def test_the_bottom_of_the_cohort_is_a_short(liquid_universe, monkeypatch):
+    _reported(liquid_universe, "AAA", "2026Q1", "2026-03-02")
+    monkeypatch.setattr(scanner, "SIGNAL_VARIANT", "cs")
+    monkeypatch.setattr(scanner, "_signal_for",
+                        lambda t, a: _cs_signal(0.02, t))
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0010))
+
+    c = scanner.scan(as_of="2026-03-03")["candidates"][0]
+    assert c["side"] == "short"
+
+
+def test_the_edge_comes_from_its_own_coefficient(liquid_universe, monkeypatch):
+    """Not from DRIFT_BPS_PER_SUE, which prices a sigma. A rank is a different
+    quantity and pricing it with the surprise coefficient would silently make
+    the two variants incomparable."""
+    _reported(liquid_universe, "AAA", "2026Q1", "2026-03-02")
+    monkeypatch.setattr(scanner, "SIGNAL_VARIANT", "cs")
+    monkeypatch.setattr(scanner, "_signal_for",
+                        lambda t, a: _cs_signal(1.0, t))
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0010))
+
+    c = scanner.scan(as_of="2026-03-03")["candidates"][0]
+    # Distance from the middle, doubled to run 0..1 across a full tail.
+    assert c["expected_edge_bps"] == pytest.approx(scanner.DRIFT_BPS_PER_TAIL)
+
+
+def test_the_scan_reports_which_coefficient_it_used(liquid_universe,
+                                                    monkeypatch):
+    _reported(liquid_universe, "AAA", "2026Q1", "2026-03-02")
+    monkeypatch.setattr(scanner, "SIGNAL_VARIANT", "cs")
+    monkeypatch.setattr(scanner, "_signal_for",
+                        lambda t, a: _cs_signal(0.97, t))
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0010))
+
+    out = scanner.scan(as_of="2026-03-03")
+    assert out["assumptions"]["variant"] == "cs"
+    assert out["assumptions"]["drift_bps_per_tail"] == scanner.DRIFT_BPS_PER_TAIL
+    assert out["assumptions"]["calibrated"] is False
+
+
+def test_a_cross_sectional_signal_that_refused_is_still_a_rejection(
+        liquid_universe, monkeypatch):
+    _reported(liquid_universe, "AAA", "2026Q1", "2026-03-02")
+    monkeypatch.setattr(scanner, "SIGNAL_VARIANT", "cs")
+    monkeypatch.setattr(scanner, "_signal_for", lambda t, a: {
+        "ticker": t, "success": False, "sue": None, "percentile": None,
+        "error": "8 names reported and 8 are required", "variant": "cs"})
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0010))
+
+    out = scanner.scan(as_of="2026-03-03")
+    assert out["candidates"] == []
+    assert "required" in out["rejected"][0]["reason"]

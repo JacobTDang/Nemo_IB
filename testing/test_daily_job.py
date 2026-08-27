@@ -857,3 +857,80 @@ def test_the_flags_reach_run_all(store, monkeypatch):
                         lambda **kw: seen.update(kw) or {"as_of": "x"})
     daily_job.main(["--as-of", "2026-03-03", "--bootstrap"])
     assert seen == {"as_of": "2026-03-03", "bootstrap": True}
+
+
+# --- the announcement table, which nothing was filling -----------------------
+#
+# record_announcement and announcements_as_of exist and are tested, and no job
+# ever wrote a row: zero in every store. The calendar fetch already parses the
+# one field that makes the table worth having -- `hour`, which is bmo or amc --
+# and then dropped it.
+#
+# It decides which session is the reaction. AMAT reported after the close on 13
+# August, so its gap is the 14th; dating it to the announcement gives -2.48%
+# instead of -6.57%. An empty table that looks populated-in-principle is how
+# someone later reads "no announcements" as a quiet market.
+
+def test_the_consensus_run_records_the_announcement(store, monkeypatch):
+    monkeypatch.setattr(daily_job, "_fetch_calendar",
+                        lambda start, end: [
+                            {"ticker": "AMAT", "fiscal_period": "2026Q3",
+                             "eps_estimate": 2.10, "eps_actual": 2.48,
+                             "timing": "amc", "date": "2026-08-13"}])
+
+    daily_job.record_consensus_snapshots(as_of="2026-08-14")
+
+    got = store.announcements_as_of("AMAT", as_of="2026-08-15")
+    assert [(a["fiscal_period"], a["announced_date"], a["timing"])
+            for a in got] == [("2026Q3", "2026-08-13", "amc")]
+
+
+def test_an_announcement_is_only_recorded_once_it_has_happened(store,
+                                                               monkeypatch):
+    """A company on next week's calendar has not announced. Recording it would
+    put a reaction date in the record before there was a reaction."""
+    monkeypatch.setattr(daily_job, "_fetch_calendar",
+                        lambda start, end: [
+                            {"ticker": "AAPL", "fiscal_period": "2026Q4",
+                             "eps_estimate": 1.55, "eps_actual": None,
+                             "timing": "amc", "date": "2026-09-05"}])
+
+    daily_job.record_consensus_snapshots(as_of="2026-08-27")
+    assert store.announcements_as_of("AAPL", as_of="2026-09-30") == []
+
+
+def test_a_calendar_row_with_no_timing_records_unknown_not_a_guess(store,
+                                                                   monkeypatch):
+    monkeypatch.setattr(daily_job, "_fetch_calendar",
+                        lambda start, end: [
+                            {"ticker": "XYZ", "fiscal_period": "2026Q1",
+                             "eps_estimate": 1.0, "eps_actual": 1.1,
+                             "timing": "unknown", "date": "2026-05-01"}])
+
+    daily_job.record_consensus_snapshots(as_of="2026-05-02")
+    got = store.announcements_as_of("XYZ", as_of="2026-05-03")
+    assert got[0]["timing"] == "unknown"
+
+
+def test_an_announcement_carries_the_stamp_of_the_run_that_saw_it(store,
+                                                                  monkeypatch):
+    monkeypatch.setattr(daily_job, "_fetch_calendar",
+                        lambda start, end: [
+                            {"ticker": "AMAT", "fiscal_period": "2026Q3",
+                             "eps_estimate": 2.10, "eps_actual": 2.48,
+                             "timing": "amc", "date": "2026-08-13"}])
+
+    daily_job.record_consensus_snapshots(as_of="2026-08-14")
+    assert store.announcements_as_of("AMAT", as_of="2026-08-13") == []
+    assert store.announcements_as_of("AMAT", as_of="2026-08-14")
+
+
+def test_a_row_with_no_announcement_date_is_not_recorded(store, monkeypatch):
+    monkeypatch.setattr(daily_job, "_fetch_calendar",
+                        lambda start, end: [
+                            {"ticker": "XYZ", "fiscal_period": "2026Q1",
+                             "eps_estimate": 1.0, "eps_actual": 1.1,
+                             "timing": "amc", "date": None}])
+
+    daily_job.record_consensus_snapshots(as_of="2026-05-02")
+    assert store.announcements_as_of("XYZ", as_of="2026-05-03") == []
