@@ -505,3 +505,34 @@ def test_the_edge_never_extrapolates_past_the_gate(liquid_universe,
     result = scanner.scan(as_of="2026-03-03")
     ceiling = scanner.MAX_ABS_SUE * scanner.DRIFT_BPS_PER_SUE
     assert result["candidates"][0]["expected_edge_bps"] <= ceiling
+
+
+# --- its own entry point ----------------------------------------------------
+#
+# Separate from the recorder's on purpose. Recording is not repeatable -- a day
+# missed is a day gone -- while a scan is a decision over an existing record and
+# can be re-run against the same day as many times as the parameters change.
+# Sharing one entry point would mean re-recording to re-decide.
+
+def test_a_scan_that_finds_nothing_still_exits_zero(liquid_universe,
+                                                    monkeypatch):
+    """An empty tape is not a failure, and paging someone for one teaches them
+    to ignore the pager."""
+    _patch_signals(monkeypatch, {})
+    assert scanner.main(["--as-of", "2026-03-03"]) == 0
+
+
+def test_a_scan_that_cannot_run_exits_non_zero(liquid_universe, monkeypatch):
+    def boom(**kwargs):
+        raise RuntimeError("store unreadable")
+
+    monkeypatch.setattr(scanner, "record_scan", boom)
+    assert scanner.main(["--as-of", "2026-03-03"]) == 1
+
+
+def test_the_entry_point_files_the_scan(liquid_universe, monkeypatch):
+    _patch_signals(monkeypatch, {"AAA": _signal("AAA", 3.0)})
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0010))
+
+    assert scanner.main(["--as-of", "2026-03-03"]) == 0
+    assert pit_store.paper_orders_as_of("2026-03-03", accepted_only=True)

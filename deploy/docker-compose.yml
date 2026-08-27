@@ -137,17 +137,6 @@ services:
   # Safe to re-run and safe to cron: filings already parsed are never
   # refetched, so a nightly run costs one index fetch plus whatever is new.
   #   0 6 * * * cd /srv/nemo/deploy && docker compose run --rm congress-sync
-  # Ingestion, not a server. Under a profile so `docker compose up` never
-  # starts it: it is a batch job that finishes, and a restart:unless-stopped
-  # batch job is a loop that re-reads the House Clerk forever.
-  #
-  #   docker compose run --rm congress-sync                  # incremental
-  #   docker compose run --rm congress-sync --house 2024 2025 2026 --senate
-  #   docker compose run --rm congress-sync --status
-  #
-  # Safe to re-run and safe to cron: filings already parsed are never
-  # refetched, so a nightly run costs one index fetch plus whatever is new.
-  #   0 6 * * * cd /srv/nemo/deploy && docker compose run --rm congress-sync
   #
   # Deliberately NOT built from the *server anchor. That anchor requires
   # NEMO_MCP_TOKEN, and compose interpolates the whole file before merging, so
@@ -174,8 +163,83 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # The point-in-time recorder. Same profile and the same reasoning as
+  # congress-sync: a batch job that finishes, so `docker compose up` must never
+  # start it and restart:unless-stopped would turn it into a loop.
+  #
+  #   docker compose run --rm research-daily                 # today
+  #   docker compose run --rm research-daily --as-of 2026-08-26
+  #   docker compose run --rm research-daily --bootstrap     # cold store
+  #
+  # On a cold store run it with --bootstrap for the first four nights. A
+  # nightly ask is capped at 3,000 names -- Yahoo answers all 10,388 with a
+  # rate limit -- so the rest arrive on a rotating slice that covers the whole
+  # registrant list in about four runs. Without --bootstrap each of those
+  # names gets one session, and eligibility needs sixty, so the universe would
+  # take a couple of hundred days to fill instead of four.
+  #
+  # Unlike congress-sync this one is NOT safe to skip. Filings can be re-read
+  # from EDGAR years later; what analysts expected on a Tuesday cannot, and a
+  # company delisted in March is gone from the vendor by June. Every night this
+  # does not run is a hole no later run can fill, which is why it exits
+  # non-zero on a failed stage -- so the scheduler can say so.
+  #
+  # After the close, allowing for late consolidated prints:
+  #   30 22 * * 1-5 cd /srv/nemo/deploy && docker compose run --rm research-daily
+  research-daily:
+    image: ${NEMO_IMAGE:-nemo-data:local}
+    env_file: ../.env
+    profiles: ["sync"]
+    restart: "no"
+    entrypoint: ["python", "-m", "research.daily_job"]
+    environment:
+      NEMO_PIT_DB: /app/data/pit.db
+    volumes:
+      - research-data:/app/data
+    tmpfs:
+      - /root/.edgar:rw,size=512m
+      - /app/db_cache:rw,size=128m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # The decision, separate from the record. Re-runnable against a past date as
+  # parameters change, which is why it is not a stage of research-daily: a scan
+  # can be redone, a night of recording cannot.
+  #
+  #   docker compose run --rm research-scan
+  #   docker compose run --rm research-scan --as-of 2026-08-26
+  #
+  # After the recorder, which it reads:
+  #   0 23 * * 1-5 cd /srv/nemo/deploy && docker compose run --rm research-scan
+  research-scan:
+    image: ${NEMO_IMAGE:-nemo-data:local}
+    env_file: ../.env
+    profiles: ["sync"]
+    restart: "no"
+    entrypoint: ["python", "-m", "research.scanner"]
+    environment:
+      NEMO_PIT_DB: /app/data/pit.db
+    volumes:
+      - research-data:/app/data
+    tmpfs:
+      - /root/.edgar:rw,size=512m
+      - /app/db_cache:rw,size=128m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 volumes:
   # Survives `docker compose down` and container replacement. Back it up the
   # way you would any database: the contents are reconstructible from the
   # public record, but only at the cost of re-reading every filing.
   congress-data:
+  # The record that cannot be rebuilt. congress-data is reconstructible from
+  # the public filings at the cost of re-reading them; this one is not
+  # reconstructible at any cost, because it is a record of what was known on a
+  # date. Back it up like a database that matters.
+  research-data:

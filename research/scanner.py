@@ -412,3 +412,42 @@ def record_scan(as_of: Optional[str] = None) -> Dict[str, Any]:
         raise
     pit_store.finish_run(rows_written=written, status="ok")
     return {**result, "written": written}
+
+
+# ------------------------------------------------------------- entry point
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """`python -m research.scanner`.
+
+    Its own entry point rather than a stage of the recorder. Recording is not
+    repeatable -- a night missed is a night gone -- while a scan is a decision
+    over a record that already exists and can be re-run against the same day
+    whenever the parameters change. Sharing one command would mean re-recording
+    in order to re-decide.
+
+    A scan that finds nothing exits 0. An empty tape is not a failure, and
+    paging someone for one teaches them to ignore the pager.
+    """
+    import argparse
+    import json
+
+    parser = argparse.ArgumentParser(
+        prog="scanner",
+        description="Rank today's candidates net of cost and file them.")
+    parser.add_argument("--as-of", dest="as_of", default=None,
+                        help="date to decide as (default: today)")
+    args = parser.parse_args(argv)
+
+    try:
+        result = record_scan(as_of=args.as_of)
+    except Exception as exc:  # noqa: BLE001 - reported, then non-zero
+        print(json.dumps({"as_of": args.as_of, "status": "failed",
+                          "error": f"{type(exc).__name__}: {exc}"}, indent=2))
+        return 1
+
+    print(json.dumps(result, indent=2, default=str))
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised via main()
+    raise SystemExit(main())

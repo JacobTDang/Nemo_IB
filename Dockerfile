@@ -45,6 +45,12 @@ COPY tools/web_search_server/ ./tools/web_search_server/
 COPY tools/financial_modeling_engine/ ./tools/financial_modeling_engine/
 COPY tools/altdata_server/ ./tools/altdata_server/
 COPY tools/preearnings/ ./tools/preearnings/
+# The point-in-time recorder and the signals over it. No server, no port and no
+# bearer token: it is a batch job with a __main__, scheduled the same way
+# congress-sync is. It ships here because it needs the same upstreams and the
+# same pinned versions, and running it anywhere else means maintaining a second
+# environment that has to stay in step with this one.
+COPY research/ ./research/
 # Only the three agent modules the servers reach. Copying agent/ wholesale
 # brings workflows/ and twelve *_Agent.py files, and with them LangGraph,
 # LangChain and the OpenAI client -- none of which this image ever runs.
@@ -93,6 +99,7 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 COPY --from=base /app/.venv /app/.venv
 COPY --from=base /app/tools /app/tools
+COPY --from=base /app/research /app/research
 COPY --from=base /app/agent /app/agent
 COPY --from=base /app/state /app/state
 COPY --from=base /app/knowledge /app/knowledge
