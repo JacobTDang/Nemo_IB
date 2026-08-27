@@ -1,15 +1,19 @@
 # Nemo_IB
 
-MCP servers that aggregate company, market, macro and alternative financial data
-from primary sources, served over streamable HTTP for any MCP client.
+Two things that share a machine and a set of upstreams.
 
-Five servers ship in the homelab image and declare **96 tools** between them.
-Every count on this page is measured against a running instance rather than
-maintained by hand.
+**MCP servers** that aggregate company, market, macro and alternative financial
+data from primary sources, served over streamable HTTP for any MCP client. Five
+ship in the homelab image and declare **98 tools** between them. Every count on
+this page is measured against a running instance rather than maintained by hand.
+
+**A point-in-time record** that the same image feeds on a schedule, and the jobs
+that read it. Nothing about it is a server: they are batch jobs that finish. See
+[Automation](#automation).
 
 | Server | Tools | Reads from | Needs |
 |---|---:|---|---|
-| `sec` | 48 | SEC EDGAR (XBRL, filing text) | `SEC_EMAIL` |
+| `sec` | 50 | SEC EDGAR (XBRL, filing text) | `SEC_EMAIL` |
 | `financial` | 20 | yfinance, local valuation models | — |
 | `finnhub` | 14 | Finnhub | `FINNHUB_API_KEY` |
 | `fred` | 5 | FRED | `FRED_API_KEY` |
@@ -52,23 +56,28 @@ catch: [`deploy/README.md`](deploy/README.md).
 
 ## Registering with an MCP client
 
-```bash
-claude mcp add --transport http nemo-sec       http://127.0.0.1:8810/mcp/ --header "Authorization: Bearer $NEMO_MCP_TOKEN"
-claude mcp add --transport http nemo-financial http://127.0.0.1:8811/mcp/ --header "Authorization: Bearer $NEMO_MCP_TOKEN"
-claude mcp add --transport http nemo-finnhub   http://127.0.0.1:8812/mcp/ --header "Authorization: Bearer $NEMO_MCP_TOKEN"
-claude mcp add --transport http nemo-fred      http://127.0.0.1:8813/mcp/ --header "Authorization: Bearer $NEMO_MCP_TOKEN"
-claude mcp add --transport http nemo-altdata   http://127.0.0.1:8814/mcp/ --header "Authorization: Bearer $NEMO_MCP_TOKEN"
+Streamable HTTP with a bearer token. One entry per server:
+
+```json
+{
+  "nemo-sec":       { "transport": "http", "url": "http://127.0.0.1:8810/mcp/" },
+  "nemo-financial": { "transport": "http", "url": "http://127.0.0.1:8811/mcp/" },
+  "nemo-finnhub":   { "transport": "http", "url": "http://127.0.0.1:8812/mcp/" },
+  "nemo-fred":      { "transport": "http", "url": "http://127.0.0.1:8813/mcp/" },
+  "nemo-altdata":   { "transport": "http", "url": "http://127.0.0.1:8814/mcp/" }
+}
 ```
 
-The trailing slash on `/mcp/` matters: without it the server answers `307` and
-some clients drop the `Authorization` header across the redirect.
+Each needs `Authorization: Bearer $NEMO_MCP_TOKEN`. The trailing slash on
+`/mcp/` matters: without it the server answers `307` and some clients drop the
+`Authorization` header across the redirect.
 
 `stdio` still works for local use — `python -m tools.web_search_server.web_search`
 with no argument — but HTTP is what the image serves.
 
 ## The tools
 
-### `sec` — 48 tools, SEC EDGAR
+### `sec` — 50 tools, SEC EDGAR
 
 Financial statements, filing text, ownership and structure, read from XBRL and
 filing documents.
@@ -167,6 +176,84 @@ are legally not itemised. Filings that arrive as scans of paper cannot be parsed
 at all and are counted in `coverage` rather than dropped. Holdings are currently
 Senate-only.
 
+## Automation
+
+A second use of the same image and the same upstreams: a store that records
+what was known on each date, and jobs that read it. All of them are batch jobs
+under the `sync` profile, so `docker compose up` never starts them — a
+`restart: unless-stopped` batch job is a loop.
+
+```bash
+cd deploy
+docker compose run --rm research-daily --bootstrap   # first four nights
+docker compose run --rm research-daily               # every night after
+```
+
+| Job | Does | When |
+|---|---|---|
+| `research-daily` | one session of prices per name, screens the universe, snapshots consensus | `30 22 * * 1-5` |
+| `research-scan` | ranks candidates net of trading cost, files the intended orders | `0 23 * * 1-5` |
+| `research-watch` | sweeps EDGAR for Schedule 13D stakes taken **in** a company | `*/20 13-23 * * 1-5` |
+| `research-score` | scores filed orders whose holding period has closed | `0 7 * * 6` |
+| `research-seed` | reconstructs the four quarters of consensus the vendor still serves | `0 8 1 * *` |
+| `congress-sync` | ingests congressional disclosures for the `altdata` server | `0 6 * * *` |
+
+Two things are true of every job: it exits non-zero when a stage fails, because
+the exit code is the only way a scheduler finds out, and it exits zero when it
+finds nothing, because most nights it will and paging on that is how the one
+night that matters gets ignored.
+
+### Why a store rather than a query
+
+Some of this data cannot be fetched later at any price. What analysts expected
+last Tuesday is unrecoverable by Thursday; a company delisted in March is gone
+from the vendor by June; the vendor serves four quarters of consensus history
+whether you ask for twelve or thirty. So the record is append-only and every
+row carries when it was written as well as what date it describes. Every reader
+filters on both, which is what stops a value learned today from being visible
+to a question asked about last month.
+
+Prices are stored as the stock printed them. `auto_adjust=False` does not mean
+unadjusted — it returns split-adjusted prices, so NVDA's 2024-06-07 close
+arrives as 120.89 against a real print of 1208.88 — and the conversion back
+happens on the way in, using splits that arrive in the same response. The
+adjustment is rebuilt at read time from actions the reader could have known, so
+a split announced in June cannot change what a May reader computed.
+
+### The record
+
+`research-daily` writes into one SQLite file on the `research-data` volume.
+It is reconstructible from the public record only at the cost of re-reading
+every filing, and the consensus in it is not reconstructible at all — back it
+up like a database that matters.
+
+```
+daily_bar          as-traded OHLCV, never overwritten
+bar_revision       where a vendor's later disagreement goes, so the original
+                   stands and the disagreement is still on the record
+corporate_action   splits and dividends, dated to their own ex-date
+universe_snapshot  who was eligible each day, and why the rest were not
+consensus_snapshot what the street expected, and what the vendor reported
+announcement       fiscal identity, never the vendor's calendar bucket
+paper_order        decisions, with the session they were for and no fill price
+activist_filing    13D events with four timestamps, latency derived at read
+run_log            every run, so a day the job did not run is visible
+```
+
+### What answers today, and what does not
+
+The time-series surprise, the spread and cost model, the universe screen, the
+13D watcher and the scanner all run now. The analyst surprise needs eight
+quarters of recorded consensus; seeding supplies four and the recorder adds one
+a quarter, so it refuses until it has them and says how many it holds.
+
+Nothing here decides how much of the drift a surprise is worth. That
+coefficient is declared, reported uncalibrated on every scan, and the point of
+recording orders and scoring them later is to replace it with one measured from
+this book's own outcomes. A replay over 652 decision dates does not yet support
+it: mean +51.3bp against a median of −71.3bp and t = +0.80, which the
+calibration gate refuses on both counts.
+
 ## Tests
 
 ```bash
@@ -182,6 +269,15 @@ The deploy gate is `testing/test_http_transport.py`, which completes a real MCP
 handshake and one live tool call against each server. A health check only proves
 the port is bound; a server whose MCP layer failed still answers it.
 
+The store and the jobs that read it carry their own suites, written around the
+two rules they exist to enforce. One sweep checks that every reader taking an
+`as_of` hides a row written after it, and fails if a reader is added and left
+out of the sweep. Another checks that every recorder run twice writes nothing
+the second time, and that every refusal returns its numbers as `None` rather
+than leaving a stale one beside `success: False`. Values that can be worked out
+on paper are asserted as numbers rather than as relationships, since a
+relationship survives a formula that is wrong by a constant factor everywhere.
+
 ## Repository layout
 
 ```
@@ -192,6 +288,17 @@ tools/
   altdata_server/         congressional disclosures, job boards, contracts, policy
   alpaca/ excel_server/ sentry_server/   not shipped in the image
   mcp_http.py             shared streamable-HTTP transport, bearer auth
+research/
+  pit_store.py            the append-only record and its point-in-time reads
+  daily_job.py            nightly recorder, universe screen, entry point
+  scanner.py              ranks candidates net of cost, files intended orders
+  scoring.py              what filed orders did, and what that implies
+  spread.py               EDGE effective spread and the round-trip cost model
+  sue.py                  quarterly EPS from XBRL, time-series and analyst
+  sue_cs.py               the same surprise ranked across names, not time
+  seed_consensus.py       reconstructs the consensus history that is still served
+  activist_watch.py       subject-side 13D detection and detection latency
+  replay.py               the scanner over history, survivorship-biased and says so
 deploy/                   compose stack, deployment and auth notes
 testing/                  offline suite plus gated live suites
 ```
