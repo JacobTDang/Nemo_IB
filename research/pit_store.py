@@ -257,6 +257,91 @@ def bars_as_of(ticker: str, as_of: str) -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+def adjusted_bars(ticker: str, as_of: str,
+                  total_return: bool = False) -> List[Dict[str, Any]]:
+    """`bars_as_of`, with the adjustment in force on `as_of` rebuilt onto it.
+
+    This is the other half of storing raw. Keeping raw OHLC is what makes a
+    result reproducible; rebuilding the adjustment here is what makes it
+    usable. Without this, every consumer measuring a return over a window
+    containing a split sees the split as the return -- NVDA's June 2024 10:1
+    is a -90% session, and it sits inside any window longer than a year.
+
+    The factor is built only from actions this reader could have known, so a
+    split announced in June cannot reach back and change what a May reader
+    computed. That drift is exactly why a vendor's adjusted close is not
+    evidence of anything.
+
+    Splits always apply: a discontinuity of that size is not a price move under
+    any interpretation. Dividends are opt-in, because whether they belong
+    depends on the question. Measuring what an investor earned, they do;
+    measuring the price the exchange printed, they do not. Choosing silently
+    means one caller or the other is quietly wrong.
+    """
+    bars = bars_as_of(ticker, as_of)
+    if not bars:
+        return []
+
+    actions = corporate_actions_as_of(ticker, as_of)
+    kinds = {"split"} if not total_return else {"split", "dividend"}
+    actions = [a for a in actions
+               if a["action_type"] in kinds and (a.get("value") or 0) > 0]
+    if not actions:
+        return [{**b, "adj_factor": 1.0} for b in bars]
+
+    closes = {b["trade_date"]: b["close"] for b in bars}
+
+    # Walk backwards from the most recent session, accumulating each action as
+    # it is passed. A bar's factor is the product of every action with an
+    # ex-date strictly after it: the ex-date session already trades at the new
+    # price, so it belongs with what follows, not with what came before.
+    by_date: Dict[str, float] = {}
+    for action in actions:
+        ex = action["ex_date"]
+        if action["action_type"] == "split":
+            factor = 1.0 / float(action["value"])
+        else:
+            # A dividend's effect is proportional to the price it came out of:
+            # the last close before the ex-date, which is what the payment was
+            # actually a claim against.
+            prior = [d for d in closes if d < ex]
+            if not prior or not closes[max(prior)]:
+                continue
+            ref = closes[max(prior)]
+            factor = (ref - float(action["value"])) / ref
+            if factor <= 0:
+                continue
+        by_date[ex] = by_date.get(ex, 1.0) * factor
+
+    # Descending, so the backward walk consumes them in the order it meets
+    # them. Keyed on "every action dated after this bar" rather than on an
+    # action landing exactly on a bar's date: an ex-date can fall on a session
+    # the store has no row for -- a holiday, a missed fetch, or a split
+    # effective after the last one recorded -- and keying on an exact match
+    # silently skips the adjustment in all three cases.
+    pending = sorted(by_date.items(), reverse=True)
+
+    out: List[Dict[str, Any]] = []
+    running = 1.0
+    cursor = 0
+    for bar in reversed(bars):
+        while cursor < len(pending) and pending[cursor][0] > bar["trade_date"]:
+            running *= pending[cursor][1]
+            cursor += 1
+        row = {**bar, "adj_factor": running}
+        if running != 1.0:
+            for field in ("open", "high", "low", "close"):
+                if row.get(field) is not None:
+                    row[field] = row[field] * running
+            if row.get("volume") is not None:
+                # Volume moves the other way: the same economic quantity of
+                # stock, denominated in more shares.
+                row["volume"] = row["volume"] / running
+        out.append(row)
+    out.reverse()
+    return out
+
+
 def revisions(ticker: Optional[str] = None) -> List[Dict[str, Any]]:
     sql = "SELECT * FROM bar_revision"
     params: tuple = ()

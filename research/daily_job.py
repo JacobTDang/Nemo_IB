@@ -18,9 +18,18 @@ from __future__ import annotations
 import os
 import statistics
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from dotenv import load_dotenv
+
 from research import pit_store
+
+# Cron has no shell profile. Every other entry point here inherits credentials
+# from the shell a human ran it in; a nightly job inherits nothing, so it reads
+# the same repo-root .env the container mounts.
+_DOTENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(dotenv_path=_DOTENV_PATH)
 
 # --- screen ---------------------------------------------------------------
 # The floor is where spread starts eating the drift; the price floor is
@@ -97,13 +106,20 @@ def _fetch_bars(tickers: Iterable[str], start: Optional[str] = None,
     if not tickers:
         return {}
 
+    # `actions=True` costs nothing -- the splits and dividends come down the
+    # same response -- and without them the prices below cannot be put back
+    # into the space they were actually traded in.
     frame = yf.download(tickers=" ".join(tickers), start=start, end=end,
-                        auto_adjust=False, group_by="ticker", progress=False,
-                        threads=True)
+                        auto_adjust=False, actions=True, group_by="ticker",
+                        progress=False, threads=True)
     out: Dict[str, List[Dict[str, Any]]] = {}
     for ticker in tickers:
+        # Not `if len(tickers) > 1`. yfinance returns a two-level column
+        # index either way, so counting tickers reads a grouped frame as flat
+        # and finds no "Close" at all.
         try:
-            sub = frame[ticker] if len(tickers) > 1 else frame
+            sub = frame[ticker] if getattr(frame.columns, "nlevels", 1) > 1 \
+                else frame
         except (KeyError, TypeError):
             continue
         rows = []
@@ -115,32 +131,69 @@ def _fetch_bars(tickers: Iterable[str], start: Optional[str] = None,
                 "open": float(row["Open"]), "high": float(row["High"]),
                 "low": float(row["Low"]), "close": float(row["Close"]),
                 "volume": float(row.get("Volume") or 0.0),
+                "split": float(row.get("Stock Splits") or 0.0),
+                "dividend": float(row.get("Dividends") or 0.0),
             })
         if rows:
             out[ticker] = rows
     return out
 
 
-def _fetch_actions(ticker: str) -> List[Dict[str, Any]]:
-    """Splits and dividends, as events rather than baked into a price."""
-    import yfinance as yf
+def _to_as_traded(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Put vendor prices back into the space the stock actually traded in.
 
-    handle = yf.Ticker(ticker)
-    events: List[Dict[str, Any]] = []
-    for series, kind in ((getattr(handle, "splits", None), "split"),
-                         (getattr(handle, "dividends", None), "dividend")):
-        if series is None or len(series) == 0:
-            continue
-        for stamp, value in series.items():
-            try:
-                amount = float(value)
-            except (TypeError, ValueError):
-                continue
-            if amount <= 0 or (kind == "split" and amount == 1.0):
-                continue
-            events.append({"ex_date": str(stamp.date()), "action_type": kind,
-                           "value": amount})
-    return events
+    `auto_adjust=False` is a misleading name: the prices are split-adjusted to
+    the moment of the request, and only dividends are left alone. NVDA's
+    2024-06-07 close comes back 120.89 against a real print of 1208.88.
+
+    Left alone, the store would hold two different price spaces with no marker
+    between them -- bars recorded forward are genuinely as-traded, because a
+    one-day window cannot contain a later split, while bootstrapped history is
+    in whatever space the vendor was in on bootstrap day. A read-time
+    adjustment would then be right on one side of that seam and out by the
+    split ratio on the other.
+
+    A bar is scaled by every split strictly after it: the ex-date session
+    already prints the new price, so it belongs with what follows. The
+    operation is exactly invertible, which is the point -- `adjusted_bars`
+    re-applies the same factor and returns the vendor's own number, so an
+    incomplete action list can never invent a price that did not exist.
+    """
+    factor = 1.0
+    out: List[Dict[str, Any]] = []
+    for row in reversed(rows):
+        if factor != 1.0:
+            row = dict(row)
+            for field in ("open", "high", "low", "close"):
+                if row.get(field) is not None:
+                    row[field] = row[field] * factor
+            if row.get("volume"):
+                row["volume"] = row["volume"] / factor
+        out.append(row)
+        split = row.get("split") or 0.0
+        if split > 0:
+            factor *= split
+    out.reverse()
+    return out
+
+
+def _record_ticker(ticker: str, rows: List[Dict[str, Any]], stamp: str) -> int:
+    """Actions first, then the bars they explain.
+
+    Order matters on a cold store: a reader that finds bars without the split
+    that shaped them has no way to tell an as-traded series from an adjusted
+    one, and this is the only moment both are in hand.
+    """
+    for row in rows:
+        if row.get("split"):
+            pit_store.record_corporate_action(
+                ticker, row["trade_date"], "split", float(row["split"]),
+                recorded_at=stamp)
+        if row.get("dividend"):
+            pit_store.record_corporate_action(
+                ticker, row["trade_date"], "dividend", float(row["dividend"]),
+                recorded_at=stamp)
+    return pit_store.record_bars(ticker, _to_as_traded(rows), recorded_at=stamp)
 
 
 def _fetch_calendar(start: str, end: str) -> List[Dict[str, Any]]:
@@ -258,8 +311,7 @@ def record_daily_bars(tickers: List[str],
             # here would make the two indistinguishable forever.
             continue
         covered += 1
-        written += pit_store.record_bars(ticker, rows,
-                                         recorded_at=_stamp(as_of))
+        written += _record_ticker(ticker, rows, _stamp(as_of))
 
     status = coverage_status(covered, len(tickers))
     pit_store.finish_run(
@@ -297,8 +349,7 @@ def bootstrap_history(tickers: List[str], lookback_days: int = 730,
         if not rows:
             continue
         covered += 1
-        written += pit_store.record_bars(ticker, rows,
-                                         recorded_at=_stamp(as_of))
+        written += _record_ticker(ticker, rows, _stamp(as_of))
 
     status = coverage_status(covered, len(tickers))
     pit_store.finish_run(rows_written=written, status=status,
@@ -432,38 +483,6 @@ def record_consensus_snapshots(as_of: Optional[str] = None,
     pit_store.finish_run(rows_written=written, status=status,
                          error=None if rows else "calendar returned no rows")
     return {"status": status, "written": written, "seen": len(rows)}
-
-
-# ------------------------------------------------------------- actions
-
-def record_actions(tickers: List[str],
-                   as_of: Optional[str] = None) -> Dict[str, Any]:
-    as_of = as_of or _today()
-    pit_store.start_run("corporate_actions", as_of_date=as_of)
-
-    written = 0
-    covered = 0
-    failures = 0
-    for ticker in tickers:
-        try:
-            events = _fetch_actions(ticker)
-        except Exception:  # noqa: BLE001 - counted, and reported in the log
-            failures += 1
-            continue
-        covered += 1
-        for event in events:
-            pit_store.record_corporate_action(
-                ticker, event["ex_date"], event["action_type"], event["value"])
-            written += 1
-
-    status = coverage_status(covered, len(tickers))
-    pit_store.finish_run(rows_written=written, status=status,
-                         error=None if status == "ok"
-                         else f"{failures} of {len(tickers)} lookups failed")
-    return {"status": status, "written": written, "failures": failures}
-
-
-# ------------------------------------------------------------------ all
 
 def run_all(as_of: Optional[str] = None,
             bootstrap: bool = False) -> Dict[str, Any]:

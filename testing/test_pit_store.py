@@ -253,3 +253,117 @@ def test_a_row_recorded_today_is_invisible_to_a_past_date(store):
     store.record_announcement("XYZ", fiscal_period="2026Q1",
                               announced_date="2026-05-01")
     assert store.announcements_as_of("XYZ", as_of="2026-05-30") == []
+
+
+# --- the other half of storing raw ------------------------------------------
+#
+# The store keeps raw OHLC and files splits and dividends as separate events,
+# on the promise that "the adjustment in force on any past date can be
+# reconstructed exactly". Nothing reconstructed it. Every consumer read
+# bars_as_of and got prices with a 10:1 discontinuity sitting in them -- NVDA's
+# June 2024 split is a -90% session to anything measuring a return, and it is
+# inside any window longer than about a year.
+#
+# Raw storage without a read-time rebuild is not a design, it is half of one.
+
+
+def _bar(d, close, volume=1000):
+    return {"trade_date": d, "open": close, "high": close, "low": close,
+            "close": close, "volume": volume}
+
+
+def test_a_split_is_rebuilt_at_read_time(store):
+    store.record_bars("NVDA", [_bar("2024-06-07", 1200.0, 100),
+                               _bar("2024-06-10", 120.0, 1000)],
+                      recorded_at="2024-06-10T21:00:00Z")
+    store.record_corporate_action("NVDA", "2024-06-10", "split", 10.0,
+                                  recorded_at="2024-06-10T21:00:00Z")
+
+    bars = store.adjusted_bars("NVDA", as_of="2024-07-01")
+
+    assert [b["close"] for b in bars] == [120.0, 120.0], (
+        "the pre-split session still carries a 10x price")
+    assert [b["volume"] for b in bars] == [1000.0, 1000.0]
+
+
+def test_the_ex_date_session_is_already_post_split(store):
+    """The ex-date is the first session that trades at the new price, so it is
+    adjusted along with everything after it, not with everything before."""
+    store.record_bars("X", [_bar("2024-06-07", 100.0), _bar("2024-06-10", 50.0)],
+                      recorded_at="2024-06-10T21:00:00Z")
+    store.record_corporate_action("X", "2024-06-10", "split", 2.0,
+                                  recorded_at="2024-06-10T21:00:00Z")
+
+    assert [b["close"] for b in store.adjusted_bars("X", as_of="2024-07-01")] \
+        == [50.0, 50.0]
+
+
+def test_two_splits_compound(store):
+    store.record_bars("X", [_bar("2024-01-02", 400.0), _bar("2024-06-10", 200.0),
+                            _bar("2024-09-10", 100.0)],
+                      recorded_at="2024-09-10T21:00:00Z")
+    for ex in ("2024-06-10", "2024-09-10"):
+        store.record_corporate_action("X", ex, "split", 2.0,
+                                      recorded_at=f"{ex}T21:00:00Z")
+
+    closes = [b["close"] for b in store.adjusted_bars("X", as_of="2024-10-01")]
+    assert closes == [100.0, 100.0, 100.0], closes
+
+
+def test_an_adjustment_is_only_as_known_as_its_action(store):
+    """The mutation bug, in the one place it can still bite. A split filed in
+    June must not reach back and change what a May reader computed -- that is
+    precisely the drift that makes a vendor's adjusted close irreproducible."""
+    store.record_bars("X", [_bar("2024-05-01", 100.0)],
+                      recorded_at="2024-05-01T21:00:00Z")
+    store.record_corporate_action("X", "2024-06-10", "split", 2.0,
+                                  recorded_at="2024-06-10T21:00:00Z")
+
+    may = store.adjusted_bars("X", as_of="2024-05-15")
+    assert may[0]["close"] == 100.0, "a June split leaked into a May read"
+    june = store.adjusted_bars("X", as_of="2024-06-15")
+    assert june[0]["close"] == 50.0
+
+
+def test_dividends_are_not_applied_unless_asked(store):
+    """A split un-adjusted is a 90% fake return; a dividend un-adjusted is a
+    0.5% one, and whether it belongs depends on whether the caller is measuring
+    total return or price. Silently choosing for them is how a price series
+    stops matching the exchange's own prints."""
+    store.record_bars("X", [_bar("2024-05-01", 100.0), _bar("2024-05-02", 99.0)],
+                      recorded_at="2024-05-02T21:00:00Z")
+    store.record_corporate_action("X", "2024-05-02", "dividend", 1.0,
+                                  recorded_at="2024-05-02T21:00:00Z")
+
+    price = store.adjusted_bars("X", as_of="2024-06-01")
+    assert price[0]["close"] == 100.0
+
+    total = store.adjusted_bars("X", as_of="2024-06-01", total_return=True)
+    assert round(total[0]["close"], 6) == 99.0, (
+        "a $1 dividend off a $100 close is a 1% adjustment to prior sessions")
+
+
+def test_adjustment_is_reported_so_a_reader_can_tell(store):
+    store.record_bars("X", [_bar("2024-06-07", 100.0), _bar("2024-06-10", 50.0)],
+                      recorded_at="2024-06-10T21:00:00Z")
+    store.record_corporate_action("X", "2024-06-10", "split", 2.0,
+                                  recorded_at="2024-06-10T21:00:00Z")
+
+    bars = store.adjusted_bars("X", as_of="2024-07-01")
+    assert bars[0]["adj_factor"] == 0.5
+    assert bars[1]["adj_factor"] == 1.0
+
+
+def test_ohlc_stays_internally_consistent(store):
+    """Adjusting close alone leaves a bar whose low is above its close."""
+    store.record_bars("X", [{"trade_date": "2024-06-07", "open": 98.0,
+                             "high": 104.0, "low": 96.0, "close": 100.0,
+                             "volume": 500}],
+                      recorded_at="2024-06-07T21:00:00Z")
+    store.record_corporate_action("X", "2024-06-10", "split", 2.0,
+                                  recorded_at="2024-06-10T21:00:00Z")
+
+    b = store.adjusted_bars("X", as_of="2024-07-01")[0]
+    assert (b["open"], b["high"], b["low"], b["close"]) == (49.0, 52.0, 48.0, 50.0)
+    assert b["low"] <= b["open"] <= b["high"]
+    assert b["volume"] == 1000.0
