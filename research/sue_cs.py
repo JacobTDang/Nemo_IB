@@ -78,6 +78,10 @@ def _shell(ticker: str, as_of: str) -> Dict[str, Any]:
     return {"ticker": ticker.upper(), "as_of": as_of, "success": False,
             "error": None, "fiscal_period": None, "estimate": None,
             "actual": None, "surprise": None, "scaled_surprise": None,
+            # When the print landed, which is what places this in time. The
+            # scanner rejects a signal it cannot date before it looks at
+            # anything else.
+            "known_at": None,
             "z": None, "robust_z": None, "percentile": None,
             # Which of the three to order on. Neither z is a sigma here; see
             # the module docstring for the numbers that settled it.
@@ -93,7 +97,8 @@ def _price_at(ticker: str, as_of: str) -> Optional[float]:
     return float(close) if close else None
 
 
-def _scaled(ticker: str, fiscal: str, as_of: str) -> Optional[Dict[str, Any]]:
+def _scaled(ticker: str, fiscal: str, as_of: str,
+            known_at: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """One name's price-scaled surprise, or None if either leg is missing."""
     actual = pit_store.actual_as_of(ticker, fiscal, as_of)
     if actual is None:
@@ -106,7 +111,7 @@ def _scaled(ticker: str, fiscal: str, as_of: str) -> Optional[Dict[str, Any]]:
     if not price or price <= 0:
         return None
     surprise = float(actual) - float(estimate)
-    return {"ticker": ticker, "fiscal_period": fiscal,
+    return {"ticker": ticker, "fiscal_period": fiscal, "known_at": known_at,
             "estimate": float(estimate), "actual": float(actual),
             "surprise": surprise, "scaled_surprise": surprise / price}
 
@@ -123,7 +128,8 @@ def cohort(as_of: Optional[str] = None,
              - timedelta(days=window_days)).isoformat()
     out = []
     for row in pit_store.reporters_since(since, as_of):
-        scaled = _scaled(row["ticker"], row["fiscal_period"], as_of)
+        scaled = _scaled(row["ticker"], row["fiscal_period"], as_of,
+                         known_at=row.get("as_of_date"))
         if scaled is not None:
             out.append(scaled)
     return out
@@ -148,8 +154,8 @@ def surprise_rank(ticker: str, as_of: Optional[str] = None,
         return result
 
     result.update({k: mine[k] for k in
-                   ("fiscal_period", "estimate", "actual", "surprise",
-                    "scaled_surprise")})
+                   ("fiscal_period", "known_at", "estimate", "actual",
+                    "surprise", "scaled_surprise")})
 
     if len(peers) < MIN_COHORT:
         result["error"] = (

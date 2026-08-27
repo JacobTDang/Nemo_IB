@@ -47,6 +47,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from research import daily_job, pit_store, scanner, spread, sue
 
+_MISSING = object()
+
 CAVEATS = (
     "survivorship: the vendor sells history only for names that still exist, "
     "so delisted companies are absent and their absence is correlated with "
@@ -207,13 +209,19 @@ def _refresh_universe_for(tickers: Sequence[str], as_of: str) -> int:
 
 
 def run(dates: Sequence[str], horizon_days: int = 20,
-        tickers: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+        tickers: Optional[Sequence[str]] = None,
+        signal_for: Any = _MISSING) -> Dict[str, Any]:
     """Scan on each date, then score what those decisions did.
 
     Uses the scanner unmodified. That is the point of building a store rather
     than a special mode: if the replay needed its own ranking logic it would be
     measuring something other than the thing that will run tomorrow.
     """
+    # The precomputed time-series table by default; None lets the scanner use
+    # whichever variant it is set to, which is how the cross-sectional one --
+    # dated by the release rather than the filing -- gets replayed at all.
+    lookup = _signal_for if signal_for is _MISSING else signal_for
+
     orders: List[Dict[str, Any]] = []
     # One print is one trade. Replayed decisions never enter the filed book, so
     # the scanner cannot read this from the store the way it does live -- and
@@ -227,7 +235,7 @@ def run(dates: Sequence[str], horizon_days: int = 20,
         else:
             daily_job.refresh_universe(as_of=as_of)
         result = scanner.scan(as_of=as_of, already_acted=acted,
-                              signal_for=_signal_for)
+                              signal_for=lookup)
         for candidate in result["candidates"]:
             orders.append({**candidate, "as_of_date": as_of})
             period = candidate.get("fiscal_period")

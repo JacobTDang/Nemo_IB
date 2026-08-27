@@ -217,3 +217,39 @@ def test_the_module_says_which_statistic_to_rank_on(store):
     out = sue_cs.surprise_rank("AAA", as_of="2026-03-03")
     assert out["rank_on"] == "percentile"
     assert 0.0 <= out["percentile"] <= 1.0
+
+
+def test_a_rank_carries_the_date_the_print_became_known(store):
+    """The scanner places every signal in time before it does anything else,
+    and a signal with no date is rejected as unplaceable. sue_cs returned
+    none: every cross-sectional candidate would have been refused in a real
+    scan while the scanner's own tests passed, because those stubbed a date
+    the module never produced."""
+    _cohort(store)
+    _reported(store, "AAA", "2026Q1", "2026-03-02", estimate=1.0, actual=1.2)
+
+    out = sue_cs.surprise_rank("AAA", as_of="2026-03-03")
+    assert out["known_at"] == "2026-03-02"
+
+
+def test_the_date_is_when_the_actual_landed_not_when_it_was_read(store):
+    _cohort(store, day="2026-03-02")
+    _reported(store, "LATE", "2026Q1", "2026-03-10", estimate=1.0, actual=1.4)
+
+    out = sue_cs.surprise_rank("LATE", as_of="2026-03-20")
+    assert out["known_at"] == "2026-03-10"
+
+
+def test_the_real_output_satisfies_the_scanner_gate(store):
+    """A contract test between the two, because the bug above was a stub that
+    had a field the module did not. Anything the scanner requires of a signal
+    has to be present on the thing the module actually returns."""
+    from research import scanner
+
+    _cohort(store, n=20)
+    _reported(store, "AAA", "2026Q1", "2026-03-02", estimate=1.0, actual=1.9)
+
+    real = {**sue_cs.surprise_rank("AAA", as_of="2026-03-03"), "variant": "cs"}
+    assert real["success"] is True, real["error"]
+    assert scanner._signal_problem(real, "2026-03-03") is None, (
+        scanner._signal_problem(real, "2026-03-03"))
