@@ -93,6 +93,11 @@ def seed(tickers: Sequence[str],
     written = 0
     incomplete = 0
     undated = 0
+    # Which quarters had no matching filing, by name. A count alone hides the
+    # difference between one derived quarter that did not resolve and a filer
+    # whose vendor labels are a year off its own -- the second can never be
+    # seeded at all, and an operator has no way to find that out from a total.
+    unmatched: Dict[str, List[str]] = {}
     failed: List[str] = []
     seen = 0
 
@@ -124,6 +129,7 @@ def seed(tickers: Sequence[str],
                 # No filer dates, nothing to stamp it at. Guessing is what put
                 # an estimate a year into the future the first time round.
                 undated += 1
+                unmatched.setdefault(ticker, []).append(fiscal)
                 continue
 
             # Skip on a recorded ACTUAL, not on the mere presence of a row.
@@ -146,7 +152,7 @@ def seed(tickers: Sequence[str],
 
     return {"tickers": len(tickers), "quarters_seen": seen,
             "written": written, "incomplete": incomplete, "undated": undated,
-            "failed": failed}
+            "unmatched": unmatched, "failed": failed}
 
 
 # ------------------------------------------------------------- entry point

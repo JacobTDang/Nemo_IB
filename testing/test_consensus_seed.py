@@ -265,3 +265,29 @@ def test_the_recorded_estimate_survives_the_seeding_of_its_actual(store,
     before = pit_store.consensus_as_of("MSFT", "2026Q4", as_of="2026-06-15")
     assert before["eps_estimate"] == 9.99
     assert before["source"] == "recorded"
+
+
+def test_a_name_whose_labels_never_match_is_named(store, monkeypatch):
+    """Finnhub's year and quarter are usually the filer's own, and for some
+    names they are not: DG's vendor labels run a full year ahead of its XBRL
+    ones, so not one of its four quarters matches and it can never be seeded.
+    Skipping is right -- guessing a stamp is what put an estimate a year in the
+    future. Skipping silently is not: the count said `undated: 9` and nothing
+    said which names would stay uncovered forever."""
+    monkeypatch.setattr(seed_consensus, "_fetch_surprises",
+                        lambda t: OFF_CALENDAR)
+    monkeypatch.setattr(seed_consensus, "_filing_dates",
+                        lambda t, as_of=None: {})
+
+    out = seed_consensus.seed(["DG"], as_of="2026-08-27")
+
+    assert out["undated"] == 1
+    assert "DG" in out["unmatched"]
+    assert "2027Q2" in out["unmatched"]["DG"]
+
+
+def test_a_name_that_matched_is_not_listed_as_unmatched(store, monkeypatch):
+    monkeypatch.setattr(seed_consensus, "_fetch_surprises",
+                        lambda t: SURPRISES)
+    out = seed_consensus.seed(["MSFT"])
+    assert out["unmatched"] == {}

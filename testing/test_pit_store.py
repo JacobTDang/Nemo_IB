@@ -422,3 +422,43 @@ def test_an_actual_recorded_later_is_invisible_too(store):
     store.record_consensus("2026-04-25", "MSFT", "2026Q2", eps_actual=4.14,
                            recorded_at="2026-06-01T21:00:00Z")
     assert store.actual_as_of("MSFT", "2026Q2", as_of="2026-05-01") is None
+
+
+def test_a_store_built_before_the_column_existed_gains_it(tmp_path, monkeypatch):
+    """CREATE TABLE IF NOT EXISTS leaves an existing table alone, so a column
+    added later needs saying explicitly -- and a deployed store is exactly the
+    one that predates it. Rows already there are observations, not
+    reconstructions, and must not be relabelled by the migration."""
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    monkeypatch.setenv("NEMO_PIT_DB", str(path))
+    with sqlite3.connect(path) as conn:
+        conn.execute("""CREATE TABLE consensus_snapshot (
+            as_of_date TEXT NOT NULL, ticker TEXT NOT NULL,
+            fiscal_period TEXT NOT NULL, eps_estimate REAL,
+            analyst_count INTEGER, recorded_at TEXT NOT NULL,
+            PRIMARY KEY (as_of_date, ticker, fiscal_period))""")
+        conn.execute("INSERT INTO consensus_snapshot VALUES "
+                     "('2026-03-01','AAPL','2026Q2',1.10,8,"
+                     "'2026-03-01T21:00:00Z')")
+
+    pit_store.init_schema()
+
+    with pit_store.connect() as conn:
+        cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info(consensus_snapshot)")}
+        row = conn.execute("SELECT * FROM consensus_snapshot").fetchone()
+    assert {"eps_actual", "source"} <= cols
+    assert row["source"] == "recorded", "existing rows were relabelled"
+    assert row["eps_estimate"] == 1.10
+
+
+def test_the_migration_is_idempotent(tmp_path, monkeypatch):
+    monkeypatch.setenv("NEMO_PIT_DB", str(tmp_path / "twice.db"))
+    pit_store.init_schema()
+    pit_store.init_schema()
+    pit_store.record_consensus("2026-03-01", "AAPL", "2026Q2",
+                               eps_estimate=1.10,
+                               recorded_at="2026-03-01T21:00:00Z")
+    assert pit_store.consensus_as_of("AAPL", "2026Q2", "2026-03-02")
