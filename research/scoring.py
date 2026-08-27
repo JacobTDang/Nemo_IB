@@ -102,35 +102,47 @@ def score_orders(as_of: Optional[str] = None,
                            f"elapsed since {entry_session}")})
             continue
 
-        exit_bar = forward[horizon_days]
-        entry_price = entry["open"]
-        exit_price = exit_bar["open"]
-        if not entry_price or not exit_price:
+        row = fill(order, entry, forward[horizon_days])
+        if row is None:
             unfilled.append({**_stub(order),
                              "reason": "a price on the path is missing"})
             continue
-
-        move = (exit_price / entry_price) - 1.0
-        if order["side"] == "short":
-            move = -move
-        gross_bps = move * 10_000
-        cost_bps = order["cost_bps"] or 0.0
-
-        scored.append({
-            **_stub(order),
-            "entry_session": entry_session,
-            "entry_price": entry_price,
-            "exit_session": exit_bar["trade_date"],
-            "exit_price": exit_price,
-            "gross_bps": gross_bps,
-            "cost_bps": cost_bps,
-            "net_bps": gross_bps - cost_bps,
-            "expected_edge_bps": order["expected_edge_bps"],
-        })
+        scored.append({**row, "expected_edge_bps": order["expected_edge_bps"]})
 
     return {"as_of": as_of, "horizon_days": horizon_days,
             "scored": scored, "pending": pending, "unfilled": unfilled,
             **_summarise(scored)}
+
+
+def fill(order: Dict[str, Any], entry: Dict[str, Any],
+         exit_bar: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """One trade's arithmetic, shared by the live path and by replay.
+
+    They differ only in where the orders come from -- the filed table or a
+    replayed run -- and this used to be copied between them, which is how a fix
+    to one silently stops applying to the other.
+
+    Entry and exit are opens. The close of the day a decision was made is a
+    price that was already known when the decision was made, and using it would
+    hand the study the move it was deciding about.
+    """
+    entry_price = entry.get("open")
+    exit_price = exit_bar.get("open")
+    if not entry_price or not exit_price:
+        return None
+
+    move = (exit_price / entry_price) - 1.0
+    if order.get("side") == "short":
+        move = -move
+    gross_bps = move * 10_000
+    cost_bps = order.get("cost_bps") or 0.0
+    return {
+        **_stub(order),
+        "entry_session": entry["trade_date"], "entry_price": entry_price,
+        "exit_session": exit_bar["trade_date"], "exit_price": exit_price,
+        "gross_bps": gross_bps, "cost_bps": cost_bps,
+        "net_bps": gross_bps - cost_bps,
+    }
 
 
 def _stub(order: Dict[str, Any]) -> Dict[str, Any]:

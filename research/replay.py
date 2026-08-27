@@ -132,8 +132,47 @@ def prints_from_filings(tickers: Sequence[str],
     return out
 
 
+# Precomputed signals, keyed by ticker. A replay over 180 decision dates
+# calling sue_ts per name per date is thousands of EDGAR requests for a series
+# that does not change; sue_ts_history returns every quarter in one pass and
+# agrees with a point-in-time sue_ts on each quarter's own filing date to
+# fifteen digits.
+_SIGNALS: Dict[str, List[Dict[str, Any]]] = {}
+
+
+def load_signals(signals: Dict[str, List[Dict[str, Any]]]) -> int:
+    """Install the precomputed table. Replaces whatever was there."""
+    _SIGNALS.clear()
+    for ticker, rows in signals.items():
+        _SIGNALS[ticker] = sorted(
+            (r for r in rows if r.get("known_at") and r.get("sue") is not None),
+            key=lambda r: r["known_at"])
+    return sum(len(v) for v in _SIGNALS.values())
+
+
+def build_signals(tickers: Sequence[str],
+                  as_of: Optional[str] = None) -> Dict[str, Any]:
+    """One EDGAR pass per name for every quarter it ever filed."""
+    table: Dict[str, List[Dict[str, Any]]] = {}
+    for ticker in tickers:
+        history = sue.sue_ts_history(ticker, as_of=as_of)
+        rows = history.get("signals") or history.get("quarters") or []
+        table[ticker] = [r for r in rows if r.get("sue") is not None]
+    loaded = load_signals(table)
+    return {"tickers": len(table), "signals": loaded}
+
+
 def _signal_for(ticker: str, as_of: str) -> Dict[str, Any]:
-    return sue.sue_ts(ticker, as_of=as_of)
+    """The most recently filed signal for this name on this date.
+
+    The most recent, never the largest. A lookup that scanned for the biggest
+    surprise available would be picking its trades with hindsight.
+    """
+    rows = [r for r in _SIGNALS.get(ticker, []) if r["known_at"][:10] <= as_of]
+    if not rows:
+        return {"ticker": ticker, "success": False, "sue": None,
+                "error": f"no filed signal for {ticker} on or before {as_of}"}
+    return {**rows[-1], "ticker": ticker, "success": True, "error": None}
 
 
 def _refresh_universe_for(tickers: Sequence[str], as_of: str) -> int:
@@ -176,11 +215,13 @@ def run(dates: Sequence[str], horizon_days: int = 20,
 
 def _score(orders: List[Dict[str, Any]],
            horizon_days: int) -> Dict[str, Any]:
-    """The same arithmetic `scoring` does, against replay orders.
+    """`scoring.fill` applied to replay orders rather than filed ones.
 
-    Deliberately not reading paper_order: a decision that was made and a
-    decision that was imagined must not share a table, or a scoring run reports
-    the imagined ones as results.
+    One implementation, deliberately: the two paths differ only in where the
+    orders come from, and copying the arithmetic between them is how a fix to
+    one stops applying to the other. What is not shared is the source --
+    paper_order holds decisions that were made, and these are decisions that
+    were imagined, so a scoring run must never see both.
     """
     from research import scoring
 
@@ -200,23 +241,10 @@ def _score(orders: List[Dict[str, Any]],
         if len(forward) <= horizon_days:
             continue
 
-        entry = forward[0]["open"]
-        exit_price = forward[horizon_days]["open"]
-        if not entry or not exit_price:
+        row = scoring.fill(order, forward[0], forward[horizon_days])
+        if row is None:
             continue
-        move = (exit_price / entry) - 1.0
-        if order.get("side") == "short":
-            move = -move
-        gross = move * 10_000
-        scored.append({
-            "ticker": order["ticker"], "as_of_date": order["as_of_date"],
-            "sue": order["sue"], "side": order.get("side"),
-            "entry_session": entry_session, "entry_price": entry,
-            "exit_session": forward[horizon_days]["trade_date"],
-            "exit_price": exit_price,
-            "gross_bps": gross, "cost_bps": order.get("cost_bps") or 0.0,
-            "net_bps": gross - (order.get("cost_bps") or 0.0),
-        })
+        scored.append({**row, "as_of_date": order["as_of_date"]})
 
     return {"scored": scored, **scoring._summarise(scored)}
 

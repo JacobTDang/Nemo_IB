@@ -208,3 +208,79 @@ def test_a_replay_screens_each_date_on_its_own_history(store, monkeypatch):
     late = {m["ticker"]: m for m in pit_store.universe_as_of(DAYS[70])}["AAA"]
     assert early["eligible"] is False and "histor" in early["exclusion_reason"]
     assert late["eligible"] is True
+
+
+def test_replay_and_live_scoring_agree_on_the_same_trade(store, monkeypatch):
+    """The two paths differ only in where the orders come from -- the live
+    table or a replay run. The arithmetic between them was copied, which is how
+    a fix to one silently stops applying to the other."""
+    import yfinance
+    from research import scoring
+
+    monkeypatch.setattr(yfinance, "download",
+                        lambda *a, **k: _frame(k["tickers"].split(), DAYS[:40]))
+    replay.build_store(["AAA"], start=DAYS[0], end=DAYS[39])
+
+    # Make the path go somewhere, so agreement is not agreement on zero.
+    pit_store.record_bars("AAA", [
+        {"trade_date": DAYS[25], "open": 130.0, "high": 131.0, "low": 129.0,
+         "close": 130.0, "volume": 5e6}], recorded_at=f"{DAYS[25]}T21:00:00Z")
+
+    order = {"ticker": "AAA", "side": "long", "sue": 2.0,
+             "fiscal_period": "2026Q1", "expected_edge_bps": 30.0,
+             "cost_bps": 7.0, "net_edge_bps": 23.0, "target_dollars": 5000.0,
+             "participation": 0.001, "spread": 0.0005,
+             "spread_resolved": True, "rank": 1,
+             "intended_session": DAYS[20]}
+
+    pit_store.record_paper_orders(DAYS[19], [order], regime="calm",
+                                 gross_target=100_000.0,
+                                 recorded_at=f"{DAYS[19]}T21:00:00Z")
+
+    live = scoring.score_orders(as_of=DAYS[39], horizon_days=5)["scored"]
+    replayed = replay._score([{**order, "as_of_date": DAYS[19]}],
+                             horizon_days=5)["scored"]
+
+    assert len(live) == 1 and len(replayed) == 1
+    for field in ("entry_price", "exit_price", "gross_bps", "net_bps"):
+        assert live[0][field] == pytest.approx(replayed[0][field]), field
+
+
+# --- signals, precomputed once ----------------------------------------------
+#
+# A replay over 180 decision dates calling sue_ts per name per date is
+# thousands of EDGAR requests for a series that does not change. sue_ts_history
+# returns every quarter in one pass, and it agrees with a point-in-time sue_ts
+# on each quarter's own filing date to fifteen digits -- verified live on MSFT.
+
+def test_a_precomputed_signal_is_only_visible_after_it_was_filed(store):
+    replay.load_signals({"AAA": [
+        {"fiscal_period": "2026Q1", "known_at": DAYS[10], "sue": 2.0,
+         "sigma_quarters": 8, "sigma_periods": ["2026Q1"], "basis_changes": []},
+        {"fiscal_period": "2026Q2", "known_at": DAYS[40], "sue": 3.0,
+         "sigma_quarters": 8, "sigma_periods": ["2026Q2"], "basis_changes": []},
+    ]})
+
+    assert replay._signal_for("AAA", DAYS[5])["success"] is False
+    assert replay._signal_for("AAA", DAYS[20])["sue"] == 2.0
+    assert replay._signal_for("AAA", DAYS[45])["sue"] == 3.0
+
+
+def test_the_latest_filed_quarter_wins_not_the_largest(store):
+    """A lookup that scanned for the biggest surprise instead of the most
+    recent one would pick its trades with hindsight."""
+    replay.load_signals({"AAA": [
+        {"fiscal_period": "2026Q1", "known_at": DAYS[10], "sue": 9.0,
+         "sigma_quarters": 8, "sigma_periods": [], "basis_changes": []},
+        {"fiscal_period": "2026Q2", "known_at": DAYS[20], "sue": 1.5,
+         "sigma_quarters": 8, "sigma_periods": [], "basis_changes": []},
+    ]})
+
+    assert replay._signal_for("AAA", DAYS[30])["sue"] == 1.5
+
+
+def test_a_name_with_no_signals_refuses_rather_than_returning_none(store):
+    replay.load_signals({})
+    out = replay._signal_for("AAA", DAYS[30])
+    assert out["success"] is False
+    assert out["error"]
