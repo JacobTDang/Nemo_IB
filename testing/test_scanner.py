@@ -633,3 +633,23 @@ def test_the_scan_reports_how_far_it_narrowed(liquid_universe, monkeypatch):
     assert result["screened"] == 2
     assert result["considered"] == 1
     assert result["narrowed_by"] == "recorded prints"
+
+
+def test_a_scan_that_had_nothing_to_do_leaves_a_record_saying_why(
+        liquid_universe, monkeypatch):
+    """A day with no orders and a day the scan never ran look identical in the
+    paper_order table, because both are empty. The run log is the only place
+    the difference can live, so the reason goes there."""
+    _reported(liquid_universe, "AAA", "2026Q1", "2026-01-01")
+
+    monkeypatch.setattr(scanner, "_signal_for", lambda t, a: _signal(t, 3.0))
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0010))
+
+    scanner.record_scan(as_of="2026-03-03")
+
+    from research import daily_job
+
+    run = daily_job.last_run("scan")
+    assert run["status"] == "ok"
+    assert run["error"], "a scan with no candidates recorded no reason"
+    assert "eligible" in run["error"] or "print" in run["error"]

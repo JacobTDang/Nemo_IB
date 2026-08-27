@@ -482,7 +482,15 @@ def record_scan(as_of: Optional[str] = None) -> Dict[str, Any]:
         pit_store.finish_run(rows_written=0, status="failed",
                              error=f"{type(exc).__name__}: {exc}")
         raise
-    pit_store.finish_run(rows_written=written, status="ok")
+    # A day with no orders and a day the scan never ran are both an empty
+    # paper_order table. The run log is the only place that difference can
+    # live, so the narrowing note goes there whether or not anything was found.
+    note = result["narrowing_note"]
+    if not result["candidates"]:
+        note = (f"no candidates: {note}; "
+                f"{len(result['undetermined'])} undetermined, "
+                f"{len(result['rejected'])} rejected")
+    pit_store.finish_run(rows_written=written, status="ok", error=note)
     return {**result, "written": written}
 
 
