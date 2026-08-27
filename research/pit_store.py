@@ -530,7 +530,7 @@ def record_consensus(as_of_date: str, ticker: str, fiscal_period: str,
                      analyst_count: Optional[int] = None,
                      eps_actual: Optional[float] = None,
                      recorded_at: Optional[str] = None,
-                     source: str = "recorded") -> None:
+                     source: str = "recorded") -> int:
     """One day's view of what the street expects.
 
     This is the series with a clock on it. Finnhub returns four quarters at
@@ -540,13 +540,14 @@ def record_consensus(as_of_date: str, ticker: str, fiscal_period: str,
     backtest starting sooner.
     """
     with connect() as conn:
-        conn.execute(
+        cur = conn.execute(
             """INSERT OR IGNORE INTO consensus_snapshot
                (as_of_date, ticker, fiscal_period, eps_estimate, eps_actual,
                 analyst_count, recorded_at, source)
                VALUES (?,?,?,?,?,?,?,?)""",
             (as_of_date, ticker, fiscal_period, eps_estimate, eps_actual,
              analyst_count, recorded_at or _now(), source))
+    return cur.rowcount or 0
 
 
 def consensus_as_of(ticker: str, fiscal_period: str,

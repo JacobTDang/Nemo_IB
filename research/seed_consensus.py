@@ -126,18 +126,23 @@ def seed(tickers: Sequence[str],
                 undated += 1
                 continue
 
-            before = pit_store.consensus_as_of(ticker, fiscal,
-                                               as_of="9999-12-31")
-            if before is not None:
+            # Skip on a recorded ACTUAL, not on the mere presence of a row.
+            # The daily job writes an estimate for everything on the calendar,
+            # so a quarter it was down for has an estimate and no actual --
+            # and skipping that leaves it half-filled forever, one quarter
+            # fewer for a window that needs six. Writes are INSERT OR IGNORE
+            # keyed on the date, so an observed estimate is never restated by
+            # the reconstruction of its actual.
+            if pit_store.actual_as_of(ticker, fiscal, "9999-12-31") is not None:
                 continue
 
-            pit_store.record_consensus(
+            written += pit_store.record_consensus(
                 period_end, ticker, fiscal, eps_estimate=estimate,
-                recorded_at=_stamp(period_end), source=SOURCE)
-            pit_store.record_consensus(
+                recorded_at=_stamp(period_end), source=SOURCE) or 0
+            written += pit_store.record_consensus(
                 known_at, ticker, fiscal, eps_estimate=estimate,
-                eps_actual=actual, recorded_at=_stamp(known_at), source=SOURCE)
-            written += 2
+                eps_actual=actual, recorded_at=_stamp(known_at),
+                source=SOURCE) or 0
 
     return {"tickers": len(tickers), "quarters_seen": seen,
             "written": written, "incomplete": incomplete, "undated": undated,

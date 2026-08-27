@@ -119,9 +119,11 @@ def test_seeding_never_overwrites_something_that_was_watched(store,
 
     seed_consensus.seed(["MSFT"])
 
-    snap = pit_store.consensus_as_of("MSFT", "2026Q4", as_of="2026-12-31")
-    assert snap["eps_estimate"] == 9.99
-    assert snap["source"] == "recorded"
+    # The read that matters is the pre-print one, because that is where the
+    # analyst surprise takes its estimate from. The observed row stands there.
+    before = pit_store.consensus_as_of("MSFT", "2026Q4", as_of="2026-07-01")
+    assert before["eps_estimate"] == 9.99
+    assert before["source"] == "recorded"
 
 
 def test_seeding_twice_changes_nothing(store, monkeypatch):
@@ -212,3 +214,54 @@ def test_a_quarter_the_filings_do_not_cover_is_skipped(store, monkeypatch):
     out = seed_consensus.seed(["NVDA"], as_of="2026-08-27")
     assert out["written"] == 0
     assert out["undated"] == 1
+
+
+# --- the gap a conservative skip leaves -------------------------------------
+
+def test_a_quarter_missing_only_its_actual_is_still_seeded(store, monkeypatch):
+    """The daily job records estimates for everything on the calendar. If it
+    was down on the day a quarter reported, that quarter has an estimate and no
+    actual -- and skipping on the mere presence of a row leaves it half-filled
+    forever, which is one quarter fewer for a window that needs six.
+    """
+    store.record_consensus("2026-06-01", "MSFT", "2026Q4", eps_estimate=4.3274,
+                           recorded_at="2026-06-01T21:00:00Z")
+    monkeypatch.setattr(seed_consensus, "_fetch_surprises",
+                        lambda t: SURPRISES)
+
+    out = seed_consensus.seed(["MSFT"])
+
+    assert pit_store.actual_as_of("MSFT", "2026Q4", as_of="2026-12-31") == 4.74
+    assert out["written"] > 0
+
+
+def test_a_quarter_that_already_has_its_actual_is_left_alone(store, monkeypatch):
+    """A real observation outranks a reconstruction of the same thing."""
+    store.record_consensus("2026-07-29", "MSFT", "2026Q4", eps_estimate=4.30,
+                           eps_actual=4.70, recorded_at="2026-07-29T21:00:00Z")
+    monkeypatch.setattr(seed_consensus, "_fetch_surprises",
+                        lambda t: SURPRISES)
+
+    seed_consensus.seed(["MSFT"])
+
+    assert pit_store.actual_as_of("MSFT", "2026Q4", as_of="2026-12-31") == 4.70
+    with pit_store.connect() as conn:
+        rows = conn.execute(
+            "SELECT source FROM consensus_snapshot WHERE fiscal_period='2026Q4'"
+        ).fetchall()
+    assert all(r["source"] == "recorded" for r in rows)
+
+
+def test_the_recorded_estimate_survives_the_seeding_of_its_actual(store,
+                                                                  monkeypatch):
+    """Filling the missing leg must not restate the leg that was observed."""
+    store.record_consensus("2026-06-01", "MSFT", "2026Q4", eps_estimate=9.99,
+                           recorded_at="2026-06-01T21:00:00Z")
+    monkeypatch.setattr(seed_consensus, "_fetch_surprises",
+                        lambda t: SURPRISES)
+
+    seed_consensus.seed(["MSFT"])
+
+    before = pit_store.consensus_as_of("MSFT", "2026Q4", as_of="2026-06-15")
+    assert before["eps_estimate"] == 9.99
+    assert before["source"] == "recorded"
