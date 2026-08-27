@@ -365,3 +365,40 @@ def latency_report(as_of: Optional[str] = None,
         "median_latency_seconds": statistics.median(live) if live else None,
         "worst_latency_seconds": max(live) if live else None,
     }
+
+
+# ------------------------------------------------------------- entry point
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """`python -m research.activist_watch`, on a short timer.
+
+    Not a stage of the nightly job. A 13D moves the price when it lands, so the
+    edge is the gap between the filing appearing on EDGAR and anyone reading
+    it -- and a once-a-night pass measures that gap in hours however fast the
+    code is. Running it every few minutes during the day is what the latency
+    figures are for.
+
+    A pass that finds nothing exits 0. Most of them find nothing; paging on
+    that is how the one that matters gets ignored.
+    """
+    import argparse
+    import json
+
+    parser = argparse.ArgumentParser(
+        prog="activist_watch",
+        description="Sweep EDGAR for subject-side 13D filings.")
+    parser.add_argument("--as-of", dest="as_of", default=None,
+                        help="date whose eligible universe to sweep "
+                             "(default: today)")
+    parser.add_argument("--max-tickers", dest="max_tickers", type=int,
+                        default=None,
+                        help="cap the sweep, for a first pass on a cold store")
+    args = parser.parse_args(argv)
+
+    result = watch_pass(as_of=args.as_of, max_tickers=args.max_tickers)
+    print(json.dumps(result, indent=2, default=str))
+    return 1 if result.get("status") == "failed" else 0
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised via main()
+    raise SystemExit(main())

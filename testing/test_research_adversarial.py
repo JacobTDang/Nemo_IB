@@ -687,3 +687,63 @@ def test_the_estimator_sees_the_splits_the_recorder_writes(store, monkeypatch):
     # And the result is a spread rather than a measurement of the split.
     bound = est["spread_upper"]
     assert bound is None or bound < 0.5, f"spread_upper came back {bound}"
+
+
+# --- degenerate market data --------------------------------------------------
+#
+# The screen keeps names above $500k of median dollar volume, but the scanner
+# sizes against `participation_rate` directly and nothing guarantees the two
+# see the same window. A name whose median session traded nothing divides by
+# zero.
+
+
+def _flat(ticker, n, close=10.0, volume=1_000_000, store=None):
+    days = []
+    d = date(2026, 1, 1)
+    while len(days) < n:
+        if d.weekday() < 5:
+            days.append(d.isoformat())
+        d += timedelta(days=1)
+    store.record_bars(ticker, [
+        {"trade_date": x, "open": close, "high": close, "low": close,
+         "close": close, "volume": volume} for x in days],
+        recorded_at=f"{days[-1]}T21:00:00Z")
+    return days
+
+
+def test_a_name_that_traded_nothing_does_not_divide_by_zero(store):
+    from research import spread as sp
+    days = _flat("DEAD", 300, volume=0.0, store=store)
+
+    out = sp.participation_rate("DEAD", days[-1], 5000.0,
+                                window=sp.RESOLVING_WINDOW)
+    assert out["reason"], "a zero-volume name came back sizeable"
+    assert out["within_limit"] is False
+
+
+def test_a_zero_volume_name_is_refused_by_the_scanner(store, monkeypatch):
+    from research import scanner as sc
+    days = _flat("DEAD", 300, volume=0.0, store=store)
+    _flat(sc.REGIME_TICKER, 300, store=store)
+    store.record_universe(days[-2], [
+        {"ticker": "DEAD", "cik": "1", "eligible": True}])
+    monkeypatch.setattr(sc, "_signal_for", lambda t, a: {
+        "ticker": t, "success": True, "sue": 3.0, "known_at": a,
+        "sigma_quarters": 8, "sigma_periods": ["2026Q1"],
+        "basis_changes": [], "fiscal_period": "2026Q1"})
+
+    result = sc.scan(as_of=days[-1])
+    assert result["candidates"] == []
+    assert result["rejected"], "no candidate and no reason"
+
+
+def test_a_perfectly_flat_price_series_is_refused_not_priced(store):
+    """Every high equals every low, so there is no range for EDGE to read a
+    spread out of. Returning zero would say trading is free."""
+    from research import spread as sp
+    days = _flat("FLAT", 300, store=store)
+
+    out = sp.estimate_spread("FLAT", days[-1], window=sp.RESOLVING_WINDOW)
+    assert out["spread"] is None or out["spread"] > 0
+    if out["spread"] is None:
+        assert out["reason"]

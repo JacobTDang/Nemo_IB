@@ -572,3 +572,55 @@ def test_each_pass_leaves_its_own_run_log_entry(store, monkeypatch):
             "ORDER BY run_id").fetchall()
     assert [r["status"] for r in rows] == ["ok", "failed"]
     assert activist_watch.last_run()["status"] == "failed"
+
+
+# --- the entry point, and why it is on its own timer ------------------------
+#
+# Everything here was built, tested and then called by nothing: not run_all,
+# not any scheduled service. A watcher that never runs records no filings and
+# measures no latency, and the latency is the whole point of it.
+#
+# It does not belong in the nightly job either. A 13D moves a price when it
+# lands, so the edge is in the gap between the filing appearing on EDGAR and
+# anyone reading it -- a once-a-night pass measures that gap in hours no matter
+# how fast the code is.
+
+def test_the_watcher_has_an_entry_point(monkeypatch):
+    from research import activist_watch as aw
+
+    seen = {}
+    monkeypatch.setattr(aw, "watch_pass",
+                        lambda **kw: seen.update(kw) or {"status": "ok",
+                                                         "recorded": 0})
+    assert aw.main([]) == 0
+    assert "as_of" in seen
+
+
+def test_a_failed_pass_exits_non_zero(monkeypatch):
+    from research import activist_watch as aw
+
+    monkeypatch.setattr(aw, "watch_pass",
+                        lambda **kw: {"status": "failed",
+                                      "error": "EDGAR returned 503"})
+    assert aw.main([]) == 1
+
+
+def test_a_pass_that_finds_nothing_exits_zero(monkeypatch):
+    """Most passes find nothing. That is not a failure and must not page."""
+    from research import activist_watch as aw
+
+    monkeypatch.setattr(aw, "watch_pass",
+                        lambda **kw: {"status": "ok", "recorded": 0})
+    assert aw.main([]) == 0
+
+
+def test_the_ticker_cap_reaches_the_pass(monkeypatch):
+    from research import activist_watch as aw
+
+    seen = {}
+    monkeypatch.setattr(aw, "watch_pass",
+                        lambda **kw: seen.update(kw) or {"status": "ok",
+                                                         "recorded": 0})
+    aw.main(["--max-tickers", "50", "--as-of", "2026-03-03"])
+    assert seen["max_tickers"] == 50
+    assert seen["as_of"] == "2026-03-03"

@@ -233,6 +233,37 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # The 13D watcher, on a short timer rather than a nightly one. A stake
+  # disclosed under Schedule 13D moves the price when it lands, so the edge is
+  # the gap between the filing appearing on EDGAR and anyone reading it -- and
+  # a once-a-night pass measures that gap in hours however fast the code is.
+  # It sweeps the eligible universe, so it needs the recorder to have run.
+  #
+  #   docker compose run --rm research-watch
+  #   docker compose run --rm research-watch --max-tickers 200   # cold start
+  #
+  # Every twenty minutes through the session and a little past the close,
+  # which is when 13Ds actually appear:
+  #   */20 13-23 * * 1-5 cd /srv/nemo/deploy && docker compose run --rm research-watch
+  research-watch:
+    image: ${NEMO_IMAGE:-nemo-data:local}
+    env_file: ../.env
+    profiles: ["sync"]
+    restart: "no"
+    entrypoint: ["python", "-m", "research.activist_watch"]
+    environment:
+      NEMO_PIT_DB: /app/data/pit.db
+    volumes:
+      - research-data:/app/data
+    tmpfs:
+      - /root/.edgar:rw,size=512m
+      - /app/db_cache:rw,size=128m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 volumes:
   # Survives `docker compose down` and container replacement. Back it up the
   # way you would any database: the contents are reconstructible from the
