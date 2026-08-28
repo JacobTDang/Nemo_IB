@@ -69,9 +69,10 @@ the spread turned out to be.
 """
 from __future__ import annotations
 
+import bisect
 import math
 import statistics
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 import numpy as np
 
@@ -315,6 +316,47 @@ def _moments(open: Sequence[float], high: Sequence[float],
 
 # ------------------------------------------------------------------- the window
 
+def _bars_across_a_split(bars: Sequence[Dict[str, Any]],
+                         actions: Sequence[Dict[str, Any]]) -> Set[int]:
+    """Indices of the bars a split's price discontinuity lands on.
+
+    An ex-date is not the same thing as a session. `pit_store.adjusted_bars`
+    keys its adjustment on "every action dated after this bar" rather than on
+    an ex-date matching a bar's date exactly, and its comment gives three ways
+    the exact match misses: the ex-date falls on a holiday, on a session a
+    fetch dropped, or after the last bar recorded. Matching exactly here misses
+    them the same way, and the cost of missing is worse than a lost adjustment
+    -- the raw -90% print stays in the window, EDGE reads it as trading cost,
+    and close-to-close volatility reads it as an eightfold jump in sigma. The
+    name is then rejected every night at several times its real cost, with a
+    number that reads like a verdict on its liquidity.
+
+    A split is one broken transition, not a broken window: the last bar priced
+    before the ex-date to the first bar priced after it. So the bar to drop is
+    the first one dated on or after the ex-date -- the ex-date's own session
+    when it printed, the next session when it did not.
+
+    Both ends of that transition have to be inside the window for there to be
+    anything to drop. A split older than the window's first bar is entirely
+    behind it and every price in the window is on the same side of it; a split
+    effective after the last bar recorded has not printed yet. Dropping a
+    session in either case would spend real evidence correcting a jump that is
+    not in the data, which is the same kind of error in the other direction.
+    """
+    # `bars_as_of` returns sessions in date order, which is what lets the
+    # boundary be found by bisection rather than by scanning.
+    dates = [b["trade_date"] for b in bars]
+    hits: Set[int] = set()
+    for action in actions:
+        if action["action_type"] != "split":
+            continue
+        first_after = bisect.bisect_left(dates, action["ex_date"])
+        if first_after == 0 or first_after == len(dates):
+            continue
+        hits.add(first_after)
+    return hits
+
+
 def _window(ticker: str, as_of: str,
             window: int) -> Dict[str, Any]:
     """The cleaned bars for one name as they stood on `as_of`, or a reason.
@@ -336,8 +378,10 @@ def _window(ticker: str, as_of: str,
     10-for-1 split is a genuine -90% print between two adjacent sessions. EDGE
     only ever compares adjacent bars, so one split breaks exactly the
     transitions that touch it -- and inflates the estimate by an order of
-    magnitude if it is left in. Only splits recorded on or before `as_of` are
-    known, which is why they are read through the point-in-time accessor.
+    magnitude if it is left in. Which bar carries that break, when the ex-date
+    itself never printed, is `_bars_across_a_split`. Only splits recorded on or
+    before `as_of` are known, which is why they are read through the
+    point-in-time accessor.
     """
     if window < MIN_SESSIONS:
         raise ValueError(
@@ -356,9 +400,8 @@ def _window(ticker: str, as_of: str,
             f"{MIN_SESSIONS} required")
         return out
 
-    split_dates = {a["ex_date"] for a
-                   in pit_store.corporate_actions_as_of(ticker, as_of)
-                   if a["action_type"] == "split"}
+    split_bars = _bars_across_a_split(
+        bars, pit_store.corporate_actions_as_of(ticker, as_of))
 
     n = len(bars)
     o = np.full(n, np.nan)
@@ -378,7 +421,7 @@ def _window(ticker: str, as_of: str,
             if bl > bh or not (bl <= bo <= bh) or not (bl <= bc <= bh):
                 usable = False
 
-        if usable and bar["trade_date"] in split_dates:
+        if usable and i in split_bars:
             usable = False
             splits_hit += 1
 
