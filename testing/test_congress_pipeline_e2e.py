@@ -19,6 +19,7 @@ import pytest
 from tools.altdata_server import congress_store as store
 from tools.altdata_server import congress_sync as sync
 from tools.altdata_server import congress_queries as q
+from tools.altdata_server import congress_trades as ct
 from tools.altdata_server.congress_trades import parse_house_ptr
 from tools.altdata_server.server import AltDataServer
 
@@ -81,6 +82,8 @@ def pipeline(tmp_path, monkeypatch):
     monkeypatch.setenv("NEMO_CONGRESS_DB", str(tmp_path / "e2e.db"))
     monkeypatch.setenv("SEC_EMAIL", "e2e@example.invalid")
     monkeypatch.setattr(sync, "_throttle", lambda: None)
+    # The Senate search paces itself between pages; nothing here is a network.
+    monkeypatch.setattr(ct, "_throttle", lambda: None)
     monkeypatch.setattr(sync, "fetch_house_index",
                         lambda year, session=None: HOUSE_INDEX)
 

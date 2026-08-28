@@ -238,6 +238,8 @@ def test_no_midpoint_is_ever_reported():
 @pytest.fixture
 def _house_only(monkeypatch):
     """A House index of `n` PTRs, each yielding one readable filing."""
+    monkeypatch.setattr(ct, "_throttle", lambda: None)
+
     def install(n, unreadable=0):
         today = __import__("datetime").datetime.now().strftime("%m/%d/%Y")
         index = [{"last": f"Member{i}", "first": "A", "filing_type": "P",
@@ -253,6 +255,8 @@ def _house_only(monkeypatch):
             return {"doc_id": doc_id, "member": f"Hon. Member{doc_id}",
                     "state_district": "XX01", "chamber": "house",
                     "source_url": "https://example.invalid",
+                    "table_found": True, "no_reportable_transactions": False,
+                    "content_hash": f"hash-of-{doc_id}",
                     "transactions": [{"chamber": "house", "ticker": "AAPL",
                                       "asset_name": "Apple Inc",
                                       "transaction_type": "purchase",
@@ -313,3 +317,220 @@ def test_amounts_survive_as_brackets_through_the_tool(_house_only):
         assert txn["amount_min"] == 1001 and txn["amount_max"] == 15000
         assert "amount" not in txn
     assert "brackets rather than figures" in result["note"]
+
+
+# ------------------------------------------- a table that was never located
+
+# The same filing as HOUSE_SINGLE with one word added to the table header --
+# the shape the Clerk's layout takes when it shifts, and the shape pdfplumber
+# produces when its extraction moves a column. Everything else still reads:
+# the Filing ID, the member and the state/district all parse, so the filing
+# looks entirely well-formed apart from having no transactions in it.
+HOUSE_HEADER_SHIFTED = HOUSE_SINGLE.replace(
+    "ID Owner Asset Transaction Date Notification Amount Cap.",
+    "ID Owner Asset Name Transaction Type Date Notification Amount Cap.")
+
+
+def test_a_shifted_table_header_is_not_read_as_a_member_who_did_not_trade():
+    """Zero transactions and a filing that parsed are not the same fact.
+
+    Three filings in the live store -- house:20025111, house:20025152 and
+    house:20033695 -- are recorded `parsed` with zero rows because of exactly
+    this, and `unparsed_filing_ids` will never offer them again.
+    """
+    filing = ct.parse_house_ptr(HOUSE_HEADER_SHIFTED)
+
+    assert filing["transactions"] == []
+    assert filing["table_found"] is False, (
+        "the parser found no transaction table and said nothing about it, so "
+        "the sync recorded the filing as read")
+
+
+def test_a_located_table_says_so():
+    filing = ct.parse_house_ptr(HOUSE_SINGLE)
+    assert filing["table_found"] is True
+    assert filing["no_reportable_transactions"] is False
+
+
+def _fake_pdfplumber(monkeypatch, text):
+    """pdfplumber, serving one page of already-extracted text."""
+    import sys
+    import types
+
+    class _Page:
+        def extract_text(self):
+            return text
+
+    class _Pdf:
+        pages = [_Page()]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setitem(sys.modules, "pdfplumber",
+                        types.SimpleNamespace(open=lambda _buf: _Pdf()))
+
+
+class _Response:
+    def __init__(self, status_code=200, text="", content=b"", headers=None):
+        self.status_code = status_code
+        self.text = text
+        self.content = content or text.encode()
+        self.headers = headers or {}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            import requests
+            raise requests.HTTPError(f"{self.status_code} for url")
+
+
+class _Session:
+    """A session serving a scripted sequence of responses."""
+
+    def __init__(self, *responses):
+        self._responses = list(responses)
+        self.calls = 0
+        self.cookies = {"csrftoken": "t"}
+        self.headers = {}
+
+    def _next(self):
+        self.calls += 1
+        return self._responses[min(self.calls - 1, len(self._responses) - 1)]
+
+    def get(self, url, **kwargs):
+        return self._next()
+
+    def post(self, url, **kwargs):
+        return self._next()
+
+
+@pytest.fixture
+def _offline(monkeypatch):
+    monkeypatch.setenv("SEC_EMAIL", "test@example.invalid")
+    monkeypatch.setattr(ct, "_sleep", lambda seconds: None)
+    monkeypatch.setattr(ct, "_throttle", lambda: None)
+
+
+def test_a_house_ptr_with_no_readable_table_is_refused(monkeypatch, _offline):
+    """A retryable error, not a permanent record of a member who did nothing."""
+    _fake_pdfplumber(monkeypatch, HOUSE_HEADER_SHIFTED)
+
+    with pytest.raises(ct.DisclosureUnavailable) as raised:
+        ct.fetch_house_ptr("20025111", 2025, session=_Session(_Response()))
+    assert "no extractable text" not in str(raised.value), (
+        "this must not be classified as a scan; a scan is never retried")
+
+
+def test_a_house_ptr_that_states_it_has_nothing_to_report_is_accepted(
+        monkeypatch, _offline):
+    """The one zero-row filing that is a fact rather than a parse failure."""
+    _fake_pdfplumber(
+        monkeypatch,
+        HOUSE_SINGLE.replace(
+            "GSK plc American Depositary Shares S 07/28/2025 08/11/2025 "
+            "$1,001 - $15,000", "No reportable transactions."))
+
+    filing = ct.fetch_house_ptr("20025111", 2025, session=_Session(_Response()))
+    assert filing["transactions"] == []
+    assert filing["no_reportable_transactions"] is True
+
+
+# ------------------------------------------- a 200 that is not the document
+
+SENATE_AGREEMENT = """
+<html><body><h1>Prohibition Agreement</h1>
+<form action="/search/home/" method="post">
+  <input type="hidden" name="csrfmiddlewaretoken" value="abc123">
+  <input type="checkbox" name="prohibition_agreement" value="1">
+  I understand the prohibition on using this information.
+</form></body></html>
+"""
+
+SENATE_EMPTY_REPORT = """
+<html><body><h1>Periodic Transaction Report</h1>
+<table><thead><tr>
+  <th>#</th><th>Transaction Date</th><th>Owner</th><th>Ticker</th>
+  <th>Asset Name</th><th>Asset Type</th><th>Type</th><th>Amount</th>
+</tr></thead><tbody></tbody></table></body></html>
+"""
+
+
+def test_an_agreement_page_is_refused_rather_than_read_as_an_empty_report():
+    """eFD serves the agreement with status 200, so raise_for_status never fires."""
+    with pytest.raises(ct.DisclosureUnavailable):
+        ct.parse_senate_ptr(SENATE_AGREEMENT)
+
+
+def test_a_page_without_the_report_table_is_refused():
+    with pytest.raises(ct.DisclosureUnavailable):
+        ct.parse_senate_ptr("<html><body><p>Too Many Requests</p></body></html>")
+
+
+def test_the_real_report_still_parses():
+    """The assertion must not refuse the document it exists to protect."""
+    assert len(ct.parse_senate_ptr(SENATE_HTML)) == 3
+
+
+def test_a_report_that_mentions_the_agreement_in_passing_still_parses():
+    """The table header is the gate; the markers only name what came instead.
+
+    eFD is one Django site, so a report page can carry the same words its
+    agreement page does. A check that refuses every real filing would be
+    worse than the silence it replaces.
+    """
+    footer = ('<footer><a href="/search/home/">Prohibition Agreement</a>'
+              '<input name="csrfmiddlewaretoken" value="x"></footer>')
+    assert len(ct.parse_senate_ptr(SENATE_HTML + footer)) == 3
+
+
+def test_an_electronic_ptr_is_never_returned_with_zero_rows(_offline):
+    """A PTR is filed to report a trade; zero rows is a failure to read it."""
+    session = _Session(_Response(text=SENATE_EMPTY_REPORT))
+    with pytest.raises(ct.DisclosureUnavailable):
+        ct.fetch_senate_ptr(session, "0000-1111")
+
+
+# ----------------------------------------------------------- being refused
+
+def test_a_rate_limited_request_waits_the_interval_it_was_given(monkeypatch,
+                                                                _offline):
+    """Marching on at a fixed 0.8s deepens the block instead of clearing it."""
+    slept = []
+    monkeypatch.setattr(ct, "_sleep", slept.append)
+    _fake_pdfplumber(monkeypatch, HOUSE_SINGLE)
+    session = _Session(_Response(429, headers={"Retry-After": "7"}),
+                       _Response())
+
+    filing = ct.fetch_house_ptr("20026537", 2025, session=session)
+
+    assert slept == [7.0], f"waited {slept} instead of the 7s it was told to"
+    assert len(filing["transactions"]) == 1, "the retry never happened"
+
+
+def test_a_source_that_keeps_refusing_is_reported_as_blocked(monkeypatch,
+                                                             _offline):
+    delays = []
+    monkeypatch.setattr(ct, "_sleep", delays.append)
+    _fake_pdfplumber(monkeypatch, HOUSE_SINGLE)
+    session = _Session(_Response(429))
+
+    with pytest.raises(ct.DisclosureBlocked):
+        ct.fetch_house_ptr("20026537", 2025, session=session)
+
+    assert session.calls <= ct.MAX_ATTEMPTS, "retried without a ceiling"
+    assert delays == sorted(delays) and delays[0] < delays[-1], (
+        f"the backoff did not grow: {delays}")
+
+
+def test_a_forbidden_response_backs_off_rather_than_failing_instantly(
+        monkeypatch, _offline):
+    """403 is how both sites refuse a caller they have decided to block."""
+    monkeypatch.setattr(ct, "_sleep", lambda seconds: None)
+    _fake_pdfplumber(monkeypatch, HOUSE_SINGLE)
+    session = _Session(_Response(403), _Response(403), _Response())
+
+    filing = ct.fetch_house_ptr("20026537", 2025, session=session)
+    assert len(filing["transactions"]) == 1

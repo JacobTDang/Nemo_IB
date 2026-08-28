@@ -23,8 +23,10 @@ the filing.
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import re
+import time
 import zipfile
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -88,6 +90,79 @@ _TYPE_NAMES = {"P": "purchase", "S": "sale", "S (partial)": "sale_partial",
 
 class DisclosureUnavailable(RuntimeError):
     """A filing could not be read. Never a statement about the member."""
+
+
+class DisclosureBlocked(DisclosureUnavailable):
+    """The source refused the request. Never a statement about the document.
+
+    Kept apart from a missing PDF because the two want opposite responses: a
+    missing document is worth moving past, and a refusal means every request
+    after it will be refused too.
+    """
+
+
+# The House Clerk and the Senate publish no rate limit. This interval is
+# deliberate politeness rather than a measured ceiling: the whole backfill is
+# a few hundred requests and there is nothing to gain by going faster.
+REQUEST_INTERVAL_S = 0.8
+_last_request = 0.0
+
+# What a refusal looks like from either site. A 403 is how a caller that has
+# already been blocked is turned away, so it is backed off from rather than
+# reported as a filing that does not exist.
+RATE_LIMITED_STATUSES = (429, 403)
+MAX_ATTEMPTS = 4
+_BACKOFF_BASE_S = 2.0
+_BACKOFF_CEILING_S = 60.0
+
+
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _throttle() -> None:
+    global _last_request
+    wait = REQUEST_INTERVAL_S - (time.monotonic() - _last_request)
+    if wait > 0:
+        _sleep(wait)
+    _last_request = time.monotonic()
+
+
+def _retry_after(response: Any, fallback: float) -> float:
+    """The wait the server asked for, falling back to our own backoff.
+
+    Retry-After may also be an HTTP date. Rather than parse one and risk
+    getting the timezone wrong in the direction of waiting less, an
+    unparseable value falls back to the backoff already in hand.
+    """
+    header = (getattr(response, "headers", None) or {}).get("Retry-After")
+    if not header:
+        return fallback
+    try:
+        return min(float(str(header).strip()), _BACKOFF_CEILING_S)
+    except ValueError:
+        return fallback
+
+
+def _request(describe: str, call) -> Any:
+    """One HTTP call that answers a refusal by waiting rather than repeating.
+
+    Without this a 429 became one `error` per filing and the run marched
+    through every remaining filing at a fixed interval, deepening the block it
+    had just been told about and arriving at the same wall the next morning.
+    """
+    delay = _BACKOFF_BASE_S
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        response = call()
+        if getattr(response, "status_code", 200) not in RATE_LIMITED_STATUSES:
+            return response
+        if attempt == MAX_ATTEMPTS:
+            raise DisclosureBlocked(
+                f"{describe}: refused with HTTP {response.status_code} on all "
+                f"{attempt} attempts. This is a fact about the caller's rate, "
+                f"not about the document; a later run will read it.")
+        _sleep(_retry_after(response, delay))
+        delay = min(delay * 2, _BACKOFF_CEILING_S)
 
 
 def _user_agent(contact: Optional[str] = None) -> str:
@@ -219,6 +294,26 @@ def _house_metadata(text: str) -> Dict[str, Optional[str]]:
     }
 
 
+# The one shape of zero-row PTR that is a fact rather than a failure to read
+# one: the filer says on the document that there is nothing in it.
+_NO_REPORTABLE = re.compile(
+    r"no\s+reportable\s+(?:transactions|activity)"
+    r"|no\s+transactions?\s+to\s+report"
+    r"|nothing\s+to\s+report", re.IGNORECASE)
+
+
+def _house_table_found(text: str) -> bool:
+    """Whether the transaction table was located at all.
+
+    One word added to the header -- "ID Owner Asset Name Transaction..." --
+    and the table is never entered, while the Filing ID, the member and the
+    state/district all still parse. The filing then looks entirely well formed
+    apart from reporting no trades, which is the one thing it cannot be
+    allowed to say by accident.
+    """
+    return any(_TABLE_START.match(line) for line in text.split("\n"))
+
+
 def _house_records(text: str) -> List[str]:
     """The transaction block, split into one joined string per row.
 
@@ -306,7 +401,13 @@ def _house_transaction(record: str) -> Optional[Dict[str, Any]]:
 
 
 def parse_house_ptr(text: str) -> Dict[str, Any]:
-    """One House Periodic Transaction Report, as extracted PDF text."""
+    """One House Periodic Transaction Report, as extracted PDF text.
+
+    `table_found` and `no_reportable_transactions` are what separate an empty
+    filing from an unread one. Without them zero transactions is a single
+    fact with two opposite meanings, and the caller writing it down has no
+    way to tell which it has.
+    """
     text = _normalise(text)
     filing = _house_metadata(text)
     transactions = [t for t in (_house_transaction(r) for r in _house_records(text))
@@ -316,6 +417,8 @@ def parse_house_ptr(text: str) -> Dict[str, Any]:
         txn["member"] = filing["member"]
         txn["state_district"] = filing["state_district"]
     filing["chamber"] = "house"
+    filing["table_found"] = _house_table_found(text)
+    filing["no_reportable_transactions"] = bool(_NO_REPORTABLE.search(text))
     filing["transactions"] = transactions
     return filing
 
@@ -338,9 +441,49 @@ def _senate_type(text: str) -> Optional[str]:
     return None
 
 
+# eFD answers with status 200 for all of these, so raise_for_status never
+# fires: the prohibition agreement when a session has lapsed, and a refusal
+# when the caller has asked too often. Read as a report, each one is an empty
+# transaction table -- a senator who traded nothing, recorded permanently.
+_SENATE_INTERSTITIAL = re.compile(
+    r"prohibition[_ ]agreement|your session has expired"
+    r"|too many requests|rate limit", re.IGNORECASE)
+
+# Two cells of the report table's own header. Absence of the header is what
+# every page that is not the report has in common, whichever page it is.
+# `csrfmiddlewaretoken` is deliberately not a marker on its own: the report is
+# served by the same Django site and may carry a token of its own, and a check
+# that refuses every real filing is worse than the one it replaces.
+_SENATE_TABLE_HEADER = ("transaction date", "amount")
+
+
+def _assert_senate_report(html: str) -> None:
+    """Refuse anything that is not the report page, loudly."""
+    lowered = html.lower()
+    missing = [cell for cell in _SENATE_TABLE_HEADER if cell not in lowered]
+    if not missing:
+        return
+
+    # The header is the gate, and the markers only name what arrived instead.
+    # Ordered the other way a report page that happens to mention the
+    # agreement in its own footer would be refused, and a check that turns
+    # every real filing away is worse than the silence it replaces.
+    interstitial = _SENATE_INTERSTITIAL.search(lowered)
+    if interstitial is not None:
+        raise DisclosureUnavailable(
+            f"the Senate served an interstitial rather than the report "
+            f"(matched {interstitial.group(0)!r}): the session has lapsed or "
+            f"the caller is being refused. This is not an empty filing.")
+    raise DisclosureUnavailable(
+        f"the response is not a Senate PTR report page: its transaction table "
+        f"header is missing {missing}. This is not an empty filing.")
+
+
 def parse_senate_ptr(html: str) -> List[Dict[str, Any]]:
     """The transaction table from one electronic Senate PTR."""
     from bs4 import BeautifulSoup
+
+    _assert_senate_report(html)
 
     # html.parser is stdlib. The lxml backend would parse this table just as
     # well, but it is not in the container's dependency group and the import
@@ -385,8 +528,11 @@ def fetch_house_index(year: int, session: Optional[requests.Session] = None
     getter = session or requests
     url = HOUSE_INDEX_URL.format(year=year)
     try:
-        response = getter.get(url, timeout=HTTP_TIMEOUT,
-                              headers={"User-Agent": _user_agent()})
+        _throttle()
+        response = _request(
+            f"House index for {year}",
+            lambda: getter.get(url, timeout=HTTP_TIMEOUT,
+                               headers={"User-Agent": _user_agent()}))
         response.raise_for_status()
         archive = zipfile.ZipFile(io.BytesIO(response.content))
         name = next(n for n in archive.namelist() if n.lower().endswith(".xml"))
@@ -419,8 +565,10 @@ def fetch_house_ptr(doc_id: str, year: int,
     getter = session or requests
     url = HOUSE_PTR_URL.format(year=year, doc_id=doc_id)
     try:
-        response = getter.get(url, timeout=HTTP_TIMEOUT,
-                              headers={"User-Agent": _user_agent()})
+        response = _request(
+            f"House PTR {doc_id} ({year})",
+            lambda: getter.get(url, timeout=HTTP_TIMEOUT,
+                               headers={"User-Agent": _user_agent()}))
         response.raise_for_status()
         with pdfplumber.open(io.BytesIO(response.content)) as pdf:
             text = "\n".join((page.extract_text() or "") for page in pdf.pages)
@@ -439,6 +587,22 @@ def fetch_house_ptr(doc_id: str, year: int,
 
     filing = parse_house_ptr(text)
     filing["source_url"] = url
+    # The bytes these rows came from, so a correction re-posted under the same
+    # DocID can be told from the copy already stored.
+    filing["content_hash"] = hashlib.sha256(response.content).hexdigest()
+
+    if not filing["transactions"] and not filing["no_reportable_transactions"]:
+        # Text extracted and nothing was read from it. That is a document this
+        # parser could not follow, not a member who did not trade, and the
+        # difference has to be an exception: recorded as `parsed` with zero
+        # rows the filing is never offered for reading again.
+        raise DisclosureUnavailable(
+            f"House PTR {doc_id} ({year}) yielded no transactions and does not "
+            f"state that it has none"
+            + ("" if filing["table_found"] else
+               "; the transaction table header was never located, so either "
+               "the Clerk's layout or the PDF text extraction has moved")
+            + f". Source: {url}")
     return filing
 
 
@@ -447,17 +611,20 @@ def senate_session() -> requests.Session:
     session = requests.Session()
     session.headers["User-Agent"] = _user_agent()
     try:
-        home = session.get(SENATE_HOME, timeout=HTTP_TIMEOUT)
+        home = _request("the Senate search page",
+                        lambda: session.get(SENATE_HOME, timeout=HTTP_TIMEOUT))
         home.raise_for_status()
         token = re.search(r'name="csrfmiddlewaretoken" value="([^"]+)"', home.text)
         if token is None:
             raise DisclosureUnavailable(
                 "the Senate search page did not carry a CSRF token; the form "
                 "has probably changed")
-        session.post(SENATE_HOME, timeout=HTTP_TIMEOUT,
+        _request("the Senate prohibition agreement",
+                 lambda: session.post(
+                     SENATE_HOME, timeout=HTTP_TIMEOUT,
                      headers={"Referer": SENATE_HOME},
                      data={"csrfmiddlewaretoken": token.group(1),
-                           "prohibition_agreement": "1"}).raise_for_status()
+                           "prohibition_agreement": "1"})).raise_for_status()
     except DisclosureUnavailable:
         raise
     except Exception as exc:  # noqa: BLE001 - surfaced, never masked
@@ -484,20 +651,25 @@ def senate_search_pages(session: requests.Session, since: str,
         if page_size <= 0:
             break
         try:
-            response = session.post(
-                SENATE_SEARCH, timeout=HTTP_TIMEOUT,
-                headers={"Referer": "https://efdsearch.senate.gov/search/",
-                         "X-CSRFToken": session.cookies.get("csrftoken", ""),
-                         "X-Requested-With": "XMLHttpRequest"},
-                data={"start": start, "length": page_size,
-                      "report_types": report_types,
-                      "filer_types": filer_types,
-                      "submitted_start_date": f"{since} 00:00:00",
-                      "submitted_end_date": "",
-                      "candidate_state": "", "senator_state": "",
-                      "office_id": "", "first_name": "", "last_name": ""})
+            _throttle()
+            response = _request(
+                f"the Senate search at row {start}",
+                lambda: session.post(
+                    SENATE_SEARCH, timeout=HTTP_TIMEOUT,
+                    headers={"Referer": "https://efdsearch.senate.gov/search/",
+                             "X-CSRFToken": session.cookies.get("csrftoken", ""),
+                             "X-Requested-With": "XMLHttpRequest"},
+                    data={"start": start, "length": page_size,
+                          "report_types": report_types,
+                          "filer_types": filer_types,
+                          "submitted_start_date": f"{since} 00:00:00",
+                          "submitted_end_date": "",
+                          "candidate_state": "", "senator_state": "",
+                          "office_id": "", "first_name": "", "last_name": ""}))
             response.raise_for_status()
             payload = response.json()
+        except DisclosureUnavailable:
+            raise
         except Exception as exc:  # noqa: BLE001 - surfaced, never masked
             raise DisclosureUnavailable(
                 f"the Senate search failed at row {start}: {exc}") from exc
@@ -540,20 +712,35 @@ def search_senate_ptrs(session: requests.Session, since: str,
     return filings
 
 
-def fetch_senate_ptr(session: requests.Session, uuid: str) -> List[Dict[str, Any]]:
+def fetch_senate_ptr(session: requests.Session, uuid: str) -> Dict[str, Any]:
+    """One electronic Senate PTR: its transactions and the bytes they came from."""
     url = SENATE_VIEW.format(uuid=uuid)
     try:
-        response = session.get(url, timeout=HTTP_TIMEOUT)
+        response = _request(f"Senate PTR {uuid}",
+                            lambda: session.get(url, timeout=HTTP_TIMEOUT))
         response.raise_for_status()
+    except DisclosureUnavailable:
+        raise
     except Exception as exc:  # noqa: BLE001 - surfaced, never masked
         raise DisclosureUnavailable(
             f"Senate PTR {uuid} could not be read: {exc}") from exc
 
+    # Raises if what came back is the agreement page or a refusal rather than
+    # the report, all of which arrive with status 200.
     transactions = parse_senate_ptr(response.text)
+    if not transactions:
+        raise DisclosureUnavailable(
+            f"Senate PTR {uuid} carries the report table and no rows inside "
+            f"it. A PTR is filed in order to report a transaction, so this is "
+            f"a page that was not read rather than a senator who did not "
+            f"trade. Source: {url}")
+
     for txn in transactions:
         txn["source_url"] = url
         txn["doc_id"] = uuid
-    return transactions
+    return {"doc_id": uuid, "source_url": url,
+            "content_hash": hashlib.sha256(response.content).hexdigest(),
+            "transactions": transactions}
 
 
 # ---------------------------------------------------------------- the tool
@@ -624,6 +811,7 @@ def get_congress_trades(ticker: Optional[str] = None,
 
             house["filings_available"] = len(candidates)
             for year, filing in candidates[:max_filings]:
+                _throttle()
                 try:
                     parsed = fetch_house_ptr(filing["doc_id"], year)
                 except DisclosureUnavailable as exc:
@@ -659,13 +847,14 @@ def get_congress_trades(ticker: Optional[str] = None,
                     # A paper filing is a scan behind a different route.
                     senate["unreadable_scans"] += 1
                     continue
+                _throttle()
                 try:
-                    rows = fetch_senate_ptr(session, filing["uuid"])
+                    report = fetch_senate_ptr(session, filing["uuid"])
                 except DisclosureUnavailable as exc:
                     errors.append(str(exc))
                     continue
                 senate["filings_read"] += 1
-                for txn in rows:
+                for txn in report["transactions"]:
                     txn["member"] = f"{filing['first']} {filing['last']}".strip()
                     txn["office"] = filing["office"]
                     txn["filed_date"] = filing["filed_date"]

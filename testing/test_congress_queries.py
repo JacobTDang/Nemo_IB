@@ -212,3 +212,29 @@ def test_member_holdings_and_trades_are_kept_apart(with_holdings):
     assert holdings["holding_count"] == 3
     assert trades["transaction_count"] == 1
     assert "holdings" in holdings and "transactions" not in holdings
+
+
+# ---------------------------------------------------- before the first sync
+
+def test_a_query_against_a_never_synced_store_is_an_empty_answer(tmp_path,
+                                                                 monkeypatch):
+    """On a fresh volume the tables do not exist yet.
+
+    The server surfaces the exception verbatim, so a new operator gets
+    `OperationalError: no such table: filings` where the empty-store guidance
+    was meant to be -- at precisely the moment it is needed.
+    """
+    monkeypatch.setenv("NEMO_CONGRESS_DB", str(tmp_path / "never-synced.db"))
+
+    result = q.ticker_activity("NVDA")
+
+    assert result["transaction_count"] == 0
+    assert result["coverage"]["total"] == 0
+    assert result["coverage"]["complete"] is False
+
+
+def test_a_holdings_query_against_a_never_synced_store_is_empty_too(tmp_path,
+                                                                    monkeypatch):
+    monkeypatch.setenv("NEMO_CONGRESS_DB", str(tmp_path / "never-synced.db"))
+    assert q.ticker_holdings("NVDA")["holding_count"] == 0
+    assert q.most_traded_tickers()["tickers"] == []

@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -35,7 +34,9 @@ import requests
 
 from . import congress_store as store
 from .congress_trades import (
+    DisclosureBlocked,
     DisclosureUnavailable,
+    _throttle,
     fetch_house_index,
     fetch_house_ptr,
     fetch_senate_ptr,
@@ -48,23 +49,21 @@ from .senate_annual import (
     search_senate_annuals,
 )
 
-# The House Clerk and the Senate publish no rate limit. This is deliberate
-# politeness rather than a measured ceiling: the whole backfill is a few
-# hundred requests and there is nothing to gain by going faster.
-_REQUEST_INTERVAL_S = 0.8
-_last_request = 0.0
-
-
-def _throttle() -> None:
-    global _last_request
-    wait = _REQUEST_INTERVAL_S - (time.monotonic() - _last_request)
-    if wait > 0:
-        time.sleep(wait)
-    _last_request = time.monotonic()
+# How many refusals in a row before the run stops asking. A source that has
+# turned down five consecutive requests is not going to answer the sixth, and
+# working through the rest of the budget deepens the block while reporting it
+# as N filings that happened to fail.
+MAX_CONSECUTIVE_FAILURES = 5
 
 
 def _is_scan(exc: Exception) -> bool:
     return "no extractable text" in str(exc)
+
+
+def _source_has_stopped_answering(exc: Exception, consecutive: int) -> bool:
+    """Whether this is the source refusing rather than one filing failing."""
+    return (isinstance(exc, DisclosureBlocked)
+            or consecutive >= MAX_CONSECUTIVE_FAILURES)
 
 
 def _house_docid_is_paper(doc_id: str) -> bool:
@@ -103,7 +102,8 @@ def _log(message: str, quiet: bool = False) -> None:
 # -------------------------------------------------------------------- House
 
 def sync_house_ptrs(year: int, max_filings: Optional[int] = None,
-                    quiet: bool = False) -> Dict[str, Any]:
+                    quiet: bool = False,
+                    recheck_days: Optional[int] = None) -> Dict[str, Any]:
     """Ingest every House Periodic Transaction Report filed in `year`.
 
     An index failure propagates rather than returning an empty run: a year in
@@ -129,13 +129,21 @@ def sync_house_ptrs(year: int, max_filings: Optional[int] = None,
         })
         by_id[f"house:{filing['doc_id']}"] = {**filing, "member_id": member}
 
-    pending = store.unparsed_filing_ids(list(by_id))
+    # What the Clerk's index says today. A filing whose index row has moved
+    # was re-posted under the same DocID, and the store is holding the
+    # numbers it superseded.
+    published = {fid: _iso_from_us(f.get("filing_date", ""))
+                 for fid, f in by_id.items()}
+    pending = store.unparsed_filing_ids(list(by_id), index_filed_dates=published,
+                                        recheck_days=recheck_days)
     already_held = len(by_id) - len(pending)
     budget = pending if max_filings is None else pending[:max_filings]
     remaining = len(pending) - len(budget)
 
     parsed = failed = scanned = 0
-    for filing_id in budget:
+    consecutive = 0
+    blocked: Optional[str] = None
+    for position, filing_id in enumerate(budget):
         filing = by_id[filing_id]
         record = {
             "filing_id": filing_id, "chamber": "house",
@@ -164,14 +172,38 @@ def sync_house_ptrs(year: int, max_filings: Optional[int] = None,
             store.upsert_filing(record)
             scanned += _is_scan(exc)
             failed += not _is_scan(exc)
+            # A scan is a document this parser cannot read; the Clerk answered
+            # perfectly well. Only a refusal counts towards giving up.
+            consecutive = 0 if _is_scan(exc) else consecutive + 1
+            if _source_has_stopped_answering(exc, consecutive):
+                blocked = str(exc)[:400]
+                remaining += len(budget) - position - 1
+                break
+            continue
+
+        if (not parsed_filing["transactions"]
+                and not parsed_filing.get("no_reportable_transactions")):
+            # `fetch_house_ptr` refuses these, but this is where 'parsed'
+            # becomes permanent, so the rule is enforced here rather than
+            # trusted to whatever produced the filing.
+            record["parse_status"] = "error"
+            record["parse_error"] = (
+                "parsed to zero transactions without stating it has none; a "
+                "PTR is filed in order to report a trade, so the table was "
+                "not read")
+            store.upsert_filing(record)
+            failed += 1
             continue
 
         record["parse_status"] = store.PARSED
         record["parsed_at"] = datetime.now(timezone.utc).isoformat(
             timespec="seconds")
-        store.upsert_filing(record)
-        store.replace_transactions(filing_id, filing["member_id"],
-                                   parsed_filing["transactions"])
+        record["content_hash"] = parsed_filing.get("content_hash")
+        # Status and rows in one transaction: a filing durably `parsed` before
+        # its rows exist is never offered for reading again.
+        store.record_parsed_filing(record,
+                                   transactions=parsed_filing["transactions"])
+        consecutive = 0
         parsed += 1
 
     store.record_sync(f"house_ptr_{year}", filings_seen=len(by_id),
@@ -179,18 +211,20 @@ def sync_house_ptrs(year: int, max_filings: Optional[int] = None,
                       cursor=str(year))
     _log(f"[house {year}] seen={len(by_id)} held={already_held} "
          f"parsed={parsed} scans={scanned} errors={failed} "
-         f"remaining={remaining}", quiet)
+         f"remaining={remaining}"
+         + (f" BLOCKED: {blocked}" if blocked else ""), quiet)
 
     return {"chamber": "house", "year": year, "filings_seen": len(by_id),
             "already_held": already_held, "filings_parsed": parsed,
             "scans": scanned, "errors": failed, "remaining": remaining,
-            "complete": remaining == 0}
+            "blocked": blocked, "complete": remaining == 0 and blocked is None}
 
 
 # ------------------------------------------------------------------- Senate
 
 def sync_senate_ptrs(days: int = 90, max_filings: Optional[int] = None,
-                     quiet: bool = False) -> Dict[str, Any]:
+                     quiet: bool = False,
+                     recheck_days: Optional[int] = None) -> Dict[str, Any]:
     """Ingest Senate PTRs filed in the last `days`."""
     store.init_schema()
     since = (datetime.now() - timedelta(days=days)).strftime("%m/%d/%Y")
@@ -215,13 +249,18 @@ def sync_senate_ptrs(days: int = 90, max_filings: Optional[int] = None,
         })
         by_id[f"senate:{filing['uuid']}"] = {**filing, "member_id": member}
 
-    pending = store.unparsed_filing_ids(list(by_id))
+    published = {fid: _iso_from_us(f.get("filed_date", ""))
+                 for fid, f in by_id.items()}
+    pending = store.unparsed_filing_ids(list(by_id), index_filed_dates=published,
+                                        recheck_days=recheck_days)
     already_held = len(by_id) - len(pending)
     budget = pending if max_filings is None else pending[:max_filings]
     remaining = len(pending) - len(budget)
 
     parsed = failed = scanned = 0
-    for filing_id in budget:
+    consecutive = 0
+    blocked: Optional[str] = None
+    for position, filing_id in enumerate(budget):
         filing = by_id[filing_id]
         record = {
             "filing_id": filing_id, "chamber": "senate",
@@ -243,19 +282,28 @@ def sync_senate_ptrs(days: int = 90, max_filings: Optional[int] = None,
 
         _throttle()
         try:
-            rows = fetch_senate_ptr(session, filing["uuid"])
+            # Raises rather than returning [] for the agreement page, an
+            # expired session, a refusal, or a report with no rows in it --
+            # all of which eFD serves with status 200.
+            report = fetch_senate_ptr(session, filing["uuid"])
         except DisclosureUnavailable as exc:
             record["parse_status"] = "error"
             record["parse_error"] = str(exc)[:400]
             store.upsert_filing(record)
             failed += 1
+            consecutive += 1
+            if _source_has_stopped_answering(exc, consecutive):
+                blocked = str(exc)[:400]
+                remaining += len(budget) - position - 1
+                break
             continue
 
         record["parse_status"] = store.PARSED
         record["parsed_at"] = datetime.now(timezone.utc).isoformat(
             timespec="seconds")
-        store.upsert_filing(record)
-        store.replace_transactions(filing_id, filing["member_id"], rows)
+        record["content_hash"] = report.get("content_hash")
+        store.record_parsed_filing(record, transactions=report["transactions"])
+        consecutive = 0
         parsed += 1
 
     store.record_sync("senate_ptr", filings_seen=len(by_id),
@@ -263,12 +311,13 @@ def sync_senate_ptrs(days: int = 90, max_filings: Optional[int] = None,
                       cursor=since)
     _log(f"[senate {days}d] seen={len(by_id)} held={already_held} "
          f"parsed={parsed} scans={scanned} errors={failed} "
-         f"remaining={remaining}", quiet)
+         f"remaining={remaining}"
+         + (f" BLOCKED: {blocked}" if blocked else ""), quiet)
 
     return {"chamber": "senate", "days": days, "filings_seen": len(by_id),
             "already_held": already_held, "filings_parsed": parsed,
             "scans": scanned, "errors": failed, "remaining": remaining,
-            "complete": remaining == 0}
+            "blocked": blocked, "complete": remaining == 0 and blocked is None}
 
 
 # ---------------------------------------------------------------------- CLI
@@ -290,6 +339,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="Senate window in days (default 90)")
     parser.add_argument("--max-filings", type=int, default=None,
                         help="Cap filings fetched per source this run")
+    parser.add_argument("--recheck-days", type=int, default=None, metavar="N",
+                        help="Also re-read filings last fetched more than N "
+                             "days ago, so a correction re-posted under the "
+                             "same id is eventually noticed")
     parser.add_argument("--status", action="store_true",
                         help="Print what the store holds and exit")
     args = parser.parse_args(argv)
@@ -315,24 +368,40 @@ def main(argv: Optional[List[str]] = None) -> int:
         parser.error("nothing to do: pass --house YEAR..., --senate, "
                      "--senate-annual, or --status")
 
-    failures = 0
+    # Before anything is fetched, because a transaction report recorded as
+    # read with no rows in it is a parse that failed, and nothing else would
+    # ever offer it again. Requeued here, this run re-reads it.
+    requeued = store.requeue_empty_transaction_reports()
+    if requeued:
+        _log(f"[repair] requeued {requeued} transaction report(s) recorded as "
+             f"parsed with no transactions in them")
+
+    failures = blocked = 0
     for year in args.house or []:
         try:
-            sync_house_ptrs(year, max_filings=args.max_filings)
+            result = sync_house_ptrs(year, max_filings=args.max_filings,
+                                     recheck_days=args.recheck_days)
+            blocked += bool(result["blocked"])
         except DisclosureUnavailable as exc:
             print(f"[house {year}] FAILED: {exc}", file=sys.stderr)
             failures += 1
 
     if args.senate:
         try:
-            sync_senate_ptrs(days=args.days, max_filings=args.max_filings)
+            result = sync_senate_ptrs(days=args.days,
+                                      max_filings=args.max_filings,
+                                      recheck_days=args.recheck_days)
+            blocked += bool(result["blocked"])
         except DisclosureUnavailable as exc:
             print(f"[senate] FAILED: {exc}", file=sys.stderr)
             failures += 1
 
     if args.senate_annual:
         try:
-            sync_senate_annuals(since=args.since, max_filings=args.max_filings)
+            result = sync_senate_annuals(since=args.since,
+                                         max_filings=args.max_filings,
+                                         recheck_days=args.recheck_days)
+            blocked += bool(result["blocked"])
         except DisclosureUnavailable as exc:
             print(f"[senate annual] FAILED: {exc}", file=sys.stderr)
             failures += 1
@@ -353,7 +422,10 @@ def main(argv: Optional[List[str]] = None) -> int:
              f"amount range(s) and {repaired['dates_cleared']} trade date(s) "
              f"that fell after their own filing")
 
-    return 1 if failures else 0
+    # A blocked source is a non-zero exit too: the run did not cover what it
+    # was asked to cover, and a caller reading only the status code would
+    # otherwise treat a refusal as a completed backfill.
+    return 1 if failures or blocked else 0
 
 
 
@@ -362,7 +434,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 def sync_senate_annuals(since: str = "01/01/2026",
                         max_filings: Optional[int] = None,
-                        quiet: bool = False) -> Dict[str, Any]:
+                        quiet: bool = False,
+                        recheck_days: Optional[int] = None) -> Dict[str, Any]:
     """Ingest Senate annual reports -- the holdings, not the trades.
 
     Only the highest amendment per (senator, calendar year) is fetched.
@@ -394,13 +467,18 @@ def sync_senate_annuals(since: str = "01/01/2026",
         })
         by_id[f"senate:annual:{filing['uuid']}"] = {**filing, "member_id": member}
 
-    pending = store.unparsed_filing_ids(list(by_id))
+    published = {fid: _iso_from_us(f.get("filed_date", ""))
+                 for fid, f in by_id.items()}
+    pending = store.unparsed_filing_ids(list(by_id), index_filed_dates=published,
+                                        recheck_days=recheck_days)
     already_held = len(by_id) - len(pending)
     budget = pending if max_filings is None else pending[:max_filings]
     remaining = len(pending) - len(budget)
 
     parsed = failed = scanned = 0
-    for filing_id in budget:
+    consecutive = 0
+    blocked: Optional[str] = None
+    for position, filing_id in enumerate(budget):
         filing = by_id[filing_id]
         year = filing.get("calendar_year")
         record = {
@@ -427,6 +505,11 @@ def sync_senate_annuals(since: str = "01/01/2026",
             record["parse_error"] = str(exc)[:400]
             store.upsert_filing(record)
             failed += 1
+            consecutive += 1
+            if _source_has_stopped_answering(exc, consecutive):
+                blocked = str(exc)[:400]
+                remaining += len(budget) - position - 1
+                break
             continue
 
         # The parser decides both, because only it has seen the heading.
@@ -439,7 +522,7 @@ def sync_senate_annuals(since: str = "01/01/2026",
         record["parse_status"] = store.PARSED
         record["parsed_at"] = datetime.now(timezone.utc).isoformat(
             timespec="seconds")
-        store.upsert_filing(record)
+        record["content_hash"] = report.get("content_hash")
 
         # Last resort: the date it was filed. A holding with no as-of at all
         # cannot be aged against the trades that came after it, and an
@@ -447,7 +530,8 @@ def sync_senate_annuals(since: str = "01/01/2026",
         as_of = report.get("as_of") or record["filed_date"]
         for row in report["holdings"]:
             row["as_of"] = row.get("as_of") or as_of
-        store.replace_holdings(filing_id, filing["member_id"], report["holdings"])
+        store.record_parsed_filing(record, holdings=report["holdings"])
+        consecutive = 0
         parsed += 1
 
     store.record_sync("senate_annual", filings_seen=len(by_id),
@@ -455,12 +539,13 @@ def sync_senate_annuals(since: str = "01/01/2026",
                       cursor=since)
     _log(f"[senate annual] seen={len(by_id)} held={already_held} "
          f"parsed={parsed} scans={scanned} errors={failed} "
-         f"remaining={remaining}", quiet)
+         f"remaining={remaining}"
+         + (f" BLOCKED: {blocked}" if blocked else ""), quiet)
 
     return {"chamber": "senate", "kind": "annual", "filings_seen": len(by_id),
             "already_held": already_held, "filings_parsed": parsed,
             "scans": scanned, "errors": failed, "remaining": remaining,
-            "complete": remaining == 0}
+            "blocked": blocked, "complete": remaining == 0 and blocked is None}
 
 
 if __name__ == "__main__":
