@@ -48,13 +48,38 @@ from research import pit_store
 SOURCE = "seeded"
 
 
+def _finnhub_server():
+    from tools.news_agregator.finnhub_server import FinnhubServer
+
+    return FinnhubServer()
+
+
 def _fetch_surprises(ticker: str) -> List[Dict[str, Any]]:
+    """One name's four quarters, with the session closed before the loop ends.
+
+    `asyncio.run` opens a loop, runs the call and closes the loop; a session
+    created inside it survives, holding a connector bound to a loop that no
+    longer exists. Nothing notices for a while. Then the collector reaches one,
+    its destructor schedules cleanup on that dead loop, and the run dies with
+    "Event loop is closed" -- which is what happened partway through seeding
+    six hundred names, after twelve had worked fine in a test.
+
+    Only the loop that made the session can close it, so it is closed here.
+    """
     import asyncio
     import json
 
-    from tools.news_agregator.finnhub_server import FinnhubServer
+    async def pull():
+        server = _finnhub_server()
+        try:
+            return await server.get_earnings_surprises(ticker)
+        finally:
+            client = getattr(server, "client", None)
+            close = getattr(client, "close", None)
+            if close is not None:
+                await close()
 
-    raw = asyncio.run(FinnhubServer().get_earnings_surprises(ticker))
+    raw = asyncio.run(pull())
     payload = json.loads(raw[0].text)
     if payload.get("data", {}).get("error"):
         raise RuntimeError(f"{ticker}: {payload['data']['error']}")

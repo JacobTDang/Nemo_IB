@@ -402,3 +402,63 @@ def test_the_seeding_reports_how_many_were_announcement_dated(store,
     out = seed_consensus.seed(["MSFT"], as_of="2026-08-27")
     assert out["announcement_dated"] == 1
     assert out["filing_dated"] == 1
+
+
+# --- one leaked session per name --------------------------------------------
+#
+# `asyncio.run` opens a loop, runs the call, and closes the loop. The aiohttp
+# session created inside it survives, holding a connector bound to a loop that
+# no longer exists. Nothing notices for a while; then the garbage collector
+# reaches one, its destructor tries to schedule cleanup on that dead loop, and
+# the run fails with "Event loop is closed".
+#
+# Twelve names in a row is fine, which is why this never showed up in a test.
+# It surfaced on the six hundredth.
+
+def test_the_client_is_closed_after_each_fetch(monkeypatch):
+    """The session has to be closed inside the loop that made it. Nothing else
+    can close it afterwards, because that loop is gone."""
+    closed = []
+
+    class Client:
+        async def close(self):
+            closed.append(True)
+
+    class Server:
+        def __init__(self):
+            self.client = Client()
+
+        async def get_earnings_surprises(self, ticker):
+            import json
+
+            from mcp.types import TextContent
+            return [TextContent(type="text", text=json.dumps(
+                {"data": {"quarters": []}}))]
+
+    monkeypatch.setattr(seed_consensus, "_finnhub_server", Server)
+
+    seed_consensus._fetch_surprises("AAPL")
+    assert closed == [True], "the session was left open"
+
+
+def test_the_client_is_closed_even_when_the_call_fails(monkeypatch):
+    """A failing name must not leak either -- over a universe the failures are
+    where the leak accumulates fastest."""
+    closed = []
+
+    class Client:
+        async def close(self):
+            closed.append(True)
+
+    class Server:
+        def __init__(self):
+            self.client = Client()
+
+        async def get_earnings_surprises(self, ticker):
+            raise ConnectionError("Finnhub returned 503")
+
+    monkeypatch.setattr(seed_consensus, "_finnhub_server", Server)
+
+    with pytest.raises(ConnectionError):
+        seed_consensus._fetch_surprises("AAPL")
+    assert closed == [True]
