@@ -78,10 +78,39 @@ def sweep_results():
     return {"results": results, "errors": errors}
 
 
+# A 429 is the one error that can never be a statement about the filer. The
+# broader marker set test_accounting_identities uses ("No filing found", "No
+# XBRL data available") is deliberately not reused here: it is sound there
+# only because its `facts` fixture proves every basket ticker has a parseable
+# 10-K before any tool runs, so "no filing" cannot be about the filer. This
+# sweep has no such proof and includes recent IPOs, where "no filing" is the
+# honest answer -- reading those as throttling would hide a real coverage gap.
+_TRANSPORT_MARKERS = ("Too Many Requests", "429")
+
+
+def _is_transport_failure(result):
+    """True when the tool never got an answer, as opposed to answering 'no'."""
+    if result is None or result.get("success"):
+        return False
+    return any(m in f"{result.get('error', '')}" for m in _TRANSPORT_MARKERS)
+
+
 def _coverage(results_for_tool):
+    """(covered, measured, throttled) -- throttled requests are not misses.
+
+    A rate-limited request comes back the same shape as a filer that does not
+    tag the concept, so counting the two together reports "the tool covers
+    63% of filers" when the truth is "we were blocked on ten of them". Under
+    a full-suite run that is exactly what happened: 22/35 here against 32/35
+    for the identical basket run alone, with no code between the two.
+
+    `measured` is the denominator that can actually be read as coverage.
+    """
+    throttled = sum(1 for r in results_for_tool.values()
+                    if _is_transport_failure(r))
     ok = sum(1 for r in results_for_tool.values()
              if r is not None and r.get("success"))
-    return ok, len(results_for_tool)
+    return ok, len(results_for_tool) - throttled, throttled
 
 
 def test_no_tool_raises_on_any_ticker(sweep_results):
@@ -168,9 +197,14 @@ def test_coverage_rates_are_recorded(sweep_results, capsys):
     not, which is why this prints rather than hides the number.
     """
     lines = ["", "coverage by tool:"]
+    blocked = []
     for tool, results in sweep_results["results"].items():
-        ok, total = _coverage(results)
-        lines.append(f"  {tool:24s} {ok:3d}/{total:3d}  {ok / total:6.1%}")
+        ok, measured, throttled = _coverage(results)
+        rate = f"{ok / measured:6.1%}" if measured else "     -"
+        note = f"   ({throttled} throttled, not counted)" if throttled else ""
+        lines.append(f"  {tool:24s} {ok:3d}/{measured:3d}  {rate}{note}")
+        if throttled:
+            blocked.append(f"{tool}: {throttled}")
 
     debt = sweep_results["results"]["debt_maturity"]
     buckets = defaultdict(int)
@@ -182,7 +216,14 @@ def test_coverage_rates_are_recorded(sweep_results, capsys):
     with capsys.disabled():
         print("\n".join(lines))
 
-    share_ok, share_total = _coverage(sweep_results["results"]["share_count"])
-    assert share_ok / share_total > 0.80, (
-        f"share count resolved for only {share_ok}/{share_total} filers; it is "
-        f"the cover-page tag every filer must report")
+    # Reported before the gate below, so a throttled run says so rather than
+    # arriving as a coverage failure that points at the extractor.
+    assert not blocked, (
+        "SEC rate-limited this sweep, so its coverage rates are not "
+        "measurements of what the tools cover:\n" +
+        "\n".join(f"  {b}" for b in blocked))
+
+    share_ok, share_measured, _ = _coverage(sweep_results["results"]["share_count"])
+    assert share_ok / share_measured > 0.80, (
+        f"share count resolved for only {share_ok}/{share_measured} filers it "
+        f"reached; it is the cover-page tag every filer must report")

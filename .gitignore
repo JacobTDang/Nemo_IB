@@ -33,3 +33,9 @@ tools/slack_channel/node_modules/
 
 # Scratch spreadsheets from ad-hoc excel-tool runs
 *.xlsx
+
+# Probe file written and removed by test_env_is_order_independent.py; ignored
+# so an interrupted run cannot leave it staged.
+testing/test_zz_env_probe_generated.py
+testing/test_zz_cache_a_generated.py
+testing/test_zz_cache_b_generated.py
