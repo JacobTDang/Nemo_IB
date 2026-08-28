@@ -435,3 +435,75 @@ def test_thanksgiving_arithmetic_holds_for_sixteen_years():
         computed = sorted(c for c in announcements._half_day_candidates(year)
                           if c.month == 11)
         assert computed == [expected], f"{year}: {computed} != {expected}"
+
+
+# --- the first run on a fresh volume ----------------------------------------
+#
+# Every test above builds the schema in a fixture, which is exactly why the
+# suite stayed green while a first `docker compose run --rm research-announce`
+# on a new volume would die on "no such table: announcement" before it wrote
+# anything. `research-daily` normally creates the store first, and nothing in
+# the compose file or the cron block enforces that ordering.
+
+def test_a_fresh_store_is_created_by_the_backfill_itself(tmp_path, monkeypatch):
+    import json
+
+    monkeypatch.setenv("NEMO_PIT_DB", str(tmp_path / "fresh.db"))
+    monkeypatch.setattr(announcements, "_fetch_8k", lambda t, **kw: [
+        Filing("2026-02-12", "2.02", "2026-02-12T21:05:00")])
+    monkeypatch.setattr(announcements, "_quarters", lambda t, as_of=None: {
+        "2026Q1": {"period_end": "2026-01-31", "known_at": "2026-02-20"}})
+
+    printed = {}
+    monkeypatch.setattr("builtins.print",
+                        lambda *a, **k: printed.setdefault("out", a[0]))
+
+    assert announcements.main(["--tickers", "AAA",
+                               "--as-of", "2026-03-01"]) == 0
+    # The per-ticker try in `backfill` would otherwise turn the missing table
+    # into a counted failure, so the exit code alone would not notice it.
+    assert json.loads(printed["out"])["failed"] == []
+    assert pit_store.announcements_as_of("AAA", "2026-03-02")
+
+
+# --- the tmpfs this job writes into -----------------------------------------
+#
+# Every 8-K this reads is cached under /root/.edgar, a 512MB tmpfs in the batch
+# container, and nothing ever removes one. The eviction that keeps the servers
+# alive is an asyncio task in the HTTP app's lifespan, which a `python -m
+# research.announcements` never starts -- so a backfill over the eligible
+# universe fills the mount and dies mid-run with `[Errno 28]`.
+#
+# Between names is the only place a batch job can prune: it has no event loop
+# and no idle moment. The pruner and its interval are the servers' own.
+
+def test_a_backfill_prunes_the_filing_cache_as_it_goes(store, monkeypatch):
+    from tools import filing_cache
+
+    monkeypatch.setattr(announcements, "_fetch_8k", lambda t, **kw: [])
+    monkeypatch.setattr(announcements, "_quarters", lambda t, as_of=None: {})
+    asked = []
+    monkeypatch.setattr(filing_cache, "prune_if_due",
+                        lambda *a, **k: asked.append(1))
+
+    announcements.backfill(["AAA", "BBB", "CCC"], as_of="2026-03-01")
+    assert len(asked) == 3, "the cache is only asked about once for the run"
+
+
+def test_a_name_that_failed_still_left_documents_in_the_cache(store,
+                                                              monkeypatch):
+    """The fetch that raised had already written whatever it read, and over a
+    universe the failures are where an unpruned cache grows fastest."""
+    from tools import filing_cache
+
+    def boom(ticker, **kw):
+        raise ConnectionError("EDGAR returned 503")
+
+    monkeypatch.setattr(announcements, "_fetch_8k", boom)
+    asked = []
+    monkeypatch.setattr(filing_cache, "prune_if_due",
+                        lambda *a, **k: asked.append(1))
+
+    out = announcements.backfill(["AAA", "BBB"], as_of="2026-03-01")
+    assert len(out["failed"]) == 2
+    assert len(asked) == 2

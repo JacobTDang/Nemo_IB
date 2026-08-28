@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from zoneinfo import ZoneInfo
 
 from research import pit_store
+from tools import filing_cache
 
 EXCHANGE_TZ = ZoneInfo("America/New_York")
 MARKET_OPEN = time(9, 30)
@@ -225,6 +226,15 @@ def backfill(tickers: Sequence[str],
     failed: List[str] = []
 
     for ticker in tickers:
+        # Every 8-K read below is cached under /root/.edgar and nothing removes
+        # one. The eviction that keeps the servers alive is an asyncio task in
+        # the HTTP app's lifespan, and this process never starts it -- so a
+        # backfill over the eligible universe fills the 512MB tmpfs and dies
+        # mid-run with `[Errno 28]`. Between names is the only place a job with
+        # no event loop can prune; the gate keeps it to one walk per interval.
+        # Asked before the fetch, so a name that raises has still had the
+        # documents it already pulled counted against the cap.
+        filing_cache.prune_if_due()
         try:
             found = for_quarters(ticker, as_of=as_of)
         except Exception as exc:  # noqa: BLE001 - counted and reported
@@ -247,6 +257,12 @@ def backfill(tickers: Sequence[str],
 def main(argv: Optional[List[str]] = None) -> int:
     import argparse
     import json
+
+    # Nothing else does, and the ordering that hides it is not enforced
+    # anywhere: the recorder normally runs first and creates the store, so the
+    # first command against a fresh volume dies on "no such table" instead.
+    # Cheap and idempotent, so it runs every time rather than once.
+    pit_store.init_schema()
 
     parser = argparse.ArgumentParser(
         prog="announcements",

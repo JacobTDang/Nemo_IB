@@ -11,11 +11,18 @@ Pruning is by access time, so a filing being read repeatedly survives while one
 fetched once months ago does not. It trims to a fraction of the cap rather than
 to the cap itself, because a single filing can be 89MB and trimming to exactly
 the limit would refill on the next fetch.
+
+Two callers drive it, on the same cap and the same interval. The HTTP servers
+run `prune_and_log` as a background task off the app's lifespan, sleeping
+between passes. The batch jobs have no event loop and no idle moment to sleep
+in -- they are a tight sequential sweep over thousands of names into the same
+tmpfs -- so they ask `prune_if_due` between names instead.
 """
 from __future__ import annotations
 
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -111,3 +118,35 @@ def prune_and_log(root: Any = None, cap: int | None = None) -> dict:
     for failure in report["failed"]:
         log.warning("filing-cache: could not remove %s", failure)
     return report
+
+
+# When the last prune ran, on the monotonic clock so a system time change
+# cannot make one overdue by years or postpone the next one indefinitely.
+# Process-global because the thing being rationed is a directory, not a
+# caller: a batch job is one sweep in one process, and the servers run their
+# own janitor on a timer instead.
+_last_prune: float | None = None
+
+
+def prune_if_due(root: Any = None, cap: int | None = None) -> dict | None:
+    """`prune_and_log`, but at most once per `interval_seconds()`.
+
+    For the callers that cannot sleep. A batch job sweeping the eligible
+    universe fetches documents into the same capped tmpfs the servers do, and
+    the janitor that keeps the servers alive is an asyncio task the jobs never
+    start -- so the jobs ask between names whether a prune is owed. Ungated,
+    that would rglob the whole cache between every SEC request.
+
+    Returns None when a prune is not due, so a caller can tell that apart from
+    a prune that ran and found nothing to remove.
+    """
+    global _last_prune
+
+    now = time.monotonic()
+    if _last_prune is not None and now - _last_prune < interval_seconds():
+        return None
+    # Stamped before the walk, not after: a prune of a full cache takes real
+    # time, and dating it from the end would let a slow one push the next
+    # one out by its own duration.
+    _last_prune = now
+    return prune_and_log(root, cap)

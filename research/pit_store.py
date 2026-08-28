@@ -76,6 +76,15 @@ CREATE TABLE IF NOT EXISTS daily_bar (
     low         REAL,
     close       REAL,
     volume      REAL,
+    -- 'recorded' if the run stood on the session it wrote, 'backfilled' if it
+    -- was replayed for a past date -- the same distinction
+    -- `consensus_snapshot.source` draws, for the same reason. `recorded_at`
+    -- alone does not say it: a replay stamps the session's own evening, which
+    -- is right for prices and silent about how the row was obtained. And a
+    -- backfilled night is worse evidence: the vendor drops delisted tickers,
+    -- so filling 1 August on 26 August is missing precisely the names this
+    -- store exists to keep.
+    source      TEXT NOT NULL DEFAULT 'recorded',
     recorded_at TEXT NOT NULL,
     PRIMARY KEY (trade_date, ticker)
 );
@@ -254,6 +263,10 @@ def connect() -> sqlite3.Connection:
 _MIGRATIONS = (
     ("consensus_snapshot", "eps_actual", "REAL"),
     ("consensus_snapshot", "source", "TEXT NOT NULL DEFAULT 'recorded'"),
+    # Rows already in a deployed store were written by a run standing on the
+    # session it recorded, so the default is the truth about them rather than a
+    # convenience.
+    ("daily_bar", "source", "TEXT NOT NULL DEFAULT 'recorded'"),
     ("paper_order", "variant", "TEXT"),
     ("paper_order", "drift_coefficient", "REAL"),
     ("paper_order", "drift_calibrated", "INTEGER"),
@@ -277,7 +290,8 @@ def init_schema() -> None:
 
 def record_bars(ticker: str, rows: Iterable[Dict[str, Any]],
                 recorded_at: Optional[str] = None,
-                conn: Optional[sqlite3.Connection] = None) -> int:
+                conn: Optional[sqlite3.Connection] = None,
+                source: str = "recorded") -> int:
     """Append sessions for one ticker. Returns the count newly written.
 
     A session already present is left exactly as it was. If the incoming values
@@ -288,16 +302,21 @@ def record_bars(ticker: str, rows: Iterable[Dict[str, Any]],
     `conn` lets a caller put these writes inside a transaction it already
     holds, which is how the split and the bars it explains reach the store
     together or not at all.
+
+    `source` says whether the run stood on the session it is writing. It
+    defaults to the ordinary case for the same reason the column's default
+    does: a caller that says nothing was recording forward.
     """
     stamp = recorded_at or _now()
     if conn is not None:
-        return _write_bars(conn, ticker, rows, stamp)
+        return _write_bars(conn, ticker, rows, stamp, source)
     with connect() as own:
-        return _write_bars(own, ticker, rows, stamp)
+        return _write_bars(own, ticker, rows, stamp, source)
 
 
 def _write_bars(conn: sqlite3.Connection, ticker: str,
-                rows: Iterable[Dict[str, Any]], stamp: str) -> int:
+                rows: Iterable[Dict[str, Any]], stamp: str,
+                source: str = "recorded") -> int:
     written = 0
     for row in rows:
         existing = conn.execute(
@@ -308,10 +327,11 @@ def _write_bars(conn: sqlite3.Connection, ticker: str,
             conn.execute(
                 """INSERT INTO daily_bar
                    (trade_date, ticker, open, high, low, close, volume,
-                    recorded_at)
-                   VALUES (?,?,?,?,?,?,?,?)""",
+                    source, recorded_at)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
                 (row["trade_date"], ticker, row.get("open"), row.get("high"),
-                 row.get("low"), row.get("close"), row.get("volume"), stamp))
+                 row.get("low"), row.get("close"), row.get("volume"), source,
+                 stamp))
             written += 1
             continue
 
@@ -1072,6 +1092,23 @@ def last_successful_run(job: str, as_of: str) -> Optional[str]:
                  AND as_of_date IS NOT NULL AND as_of_date <= ?""",
             (job, as_of)).fetchone()
     return row["last"] if row and row["last"] else None
+
+
+def first_run(job: str) -> Optional[str]:
+    """The earliest date `job` ever ran for, or None if it never has.
+
+    What separates a gap from a store that did not exist yet. `missing_days`
+    answers over whatever range it is handed, so a fresh volume asked about the
+    last month reports twenty-two missed nights -- the same saturation that
+    made the gap report worth nothing in the first place. A failed or
+    unfinished run counts here: it is not coverage, but it is proof the
+    recorder was running.
+    """
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT MIN(as_of_date) AS first FROM run_log
+               WHERE job = ? AND as_of_date IS NOT NULL""", (job,)).fetchone()
+    return row["first"] if row and row["first"] else None
 
 
 def missing_days(job: str, start: str, end: str) -> List[str]:

@@ -44,6 +44,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Sequence
 
 from research import pit_store
+from tools import filing_cache
 
 SOURCE = "seeded"
 
@@ -144,6 +145,14 @@ def seed(tickers: Sequence[str],
     seen = 0
 
     for ticker in tickers:
+        # A vendor job that reaches EDGAR twice per name on the way: the filer
+        # dates below and the Item 2.02 release after them. Both cache their
+        # documents under /root/.edgar, the same 512MB tmpfs the watcher fills,
+        # and nothing removes one -- the eviction that keeps the servers alive
+        # is an asyncio task in the HTTP app's lifespan and this process never
+        # starts it. Between names is the only place a job with no event loop
+        # can prune; the gate keeps it to one walk per interval.
+        filing_cache.prune_if_due()
         try:
             rows = _fetch_surprises(ticker)
             dates = _filing_dates(ticker, as_of=as_of)
@@ -234,6 +243,14 @@ def seed(tickers: Sequence[str],
 def main(argv: Optional[List[str]] = None) -> int:
     import argparse
     import json
+
+    # Nothing else does, and the ordering that hides it is not enforced
+    # anywhere: the recorder normally runs first and creates the store, so the
+    # first command against a fresh volume dies on "no such table" instead.
+    # Seeding is the likeliest job to be that first command -- a cold store is
+    # exactly what it exists for. Cheap and idempotent, so it runs every time
+    # rather than once.
+    pit_store.init_schema()
 
     parser = argparse.ArgumentParser(
         prog="seed_consensus",

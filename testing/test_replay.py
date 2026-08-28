@@ -571,3 +571,34 @@ def test_a_fresh_store_is_created_by_the_replay_itself(tmp_path, monkeypatch):
     monkeypatch.setenv("NEMO_PIT_DB", str(tmp_path / "fresh.db"))
     replay.load_signals({})
     assert replay.main(["--dates", DAYS[10], "--tickers", "AAA"]) == 0
+
+
+def test_a_replay_built_store_says_its_bars_were_backfilled(tmp_path, monkeypatch):
+    """`build_store` pulls a whole history at once and stamps it day by day.
+
+    Every row it writes is a backfill by construction -- the session it
+    describes is months past and the vendor has already dropped whatever
+    delisted since. `daily_bar.source` exists to say so, and taking its
+    default would have every replayed row claim it was recorded on the
+    evening it describes, which is the one thing that column is for.
+    """
+    monkeypatch.setenv("NEMO_PIT_DB", str(tmp_path / "pit.db"))
+    import importlib
+    from research import pit_store as store
+    importlib.reload(store)
+    store.init_schema()
+
+    rows = [{"trade_date": "2026-03-02", "open": 10.0, "high": 11.0,
+             "low": 9.5, "close": 10.5, "volume": 1_000_000.0}]
+    monkeypatch.setattr(replay.daily_job, "_fetch_bars",
+                        lambda *a, **k: {"AAA": rows})
+
+    replay.build_store(["AAA"], start="2026-03-01", end="2026-03-03")
+
+    with store.connect() as conn:
+        got = conn.execute(
+            "SELECT source FROM daily_bar WHERE ticker='AAA'").fetchone()
+    assert got is not None, "build_store wrote nothing"
+    assert got[0] == "backfilled", (
+        f"a replayed session claims source={got[0]!r}; it was not recorded "
+        f"on the evening it describes")

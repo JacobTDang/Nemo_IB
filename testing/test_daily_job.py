@@ -19,6 +19,8 @@ gets fixed. The dangerous ones are the quiet kind:
 
 Every test here is about one of those, not about the happy path.
 """
+from datetime import date, timedelta
+
 import pytest
 
 from research import daily_job, pit_store
@@ -49,9 +51,17 @@ def test_a_run_that_fetched_nothing_is_not_recorded_as_ok(store, monkeypatch):
 
 def test_a_partial_fetch_is_recorded_as_partial(store, monkeypatch):
     """Half the universe failing is neither success nor failure, and calling
-    it either one loses the number that matters."""
-    monkeypatch.setattr(daily_job, "_fetch_bars",
-                        lambda tickers, **kw: {"AAPL": _bars("2026-03-03")})
+    it either one loses the number that matters.
+
+    Half of what, though: the ratio is against the names the vendor answered
+    for, not against the ask. MSFT traded during the window and then had no bar
+    on the session itself, which is a hole in a series that exists. A name that
+    answered nowhere in the window is a different fact and the next section is
+    about it.
+    """
+    monkeypatch.setattr(daily_job, "_fetch_bars", lambda tickers, **kw: {
+        "AAPL": _bars("2026-03-03"), "MSFT": _bars("2026-03-02"),
+        daily_job.FETCH_CANARY: _bars("2026-03-02", "2026-03-03")})
 
     daily_job.record_daily_bars(["AAPL", "MSFT"], as_of="2026-03-03")
 
@@ -587,7 +597,8 @@ def test_a_lost_batch_reaches_the_run_log(store, monkeypatch):
     """Where an operator will actually see it."""
     def fetch(tickers, **kw):
         kw.get("failures", []).append("batch 2 of 52: ConnectionError: 502")
-        return {"AAPL": _bars("2026-03-03")}
+        return {"AAPL": _bars("2026-03-03"),
+                daily_job.FETCH_CANARY: _bars("2026-03-03")}
 
     monkeypatch.setattr(daily_job, "_fetch_bars", fetch)
     daily_job.record_daily_bars(["AAPL", "MSFT"], as_of="2026-03-03")
@@ -730,6 +741,23 @@ def test_the_canary_is_not_smuggled_into_the_results(monkeypatch):
 # every name its sixty sessions inside a cycle.
 
 
+def _capture_asks(monkeypatch):
+    """Every ticker asked for over the night, not just the last stage's.
+
+    A night is two fetches: one session for the names a signal reads, and a
+    history window for the rotation slice. A capture that keeps only the last
+    call sees half of the ask, and which half depends on stage order.
+    """
+    seen = set()
+
+    def fetch(tickers, **kw):
+        seen.update(tickers)
+        return {}
+
+    monkeypatch.setattr(daily_job, "_fetch_bars", fetch)
+    return seen
+
+
 def test_a_new_listing_can_reach_eligibility(store, monkeypatch):
     monkeypatch.setattr(daily_job, "_fetch_sec_tickers", lambda: [
         {"ticker": "OLD", "cik": "1", "name": "Old Co"},
@@ -745,15 +773,13 @@ def test_a_new_listing_can_reach_eligibility(store, monkeypatch):
     ],
                           recorded_at="2026-03-02T21:00:00Z")
 
-    asked = {}
-    monkeypatch.setattr(daily_job, "_fetch_bars",
-                        lambda tickers, **kw: asked.update(t=list(tickers)) or {})
+    asked = _capture_asks(monkeypatch)
     monkeypatch.setattr(daily_job, "record_consensus_snapshots",
                         lambda **kw: {"status": "ok"})
 
     daily_job.run_all(as_of="2026-03-03")
 
-    assert "IPO" in asked["t"], (
+    assert "IPO" in asked, (
         "an ineligible name is never fetched, so it can never become eligible")
 
 
@@ -765,14 +791,12 @@ def test_the_nightly_ask_is_bounded(store, monkeypatch):
     monkeypatch.setattr(daily_job, "record_consensus_snapshots",
                         lambda **kw: {"status": "ok"})
 
-    asked = {}
-    monkeypatch.setattr(daily_job, "_fetch_bars",
-                        lambda tickers, **kw: asked.update(t=list(tickers)) or {})
+    asked = _capture_asks(monkeypatch)
 
     daily_job.run_all(as_of="2026-03-03")
 
     # Minus the liveness canary, which every fetch carries and none records.
-    universe = [t for t in asked["t"] if t != daily_job.FETCH_CANARY]
+    universe = asked - {daily_job.FETCH_CANARY}
     assert len(universe) <= daily_job.MAX_NIGHTLY_TICKERS
 
 
@@ -811,13 +835,11 @@ def test_eligible_names_are_never_starved_by_the_rotation(store, monkeypatch):
         {"ticker": f"T{i}", "cik": str(i), "eligible": True} for i in range(60)],
                           recorded_at="2026-03-02T21:00:00Z")
 
-    asked = {}
-    monkeypatch.setattr(daily_job, "_fetch_bars",
-                        lambda tickers, **kw: asked.update(t=set(tickers)) or {})
+    asked = _capture_asks(monkeypatch)
 
     daily_job.run_all(as_of="2026-03-03")
 
-    assert {f"T{i}" for i in range(60)} <= asked["t"]
+    assert {f"T{i}" for i in range(60)} <= asked
 
 
 # --- the entry point cron actually calls ------------------------------------
@@ -1034,10 +1056,10 @@ def test_one_ticker_that_cannot_be_written_does_not_cost_the_night(
 
     real = daily_job._record_ticker
 
-    def flaky(ticker, rows, stamp, keep=None):
+    def flaky(ticker, rows, stamp, keep=None, source="recorded"):
         if ticker == "MSFT":
             raise sqlite3.OperationalError("database is locked")
-        return real(ticker, rows, stamp, keep=keep)
+        return real(ticker, rows, stamp, keep=keep, source=source)
 
     monkeypatch.setattr(daily_job, "_record_ticker", flaky)
 
@@ -1193,3 +1215,369 @@ def test_a_rerun_reports_the_rows_it_actually_wrote(store, monkeypatch):
         f"the rerun reported {second['written']} rows it did not write")
     assert second["seen"] == 1, "the rows it saw are still worth reporting"
     assert daily_job.last_run("consensus")["rows_written"] == 0
+
+
+# --- what "ok" means when the ask is padded with names expected to be empty --
+#
+# The nightly ask is the eligible set plus a rotating slice of the SEC
+# registrant list, and that list is thousands of delisted shells that will
+# never return a bar again. Measured against it, coverage was never complete:
+# every weekday logged `partial`, carried "1847 of 3000 tickers returned data"
+# in the error column, and landed in `missing_days` -- so the store's own gap
+# detector was saturated and a night that genuinely failed read exactly like a
+# normal one.
+#
+# So `ok` is measured against reachability instead: the probe answered, no
+# batch was lost, and every name the vendor answered for in the window has its
+# session. A shell that answers nowhere is not a hole in the record; it is the
+# record.
+
+
+def test_a_name_the_vendor_never_answered_for_is_not_a_hole(store, monkeypatch):
+    monkeypatch.setattr(daily_job, "_fetch_bars", lambda tickers, **kw: {
+        "AAPL": _bars("2026-03-03"),
+        daily_job.FETCH_CANARY: _bars("2026-03-03")})
+
+    result = daily_job.record_daily_bars(["AAPL", "DELISTED"],
+                                         as_of="2026-03-03")
+
+    assert result["status"] == "ok", (
+        "a delisted shell in the rotation made an ordinary night partial")
+    assert daily_job.last_run("daily_bars")["error"] is None, (
+        "an ordinary night wrote to the error column, where an operator "
+        "scanning for real errors has to read it")
+    assert store.missing_days("daily_bars", "2026-03-03", "2026-03-03") == []
+
+
+def test_a_name_that_traded_in_the_window_but_not_on_the_day_is_a_hole(
+        store, monkeypatch):
+    """The other side of it, and the reason the window is wider than the
+    session: a name the vendor answered for two days ago and not today has a
+    series with a gap in it, which is exactly what `partial` is for."""
+    monkeypatch.setattr(daily_job, "_fetch_bars", lambda tickers, **kw: {
+        "AAPL": _bars("2026-03-03"), "HALTED": _bars("2026-03-02"),
+        daily_job.FETCH_CANARY: _bars("2026-03-02", "2026-03-03")})
+
+    result = daily_job.record_daily_bars(["AAPL", "HALTED"],
+                                         as_of="2026-03-03")
+
+    assert result["status"] == "partial"
+    assert store.bars_as_of("HALTED", "2026-03-03") == [], (
+        "a session the vendor did not report was written anyway")
+
+
+def test_a_probe_that_did_not_answer_is_a_failed_night(store, monkeypatch):
+    """Reachability is what `ok` now asserts, so the liveness probe is what
+    decides it. With no canary anywhere in the window the vendor did not
+    answer, and nothing about the absences can be believed."""
+    monkeypatch.setattr(daily_job, "_fetch_bars",
+                        lambda tickers, **kw: {"AAPL": _bars("2026-03-03")})
+
+    result = daily_job.record_daily_bars(["AAPL"], as_of="2026-03-03")
+
+    assert result["status"] == "failed"
+    assert store.missing_days("daily_bars", "2026-03-03", "2026-03-03") == \
+        ["2026-03-03"]
+
+
+def test_a_lost_batch_is_never_a_complete_night(store, monkeypatch):
+    """Every name in a lost batch is simply absent from the fetch, so a ratio
+    computed over what came back cannot see it. Two hundred names lost to a 502
+    would otherwise read as two hundred companies that do not trade."""
+    def fetch(tickers, **kw):
+        kw.get("failures", []).append(
+            "batch 2 of 2 failed after 3 attempts (200 tickers, M..Z): "
+            "ConnectionError: 502")
+        return {"AAPL": _bars("2026-03-03"),
+                daily_job.FETCH_CANARY: _bars("2026-03-03")}
+
+    monkeypatch.setattr(daily_job, "_fetch_bars", fetch)
+
+    result = daily_job.record_daily_bars(["AAPL"], as_of="2026-03-03")
+
+    assert result["status"] == "partial"
+    assert "502" in str(daily_job.last_run("daily_bars")["error"])
+
+
+# --- and the gap report, which nothing called -------------------------------
+#
+# `missing_days` had no production caller at all: it appeared in its own
+# definition and in two comments. A detector nothing reads is not a detector.
+
+
+def test_the_nightly_run_reports_the_gaps_in_its_own_record(store, monkeypatch):
+    store.start_run("daily_bars", as_of_date="2026-03-02")
+    store.finish_run(rows_written=1, status="ok")
+
+    monkeypatch.setattr(daily_job, "_fetch_sec_tickers",
+                        lambda: [{"ticker": "AAA", "cik": "1", "name": "A"}])
+    monkeypatch.setattr(daily_job, "_fetch_bars", lambda tickers, **kw: {
+        "AAA": _bars("2026-03-04"),
+        daily_job.FETCH_CANARY: _bars("2026-03-04")})
+    monkeypatch.setattr(daily_job, "record_consensus_snapshots",
+                        lambda **kw: {"status": "ok"})
+
+    result = daily_job.run_all(as_of="2026-03-04")
+
+    assert result["gaps"] == ["2026-03-03"], (
+        f"the night between two runs is not reported: {result.get('gaps')!r}")
+
+
+def test_the_gap_report_does_not_count_days_before_the_store_existed(
+        store, monkeypatch):
+    """A fresh volume has no history and no holes. Reporting its first month as
+    twenty-two gaps is the same noise the status fix removed."""
+    monkeypatch.setattr(daily_job, "_fetch_sec_tickers",
+                        lambda: [{"ticker": "AAA", "cik": "1", "name": "A"}])
+    monkeypatch.setattr(daily_job, "_fetch_bars", lambda tickers, **kw: {
+        "AAA": _bars("2026-03-04"),
+        daily_job.FETCH_CANARY: _bars("2026-03-04")})
+    monkeypatch.setattr(daily_job, "record_consensus_snapshots",
+                        lambda **kw: {"status": "ok"})
+
+    result = daily_job.run_all(as_of="2026-03-04")
+
+    assert result["gaps"] == []
+
+
+# --- a new listing must reach eligibility inside a lifetime ------------------
+#
+# `record_daily_bars` writes one session per ticker per run, so a name that is
+# only ever in the rotation accrued one bar per cycle while the screen counts
+# sixty recorded rows. Against the 10,388-name registrant list that is a
+# nine-night cycle at 2,000 eligible names -- 540 weekdays, over two years,
+# before a newcomer can be screened at all, and nearly four years at 2,500.
+#
+# The universe was frozen: IPOs and re-listings never entered, so the backtest
+# inherited the survivorship bias the whole store exists to avoid, arriving
+# through the ask policy instead of through the vendor. The rotation slice is
+# fetched with a history window for exactly this reason.
+
+
+def _weekdays_through(as_of, count):
+    """`count` weekdays ending on `as_of`."""
+    out, day = [], date.fromisoformat(as_of)
+    while len(out) < count:
+        if day.weekday() < 5:
+            out.append(day.isoformat())
+        day -= timedelta(days=1)
+    return sorted(out)
+
+
+def _window_vendor(monkeypatch, sessions):
+    """A vendor that answers with every session inside the requested window.
+
+    `end` is exclusive, the way yfinance's is -- which is the whole reason the
+    bootstrap window needs the extra day.
+    """
+    def fetch(tickers, start=None, end=None, failures=None):
+        days = [d for d in sessions
+                if (start is None or d >= start) and (end is None or d < end)]
+        return {t: _bars(*days) for t in tickers} if days else {}
+
+    monkeypatch.setattr(daily_job, "_fetch_bars", fetch)
+
+
+def test_a_new_listing_reaches_eligibility_in_one_night(store, monkeypatch):
+    day = "2026-03-04"
+    _window_vendor(monkeypatch, _weekdays_through(day, 120))
+    monkeypatch.setattr(daily_job, "_fetch_sec_tickers", lambda: [
+        {"ticker": "IPO", "cik": "1", "name": "Newly Listed Inc"}])
+    monkeypatch.setattr(daily_job, "record_consensus_snapshots",
+                        lambda **kw: {"status": "ok"})
+    monkeypatch.setattr(daily_job, "_today", lambda: day)
+
+    daily_job.run_all(as_of=day)
+
+    bars = store.bars_as_of("IPO", day)
+    assert len(bars) >= daily_job.MIN_HISTORY_SESSIONS, (
+        f"a night in the rotation gave the newcomer {len(bars)} sessions, so "
+        f"it needs {daily_job.MIN_HISTORY_SESSIONS} cycles to be screened")
+    member = {m["ticker"]: m for m in store.universe_as_of(day)}["IPO"]
+    assert member["eligible"] is True, member["exclusion_reason"]
+
+
+def test_the_newcomers_own_session_is_not_left_out(store, monkeypatch):
+    """The history window is what makes it eligible; the session the run is
+    for is what the next night's series continues from. Fetched end-exclusive
+    it would be a permanent one-session hole in every name's first night."""
+    day = "2026-03-04"
+    _window_vendor(monkeypatch, _weekdays_through(day, 120))
+    monkeypatch.setattr(daily_job, "_fetch_sec_tickers", lambda: [
+        {"ticker": "IPO", "cik": "1", "name": "Newly Listed Inc"}])
+    monkeypatch.setattr(daily_job, "record_consensus_snapshots",
+                        lambda **kw: {"status": "ok"})
+    monkeypatch.setattr(daily_job, "_today", lambda: day)
+
+    daily_job.run_all(as_of=day)
+
+    assert [b for b in store.bars_as_of("IPO", day)
+            if b["trade_date"] == day], "the newcomer has no bar for tonight"
+
+
+def test_the_names_a_signal_reads_still_cost_one_session_a_night(
+        store, monkeypatch):
+    """The window is for names that need history, not for the whole ask. An
+    eligible name re-fetched two hundred sessions deep every night is the
+    request size the rate limiter answers."""
+    windows = {}
+
+    def fetch(tickers, start=None, end=None, failures=None):
+        for t in tickers:
+            windows[t] = start
+        return {}
+
+    monkeypatch.setattr(daily_job, "_fetch_bars", fetch)
+    monkeypatch.setattr(daily_job, "_fetch_sec_tickers", lambda: [
+        {"ticker": "OLD", "cik": "1", "name": "Old Co"},
+        {"ticker": "NEW", "cik": "2", "name": "New Co"}])
+    monkeypatch.setattr(daily_job, "record_consensus_snapshots",
+                        lambda **kw: {"status": "ok"})
+    store.record_universe("2026-03-02", [{"ticker": "OLD", "cik": "1",
+                                          "eligible": True}],
+                          recorded_at="2026-03-02T21:00:00Z")
+
+    daily_job.run_all(as_of="2026-03-04")
+
+    assert windows["OLD"] > windows["NEW"], (
+        f"the eligible name was asked for from {windows['OLD']} and the "
+        f"newcomer from {windows['NEW']}")
+
+
+# --- a night filled in later is not the night it describes -------------------
+#
+# `_stamp` dates a replayed run to the session it records, which is right for
+# prices and silent about provenance. The store already draws this distinction
+# everywhere else -- `consensus_snapshot.source` is 'recorded' or 'seeded',
+# `activist_filing` derives `is_backfill` -- and a backfilled night is
+# materially worse data: yfinance drops delisted tickers, so filling 1 August
+# on 26 August is missing exactly the names the store exists to preserve.
+
+
+def test_a_session_filled_in_later_says_so(store, monkeypatch):
+    _clock(monkeypatch, "2026-08-26T22:30:00")
+    monkeypatch.setattr(daily_job, "_fetch_bars", lambda tickers, **kw: {
+        "AAPL": _bars("2026-08-03"),
+        daily_job.FETCH_CANARY: _bars("2026-08-03")})
+
+    daily_job.record_daily_bars(["AAPL"], as_of="2026-08-03")
+
+    bar = store.bars_as_of("AAPL", "2026-08-26")[0]
+    assert bar["source"] == "backfilled", (
+        "a night replayed three weeks later is indistinguishable from one "
+        "recorded as it happened")
+
+
+def test_a_session_recorded_on_its_own_evening_says_that(store, monkeypatch):
+    _clock(monkeypatch, "2026-08-26T22:30:00")
+    monkeypatch.setattr(daily_job, "_fetch_bars", lambda tickers, **kw: {
+        "AAPL": _bars("2026-08-26"),
+        daily_job.FETCH_CANARY: _bars("2026-08-26")})
+
+    daily_job.record_daily_bars(["AAPL"], as_of="2026-08-26")
+
+    assert store.bars_as_of("AAPL", "2026-08-26")[0]["source"] == "recorded"
+
+
+def test_history_pulled_for_a_past_date_is_marked_too(store, monkeypatch):
+    """The bootstrap has the same two cases: pulled today it is history we are
+    learning now, replayed for a past date it is a reconstruction."""
+    _clock(monkeypatch, "2026-08-26T22:30:00")
+    monkeypatch.setattr(daily_job, "_fetch_bars", lambda tickers, **kw: {
+        "AAPL": _bars("2026-08-03", "2026-08-04")})
+
+    daily_job.bootstrap_history(["AAPL"], as_of="2026-08-04")
+
+    assert {b["source"] for b in store.bars_as_of("AAPL", "2026-08-26")} == \
+        {"backfilled"}
+
+
+# --- and something that replays the gaps ------------------------------------
+#
+# There was no backfill mechanism at all: after a multi-day outage an operator
+# hand-ran `--as-of` for each date, and nothing enumerated which dates those
+# were. The gap list is the enumeration.
+
+
+def test_backfill_replays_exactly_the_weekdays_with_no_finished_run(
+        store, monkeypatch):
+    for day in ("2026-08-03", "2026-08-05"):
+        store.start_run("daily_bars", as_of_date=day)
+        store.finish_run(rows_written=1, status="ok")
+    _clock(monkeypatch, "2026-08-06T22:30:00")
+
+    replayed = []
+    monkeypatch.setattr(daily_job, "run_all",
+                        lambda as_of=None, **kw: replayed.append(as_of)
+                        or {"as_of": as_of, "daily_bars": {"status": "ok"}})
+
+    assert daily_job.main(["--backfill"]) == 0
+    assert replayed == ["2026-08-04"], (
+        f"the backfill replayed {replayed!r} rather than the one missing day")
+
+
+def test_backfill_does_not_replay_the_day_it_is_running_on(store, monkeypatch):
+    """Today is the nightly job's own date. Replaying it here would either
+    duplicate the run that is about to happen or record a session that has not
+    closed yet."""
+    store.start_run("daily_bars", as_of_date="2026-08-03")
+    store.finish_run(rows_written=1, status="ok")
+    _clock(monkeypatch, "2026-08-06T22:30:00")
+
+    replayed = []
+    monkeypatch.setattr(daily_job, "run_all",
+                        lambda as_of=None, **kw: replayed.append(as_of)
+                        or {"as_of": as_of, "daily_bars": {"status": "ok"}})
+
+    daily_job.main(["--backfill"])
+
+    assert "2026-08-06" not in replayed
+    assert replayed == ["2026-08-04", "2026-08-05"]
+
+
+def test_a_backfilled_day_that_failed_exits_non_zero(store, monkeypatch):
+    """Same contract as the nightly path: a scheduler only ever learns from the
+    exit code."""
+    store.start_run("daily_bars", as_of_date="2026-08-03")
+    store.finish_run(rows_written=1, status="ok")
+    _clock(monkeypatch, "2026-08-06T22:30:00")
+    monkeypatch.setattr(daily_job, "run_all",
+                        lambda as_of=None, **kw: {
+                            "as_of": as_of, "daily_bars": {"status": "failed"}})
+
+    assert daily_job.main(["--backfill"]) == 1
+
+
+def test_backfill_on_a_store_that_never_ran_fills_nothing(store, monkeypatch):
+    """A volume with no run log has no gaps -- it has no record. Filling a
+    month of history unasked is a different operation, and `--since` is how
+    someone asks for it."""
+    _clock(monkeypatch, "2026-08-06T22:30:00")
+    replayed = []
+    monkeypatch.setattr(daily_job, "run_all",
+                        lambda as_of=None, **kw: replayed.append(as_of) or
+                        {"as_of": as_of})
+
+    assert daily_job.main(["--backfill"]) == 0
+    assert replayed == []
+
+    daily_job.main(["--backfill", "--since", "2026-08-04"])
+    assert replayed == ["2026-08-04", "2026-08-05"]
+
+
+def test_backfill_cannot_be_pointed_at_today(store, monkeypatch):
+    """`--as-of` is the end of the window when backfilling, and an end of today
+    would put the session the nightly job is about to record into the list of
+    nights to replay."""
+    store.start_run("daily_bars", as_of_date="2026-08-03")
+    store.finish_run(rows_written=1, status="ok")
+    _clock(monkeypatch, "2026-08-06T22:30:00")
+
+    replayed = []
+    monkeypatch.setattr(daily_job, "run_all",
+                        lambda as_of=None, **kw: replayed.append(as_of)
+                        or {"as_of": as_of, "daily_bars": {"status": "ok"}})
+
+    daily_job.main(["--backfill", "--as-of", "2026-08-06"])
+
+    assert replayed == ["2026-08-04", "2026-08-05"]

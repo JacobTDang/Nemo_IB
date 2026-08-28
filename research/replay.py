@@ -111,7 +111,13 @@ def build_store(tickers: Sequence[str], start: str, end: str) -> Dict[str, Any]:
                 pit_store.record_corporate_action(
                     ticker, row["trade_date"], "dividend",
                     float(row["dividend"]), recorded_at=when)
-            written += pit_store.record_bars(ticker, [row], recorded_at=when)
+            # Every row here is a backfill by construction: the session is
+            # months past and the vendor has already dropped whatever delisted
+            # since. Taking the default would have a replayed store claim its
+            # bars were recorded on the evening they describe, which is the
+            # one thing `source` exists to deny.
+            written += pit_store.record_bars(ticker, [row], recorded_at=when,
+                                             source="backfilled")
 
     return {"tickers": len(fetched), "rows": written,
             "start": start, "end": end, "caveats": list(CAVEATS)}

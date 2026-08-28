@@ -603,3 +603,72 @@ def test_a_run_that_never_finished_is_not_coverage(store):
     """A crashed process leaves a started row with no finish."""
     store.start_run("daily_bars", as_of_date="2026-03-02")
     assert store.last_successful_run("daily_bars", "2026-03-04") is None
+
+
+# --- a bar filled in later is not the same evidence as one watched ----------
+#
+# `daily_job._stamp` dates a replayed run to the session it records, which is
+# defensible for prices and says nothing about provenance. Every other table
+# here draws the distinction -- `consensus_snapshot.source` is 'recorded' or
+# 'seeded', `activist_filing` derives `is_backfill` -- and a backfilled night
+# is materially worse data, because the vendor drops delisted tickers and a
+# night filled in three weeks late is missing exactly the names this store
+# exists to preserve.
+
+
+def test_a_bar_carries_where_it_came_from(store):
+    store.record_bars("AAPL", [_bar("2026-08-03", 10.0)],
+                      recorded_at="2026-08-26T21:00:00Z", source="backfilled")
+    store.record_bars("AAPL", [_bar("2026-08-26", 11.0)],
+                      recorded_at="2026-08-26T21:00:00Z")
+
+    got = {b["trade_date"]: b["source"]
+           for b in store.bars_as_of("AAPL", "2026-08-27")}
+    assert got == {"2026-08-03": "backfilled", "2026-08-26": "recorded"}
+
+
+def test_a_store_built_before_the_source_column_gains_it(tmp_path, monkeypatch):
+    """The deployed store is exactly the one that predates the column. Rows
+    already in it were written by a recorder standing on the day they describe,
+    so the migration must not relabel them as reconstructions."""
+    import sqlite3
+
+    path = tmp_path / "old_bars.db"
+    monkeypatch.setenv("NEMO_PIT_DB", str(path))
+    with sqlite3.connect(path) as conn:
+        conn.execute("""CREATE TABLE daily_bar (
+            trade_date TEXT NOT NULL, ticker TEXT NOT NULL, open REAL,
+            high REAL, low REAL, close REAL, volume REAL,
+            recorded_at TEXT NOT NULL,
+            PRIMARY KEY (trade_date, ticker))""")
+        conn.execute("INSERT INTO daily_bar VALUES "
+                     "('2026-03-03','AAPL',1.0,2.0,0.5,1.5,1000,"
+                     "'2026-03-03T21:00:00Z')")
+
+    pit_store.init_schema()
+
+    with pit_store.connect() as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(daily_bar)")}
+        row = conn.execute("SELECT * FROM daily_bar").fetchone()
+    assert "source" in cols
+    assert row["source"] == "recorded", "existing bars were relabelled"
+    assert row["close"] == 1.5
+
+    # ...and the store still writes through the migrated table.
+    pit_store.record_bars("AAPL", [_bar("2026-03-04", 2.0)],
+                          recorded_at="2026-03-04T21:00:00Z")
+    assert len(pit_store.bars_as_of("AAPL", "2026-03-05")) == 2
+
+
+def test_the_store_says_when_a_job_first_ran(store):
+    """What separates a gap from a store that did not exist yet. Without it a
+    fresh volume reports its first month as twenty-two missed nights."""
+    assert store.first_run("daily_bars") is None
+    store.start_run("daily_bars", as_of_date="2026-03-03")
+    store.finish_run(rows_written=0, status="failed", error="vendor timeout")
+    store.start_run("daily_bars", as_of_date="2026-03-04")
+    store.finish_run(rows_written=1, status="ok")
+
+    assert store.first_run("daily_bars") == "2026-03-03", (
+        "a night that ran and failed still says the store was running")
+    assert store.first_run("consensus") is None

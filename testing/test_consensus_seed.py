@@ -462,3 +462,70 @@ def test_the_client_is_closed_even_when_the_call_fails(monkeypatch):
     with pytest.raises(ConnectionError):
         seed_consensus._fetch_surprises("AAPL")
     assert closed == [True]
+
+
+# --- the first run on a fresh volume ----------------------------------------
+#
+# Every test above builds the schema in a fixture, which is exactly why the
+# suite stayed green while a first `docker compose run --rm research-seed` on a
+# new volume would die on "no such table: consensus" before it wrote anything.
+# Seeding is the job most likely to run first -- it is what a cold store needs
+# and it is not on the nightly timer -- so the ordering that hides this is the
+# one it least reliably has.
+
+def test_a_fresh_store_is_created_by_the_seed_itself(tmp_path, monkeypatch):
+    import json
+
+    monkeypatch.setenv("NEMO_PIT_DB", str(tmp_path / "fresh.db"))
+    monkeypatch.setattr(seed_consensus, "_fetch_surprises",
+                        lambda ticker: SURPRISES)
+
+    printed = {}
+    monkeypatch.setattr("builtins.print",
+                        lambda *a, **k: printed.setdefault("out", a[0]))
+
+    assert seed_consensus.main(["--tickers", "MSFT"]) == 0
+    assert json.loads(printed["out"])["written"] == 4
+    assert pit_store.consensus_as_of("MSFT", "2026Q4", "2026-07-30")
+
+
+# --- the tmpfs this job writes into -----------------------------------------
+#
+# Seeding is named in the issue as a vendor job, and it is -- but it reaches
+# EDGAR twice per name on the way: `sue.eps_series` for the filer's own dates
+# and `announcements.for_quarters` for the Item 2.02 release. Both cache their
+# documents under /root/.edgar, the same 512MB tmpfs `research-watch` and
+# `research-announce` fill, and a seed runs over the same eligible universe.
+#
+# Between names is the only place a batch job can prune: it has no event loop
+# and no idle moment. The pruner and its interval are the servers' own.
+
+def test_a_seed_prunes_the_filing_cache_as_it_goes(store, monkeypatch):
+    from tools import filing_cache
+
+    monkeypatch.setattr(seed_consensus, "_fetch_surprises", lambda ticker: [])
+    asked = []
+    monkeypatch.setattr(filing_cache, "prune_if_due",
+                        lambda *a, **k: asked.append(1))
+
+    seed_consensus.seed(["AAA", "BBB", "CCC"], as_of="2026-08-27")
+    assert len(asked) == 3, "the cache is only asked about once for the run"
+
+
+def test_a_name_that_failed_still_left_documents_in_the_cache(store,
+                                                              monkeypatch):
+    """The fetch that raised had already written whatever it read, and over a
+    universe the failures are where an unpruned cache grows fastest."""
+    from tools import filing_cache
+
+    def boom(ticker):
+        raise ConnectionError("Finnhub returned 503")
+
+    monkeypatch.setattr(seed_consensus, "_fetch_surprises", boom)
+    asked = []
+    monkeypatch.setattr(filing_cache, "prune_if_due",
+                        lambda *a, **k: asked.append(1))
+
+    out = seed_consensus.seed(["AAA", "BBB"], as_of="2026-08-27")
+    assert len(out["failed"]) == 2
+    assert len(asked) == 2

@@ -74,10 +74,27 @@ def _stamp(as_of: str) -> str:
     return f"{as_of}T21:00:00Z"
 
 
+def _source(as_of: str) -> str:
+    """Whether this run stood on the session it is recording.
+
+    `_stamp` backdates a replay to the day it describes, which is right for
+    prices and says nothing about how the row was obtained -- and the two are
+    not the same evidence. yfinance drops delisted tickers, so a night filled
+    in three weeks later is missing exactly the names this store exists to
+    preserve, and no reader could tell it from a night watched live.
+
+    The store already draws this line everywhere else: `consensus_snapshot`
+    separates 'recorded' from 'seeded', `activist_filing` derives
+    `is_backfill`. This is the same distinction, in the same words.
+    """
+    return "recorded" if as_of == _today() else "backfilled"
+
+
 # --------------------------------------------------------------- seams
 
 def _record_probe(fetched: Dict[str, List[Dict[str, Any]]], stamp: str,
-                  keep, requested: List[str]) -> None:
+                  keep, requested: List[str],
+                  source: str = "recorded") -> None:
     """Keep the canary's own sessions.
 
     It is fetched every night anyway, as the liveness probe, and it is also
@@ -94,7 +111,7 @@ def _record_probe(fetched: Dict[str, List[Dict[str, Any]]], stamp: str,
         return
     rows = fetched.get(FETCH_CANARY) or []
     if rows:
-        _record_ticker(FETCH_CANARY, rows, stamp, keep=keep)
+        _record_ticker(FETCH_CANARY, rows, stamp, keep=keep, source=source)
 
 
 def _fetch_sec_tickers() -> List[Dict[str, Any]]:
@@ -321,7 +338,7 @@ def _to_as_traded(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _record_ticker(ticker: str, rows: List[Dict[str, Any]], stamp: str,
-                   keep=None) -> int:
+                   keep=None, source: str = "recorded") -> int:
     """Actions first, then the bars they explain, in one transaction.
 
     Order matters on a cold store: a reader that finds bars without the split
@@ -358,7 +375,7 @@ def _record_ticker(ticker: str, rows: List[Dict[str, Any]], stamp: str,
             # that had not happened yet.
             as_traded = [r for r in as_traded if keep(r["trade_date"])]
         return pit_store.record_bars(ticker, as_traded, recorded_at=stamp,
-                                     conn=conn)
+                                     conn=conn, source=source)
 
 
 def _fetch_calendar(start: str, end: str) -> List[Dict[str, Any]]:
@@ -443,6 +460,13 @@ def coverage_status(covered: int, requested: int) -> str:
     Reported separately from `rows_written` on purpose: a run that reached one
     ticker out of five thousand wrote rows and is not a working day, and only
     the ratio shows that.
+
+    What `requested` means is the caller's problem and it matters. A watcher
+    that looks up one folder per name is asked for names it can reach, so its
+    own count is the right denominator. The bar recorder is not: its ask
+    carries a rotating slice of the SEC registrant list, thousands of delisted
+    shells that will never answer again, and measured against that no night is
+    ever complete. See `_bars_status`.
     """
     if requested == 0:
         # Asked for nothing and got nothing. That is a complete run over an
@@ -451,6 +475,41 @@ def coverage_status(covered: int, requested: int) -> str:
     if covered == 0:
         return "failed"
     return "ok" if covered >= requested else "partial"
+
+
+def _bars_status(covered: int, answered: int, requested: int,
+                 probe_answered: bool, failures: List[str]) -> str:
+    """A bar run's verdict, measured against what could be reached.
+
+    `covered >= requested` was the old rule and `requested` is the nightly ask,
+    which deliberately contains names expected to be empty. So every weekday
+    logged `partial` with "1847 of 3000 tickers returned data" in the error
+    column, every weekday landed in `missing_days`, and the store's own gap
+    detector could no longer point at the one night that really was missed.
+
+    The three facts that do say whether a night worked:
+
+      The probe answered. Each batch carries a name that always trades, so a
+      run with no canary anywhere in the window did not reach the vendor and
+      nothing about its absences means anything.
+
+      No batch was lost. Every name in a lost batch is simply absent from the
+      response, so a ratio computed over what came back cannot see it -- two
+      hundred names lost to a 502 would read as two hundred companies that do
+      not trade.
+
+      Every name the vendor answered for in the window has its session. A
+      shell that answers nowhere is not a hole in the record; a name that
+      printed on Monday and is missing on Tuesday is.
+    """
+    if requested == 0:
+        # Asked for nothing, so there was nothing to reach. A run over an empty
+        # list is complete, and the probe has no verdict to give about it.
+        return "ok"
+    if not probe_answered:
+        return "failed"
+    status = coverage_status(covered, answered)
+    return "partial" if failures and status == "ok" else status
 
 
 # ------------------------------------------------------------------ bars
@@ -516,6 +575,12 @@ def record_daily_bars(tickers: List[str],
 
     written = 0
     covered = 0
+    # Names the vendor answered for somewhere in the window: it knows them and
+    # they still trade. This is the denominator -- not the ask, which carries
+    # the rotation slice of the registrant list and is thousands of names
+    # expected to be empty.
+    answered = 0
+    source = _source(as_of)
     for ticker in tickers:
         rows = fetched.get(ticker) or []
         if not rows:
@@ -523,6 +588,7 @@ def record_daily_bars(tickers: List[str],
             # a session in which nobody traded, and writing a zero-volume row
             # here would make the two indistinguishable forever.
             continue
+        answered += 1
         if not any(r["trade_date"] == as_of for r in rows):
             # Present in the window but absent on the day. The window is wider
             # than the session being recorded, so this is the same absence as
@@ -535,7 +601,8 @@ def record_daily_bars(tickers: List[str],
         # run yet -- and consensus is the one series no later run can refetch.
         try:
             written += _record_ticker(ticker, rows, _stamp(as_of),
-                                      keep=lambda d, _o=as_of: d == _o)
+                                      keep=lambda d, _o=as_of: d == _o,
+                                      source=source)
         except Exception as exc:  # noqa: BLE001 - reported, never masked
             failures.append(f"{ticker}: {type(exc).__name__}: {exc}")
             continue
@@ -546,12 +613,18 @@ def record_daily_bars(tickers: List[str],
 
     try:
         _record_probe(fetched, _stamp(as_of),
-                      lambda d, _o=as_of: d == _o, list(tickers))
+                      lambda d, _o=as_of: d == _o, list(tickers), source)
     except Exception as exc:  # noqa: BLE001 - reported, never masked
         failures.append(f"{FETCH_CANARY}: {type(exc).__name__}: {exc}")
 
-    status = coverage_status(covered, len(tickers))
-    detail = f"{covered} of {len(tickers)} tickers recorded"
+    status = _bars_status(covered, answered, len(tickers), bool(index_rows),
+                          failures)
+    detail = (f"{covered} of {answered} reachable tickers recorded, "
+              f"{len(tickers)} asked")
+    if tickers and not index_rows:
+        detail = (f"{FETCH_CANARY} returned no session anywhere in the window, "
+                  f"so the vendor did not answer and no absence here means "
+                  f"anything; {detail}")
     if failures:
         detail = f"{detail}; {len(failures)} lost: " \
                  + " | ".join(failures[:3])
@@ -559,27 +632,40 @@ def record_daily_bars(tickers: List[str],
                          error=None if status == "ok" and not failures
                          else detail)
     return {"status": status, "written": written, "covered": covered,
-            "requested": len(tickers), "failures": failures}
+            "answered": answered, "requested": len(tickers),
+            "source": source, "failures": failures}
 
 
 def bootstrap_history(tickers: List[str], lookback_days: int = 730,
-                      as_of: Optional[str] = None) -> Dict[str, Any]:
+                      as_of: Optional[str] = None,
+                      job: str = "bootstrap_history") -> Dict[str, Any]:
     """Pull history once so the screen has something to stand on.
 
     Stamped with today's date, not the sessions' own. That is the whole point:
     this history was learned today, and a simulation standing in 2024 must not
     see it. Useful for computing today's screen; correctly invisible to any
     past-dated question.
+
+    `job` is the run-log label. Cold-store bootstrapping is not the only caller
+    any more -- the nightly newcomer pass runs the same fetch over the rotation
+    slice -- and a nightly row filed under `bootstrap_history` would say a
+    one-off migration happens every night.
     """
     as_of = as_of or _today()
     start = (date.fromisoformat(as_of) - timedelta(days=lookback_days)).isoformat()
-    pit_store.start_run("bootstrap_history", as_of_date=as_of)
+    pit_store.start_run(job, as_of_date=as_of)
 
     # Through today when `as_of` is in the past, for the same reason the daily
     # path does it: the vendor has divided this whole history by every split
     # since, and only the sessions in the window carry the split column that
     # undoes it. Everything past `as_of` is dropped before writing.
-    end = max(as_of, _today())
+    #
+    # The extra day is because the vendor's `end` is exclusive. Without it a
+    # run stops one session short of the day it is for, which was invisible
+    # while a nightly pass always followed for the same names -- and is a
+    # permanent hole now that a newcomer's first night IS this call.
+    end = (date.fromisoformat(max(as_of, _today()))
+           + timedelta(days=1)).isoformat()
 
     # Asked for by name, so it survives the canary strip. The nightly path
     # already does this; without it here the index's HISTORY is never written,
@@ -588,8 +674,9 @@ def bootstrap_history(tickers: List[str], lookback_days: int = 730,
     asked = list(tickers) if FETCH_CANARY in tickers \
         else [*tickers, FETCH_CANARY]
 
+    failures: List[str] = []
     try:
-        fetched = _fetch_bars(asked, start=start, end=end)
+        fetched = _fetch_bars(asked, start=start, end=end, failures=failures)
     except Exception as exc:  # noqa: BLE001
         pit_store.finish_run(rows_written=0, status="failed",
                              error=f"{type(exc).__name__}: {exc}")
@@ -597,17 +684,23 @@ def bootstrap_history(tickers: List[str], lookback_days: int = 730,
 
     written = 0
     covered = 0
-    failures: List[str] = []
+    # As in the nightly pass: the names the vendor answered for, not the names
+    # asked for. This runs over the rotation slice every night now, and that
+    # slice is mostly registrants that have not traded in years.
+    answered = 0
+    source = _source(as_of)
     for ticker in tickers:
         rows = fetched.get(ticker) or []
         if not rows:
             continue
+        answered += 1
         # Guarded for the same reason the nightly loop is, and more so: a
         # two-year window is where the splits actually are, so this is the loop
         # a refused action value stops first.
         try:
             written += _record_ticker(ticker, rows, _stamp(as_of),
-                                      keep=lambda d, _o=as_of: d <= _o)
+                                      keep=lambda d, _o=as_of: d <= _o,
+                                      source=source)
         except Exception as exc:  # noqa: BLE001 - reported, never masked
             failures.append(f"{ticker}: {type(exc).__name__}: {exc}")
             continue
@@ -615,18 +708,22 @@ def bootstrap_history(tickers: List[str], lookback_days: int = 730,
 
     try:
         _record_probe(fetched, _stamp(as_of),
-                      lambda d, _o=as_of: d <= _o, list(tickers))
+                      lambda d, _o=as_of: d <= _o, list(tickers), source)
     except Exception as exc:  # noqa: BLE001 - reported, never masked
         failures.append(f"{FETCH_CANARY}: {type(exc).__name__}: {exc}")
 
-    status = coverage_status(covered, len(tickers))
-    detail = f"{covered} of {len(tickers)} returned history"
+    status = _bars_status(covered, answered, len(tickers),
+                          bool(fetched.get(FETCH_CANARY)), failures)
+    detail = (f"{covered} of {answered} reachable tickers returned history, "
+              f"{len(tickers)} asked")
     if failures:
         detail = f"{detail}; {len(failures)} lost: " + " | ".join(failures[:3])
     pit_store.finish_run(rows_written=written, status=status,
                          error=None if status == "ok" and not failures
                          else detail)
-    return {"status": status, "written": written, "covered": covered}
+    return {"status": status, "written": written, "covered": covered,
+            "answered": answered, "requested": len(tickers), "source": source,
+            "failures": failures}
 
 
 # -------------------------------------------------------------- universe
@@ -796,15 +893,33 @@ MAX_NIGHTLY_TICKERS = 3000
 # ordinary operation. The cap is a target; this is the guarantee.
 MIN_NEWCOMER_SLOTS = 500
 
+# How far back a newcomer's first fetch reaches. The screen counts recorded
+# sessions, so a name fetched one session per rotation needs
+# MIN_HISTORY_SESSIONS whole cycles before it can be screened at all -- at two
+# thousand eligible names the cycle is nine nights, which is 540 weekdays, and
+# at two and a half thousand it is nearly four years. The universe was frozen
+# and the backtest inherited the survivorship bias through the ask policy
+# rather than through the vendor.
+#
+# Sixty sessions is about eighty-four calendar days; the rest is holidays and
+# the margin that keeps a thin month from landing one session short.
+NEWCOMER_HISTORY_DAYS = 120
 
-def nightly_tickers(as_of: str, registrants: List[str]) -> List[str]:
-    """Everyone eligible, plus this night's slice of everyone else.
+
+def _nightly_split(as_of: str,
+                   registrants: List[str]) -> tuple[List[str], List[str]]:
+    """Tonight's ask, in its two halves: the members, then the newcomers.
 
     Eligible names are never rotated out. They are what a signal actually
     reads, and a hole in one of those series is a hole where it costs most.
     The slice is keyed on the date so it is deterministic -- a rerun of a given
     night asks for exactly what that night asked for, which is the same
     property the rest of the store is built on.
+
+    They are returned apart because they want different requests. A member
+    needs one session appended to a series it already has; a newcomer needs
+    enough history to be screened, and asking for it one session at a time is
+    what froze the universe.
     """
     eligible = eligible_tickers(as_of)
     keep = list(dict.fromkeys(eligible))
@@ -813,7 +928,7 @@ def nightly_tickers(as_of: str, registrants: List[str]) -> List[str]:
 
     room = max(MIN_NEWCOMER_SLOTS, MAX_NIGHTLY_TICKERS - len(keep))
     if not rest:
-        return keep
+        return keep, []
 
     # Ordinal of the date, so consecutive nights take consecutive slices and
     # the cycle length is len(rest) / room nights.
@@ -821,7 +936,13 @@ def nightly_tickers(as_of: str, registrants: List[str]) -> List[str]:
     slice_ = rest[offset:offset + room]
     if len(slice_) < room:
         slice_ += rest[:room - len(slice_)]
-    return keep + slice_
+    return keep, slice_
+
+
+def nightly_tickers(as_of: str, registrants: List[str]) -> List[str]:
+    """Everyone eligible, plus this night's slice of everyone else."""
+    keep, newcomers = _nightly_split(as_of, registrants)
+    return keep + newcomers
 
 
 def run_all(as_of: Optional[str] = None,
@@ -839,15 +960,25 @@ def run_all(as_of: Optional[str] = None,
     except Exception as exc:  # noqa: BLE001
         return {**results, "error": f"universe unavailable: {exc}"}
 
-    asked = nightly_tickers(as_of, registrants)
-    results["asked"] = len(asked)
+    keep, newcomers = _nightly_split(as_of, registrants)
+    results["asked"] = len(keep) + len(newcomers)
 
     stages: List[Any] = []
     if bootstrap:
-        stages.append(("bootstrap", lambda: bootstrap_history(asked,
-                                                              as_of=as_of)))
-    stages += [("daily_bars", lambda: record_daily_bars(asked, as_of=as_of)),
-               ("universe", lambda: refresh_universe(as_of=as_of)),
+        stages.append(("bootstrap",
+                       lambda: bootstrap_history(keep + newcomers,
+                                                 as_of=as_of)))
+    stages.append(("daily_bars", lambda: record_daily_bars(keep, as_of=as_of)))
+    # The rotation slice, with enough history to be screened tonight rather
+    # than in two years. Skipped under `bootstrap`, which has already asked for
+    # the same names over a far longer window -- asking twice is a doubled
+    # request against the rate limit that `MAX_NIGHTLY_TICKERS` exists for.
+    if newcomers and not bootstrap:
+        stages.append(("newcomers",
+                       lambda: bootstrap_history(
+                           newcomers, lookback_days=NEWCOMER_HISTORY_DAYS,
+                           as_of=as_of, job="newcomers")))
+    stages += [("universe", lambda: refresh_universe(as_of=as_of)),
                ("consensus", lambda: record_consensus_snapshots(as_of=as_of))]
 
     # In order, but not on each other's success. Called as bare statements, an
@@ -862,10 +993,95 @@ def run_all(as_of: Optional[str] = None,
         except Exception as exc:  # noqa: BLE001 - reported, never masked
             results[name] = {"status": "failed",
                              "error": f"{type(exc).__name__}: {exc}"}
+
+    # Reported after the stages, so tonight counts as tonight. A stage that
+    # failed leaves this night in the list, which is the point.
+    results["gaps"] = coverage_gaps(as_of=as_of)
     return results
 
 
+# ------------------------------------------------------- gaps, and filling them
+#
+# `missing_days` has been in the store since the first commit and nothing ever
+# called it: it appeared in its own definition and in two comments. A gap
+# detector nothing reads is not a detector, and the nights it would have named
+# were the ones an operator most needed told about.
+
+# How far back the nightly report looks. Long enough to cover a long weekend
+# and the outage that started over it, short enough that a store down for a
+# quarter says so once rather than growing a longer list every night.
+GAP_REPORT_DAYS = 30
+
+
+def coverage_gaps(as_of: Optional[str] = None, days: int = GAP_REPORT_DAYS,
+                  job: str = "daily_bars") -> List[str]:
+    """Weekdays in the trailing window that no finished run covers.
+
+    Clamped to the first date the job ever ran for. Before that the recorder
+    did not exist, so a fresh volume would report its first month as
+    twenty-two missed nights -- the same saturation that made the status column
+    worth nothing, arriving through the report instead.
+    """
+    as_of = as_of or _today()
+    first = pit_store.first_run(job)
+    if first is None:
+        return []
+    start = (date.fromisoformat(as_of) - timedelta(days=days)).isoformat()
+    return pit_store.missing_days(job, max(start, first), as_of)
+
+
+def backfill(since: Optional[str] = None, until: Optional[str] = None,
+             job: str = "daily_bars") -> Dict[str, Any]:
+    """Replay every weekday in the window that no finished run covers.
+
+    There was no backfill mechanism at all: after a multi-day outage an
+    operator hand-ran `--as-of` for each date and nothing enumerated which
+    dates those were. This is that enumeration, and it is the same list the
+    nightly run now reports.
+
+    Never today. Today is the nightly job's own date, and replaying it here
+    would either duplicate the run about to happen or record a session that has
+    not closed yet.
+
+    What it writes is genuinely worse evidence than the night it stands in for
+    -- the vendor drops delisted tickers, so filling 1 August on 26 August is
+    missing exactly the names the store exists to preserve -- which is why
+    those rows are written as `backfilled` and say so.
+    """
+    # Clamped rather than defaulted, so an `until` of today or later cannot
+    # smuggle tonight's own date into a list of nights to replay.
+    yesterday = (date.fromisoformat(_today()) - timedelta(days=1)).isoformat()
+    until = min(until or yesterday, yesterday)
+    if since is None:
+        first = pit_store.first_run(job)
+        if first is None:
+            # No run log is not a record with holes in it; it is no record.
+            # Filling a month of history unasked is a different operation, and
+            # `since` is how someone asks for it.
+            return {"gaps": [], "days": {},
+                    "note": f"{job} has never run, so it has no gaps -- only "
+                            f"an empty record. Pass --since to fill a window "
+                            f"anyway"}
+        window = (date.fromisoformat(until)
+                  - timedelta(days=GAP_REPORT_DAYS)).isoformat()
+        since = max(first, window)
+
+    gaps = pit_store.missing_days(job, since, until)
+    days: Dict[str, Any] = {}
+    for day in gaps:
+        days[day] = run_all(as_of=day)
+    return {"gaps": gaps, "days": days, "since": since, "until": until}
+
+
 # ------------------------------------------------------------- entry point
+
+def _any_stage_failed(result: Dict[str, Any]) -> bool:
+    """Whether a `run_all` result contains a stage that failed."""
+    if result.get("error"):
+        return True
+    return any(v["status"] == "failed" for v in result.values()
+               if isinstance(v, dict) and "status" in v)
+
 
 def main(argv: Optional[List[str]] = None) -> int:
     """`python -m research.daily_job`, which is what the schedule invokes.
@@ -882,9 +1098,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         prog="daily_job",
         description="Record one day into the point-in-time store.")
     parser.add_argument("--as-of", dest="as_of", default=None,
-                        help="date to record as (default: today)")
+                        help="date to record as (default: today); with "
+                             "--backfill, the last date the gap list covers")
     parser.add_argument("--bootstrap", action="store_true",
                         help="pull history first; needed once on a cold store")
+    parser.add_argument("--backfill", action="store_true",
+                        help="replay every weekday with no finished run "
+                             "instead of recording tonight")
+    parser.add_argument("--since", default=None,
+                        help="earliest date --backfill will consider "
+                             "(default: the trailing window, never earlier "
+                             "than the first night the recorder ran)")
     args = parser.parse_args(argv)
 
     # Nothing else does. The container entry point every batch service
@@ -894,17 +1118,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     # fixture. Cheap and idempotent, so it runs every night rather than once.
     pit_store.init_schema()
 
+    if args.backfill:
+        filled = backfill(since=args.since, until=args.as_of)
+        print(json.dumps(filled, indent=2, default=str))
+        # One bad night in the list is a night still missing, and the operator
+        # who ran this is the one person who will act on knowing that.
+        return 1 if any(_any_stage_failed(day)
+                        for day in filled["days"].values()) else 0
+
     kwargs: Dict[str, Any] = {"as_of": args.as_of}
     if args.bootstrap:
         kwargs["bootstrap"] = True
     result = run_all(**kwargs)
     print(json.dumps(result, indent=2, default=str))
 
-    if result.get("error"):
-        return 1
-    stages = [v for k, v in result.items()
-              if isinstance(v, dict) and "status" in v]
-    return 1 if any(s["status"] == "failed" for s in stages) else 0
+    return 1 if _any_stage_failed(result) else 0
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised via main()

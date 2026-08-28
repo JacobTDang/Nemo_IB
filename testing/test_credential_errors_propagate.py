@@ -24,7 +24,7 @@ def test_resolve_raises_the_specific_type(monkeypatch):
     monkeypatch.setattr(gt, "load_dotenv", lambda *a, **k: None)
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
     with pytest.raises(CredentialsMissing):
-        gt.GroqModel()._resolve_api_key()
+        gt.GroqModel()._resolve_credential()
 
 
 def test_openrouter_raises_the_same_type(monkeypatch):
