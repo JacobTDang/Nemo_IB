@@ -51,10 +51,15 @@ COPY tools/preearnings/ ./tools/preearnings/
 # same pinned versions, and running it anywhere else means maintaining a second
 # environment that has to stay in step with this one.
 COPY research/ ./research/
-# Only the three agent modules the servers reach. Copying agent/ wholesale
-# brings workflows/ and twelve *_Agent.py files, and with them LangGraph,
-# LangChain and the OpenAI client -- none of which this image ever runs.
-# Verified by importing all five servers and recording what loads.
+# Only the three agent modules the servers reach. Retiring the
+# LangGraph/OpenRouter layer (issue #63) removed workflows/ and twelve
+# *_Agent.py files, so this list is no longer holding back LangGraph and
+# LangChain -- those are gone from the dependency set entirely. It is still
+# load-bearing for what remains: copying agent/ wholesale brings groq_template
+# (and with it the OpenAI client and ollama), Execution_Agent (the broker),
+# MCP_manager, and rag/ (sentence-transformers, and behind it torch) -- none of
+# which this image runs. Verified by importing all five servers and recording
+# what loads.
 COPY agent/__init__.py ./agent/
 COPY agent/cache.py ./agent/
 COPY agent/exposure_analyzer.py ./agent/

@@ -1,9 +1,15 @@
 """Constructing a model must not require a credential.
 
-Fourteen tests instantiate Financial_Modeling_Agent only to reach deterministic
-methods. Validating the key in __init__ held those tests hostage to a
-credential their code paths never use. The key is still required -- it is
+Fourteen tests instantiated Financial_Modeling_Agent only to reach
+deterministic methods. Validating the key in __init__ held those tests hostage
+to a credential their code paths never use. The key is still required -- it is
 checked on first real use, and explicitly at boot via validate_credentials().
+
+The OpenRouter half of this file went with `agent/openrouter_template.py` and
+`agent/Financial_Modeling_Agent.py` when the LangGraph/OpenRouter layer was
+retired (issue #63). `GroqModel` is the surviving template, and it is the one
+the news daemons build through `Materiality_Classifier` -- which is where a
+credential checked at construction would actually bite.
 
 load_dotenv is patched out in every test because it would otherwise repopulate
 the environment from the developer's .env and defeat the point.
@@ -56,58 +62,3 @@ def test_groq_client_is_built_once(monkeypatch):
     monkeypatch.setenv("GROQ_API_KEY", "test-key-not-real")
     model = gt.GroqModel()
     assert model.client is model.client
-
-
-def test_openrouter_constructs_without_a_key(monkeypatch):
-    import agent.openrouter_template as ot
-    _no_dotenv(monkeypatch, ot)
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    model = ot.OpenRouterModel(model_name="vendor/model:free")
-    assert model.model_name == "vendor/model:free"
-
-
-def test_openrouter_client_access_raises_without_a_key(monkeypatch):
-    import agent.openrouter_template as ot
-    _no_dotenv(monkeypatch, ot)
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    monkeypatch.delenv("OPENROUTER_NEMOTRON", raising=False)
-    model = ot.OpenRouterModel(model_name="vendor/model:free")
-    with pytest.raises(ValueError, match="No API key found"):
-        _ = model.client
-
-
-def test_openrouter_fallback_client_raises_without_a_key(monkeypatch):
-    """The fallback path must not become a silent way to skip the check."""
-    import agent.openrouter_template as ot
-    _no_dotenv(monkeypatch, ot)
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    monkeypatch.delenv("OPENROUTER_GLM", raising=False)
-    model = ot.OpenRouterModel(model_name="vendor/model:free")
-    with pytest.raises(ValueError, match="No API key found"):
-        _ = model.fallback_client
-
-
-def test_openrouter_validate_credentials_raises_without_a_key(monkeypatch):
-    import agent.openrouter_template as ot
-    _no_dotenv(monkeypatch, ot)
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    with pytest.raises(ValueError, match="No API key found"):
-        ot.OpenRouterModel(model_name="vendor/model:free").validate_credentials()
-
-
-def test_openrouter_client_is_built_once(monkeypatch):
-    import agent.openrouter_template as ot
-    _no_dotenv(monkeypatch, ot)
-    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key-not-real")
-    model = ot.OpenRouterModel(model_name="vendor/model:free")
-    assert model.client is model.client
-    assert model.fallback_client is model.fallback_client
-
-
-def test_financial_modeling_agent_constructs_without_a_key(monkeypatch):
-    """The concrete reason this task exists: 14 pure-logic tests build this."""
-    import agent.openrouter_template as ot
-    _no_dotenv(monkeypatch, ot)
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    from agent.Financial_Modeling_Agent import Financial_Modeling_Agent
-    assert Financial_Modeling_Agent() is not None

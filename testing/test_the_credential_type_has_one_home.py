@@ -4,16 +4,21 @@ Issue #17 introduced it in `agent/openrouter_template.py`. Issue #59 needed it
 in five more modules and #60 in a seventh, and each of those decisions declined
 to import the original for a reason that was correct at the time:
 
-* `agent/groq_template.py` is imported *by* `openrouter_template` for
-  `CredentialsMissing`, so importing back is a cycle.
+* `agent/groq_template.py` was imported *by* `openrouter_template` for
+  `CredentialsMissing`, so importing back was a cycle.
 * `agent/Execution_Agent.py` is a 112-module import; reaching
-  `openrouter_template` costs 1146 in 0.23s, and the one module that talks to
+  `openrouter_template` cost 1146 in 0.23s, and the one module that talks to
   the broker should not load openai and ollama to reach a value class.
 * `tools/alpaca_server/`, `tools/news_agregator/` and `tools/altdata_server/`
   are data sources. `testing/test_agent_package_boundary.py` exists to keep the
-  LLM layer out of their image, and `openrouter_template` also calls
+  LLM layer out of their image, and `openrouter_template` also called
   `sys.stdout.reconfigure()` at import -- on an MCP stdio server, stdout is the
   wire.
+
+`agent/openrouter_template.py` itself was deleted with the LangGraph/OpenRouter
+layer (issue #63), so the list below is one shorter. The rule it was the first
+violation of is unchanged, and `agent/groq_template.py` still reconfigures
+stdout at import, so the constraint on the shared home is exactly as tight.
 
 Seven copies of a security-critical class is still seven chances for one of
 them to drift, and the divergence would only ever show up as the leak. What all
@@ -43,7 +48,6 @@ SKIP = {".venv", ".git", "__pycache__", ".pytest_cache", ".ruff_cache",
 
 # The modules that hold a credential and therefore name the type.
 CONSUMERS = [
-    "agent.openrouter_template",
     "agent.groq_template",
     "agent.Execution_Agent",
     "tools.alpaca_server.alpaca_server",
@@ -132,7 +136,7 @@ def test_importing_it_loads_nothing_that_is_not_already_there():
 
 
 def test_it_never_reaches_for_the_transport():
-    """`agent/openrouter_template.py` calls `sys.stdout.reconfigure()` as a
+    """`agent/groq_template.py` calls `sys.stdout.reconfigure()` as a
     side effect of being imported. `tools/altdata_server/server.py` is an MCP
     **stdio** server: stdout is its wire, and a credential helper that writes
     to it -- or reconfigures it -- corrupts the protocol rather than the log.

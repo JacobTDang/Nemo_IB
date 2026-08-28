@@ -13,31 +13,47 @@ same disclosure by a different route. So the value is kept behind `Secret`
 instead: there is nothing renderable left to render, which closes all of them
 at once.
 
+**What issue #63 changed.** `agent/openrouter_template.py` -- the module this
+file was written about, and the one the probe and the end-to-end
+`--showlocals` run exercised -- was deleted with the LangGraph/OpenRouter
+layer. Those tests went with it: a probe function that no longer exists cannot
+leak a key. What survives is the rule, and the module it now applies to is
+`agent/groq_template.py`, the remaining LLM template. It is not a museum
+piece: the news daemons build it on every article through
+`Materiality_Classifier`, so it holds a live credential in a loop.
+
+The end-to-end proof that a *failing pytest run* discloses nothing is held for
+the credentials that can move money by
+`testing/test_a_broker_credential_is_never_rendered.py`, which runs a
+deliberately-failing suite under `--showlocals` in a subprocess. It is not
+duplicated here.
+
 The sentinel below is synthetic and constructed here. The real key is never
 read, compared against, or asserted on -- a test that loads the live
 credential in order to prove it does not escape is itself the escape.
 """
+import ast
 import os
-import subprocess
-import sys
 
 import pytest
 
-import agent.openrouter_template as ort
-from agent.openrouter_template import Secret
+import agent.groq_template as gt
+from agent.groq_template import CredentialsMissing, Secret
 
 
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-# Shaped like a real OpenRouter key so that anything matching on the 'sk-or-v1-'
-# prefix treats it the way it would treat the live one, but with a body that
-# could only have come from this file.
-_SENTINEL = "sk-or-v1-synthetic0000sentinel0000donotuse"
+# Shaped like a real Groq key so that anything matching on the 'gsk_' prefix
+# treats it the way it would treat the live one, but with a body that could
+# only have come from this file.
+_SENTINEL = "gsk_synthetic0000sentinel0000donotuse"
 
 
 # ---------------------------------------------------------------------------
-# Secret itself
+# Secret itself, reached through the module that holds the credential
 # ---------------------------------------------------------------------------
+#
+# Imported from `agent.groq_template` rather than from `common.secret` on
+# purpose: `mod.Secret` is the name this module's own code and its callers
+# reach for, so a module that quietly grew a local one back fails here.
 
 @pytest.mark.parametrize(
   "render",
@@ -84,178 +100,85 @@ def test_a_secret_scrubs_its_value_out_of_provider_text():
 
 
 # ---------------------------------------------------------------------------
-# The probe
+# The read
 # ---------------------------------------------------------------------------
 
-def test_the_probe_refuses_a_bare_string_credential():
-  """Wrapping a bare string on the callee's side would be no fix at all: the
-  raw value would still sit in the *caller's* frame, which is where it leaked
-  from. So the bare string is refused, and the refusal names the type only."""
-  with pytest.raises(TypeError) as caught:
-    ort._verify_model_alive("vendor/model:free", _SENTINEL)
+def test_the_credential_leaves_the_read_already_wrapped(monkeypatch):
+  """The value must never exist as a bare `str` in any frame, including this
+  one. Returning it wrapped is what makes that true of every caller at once."""
+  monkeypatch.setattr(gt, "load_dotenv", lambda *a, **k: None)
+  monkeypatch.setenv("GROQ_API_KEY", _SENTINEL)
+
+  resolved = gt.GroqModel()._resolve_credential()
+  assert isinstance(resolved, Secret)
+  assert _SENTINEL not in repr(resolved)
+
+
+def test_the_read_is_annotated_as_returning_a_secret():
+  """Belt and braces on the signature, so a bare `str` cannot come back under
+  the same name."""
+  import inspect
+
+  annotation = inspect.signature(gt.GroqModel._resolve_credential).return_annotation
+  assert "Secret" in str(annotation), (
+    "_resolve_credential no longer declares that it returns a Secret")
+
+
+def test_the_template_refuses_to_report_on_a_credential_it_does_not_have(monkeypatch):
+  """An unset key must raise, not sail into the SDK constructor.
+
+  A client built from an empty string is a client that fails later, somewhere
+  else, with a provider error that names neither the cause nor the fix."""
+  monkeypatch.setattr(gt, "load_dotenv", lambda *a, **k: None)
+  monkeypatch.setenv("GROQ_API_KEY", "")
+
+  with pytest.raises(CredentialsMissing) as caught:
+    _ = gt.GroqModel().client
   assert _SENTINEL not in str(caught.value)
 
 
-def test_the_probe_refuses_to_report_on_a_credential_it_does_not_have():
-  """An unset key must raise, not sail into the client.
-
-  The generic handler below reads any non-404 as "not a 404, so keep it in the
-  pool". An empty key makes the SDK's own constructor raise, which that handler
-  would have read as a live model -- a model marked verified that was never
-  probed, which is the exact failure CredentialRejected exists to prevent."""
-  from agent.groq_template import CredentialsMissing
-
-  with pytest.raises(CredentialsMissing):
-    ort._verify_model_alive("vendor/model:free", Secret(""))
-
-
 # ---------------------------------------------------------------------------
-# End to end: a real pytest run over a deliberately failing probe
+# The rule, enforced mechanically on the module that holds the credential
 # ---------------------------------------------------------------------------
 
-# Run in a subprocess because the thing under test is pytest's own traceback
-# rendering, which cannot be observed from inside the run it is rendering.
-# --showlocals is the strict setting: without it pytest prints only a frame's
-# arguments, so the run would pass on a fix that moved the key from a parameter
-# into a local and called it done.
-_PROBE_MODULE = '''\
-"""Written by testing/test_a_credential_is_never_rendered.py. Not a fixture.
-
-Every test here is meant to fail. The parent asserts on what the failures
-print.
-"""
-import sys
-
-sys.path.insert(0, {root!r})
-
-import openai
-import pytest
-
-import agent.openrouter_template as ort
+_CREDENTIALISH = ("KEY", "SECRET", "TOKEN", "PASSWORD")
 
 
-def _rejecting_openai(**kwargs):
-  """An OpenAI stand-in that answers every request with a 401.
+def _is_credential_read(node):
+  """True for `os.getenv("...KEY...")` and `os.getenv(self._api_key_env)`.
 
-  Mocked rather than live so this reaches the credential-rejection branch
-  offline and on every run -- that branch is the one that raises, and only a
-  frame that raises gets rendered.
+  The indirect form matters here: `GroqModel` reads through
+  `self._api_key_env`, so a check that only understood string literals would
+  pass this module without looking at anything.
   """
-  class _Completions:
-    def create(self, **kw):
-      err = openai.AuthenticationError.__new__(openai.AuthenticationError)
-      Exception.__init__(err, "Missing Authentication header")
-      raise err
-
-  class _Chat:
-    completions = _Completions()
-
-  class _Client:
-    chat = _Chat()
-
-  return _Client()
-
-
-@pytest.fixture(autouse=True)
-def _isolate(monkeypatch):
-  # No .env: the credential must be the sentinel the parent exported and
-  # nothing else.
-  monkeypatch.setattr(ort, "load_dotenv", lambda *a, **k: None)
-  monkeypatch.setattr(ort, "OpenAI", _rejecting_openai)
-
-
-def test_probe_reading_the_environment():
-  ort._verify_model_alive("vendor/model:free")
-
-
-def test_probe_handed_the_credential():
-  ort._verify_model_alive("vendor/model:free", ort._openrouter_credential())
-
-
-def test_pool_refuses_and_reports():
-  ort.primary_reasoning_model()
-'''
-
-
-@pytest.fixture
-def _failing_probe_run(tmp_path):
-  """A pytest run whose every test fails inside the liveness probe."""
-  probe = tmp_path / "test_probe_that_must_fail.py"
-  probe.write_text(_PROBE_MODULE.format(root=_PROJECT_ROOT))
-
-  env = dict(os.environ)
-  env["OPENROUTER_API_KEY"] = _SENTINEL
-  env["OPENROUTER_GLM"] = _SENTINEL
-  env["OPENROUTER_NEMOTRON"] = _SENTINEL
-  env["PYTHONDONTWRITEBYTECODE"] = "1"
-
-  result = subprocess.run(
-    [sys.executable, "-m", "pytest", str(probe),
-     "-p", "no:randomly", "-p", "no:cacheprovider", "--showlocals", "-q"],
-    cwd=_PROJECT_ROOT, env=env, capture_output=True, text=True, timeout=300,
-  )
-  return result.stdout + result.stderr
-
-
-def test_the_probe_still_refuses_loudly(_failing_probe_run):
-  """The guard on the assertion below.
-
-  "no key in the output" is trivially true of a run that never reached the
-  credential -- an import error, a TypeError on the call, a skip. This pins
-  that all three probes did reach it and all three refused, so the assertion
-  that follows is made about a run where the key really was in play.
-  """
-  assert "3 failed" in _failing_probe_run, (
-    "the probe run did not fail in the three expected places, so it never "
-    f"exercised the credential:\n{_failing_probe_run[-3000:]}")
-  assert _failing_probe_run.count("CredentialRejected") >= 3, (
-    "a probe returned instead of refusing a rejected credential; "
-    "CredentialRejected must not be weakened")
-
-
-def test_a_failing_probe_writes_no_key_material(_failing_probe_run):
-  """Issue #17: this is what used to write the live key to stdout."""
-  assert _SENTINEL not in _failing_probe_run
-  assert "synthetic0000sentinel" not in _failing_probe_run, \
-    "part of the credential reached the traceback"
-
-
-def test_the_probe_takes_no_bare_credential_parameter():
-  """Belt and braces on the signature itself, so the parameter cannot come
-  back under a different name."""
-  import inspect
-
-  params = inspect.signature(ort._verify_model_alive).parameters
-  assert "api_key" not in params, \
-    "_verify_model_alive grew a bare-string credential parameter again"
-  annotations = [str(p.annotation) for p in params.values()]
-  assert any("Secret" in a for a in annotations), \
-    "the credential parameter is no longer typed as Secret"
+  if not (isinstance(node, ast.Call)
+          and isinstance(node.func, ast.Attribute)
+          and node.func.attr == "getenv"
+          and node.args):
+    return False
+  target = node.args[0]
+  if isinstance(target, ast.Constant) and isinstance(target.value, str):
+    name = target.value
+  elif isinstance(target, ast.Attribute):
+    name = target.attr        # self._api_key_env
+  elif isinstance(target, ast.Name):
+    name = target.id
+  else:
+    return False
+  return any(word in name.upper() for word in _CREDENTIALISH)
 
 
 def test_the_module_binds_no_unwrapped_credential():
-  """Nothing in this module may bind a raw credential to a name.
+  """Nothing in the module may bind a raw credential to a name.
 
   Under --showlocals a local is rendered exactly like a parameter, so moving
-  the key out of the signature and into a variable would have looked like a fix
-  and disclosed the same value. The rule enforced here is narrow and mechanical:
-  a credential read out of the environment has to be inside a `Secret(...)`
-  before it is assigned to anything.
+  the key out of a signature and into a variable would have looked like a fix
+  and disclosed the same value. The rule enforced here is narrow and
+  mechanical: a credential read out of the environment has to be inside a
+  `Secret(...)` before it is assigned to anything.
   """
-  import ast
+  source = ast.parse(open(gt.__file__, encoding="utf-8").read())
 
-  credentialish = ("KEY", "SECRET", "TOKEN", "PASSWORD")
-
-  def _is_credential_read(node):
-    return (isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "getenv"
-            and node.args
-            and isinstance(node.args[0], ast.Constant)
-            and isinstance(node.args[0].value, str)
-            and any(w in node.args[0].value.upper() for w in credentialish))
-
-  source = ast.parse(open(ort.__file__).read())
   offenders = []
   for assignment in ast.walk(source):
     if not isinstance(assignment, ast.Assign):
@@ -268,8 +191,26 @@ def test_the_module_binds_no_unwrapped_credential():
         wrapped.update(id(n) for n in ast.walk(node))
     for node in ast.walk(assignment.value):
       if _is_credential_read(node) and id(node) not in wrapped:
-        offenders.append((node.args[0].value, assignment.lineno))
+        offenders.append((ast.unparse(node), assignment.lineno))
 
   assert not offenders, (
-    f"a credential is assigned unwrapped in {ort.__file__} "
-    f"(env var, line): {offenders}. Wrap it in Secret(...) at the read.")
+    f"a credential is assigned unwrapped in {gt.__file__} "
+    f"(read, line): {offenders}. Wrap it in Secret(...) at the read.")
+
+
+def test_the_check_above_can_actually_fail():
+  """A mechanical rule that matches nothing passes everything.
+
+  `GroqModel` reads its key indirectly, so this pins that the detector sees
+  that form -- otherwise the test above would be green on a module it never
+  looked inside.
+  """
+  tree = ast.parse(
+    "import os\n"
+    "cred = os.getenv(self._api_key_env)\n"
+    "safe = Secret(os.getenv(self._api_key_env) or '')\n")
+  reads = [n for n in ast.walk(tree) if _is_credential_read(n)]
+  assert len(reads) == 2, (
+    "the detector no longer recognises `os.getenv(self._api_key_env)`, so the "
+    "rule above is vacuous on every module that reads its key indirectly")
+  assert os.path.exists(gt.__file__)

@@ -412,18 +412,6 @@ def test_a_lookup_echo_alone_is_not_content():
                          "articles": [{"headline": "x"}]}) is True
 
 
-def test_the_news_agent_still_finds_the_articles():
-    """`_process_news` read `tool_result["data"]` as a list and passed a dict
-    straight through as 'no articles to analyze' -- the same silence, moved."""
-    from agent.workflows.execution_engine import _extract_articles
-    from tools.news_agregator.finnhub_server import _news_page
-
-    page = _news_page(_articles(30), "2026-08-18", "2026-08-26", cap=20)
-    assert len(_extract_articles({"data": page})) == 20
-    assert len(_extract_articles({"data": _articles(3)})) == 3
-    assert _extract_articles({"data": {"error": "boom"}}) == []
-
-
 @requires_finnhub
 @pytest.mark.network
 def test_company_news_reports_its_cap_live():

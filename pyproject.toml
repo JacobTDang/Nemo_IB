@@ -69,15 +69,6 @@ dependencies = [
   "jsonschema==4.25.1",
   "jsonschema-specifications==2025.9.1",
   "justext==3.0.2",
-  "langchain-classic==1.0.1",
-  "langchain-community==0.4.1",
-  "langchain-core==1.2.7",
-  "langchain-text-splitters==1.1.0",
-  "langgraph==1.0.6",
-  "langgraph-checkpoint==4.0.0",
-  "langgraph-prebuilt==1.0.6",
-  "langgraph-sdk==0.3.3",
-  "langsmith==0.6.2",
   "lxml==6.0.2",
   "lxml-html-clean==0.4.3",
   "markdown-it-py==4.0.0",
@@ -216,10 +207,14 @@ dev = [
 
 # Exactly what the five data-source MCP servers import, derived by importing
 # each server and recording what loads -- not guessed. The full project
-# dependency set installs 189 distributions, of which 88 are never referenced
-# anywhere in the servers' source: LangGraph and LangChain (used only by
-# agent/workflows), the FinBERT leftovers (transformers, tokenizers,
-# safetensors), scipy, scikit-learn, selenium, sympy, alpaca-py and pytest.
+# dependency set installs far more than the servers reference: the FinBERT
+# leftovers (transformers, tokenizers, safetensors), scipy, scikit-learn,
+# selenium, sympy, alpaca-py and pytest.
+#
+# LangGraph and LangChain used to head that list. They were only ever imported
+# by `agent/workflows/analysis_workflow.py`, which was deleted with the rest of
+# the LangGraph/OpenRouter layer (issue #63), so the nine packages are gone from
+# the project dependencies entirely rather than merely excluded from here.
 #
 # The homelab image installs only this group, so none of that reaches the host.
 server = [

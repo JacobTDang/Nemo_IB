@@ -27,15 +27,6 @@ def test_resolve_raises_the_specific_type(monkeypatch):
         gt.GroqModel()._resolve_credential()
 
 
-def test_openrouter_raises_the_same_type(monkeypatch):
-    import agent.openrouter_template as ot
-    monkeypatch.setattr(ot, "load_dotenv", lambda *a, **k: None)
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    monkeypatch.delenv("OPENROUTER_NEMOTRON", raising=False)
-    with pytest.raises(CredentialsMissing):
-        ot.OpenRouterModel(model_name="vendor/model:free")._resolve_credential()
-
-
 def test_classify_propagates_a_missing_credential(monkeypatch):
     """The regression: this must raise, not return None."""
     from agent.Materiality_Classifier import Materiality_Classifier

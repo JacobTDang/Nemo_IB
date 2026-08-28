@@ -79,3 +79,155 @@ def test_a_data_source_module_reaching_it_still_loads_no_llm_layer():
                or "groq_template" in m or "openrouter_template" in m
                or m.endswith("_Agent")}
         assert not llm, f"{module} now pulls in the LLM layer: {sorted(llm)}"
+
+
+# --- what issue #63 makes checkable that was not checkable before -----------
+#
+# Until the LangGraph/OpenRouter layer was retired, "the LLM stack is out of
+# the data-source image" was a property of one COPY list in the Dockerfile:
+# langgraph and langchain were installed in the project venv, and one module
+# -- agent/workflows/analysis_workflow.py -- imported them. The tests above
+# measure the blast radius of that import.
+#
+# The layer is gone, so the property is now absolute rather than local: not
+# "agent.cache does not reach LangGraph" but "nothing does, and it is not
+# installable". Those are the assertions below. They are cheap, and they are
+# what stops the stack coming back one convenient import at a time.
+
+import ast
+import pathlib
+
+_REPO = pathlib.Path(__file__).resolve().parent.parent
+
+_RETIRED = ("langgraph", "langchain", "langchain_core", "langchain_community",
+            "langchain_classic", "langchain_text_splitters", "langgraph_sdk",
+            "langgraph_checkpoint", "langgraph_prebuilt", "langsmith")
+
+_SKIP_DIRS = {".venv", ".git", "__pycache__", ".pytest_cache", ".ruff_cache",
+              "node_modules", ".superpowers"}
+
+
+def _python_sources():
+    for path in _REPO.rglob("*.py"):
+        if not _SKIP_DIRS & set(path.relative_to(_REPO).parts):
+            yield path
+
+
+def test_nothing_in_the_tree_imports_the_retired_orchestration_stack():
+    """Read off the syntax tree, not the text, so the prose above -- and the
+    package names in the assertions further up this file -- do not count as
+    imports of the thing they are about."""
+    offenders = []
+    for path in _python_sources():
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                names = [node.module] if node.module else []
+            else:
+                continue
+            for name in names:
+                if name.split(".")[0] in _RETIRED:
+                    offenders.append(
+                        f"{path.relative_to(_REPO)}:{node.lineno}: {name}")
+
+    assert not offenders, (
+        "the LangGraph/LangChain stack is imported again by:\n  "
+        + "\n  ".join(offenders)
+        + "\nIt was retired with the orchestration layer (issue #63) and is no "
+          "longer a project dependency, so this import cannot resolve in a "
+          "clean environment.")
+
+
+_RETIRED_DISTS = {
+    "langchain-classic", "langchain-community", "langchain-core",
+    "langchain-text-splitters", "langgraph", "langgraph-checkpoint",
+    "langgraph-prebuilt", "langgraph-sdk", "langsmith",
+}
+
+
+def test_the_retired_stack_is_not_a_project_dependency():
+    """An import that cannot resolve is caught by the test above only on a
+    machine where the package is genuinely absent. This one is true everywhere:
+    it reads the manifests, so a re-added pin fails here even in a venv that
+    still happens to carry the wheels."""
+    pinned = []
+
+    pyproject = (_REPO / "pyproject.toml").read_text(encoding="utf-8")
+    for line in pyproject.splitlines():
+        stripped = line.strip().lstrip('"').strip()
+        if stripped.split("==")[0].replace("_", "-").lower() in _RETIRED_DISTS:
+            pinned.append(f"pyproject.toml: {line.strip()}")
+
+    # requirements.txt is UTF-16 on this repo; decoding it as UTF-8 silently
+    # produces one unsplittable line, which would pass this test by matching
+    # nothing at all.
+    raw = (_REPO / "requirements.txt").read_bytes()
+    requirements = raw.decode("utf-16" if raw[:2] in (b"\xff\xfe", b"\xfe\xff")
+                              else "utf-8")
+    assert len(requirements.splitlines()) > 50, (
+        "requirements.txt decoded to almost nothing, so the scan below is "
+        "vacuous -- check the file encoding")
+    for line in requirements.splitlines():
+        if line.strip().split("==")[0].replace("_", "-").lower() in _RETIRED_DISTS:
+            pinned.append(f"requirements.txt: {line.strip()}")
+
+    assert not pinned, (
+        "the retired orchestration stack is pinned again:\n  "
+        + "\n  ".join(pinned))
+
+
+# --- the image's own agent/ list, checked rather than commented -------------
+
+def _agent_modules_the_dockerfile_ships():
+    """The agent modules `COPY agent/... ./agent/` puts in the image."""
+    shipped = set()
+    for line in (_REPO / "Dockerfile").read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line.startswith("COPY agent/"):
+            continue
+        source = line.split()[1]                      # agent/cache.py
+        stem = source[len("agent/"):].removesuffix(".py").rstrip("/")
+        shipped.add("agent" if stem == "__init__" else f"agent.{stem}")
+    return shipped
+
+
+def test_the_dockerfile_still_names_the_agent_modules_it_copies():
+    """Guard on the parser: a COPY list this test reads as empty would make
+    the assertion below trivially true."""
+    shipped = _agent_modules_the_dockerfile_ships()
+    assert "agent" in shipped and "agent.cache" in shipped, (
+        f"the Dockerfile's agent COPY list parsed as {sorted(shipped)}; the "
+        f"check below cannot be trusted")
+
+
+def test_a_shipped_server_imports_no_agent_module_the_image_leaves_behind():
+    """The Dockerfile copies four files out of agent/ rather than the package.
+
+    A server that grows a module-scope `from agent.<x> import ...` for an `x`
+    outside that list imports fine here and fails at container start, where the
+    file simply is not there. The comment above the COPY lines says this was
+    "verified by importing all five servers and recording what loads" -- which
+    was true when it was written and is a one-time act. This does it on every
+    run.
+
+    Module scope only: the RAG tools reach `agent.rag` from inside a function
+    and are capability-gated on it being importable, which is exactly how a
+    module the image deliberately omits is supposed to be reached.
+    """
+    servers = ("tools.news_agregator.fred_server",
+               "tools.news_agregator.finnhub_server",
+               "tools.web_search_server.web_search",
+               "tools.financial_modeling_engine.analysis_tools",
+               "tools.altdata_server.server")
+    shipped = _agent_modules_the_dockerfile_ships()
+
+    for server in servers:
+        loaded = _loaded_after(f"import {server}")
+        reached = {m for m in loaded if m == "agent" or m.startswith("agent.")}
+        missing = reached - shipped
+        assert not missing, (
+            f"{server} imports {sorted(missing)} at module scope, which the "
+            f"Dockerfile does not COPY into the image. Either add it to the "
+            f"COPY list or move the import inside the function that needs it.")

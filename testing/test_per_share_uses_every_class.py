@@ -6,12 +6,11 @@ provider, `sharesOutstanding` for a single class. For GOOGL those differ by
 `shares_outstanding_all_classes` reproduces the market cap to 0.0000%, and a
 `share_count_basis_mismatch` warning names the multiple.
 
-The reconciliation is worth nothing if the models keep reading the old field.
+The reconciliation is worth nothing if the number itself is wrong.
 `calculate_dcf` divides equity value by a share count to produce
-`price_per_share`, and the execution engine resolved that from
-`sharesOutstanding` -- so a fair value for GOOGL came out 2.08x too high, and
-the fix one layer up would have looked complete while the number a caller acts
-on stayed wrong.
+`price_per_share`, and a caller resolving that from `sharesOutstanding` gets a
+fair value for GOOGL 2.08x too high -- so the test below checks the divisor
+against the market cap rather than against any one caller.
 
 Single-class filers are unaffected: for them the two fields are the same
 number, which is why this went unnoticed on NVDA, AAPL and MSFT.
@@ -19,28 +18,13 @@ number, which is why this went unnoticed on NVDA, AAPL and MSFT.
 import pytest
 
 
-def test_the_engine_resolves_the_all_class_count():
-    from agent.workflows import execution_engine
-
-    mapping = execution_engine.VARIABLE_SOURCE_KEYS \
-        if hasattr(execution_engine, "VARIABLE_SOURCE_KEYS") else None
-    if mapping is None:
-        import re
-        src = open(execution_engine.__file__).read()
-        assert "'shares_outstanding': 'shares_outstanding_all_classes'" in src, (
-            "the engine still maps shares_outstanding to the single-class "
-            "provider field, so a multi-class DCF stays 2.08x too high")
-        return
-    assert mapping.get("shares_outstanding") == "shares_outstanding_all_classes"
-
-
-def test_the_modelling_agent_asks_for_the_all_class_count():
-    import agent.Financial_Modeling_Agent as fma
-
-    src = open(fma.__file__).read()
-    assert "shares_outstanding_all_classes" in src, (
-        "the modelling agent still resolves sharesOutstanding, which is one "
-        "class on GOOGL and BRK-B")
+# The two consumers this file pinned -- `agent/workflows/execution_engine.py`,
+# which resolved the divisor for `calculate_dcf`, and
+# `agent/Financial_Modeling_Agent.py`, which asked for it -- were deleted with
+# the LangGraph/OpenRouter layer (issue #63). Nothing in the tree reads
+# `sharesOutstanding` as a share count any more, so what is left to pin is the
+# reconciliation itself: the field the response publishes has to reproduce the
+# market cap, which is the property every future consumer will depend on.
 
 
 @pytest.mark.network
