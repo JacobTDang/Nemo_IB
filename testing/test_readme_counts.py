@@ -228,9 +228,18 @@ def test_the_sec_gating_is_described_accurately(readme):
 DEPLOY = README.parent / "deploy" / "README.md"
 COMPOSE = README.parent / "deploy" / "docker-compose.yml"
 
+# The whole command is captured, not just the service name. The line grew a
+# `flock` and an `--env-file`, and a pattern that matched only the ends of it
+# would have gone on passing while the page and the compose file disagreed
+# about the middle -- which is the entire failure this section exists to catch.
 CRON = re.compile(
     r"^\s*([0-9*/]+ +[0-9*/-]+ +[0-9*]+ +[0-9*]+ +[0-9*-]+)\s+"
-    r"cd /srv/nemo/deploy && docker compose run --rm ([a-z-]+)\s*$", re.M)
+    r"(cd /srv/nemo/deploy && \S.*?)\s*$", re.M)
+# `docker compose` and not bare `docker`: the Secrets section runs a
+# `docker run --rm -e SEEK=...` grep of the image, and `-e` is not a service.
+# The name must start with a letter for the same reason -- `--rm --entrypoint`
+# is a flag, not the service that follows it.
+RUNS = re.compile(r"docker compose\b[^\n]*?run --rm ([a-z][a-z0-9-]*)")
 
 
 @pytest.fixture(scope="module")
@@ -247,16 +256,15 @@ def test_every_schedule_on_the_page_is_the_one_in_the_compose_file(deploy_doc,
                                                                    compose):
     found = CRON.findall(deploy_doc)
     assert found, "the deploy page no longer lists any schedules"
-    for schedule, service in found:
+    for schedule, command in found:
         normalised = " ".join(schedule.split())
-        assert f"{normalised} cd /srv/nemo/deploy && docker compose run --rm " \
-               f"{service}" in compose, (
-            f"the page schedules {service} at '{normalised}'; the compose file "
+        assert f"{normalised} {command}" in compose, (
+            f"the page schedules '{normalised} {command}'; the compose file "
             f"does not")
 
 
 def test_every_service_the_page_names_exists(deploy_doc, compose):
-    named = set(re.findall(r"docker compose run --rm ([a-z-]+)", deploy_doc))
+    named = set(RUNS.findall(deploy_doc))
     assert named, "the page names no services"
     for service in named:
         assert re.search(rf"^  {service}:$", compose, re.M), (
@@ -266,10 +274,8 @@ def test_every_service_the_page_names_exists(deploy_doc, compose):
 def test_every_scheduled_service_is_on_the_page(compose, deploy_doc):
     """The other direction. A job added to the stack and left undocumented is
     one nobody schedules, and a recorder nobody schedules records nothing."""
-    scheduled = set(re.findall(
-        r"docker compose run --rm ([a-z-]+)\s*$", compose, re.M))
-    documented = set(re.findall(r"docker compose run --rm ([a-z-]+)",
-                                deploy_doc))
+    scheduled = set(re.findall(RUNS.pattern + r"\s*$", compose, re.M))
+    documented = set(RUNS.findall(deploy_doc))
     missing = scheduled - documented
     assert not missing, f"scheduled but not documented: {sorted(missing)}"
 

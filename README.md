@@ -13,26 +13,33 @@ cp .env.example .env          # SEC_EMAIL, FINNHUB_API_KEY, FRED_API_KEY
 docker build -t nemo-data:local .
 
 cd deploy
-NEMO_MCP_TOKEN=$(openssl rand -hex 32) docker compose up -d
+NEMO_MCP_TOKEN=$(openssl rand -hex 32) docker compose --env-file ../.env up -d
 ```
 
 `SEC_EMAIL` is required — SEC fair access wants a real contact address in the
 User-Agent, and the servers refuse to call EDGAR without one rather than send a
 placeholder.
 
+`--env-file ../.env` is not optional. Each service declares only the keys its
+own code reads, and compose interpolates those from a `.env` beside the compose
+file — which is `deploy/.env`, not the one at the repo root. Without the flag
+every credential resolves empty. That fails loud rather than quietly: the
+servers refuse to start without a token, `/ready` answers 503, and `finnhub`
+and `fred` crash-loop on a missing key.
+
 Ports publish on `127.0.0.1` unless `NEMO_BIND_ADDR` says otherwise, so a
 missing variable fails closed instead of exposing five servers to the LAN. On a
 homelab, set it to the machine's Tailscale address:
 
 ```bash
-NEMO_BIND_ADDR=100.x.y.z NEMO_MCP_TOKEN=... docker compose up -d
+NEMO_BIND_ADDR=100.x.y.z NEMO_MCP_TOKEN=... docker compose --env-file ../.env up -d
 ```
 
 For a different architecture than the build host:
 
 ```bash
 docker buildx build --platform linux/amd64 -t nemo-data:amd64 --load .
-NEMO_IMAGE=nemo-data:amd64 NEMO_TARGET_ARCH=amd64 docker compose up -d
+NEMO_IMAGE=nemo-data:amd64 NEMO_TARGET_ARCH=amd64 docker compose --env-file ../.env up -d
 ```
 
 Deployment detail — what persists, log retention, auth, and the blockers a
@@ -159,8 +166,9 @@ Clerk PTRs (PDF) and Senate eFD filings are parsed once into SQLite, because a
 round trip plus a PDF parse per filing made every answer partial:
 
 ```bash
-docker compose run --rm congress-sync --house 2024 2025 2026 --senate --senate-annual
-docker compose run --rm congress-sync --status
+docker compose --env-file ../.env run --rm congress-sync \
+  --house 2024 2025 2026 --senate --senate-annual
+docker compose --env-file ../.env run --rm congress-sync --status
 ```
 
 Safe to re-run and safe to cron; nothing already parsed is fetched twice.
@@ -181,8 +189,8 @@ is a loop.
 
 ```bash
 cd deploy
-docker compose run --rm research-daily --bootstrap   # first four nights
-docker compose run --rm research-daily               # every night after
+docker compose --env-file ../.env run --rm research-daily --bootstrap   # first four nights
+docker compose --env-file ../.env run --rm research-daily               # every night after
 ```
 
 | Job | Does | When |

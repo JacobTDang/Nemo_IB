@@ -1690,7 +1690,11 @@ if __name__ == "__main__":
     # that spawns it. stdio stays the default for local use.
     from tools.mcp_http import run_http
     print("Starting web_client over streamable HTTP", file=sys.stderr, flush=True)
-    run_http(WebSearchServer().server)
+    # SEC fair access needs a real contact address in the User-Agent, and
+    # nothing builds that identity at startup: without SEC_EMAIL this server
+    # comes up with all 48 tools and every EDGAR call fails at runtime.
+    # NAME is not declared -- it falls back to "Investment Analyst".
+    run_http(WebSearchServer().server, required_env=("SEC_EMAIL",))
 
   elif system_args == "server":
     print("Starting web_client process", file=sys.stderr, flush=True)

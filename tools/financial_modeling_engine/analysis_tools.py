@@ -2333,7 +2333,11 @@ if __name__ == "__main__":
     # that spawns it. stdio stays the default for local use.
     from tools.mcp_http import run_http
     print("Starting financial engine over streamable HTTP", file=sys.stderr, flush=True)
-    run_http(Financial_Analysis().server)
+    # Explicitly none: prices come from Yahoo and the calculators take their
+    # inputs as arguments, so there is no key whose absence breaks a tool.
+    # Stated rather than defaulted -- the default is also what a server that
+    # simply forgot to declare looks like.
+    run_http(Financial_Analysis().server, required_env=())
 
   elif sys.argv[1] == "server":
     print("Starting Financial Analysis Server", file=sys.stderr, flush=True)

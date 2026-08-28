@@ -2300,7 +2300,8 @@ if __name__ == "__main__":
     # that spawns it. stdio stays the default for local use.
     from tools.mcp_http import run_http
     print("Starting finnhub over streamable HTTP", file=sys.stderr, flush=True)
-    run_http(FinnhubServer().server)
+    # Every tool here is a Finnhub call.
+    run_http(FinnhubServer().server, required_env=("FINNHUB_API_KEY",))
 
   elif sys.argv[1] == "server":
     print("Starting finnhub process", file=sys.stderr, flush=True)

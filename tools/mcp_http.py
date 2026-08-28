@@ -91,8 +91,11 @@ def build_app(mcp_server: Any, *, stateless: bool = True,
                              "stateless": stateless})
 
     async def ready(_request):
-        # Always 200; the verdict is in the body. See _readiness_report.
-        return JSONResponse(_readiness_report(manager, required_env))
+        # 503 when a blocking check fails, 200 otherwise; the detail is in the
+        # body either way. See _readiness_report.
+        report = _readiness_report(manager, required_env)
+        return JSONResponse(
+            report, status_code=503 if report["blocking"] else 200)
 
     @contextlib.asynccontextmanager
     async def lifespan(_app):
@@ -137,9 +140,15 @@ def run_http(mcp_server: Any, *, host: str | None = None,
     address.
 
     `required_env` is this server's declaration of the environment variables
-    its tools need; /ready reports any that are absent. A missing key is not a
-    reason to refuse to start -- most of these servers still answer plenty of
-    questions without one -- so it is reported rather than enforced.
+    its tools cannot work without. A missing key is not a reason to refuse to
+    start -- a container that exits tells an operator less than one that says
+    which variable is absent -- but it does make /ready answer 503, so the
+    compose healthcheck marks the container unhealthy instead of green.
+
+    Declare only what the tools genuinely cannot work without. A key with a
+    working default, or one whose absence is a documented degradation, does not
+    belong here: the healthcheck reads this, and an over-declaration marks a
+    working container unhealthy forever.
     """
     host = host or os.environ.get("MCP_HTTP_HOST", "0.0.0.0")
     port = port or int(os.environ.get("MCP_HTTP_PORT", DEFAULT_PORT))
@@ -192,10 +201,27 @@ def request_scratch(prefix: str = "mcp-req-"):
 #
 # /ready reports the facts separately rather than a single verdict with no
 # evidence behind it, because "not ready" without the reason leaves an operator
-# guessing. It always returns 200 -- several orchestrators kill a container on
-# a failing readiness probe, and "degraded but still serving cached SEC data"
-# is a state worth keeping alive.
+# guessing.
+#
+# The status code answers a narrower question than the body: can this server do
+# its job at all. That is what a healthcheck can act on, and it is not the same
+# as "every check passed" -- see BLOCKING_CHECKS.
 # ---------------------------------------------------------------------------
+
+# The checks whose failure means this server cannot answer correctly, and so
+# the only ones that decide the status code.
+#
+# `last_success` is deliberately not one. It is false on every container for
+# the first few seconds of its life and false again on any server nobody has
+# queried today, and the compose healthcheck reads this endpoint -- gating the
+# code on it would mark all five unhealthy every morning, which is a signal
+# nobody reads by the time it means something. It stays in `degraded`, where an
+# operator asking "is this deployment working" sees it.
+#
+# `credentials` is one, and it is why this endpoint got a status code at all:
+# nothing builds an SEC identity at startup, so a server with no SEC_EMAIL came
+# up green with all 48 tools and failed every EDGAR call at runtime.
+BLOCKING_CHECKS = ("process", "mcp", "credentials")
 
 # When something last succeeded against an upstream. Module-level because the
 # servers are stateless per request: nothing else outlives a request to hold
@@ -296,7 +322,17 @@ def _run_check(check) -> dict:
 
 
 def _readiness_report(manager: Any, required_env: Sequence[str]) -> dict:
-    """The /ready body: every check, the failing ones named, and the AND."""
+    """The /ready body: every check, the failing ones named, and two verdicts.
+
+    `degraded` is every failing check and `ready` is the AND of all of them --
+    unchanged, because "this container has never answered anything" is a real
+    answer to "is this deployment working".
+
+    `blocking` is the subset that stops the server doing its job, and it is
+    what the status code reads. Both are reported because they genuinely
+    differ: `ready: false, blocking: []` is a server that works and has been
+    idle, and calling that unhealthy would be a false alarm.
+    """
     checks = {
         "process": _run_check(_check_process),
         "mcp": _run_check(lambda: _check_mcp(manager)),
@@ -308,6 +344,7 @@ def _readiness_report(manager: Any, required_env: Sequence[str]) -> dict:
         "ready": not degraded,
         "checks": checks,
         "degraded": degraded,
+        "blocking": [name for name in degraded if name in BLOCKING_CHECKS],
         "checked_at": _utc_iso(dt.datetime.now(dt.timezone.utc)),
     }
 

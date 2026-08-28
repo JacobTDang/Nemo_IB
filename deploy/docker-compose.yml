@@ -11,7 +11,7 @@
 # rather than publishing five servers to an untrusted LAN. On the homelab set it
 # to the machine's Tailscale address:
 #
-#   NEMO_BIND_ADDR=100.x.y.z docker compose up -d
+#   NEMO_BIND_ADDR=100.x.y.z docker compose --env-file ../.env up -d
 #
 # Never set it to 0.0.0.0. The bearer token is defence in depth behind the
 # network boundary, not a substitute for one: on a flat home network that is
@@ -20,13 +20,82 @@
 # Build for the target architecture before deploying. Proxmox VE is x86-64
 # only, so an image built on Apple Silicon without --platform will not run:
 #   docker buildx build --platform linux/amd64 -t nemo-data:amd64 -f ../Dockerfile ..
+#
+# ---------------------------------------------------------------------------
+# Run every command from this directory with `--env-file ../.env`.
+#
+# There used to be `env_file: ../.env` on all twelve services. `env_file`
+# cannot be filtered -- it hands the container every line in the file -- so
+# research-score, a weekly job that opens pit.db and nothing else, received
+# ALPACA_LIVE_KEY, ALPACA_LIVE_SECRET, both paper keys, three OpenRouter
+# variables, GROQ_API_KEY and DISCORD_WEBHOOK_URL. Eighteen keys where it needs
+# one. A key that reaches a container it does not need is a key any traceback
+# in that container can print, and one more copy in `docker inspect`.
+#
+# So each service now names what it gets, and the values are interpolated. That
+# is the part that needs the flag: compose reads `${VAR}` from the shell and
+# from the `.env` beside the compose file -- never from an `env_file:` entry,
+# and never from ../.env by default. Without `--env-file ../.env` every
+# interpolated key resolves to empty, which the servers report at /ready and
+# the batch jobs raise on.
+#
+# The .env stays at the repo root rather than moving in here, because
+# .dockerignore excludes `.env` at the context root and would not exclude
+# `deploy/.env` -- moving it would put it back inside the build context.
+#
+# The same flag also makes NEMO_MCP_TOKEN in .env work, which it never did:
+# with env_file alone the token had to be exported into the shell.
+# ---------------------------------------------------------------------------
+
+# Prune the filing cache below the 512m tmpfs, well before it fills. Read by
+# tools/filing_cache.py, and set on the batch jobs as well as the servers --
+# research/activist_watch.py and research/announcements.py both drive
+# edgartools into the same /root/.edgar, and a full-universe sweep with no
+# --max-tickers is how that mount reaches [Errno 28] again.
+#
+# Stated plainly: on the batch jobs these two are still inert. The interval
+# pruner (_prune_filing_cache_forever) starts in the HTTP app's lifespan and
+# nowhere else, and the jobs never import tools.mcp_http, so nothing in them
+# reads these values yet. The tmpfs cap is the only bound they have today. The
+# missing half is a prune call from the jobs themselves; until it lands,
+# testing/test_compose_env_minimality.py lists them by name as declared ahead
+# of the code rather than letting them pass unnoticed.
+x-filing-cache-env: &filing-cache-env
+  NEMO_FILING_CACHE_CAP_MB: ${NEMO_FILING_CACHE_CAP_MB:-360}
+  NEMO_FILING_CACHE_INTERVAL_S: ${NEMO_FILING_CACHE_INTERVAL_S:-300}
+
+# What every server gets, and no more. Merged into each service's own
+# `environment:` with a nested `<<:`, not inherited from the *server anchor
+# below: a YAML merge key is shallow, so a service that writes its own
+# `environment:` replaces the anchor's outright. Inherited the obvious way,
+# adding SEC_EMAIL to one server would silently drop MCP_AUTH_TOKEN from it and
+# the container would refuse to start.
+x-server-env: &server-env
+  <<: *filing-cache-env
+  # Set MCP_LOG_RESPONSES=1 to echo response payloads into `docker logs`.
+  # Off by default: bodies are large and the logs land on the host disk.
+  MCP_LOG_RESPONSES: ${MCP_LOG_RESPONSES:-0}
+  MCP_LOG_RESPONSE_CHARS: ${MCP_LOG_RESPONSE_CHARS:-4000}
+  # Per-server token. Generate it once and put it in ../.env, or export it:
+  #   export NEMO_MCP_TOKEN=$(openssl rand -hex 32)
+  #
+  # No `:?` here. Compose interpolates the whole file before it merges
+  # anything, so a required-variable marker anywhere in this file fires for
+  # every service in it -- including congress-sync, a batch job that binds no
+  # port, serves nothing and has no use for a bearer token, and which could
+  # not be run at all without one.
+  #
+  # The guarantee is unchanged and lives where it belongs: resolve_auth_token()
+  # in tools/mcp_http.py refuses to start a server whose token is unset,
+  # rather than silently publishing every tool. That is tested, and it fails
+  # at container start instead of at compose parse.
+  MCP_AUTH_TOKEN: ${NEMO_MCP_TOKEN:-}
 
 x-server: &server
   # Overridable so the homelab can deploy the amd64 build the notes above
   # describe. Pinned to one tag, following those instructions produced an
   # image this file would never use.
   image: ${NEMO_IMAGE:-nemo-data:local}
-  env_file: ../.env
   restart: unless-stopped
   # Docker writes container logs to the HOST disk, outside the tmpfs that
   # bounds everything else, and the default json-file driver has no limit at
@@ -40,31 +109,6 @@ x-server: &server
     options:
       max-size: "10m"
       max-file: "3"
-  environment:
-    # Set MCP_LOG_RESPONSES=1 to echo response payloads into `docker logs`.
-    # Off by default: bodies are large and the logs land on the host disk.
-    MCP_LOG_RESPONSES: ${MCP_LOG_RESPONSES:-0}
-    MCP_LOG_RESPONSE_CHARS: ${MCP_LOG_RESPONSE_CHARS:-4000}
-    # Per-server token, supplied by the shell rather than written here so it
-    # never lands in a file.
-    #   export NEMO_MCP_TOKEN=$(openssl rand -hex 32)
-    #
-    # No `:?` here. Compose interpolates the whole file before it merges
-    # anything, so a required-variable marker in this anchor fires for every
-    # service in the file -- including congress-sync, a batch job that binds no
-    # port, serves nothing and has no use for a bearer token, and which could
-    # not be run at all without one.
-    #
-    # The guarantee is unchanged and lives where it belongs: resolve_auth_token()
-    # in tools/mcp_http.py refuses to start a server whose token is unset,
-    # rather than silently publishing every tool. That is tested, and it fails
-    # at container start instead of at compose parse.
-    MCP_AUTH_TOKEN: ${NEMO_MCP_TOKEN:-}
-    # Prune the filing cache below the 512m tmpfs above, well before it fills.
-    NEMO_FILING_CACHE_CAP_MB: ${NEMO_FILING_CACHE_CAP_MB:-360}
-    NEMO_FILING_CACHE_INTERVAL_S: ${NEMO_FILING_CACHE_INTERVAL_S:-300}
-    # Persistent, on the named volume rather than the tmpfs above.
-    NEMO_CONGRESS_DB: /app/data/congress.db
   # Both writable paths are RAM-backed and capped. edgartools caches every
   # filing it fetches -- 2MB after a single one, unbounded across tickers --
   # and a long-lived container no longer gets --rm to clean up after it.
@@ -85,13 +129,21 @@ x-server: &server
     - congress-data:/app/data
   healthcheck:
     # No curl in the runtime stage; python is what the image has.
-    # /health only proves the port is bound and the app started. A server whose
-    # MCP layer failed still answers it, which is why the deploy gate is the
-    # handshake test rather than this.
+    #
+    # /ready, not /health. /health only proves the port is bound and the app
+    # started -- a server whose MCP session manager never came up answers it,
+    # and so does one with no SEC_EMAIL serving 48 tools that all fail on the
+    # first EDGAR call. /ready answers 503 for both, and prints the body so
+    # `docker inspect` says which check failed rather than only that one did.
+    #
+    # It does not answer 503 for a server that has simply not been asked
+    # anything yet; see BLOCKING_CHECKS in tools/mcp_http.py.
+    #
+    # The deploy gate is still the handshake test, not this.
     test: ["CMD", "python", "-c",
-           "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health',timeout=3).status==200 else 1)"]
+           "import sys,urllib.request as r\ntry:\n probe=r.urlopen('http://localhost:8080/ready',timeout=5)\nexcept r.HTTPError as failed:\n probe=failed\nsys.stderr.write(probe.read().decode()[:600])\nsys.exit(0 if probe.status==200 else 1)"]
     interval: 30s
-    timeout: 5s
+    timeout: 10s
     retries: 3
     start_period: 10s
 
@@ -101,42 +153,108 @@ services:
     container_name: nemo-sec
     command: python -m tools.web_search_server.web_search http
     ports: ["${NEMO_BIND_ADDR:-127.0.0.1}:8810:8080"]
+    environment:
+      <<: *server-env
+      # SEC fair access requires a real contact address in the User-Agent.
+      # Declared to run_http as well, so an unset one turns /ready red instead
+      # of serving 48 tools that fail on their first EDGAR call.
+      SEC_EMAIL: ${SEC_EMAIL:-}
+      # Optional: falls back to "Investment Analyst".
+      NAME: ${NAME:-}
+      # SEARXNG_URL is deliberately absent. The image installs no SearXNG, and
+      # `search` is gated on one answering -- handing the container a URL that
+      # resolves to something on the operator's laptop would advertise a tool
+      # that returns an empty result list from inside the container.
 
   financial:
     <<: *server
     container_name: nemo-financial
     command: python -m tools.financial_modeling_engine.analysis_tools http
     ports: ["${NEMO_BIND_ADDR:-127.0.0.1}:8811:8080"]
+    environment:
+      # Nothing beyond the shared settings. Prices come from Yahoo, which takes
+      # no key, and the calculators take their inputs as arguments.
+      <<: *server-env
 
   finnhub:
     <<: *server
     container_name: nemo-finnhub
     command: python -m tools.news_agregator.finnhub_server http
     ports: ["${NEMO_BIND_ADDR:-127.0.0.1}:8812:8080"]
+    environment:
+      <<: *server-env
+      FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
 
   fred:
     <<: *server
     container_name: nemo-fred
     command: python -m tools.news_agregator.fred_server http
     ports: ["${NEMO_BIND_ADDR:-127.0.0.1}:8813:8080"]
+    environment:
+      <<: *server-env
+      FRED_API_KEY: ${FRED_API_KEY:-}
 
   altdata:
     <<: *server
     container_name: nemo-altdata
     command: python -m tools.altdata_server.server http
     ports: ["${NEMO_BIND_ADDR:-127.0.0.1}:8814:8080"]
+    environment:
+      <<: *server-env
+      # Persistent, on the named volume rather than the tmpfs above. Only this
+      # server reads the congressional store, so only this one is told where it
+      # is.
+      NEMO_CONGRESS_DB: /app/data/congress.db
+      # Both optional and both currently unset, so get_policy_signals,
+      # get_government_contracts and get_taiwan_monthly_revenue degrade and say
+      # so in their own output. Declared anyway: without these lines, filling
+      # them in in ../.env would change nothing, which is the confusing failure.
+      # Not declared to run_http -- a documented degradation must not make the
+      # healthcheck red.
+      CONGRESS_API_KEY: ${CONGRESS_API_KEY:-}
+      FINMIND_TOKEN: ${FINMIND_TOKEN:-}
+
+  # -------------------------------------------------------------------------
+  # The scheduled jobs. Everything below binds no port, serves nothing and
+  # finishes.
+  #
+  # Every documented cron line is wrapped in `flock -n`. `docker compose run`
+  # has no lock of its own, so a pass that overruns its interval -- a
+  # research-watch sweep of the whole eligible universe against the */20 timer
+  # -- starts a second container against the same database. `-n` makes the
+  # second one exit non-zero immediately rather than wait, because a skipped
+  # pass that says nothing is indistinguishable from one that never fired.
+  #
+  # And `--rm` is not a guarantee. Removal happens in the compose CLI after the
+  # container exits, so a host reboot mid-job kills the CLI and leaves the
+  # container in Exited forever. These services set no container_name, so each
+  # run makes a uniquely-named container and the orphans accumulate rather than
+  # colliding -- each carrying up to 30MB of json-file logs under
+  # /var/lib/docker/containers/, on host disk, which is the one place nothing
+  # here bounds. The log cap is per container; N orphans is 30MB x N.
+  #
+  # So: sweep them. The label is what keeps this off every other project's
+  # exited containers on the same host, and its value is this directory's name,
+  # which is where compose gets the project name from -- hence the cd.
+  #   0 4 * * * cd /srv/nemo/deploy && docker container prune -f --filter until=24h --filter label=com.docker.compose.project=deploy
+  #
+  # A reboot mid-job does NOT block the next run, and that part is well built:
+  # start_run (research/pit_store.py) only INSERTs, and missing_days counts a
+  # started-but-unfinished row as a gap. There is no lock file or run marker to
+  # go stale.
+  # -------------------------------------------------------------------------
 
   # Ingestion, not a server. Under a profile so `docker compose up` never
   # starts it: it is a batch job that finishes, and a restart:unless-stopped
   # batch job is a loop that re-reads the House Clerk forever.
   #
-  #   docker compose run --rm congress-sync                  # incremental
-  #   docker compose run --rm congress-sync --house 2024 2025 2026 --senate
-  #   docker compose run --rm congress-sync --status
+  #   docker compose --env-file ../.env run --rm congress-sync                  # incremental
+  #   docker compose --env-file ../.env run --rm congress-sync --house 2024 2025 2026 --senate
+  #   docker compose --env-file ../.env run --rm congress-sync --status
   #
   # Safe to re-run and safe to cron: filings already parsed are never
   # refetched, so a nightly run costs one index fetch plus whatever is new.
-  #   0 6 * * * cd /srv/nemo/deploy && docker compose run --rm congress-sync
+  #   0 6 * * * cd /srv/nemo/deploy && flock -n /var/lock/nemo-congress-sync.lock docker compose --env-file ../.env run --rm congress-sync
   #
   # Deliberately NOT built from the *server anchor. That anchor requires
   # NEMO_MCP_TOKEN, and compose interpolates the whole file before merging, so
@@ -145,13 +263,14 @@ services:
   # one.
   congress-sync:
     image: ${NEMO_IMAGE:-nemo-data:local}
-    env_file: ../.env
     profiles: ["sync"]
     restart: "no"
     entrypoint: ["python", "-m", "tools.altdata_server.congress_sync"]
     command: ["--house", "2026", "--senate", "--days", "90"]
     environment:
+      <<: *filing-cache-env
       NEMO_CONGRESS_DB: /app/data/congress.db
+      SEC_EMAIL: ${SEC_EMAIL:-}
     volumes:
       - congress-data:/app/data
     tmpfs:
@@ -167,9 +286,9 @@ services:
   # congress-sync: a batch job that finishes, so `docker compose up` must never
   # start it and restart:unless-stopped would turn it into a loop.
   #
-  #   docker compose run --rm research-daily                 # today
-  #   docker compose run --rm research-daily --as-of 2026-08-26
-  #   docker compose run --rm research-daily --bootstrap     # cold store
+  #   docker compose --env-file ../.env run --rm research-daily                 # today
+  #   docker compose --env-file ../.env run --rm research-daily --as-of 2026-08-26
+  #   docker compose --env-file ../.env run --rm research-daily --bootstrap     # cold store
   #
   # On a cold store run it with --bootstrap for the first four nights. A
   # nightly ask is capped at 3,000 names -- Yahoo answers all 10,388 with a
@@ -185,15 +304,17 @@ services:
   # non-zero on a failed stage -- so the scheduler can say so.
   #
   # After the close, allowing for late consolidated prints:
-  #   30 22 * * 1-5 cd /srv/nemo/deploy && docker compose run --rm research-daily
+  #   30 22 * * 1-5 cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-daily.lock docker compose --env-file ../.env run --rm research-daily
   research-daily:
     image: ${NEMO_IMAGE:-nemo-data:local}
-    env_file: ../.env
     profiles: ["sync"]
     restart: "no"
     entrypoint: ["python", "-m", "research.daily_job"]
     environment:
+      <<: *filing-cache-env
       NEMO_PIT_DB: /app/data/pit.db
+      SEC_EMAIL: ${SEC_EMAIL:-}
+      FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
     volumes:
       - research-data:/app/data
     tmpfs:
@@ -209,19 +330,20 @@ services:
   # parameters change, which is why it is not a stage of research-daily: a scan
   # can be redone, a night of recording cannot.
   #
-  #   docker compose run --rm research-scan
-  #   docker compose run --rm research-scan --as-of 2026-08-26
+  #   docker compose --env-file ../.env run --rm research-scan
+  #   docker compose --env-file ../.env run --rm research-scan --as-of 2026-08-26
   #
   # After the recorder, which it reads:
-  #   0 23 * * 1-5 cd /srv/nemo/deploy && docker compose run --rm research-scan
+  #   0 23 * * 1-5 cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-scan.lock docker compose --env-file ../.env run --rm research-scan
   research-scan:
     image: ${NEMO_IMAGE:-nemo-data:local}
-    env_file: ../.env
     profiles: ["sync"]
     restart: "no"
     entrypoint: ["python", "-m", "research.scanner"]
     environment:
+      <<: *filing-cache-env
       NEMO_PIT_DB: /app/data/pit.db
+      SEC_EMAIL: ${SEC_EMAIL:-}
     volumes:
       - research-data:/app/data
     tmpfs:
@@ -239,20 +361,23 @@ services:
   # a once-a-night pass measures that gap in hours however fast the code is.
   # It sweeps the eligible universe, so it needs the recorder to have run.
   #
-  #   docker compose run --rm research-watch
-  #   docker compose run --rm research-watch --max-tickers 200   # cold start
+  #   docker compose --env-file ../.env run --rm research-watch
+  #   docker compose --env-file ../.env run --rm research-watch --max-tickers 200   # cold start
   #
   # Every twenty minutes through the session and a little past the close,
   # which is when 13Ds actually appear:
-  #   */20 13-23 * * 1-5 cd /srv/nemo/deploy && docker compose run --rm research-watch
+  #   */20 13-23 * * 1-5 cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-watch.lock docker compose --env-file ../.env run --rm research-watch
   research-watch:
     image: ${NEMO_IMAGE:-nemo-data:local}
-    env_file: ../.env
     profiles: ["sync"]
     restart: "no"
     entrypoint: ["python", "-m", "research.activist_watch"]
     environment:
+      <<: *filing-cache-env
       NEMO_PIT_DB: /app/data/pit.db
+      SEC_EMAIL: ${SEC_EMAIL:-}
+      NAME: ${NAME:-}
+      FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
     volumes:
       - research-data:/app/data
     tmpfs:
@@ -269,13 +394,15 @@ services:
   # nothing. Weekly is plenty -- a twenty-session horizon means today's answer
   # is mostly last month's trades.
   #
-  #   docker compose run --rm research-score
-  #   docker compose run --rm research-score --horizon-days 40
+  # The narrowest environment in the file, and the reason the rest of them are
+  # narrow: this job opens pit.db and calls no upstream at all.
   #
-  #   0 7 * * 6 cd /srv/nemo/deploy && docker compose run --rm research-score
+  #   docker compose --env-file ../.env run --rm research-score
+  #   docker compose --env-file ../.env run --rm research-score --horizon-days 40
+  #
+  #   0 7 * * 6 cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-score.lock docker compose --env-file ../.env run --rm research-score
   research-score:
     image: ${NEMO_IMAGE:-nemo-data:local}
-    env_file: ../.env
     profiles: ["sync"]
     restart: "no"
     entrypoint: ["python", "-m", "research.scoring"]
@@ -283,6 +410,14 @@ services:
       NEMO_PIT_DB: /app/data/pit.db
     volumes:
       - research-data:/app/data
+    # This was the one batch service with no tmpfs, so /app/db_cache and
+    # /root/.edgar went to the container's writable layer on host disk,
+    # uncapped. --rm kept the blast radius to one run, but an orphaned
+    # container keeps its layer, and the reboot case above is how one is
+    # orphaned. No reason for it to be the exception.
+    tmpfs:
+      - /root/.edgar:rw,size=512m
+      - /app/db_cache:rw,size=128m
     logging:
       driver: json-file
       options:
@@ -298,21 +433,23 @@ services:
   # nobody was watching -- and sue_af reports how many of its quarters are
   # reconstructions rather than observations.
   #
-  #   docker compose run --rm research-seed
-  #   docker compose run --rm research-seed --tickers MSFT AAPL NVDA
+  #   docker compose --env-file ../.env run --rm research-seed
+  #   docker compose --env-file ../.env run --rm research-seed --tickers MSFT AAPL NVDA
   #
   # Safe to re-run: a quarter already in the record is never overwritten,
   # because a real observation outranks a reconstruction of it. Monthly is
   # plenty -- it only picks up names newly in the universe.
-  #   0 8 1 * * cd /srv/nemo/deploy && docker compose run --rm research-seed
+  #   0 8 1 * * cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-seed.lock docker compose --env-file ../.env run --rm research-seed
   research-seed:
     image: ${NEMO_IMAGE:-nemo-data:local}
-    env_file: ../.env
     profiles: ["sync"]
     restart: "no"
     entrypoint: ["python", "-m", "research.seed_consensus"]
     environment:
+      <<: *filing-cache-env
       NEMO_PIT_DB: /app/data/pit.db
+      SEC_EMAIL: ${SEC_EMAIL:-}
+      FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
     volumes:
       - research-data:/app/data
     tmpfs:
@@ -330,24 +467,82 @@ services:
   # and up to a month for banks and retailers. The hour comes from the SEC
   # acceptance time, read in New York, and decides which session reacted.
   #
-  #   docker compose run --rm research-announce
-  #   docker compose run --rm research-announce --tickers JPM WMT TGT
+  #   docker compose --env-file ../.env run --rm research-announce
+  #   docker compose --env-file ../.env run --rm research-announce --tickers JPM WMT TGT
   #
   # Safe to re-run and cheap after the first pass. Weekly is plenty:
-  #   0 9 * * 6 cd /srv/nemo/deploy && docker compose run --rm research-announce
+  #   0 9 * * 6 cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-announce.lock docker compose --env-file ../.env run --rm research-announce
   research-announce:
     image: ${NEMO_IMAGE:-nemo-data:local}
-    env_file: ../.env
     profiles: ["sync"]
     restart: "no"
     entrypoint: ["python", "-m", "research.announcements"]
     environment:
+      <<: *filing-cache-env
       NEMO_PIT_DB: /app/data/pit.db
+      SEC_EMAIL: ${SEC_EMAIL:-}
+      FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
     volumes:
       - research-data:/app/data
     tmpfs:
       - /root/.edgar:rw,size=512m
       - /app/db_cache:rw,size=128m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # The backup for research-data, the volume this file calls unrecoverable.
+  # Until this existed, nothing anywhere in the repo copied it: one
+  # `docker compose down -v` or `docker system prune --volumes` destroyed the
+  # only copy of a record that cannot be rebuilt at any price.
+  #
+  # It uses sqlite3's online backup API -- what the CLI's `.backup` dot-command
+  # drives -- because a plain `cp` of a live SQLite file copies pages while
+  # they are being written and restores torn. There is no quiet window to copy
+  # in: six jobs write on a schedule and the 13D watcher runs every twenty
+  # minutes through the session.
+  #
+  # /backups is a host path, deliberately not a named volume: a named volume
+  # would be destroyed by the same `down -v` this exists to survive. Copy it
+  # off the host as well -- a backup on the machine that dies is not a backup.
+  #
+  #   docker compose --env-file ../.env run --rm research-backup
+  #   15 3 * * * cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-backup.lock docker compose --env-file ../.env run --rm research-backup
+  research-backup:
+    image: ${NEMO_IMAGE:-nemo-data:local}
+    profiles: ["sync"]
+    restart: "no"
+    entrypoint:
+      - python
+      - -c
+      - |
+        import datetime, pathlib, sqlite3, sys
+        source_path = pathlib.Path("/app/data/pit.db")
+        out = pathlib.Path("/backups")
+        # Refuse rather than write an empty file over yesterday's good copy:
+        # a mistyped volume gives an empty /app/data, and a backup job whose
+        # failure mode is a valid-looking 0-row database is worse than none.
+        if not source_path.exists():
+            sys.exit(f"{source_path} is not there -- check the volume mount")
+        out.mkdir(parents=True, exist_ok=True)
+        dest = out / f"pit-{datetime.date.today().isoformat()}.db"
+        source, target = sqlite3.connect(source_path), sqlite3.connect(dest)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+            source.close()
+        # Host disk, so it needs a bound of its own. Fourteen dailies.
+        stale = sorted(out.glob("pit-*.db"))[:-14]
+        for path in stale:
+            path.unlink()
+        print(f"wrote {dest} ({dest.stat().st_size} bytes), "
+              f"removed {len(stale)} older than the last 14")
+    volumes:
+      - research-data:/app/data
+      - ${NEMO_BACKUP_DIR:-/srv/nemo/backups}:/backups
     logging:
       driver: json-file
       options:
@@ -362,5 +557,6 @@ volumes:
   # The record that cannot be rebuilt. congress-data is reconstructible from
   # the public filings at the cost of re-reading them; this one is not
   # reconstructible at any cost, because it is a record of what was known on a
-  # date. Back it up like a database that matters.
+  # date. research-backup above copies it nightly; see deploy/README.md for the
+  # restore.
   research-data:

@@ -3016,7 +3016,11 @@ if __name__ == "__main__":
         # that spawns it. stdio stays the default for local use.
         from tools.mcp_http import run_http
         print("[altdata] starting over streamable HTTP", file=sys.stderr, flush=True)
-        run_http(AltDataServer().server)
+        # Explicitly none. CONGRESS_API_KEY and FINMIND_TOKEN are real keys
+        # this server reads, but their absence is a documented degradation
+        # the tools report in their own output -- declaring them here would
+        # mark a container that is working as designed unhealthy forever.
+        run_http(AltDataServer().server, required_env=())
     else:
         print("[altdata] starting", file=sys.stderr, flush=True)
         srv = AltDataServer()
