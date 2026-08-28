@@ -135,21 +135,27 @@ def earnings_releases(ticker: str,
     return sorted(out, key=lambda r: r["announced_date"], reverse=True)
 
 
-def for_quarters(ticker: str,
-                 as_of: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+def for_quarters(ticker: str, as_of: Optional[str] = None,
+                 quarters: Optional[Dict[str, Dict]] = None
+                 ) -> Dict[str, Dict[str, Any]]:
     """The release that reported each quarter, keyed on fiscal period.
 
     A release belongs to a quarter if it fell after that quarter closed and no
     later than the filing that reported it. Outside that window it is a
     different quarter's release, and no release at all means the quarter is
     absent rather than dated by its 10-Q.
+
+    `quarters` lets a caller that already has the series pass it in. Seeding
+    fetches it for the filing dates and would otherwise fetch it again here,
+    which over 595 names is 1,190 requests for the same data.
     """
     releases = earnings_releases(ticker, as_of=as_of)
     if not releases:
         return {}
 
+    known = quarters if quarters is not None else _quarters(ticker, as_of=as_of)
     out: Dict[str, Dict[str, Any]] = {}
-    for period, dates in (_quarters(ticker, as_of=as_of) or {}).items():
+    for period, dates in (known or {}).items():
         period_end, known_at = dates.get("period_end"), dates.get("known_at")
         if not period_end or not known_at:
             continue

@@ -330,3 +330,31 @@ def test_re_running_the_backfill_changes_nothing(store, monkeypatch):
                         lambda t, as_of=None: QUARTERS)
     assert announcements.backfill(["AAA"], "2026-03-20")["written"] == 1
     assert announcements.backfill(["AAA"], "2026-03-20")["written"] == 0
+
+
+def test_the_quarters_can_be_supplied_instead_of_refetched(monkeypatch):
+    """Seeding already fetches this series to get the filing dates. Fetching
+    it again here doubles the EDGAR calls on a path that runs over the whole
+    universe -- 595 names became 1,190 requests for the same data."""
+    calls = []
+
+    def counted(ticker, as_of=None):
+        calls.append(ticker)
+        return QUARTERS
+
+    monkeypatch.setattr(announcements, "_quarters", counted)
+    monkeypatch.setattr(announcements, "_fetch_8k", lambda t, **kw: [
+        Filing("2026-02-11", "2.02", "2026-02-11T21:05:00")])
+
+    got = announcements.for_quarters("AAA", as_of="2026-03-20",
+                                     quarters=QUARTERS)
+    assert got["2026Q1"]["announced_date"] == "2026-02-11"
+    assert calls == [], "the series was fetched again despite being supplied"
+
+
+def test_it_still_fetches_when_nothing_is_supplied(monkeypatch):
+    monkeypatch.setattr(announcements, "_quarters",
+                        lambda t, as_of=None: QUARTERS)
+    monkeypatch.setattr(announcements, "_fetch_8k", lambda t, **kw: [
+        Filing("2026-02-11", "2.02", "2026-02-11T21:05:00")])
+    assert announcements.for_quarters("AAA", "2026-03-20")["2026Q1"]

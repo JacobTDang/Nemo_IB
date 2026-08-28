@@ -57,7 +57,7 @@ def _filings(monkeypatch):
     # written before announcement-dating keep their expectations. The ones
     # that are about the release override this.
     monkeypatch.setattr(seed_consensus, "_announcements",
-                        lambda t, as_of=None: {})
+                        lambda t, as_of=None, **kw: {})
 
 
 def test_a_seeded_quarter_carries_both_legs(store, monkeypatch):
@@ -351,7 +351,7 @@ def test_a_seeded_actual_is_known_on_the_announcement(store, monkeypatch):
     monkeypatch.setattr(seed_consensus, "_fetch_surprises",
                         lambda t: SURPRISES)
     monkeypatch.setattr(seed_consensus, "_announcements",
-                        lambda t, as_of=None: ANNOUNCED)
+                        lambda t, as_of=None, **kw: ANNOUNCED)
 
     seed_consensus.seed(["MSFT"], as_of="2026-08-27")
 
@@ -366,7 +366,7 @@ def test_the_estimate_still_predates_the_announcement(store, monkeypatch):
     monkeypatch.setattr(seed_consensus, "_fetch_surprises",
                         lambda t: SURPRISES)
     monkeypatch.setattr(seed_consensus, "_announcements",
-                        lambda t, as_of=None: ANNOUNCED)
+                        lambda t, as_of=None, **kw: ANNOUNCED)
 
     seed_consensus.seed(["MSFT"], as_of="2026-08-27")
 
@@ -381,7 +381,7 @@ def test_without_an_announcement_it_falls_back_to_the_filing(store,
     monkeypatch.setattr(seed_consensus, "_fetch_surprises",
                         lambda t: SURPRISES)
     monkeypatch.setattr(seed_consensus, "_announcements",
-                        lambda t, as_of=None: {})
+                        lambda t, as_of=None, **kw: {})
 
     seed_consensus.seed(["MSFT"], as_of="2026-08-27")
     assert pit_store.actual_as_of("MSFT", "2026Q4", "2026-07-29") == 4.74
@@ -396,7 +396,7 @@ def test_the_seeding_reports_how_many_were_announcement_dated(store,
     monkeypatch.setattr(seed_consensus, "_fetch_surprises",
                         lambda t: SURPRISES)
     monkeypatch.setattr(seed_consensus, "_announcements",
-                        lambda t, as_of=None: {
+                        lambda t, as_of=None, **kw: {
                             "2026Q4": ANNOUNCED["2026Q4"]})
 
     out = seed_consensus.seed(["MSFT"], as_of="2026-08-27")

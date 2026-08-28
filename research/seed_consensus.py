@@ -90,12 +90,18 @@ def _stamp(day: str) -> str:
     return f"{day}T21:00:00Z"
 
 
-def _announcements(ticker: str,
-                   as_of: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
-    """When the market learned each quarter, from the Item 2.02 filing."""
+def _announcements(ticker: str, as_of: Optional[str] = None,
+                   quarters: Optional[Dict[str, Dict]] = None
+                   ) -> Dict[str, Dict[str, Any]]:
+    """When the market learned each quarter, from the Item 2.02 filing.
+
+    Takes the series the caller already fetched for the filing dates rather
+    than fetching it again -- over 595 names that was 1,190 EDGAR requests for
+    one set of quarters.
+    """
     from research import announcements
 
-    return announcements.for_quarters(ticker, as_of=as_of)
+    return announcements.for_quarters(ticker, as_of=as_of, quarters=quarters)
 
 
 def _filing_dates(ticker: str,
@@ -141,7 +147,7 @@ def seed(tickers: Sequence[str],
         try:
             rows = _fetch_surprises(ticker)
             dates = _filing_dates(ticker, as_of=as_of)
-            announced = _announcements(ticker, as_of=as_of)
+            announced = _announcements(ticker, as_of=as_of, quarters=dates)
         except Exception as exc:  # noqa: BLE001 - counted and reported
             failed.append(f"{ticker}: {type(exc).__name__}: {exc}")
             continue
