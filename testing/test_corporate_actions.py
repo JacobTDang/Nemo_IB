@@ -89,6 +89,52 @@ def test_years_window_excludes_older_actions(monkeypatch):
     assert result["split_count"] == 1
 
 
+class _UnknownTicker:
+    """A symbol yfinance does not recognise.
+
+    yfinance answers a 404 with empty structures rather than an exception, so
+    an unknown symbol reaches the code as a handle whose `info` is empty. The
+    fake above has no `info` at all, which `symbol_is_resolved` reads as "we
+    failed to look" -- a different thing, and deliberately not a refusal.
+    """
+    def __init__(self):
+        self.info = {}
+        self.dividends = _series([])
+        self.splits = _series([])
+
+
+def test_unresolved_symbol_still_carries_the_collection_keys(monkeypatch):
+    """The refusal keeps the shape the success and error paths both promise.
+
+    `splits` and `dividends` are documented as always present, and the
+    exception path below returns them empty for exactly that reason. The
+    unresolved path did not, so a caller that reached for `result["splits"]`
+    after a delisted ticker got a KeyError instead of the refusal it was
+    handed -- and one using `.get("splits", [])` read "no splits on record"
+    from a lookup that never resolved the symbol.
+    """
+    monkeypatch.setattr(ca, "_ticker", lambda t: _UnknownTicker())
+    result = ca.get_corporate_actions("NKLA")
+    assert result["success"] is False
+    assert "did not resolve" in result["error"]
+    assert result["splits"] == []
+    assert result["dividends"] == []
+
+
+def test_unresolved_symbol_claims_no_dividend_facts(monkeypatch):
+    """Empty lists must not become positive claims about the security.
+
+    An unresolved lookup knows nothing, so the fields that would read as
+    findings -- a dividend total, a split count, a `pays_dividend` verdict --
+    stay absent rather than being reported as zero and false.
+    """
+    monkeypatch.setattr(ca, "_ticker", lambda t: _UnknownTicker())
+    result = ca.get_corporate_actions("NKLA")
+    for claim in ("pays_dividend", "ttm_dividend", "split_count",
+                  "dividend_count", "latest_split_ratio"):
+        assert claim not in result, f"{claim} is a claim about an unknown symbol"
+
+
 def test_failure_is_reported_not_swallowed(monkeypatch):
     def explode(_):
         raise RuntimeError("yfinance unavailable")
