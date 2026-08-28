@@ -577,7 +577,17 @@ def test_policy_provider_outage_is_not_an_absence_of_bills(monkeypatch):
     assert out["bill_count"] is None
 
 
-def test_policy_zero_matching_bills_is_a_genuine_empty(monkeypatch):
+def test_policy_zero_bills_from_the_provider_is_not_a_neutral_climate(monkeypatch):
+    """GovTrack answering 200 with nothing, for every keyword, is not a
+    finding about the legislative record. It is the absence of one.
+
+    This test asserted `signal == "neutral"` on exactly this input, reasoning
+    that the provider had answered and nothing had matched. A later audit
+    showed the two are not the same thing: forty bills all older than
+    `lookback_days` produced a byte-identical response, and a consumer reads
+    `neutral` as an affirmative claim that the docket is balanced (issue #18).
+    The genuine empty is the test below.
+    """
     _no_congress_key(monkeypatch)
     monkeypatch.setattr(requests, "get",
                         _RoutedGet({"govtrack.us": (200, {"objects": []})}))
@@ -586,8 +596,31 @@ def test_policy_zero_matching_bills_is_a_genuine_empty(monkeypatch):
 
     assert out["success"] is True
     assert out["bill_count"] == 0
-    assert out["signal"] == "neutral"
+    assert out["signal"] is None
+    assert out["provider_rows_returned"] == 0
+    assert any("returned no bill" in d for d in out["degraded"]), out["degraded"]
     assert out["keywords_searched"]
+
+
+def test_policy_bills_outside_the_window_is_a_genuine_empty(monkeypatch):
+    """The empty that may still be called neutral: the provider returned a
+    real docket and none of it is recent enough to score."""
+    _no_congress_key(monkeypatch)
+    stale = [dict(_bill(f"An Old Act No {i}"),
+                  introduced_date="2019-01-15",
+                  current_status_date="2019-01-15")
+             for i in range(4)]
+    monkeypatch.setattr(requests, "get",
+                        _RoutedGet({"govtrack.us": (200, {"objects": stale})}))
+
+    out = alt._fetch_policy_signals("NVDA", "Technology", 30)
+
+    assert out["success"] is True
+    assert out["bill_count"] == 0
+    assert out["signal"] == "neutral"
+    assert out["provider_rows_returned"] > 0
+    assert out["bills_before_lookback_filter"] == 4
+    assert not any("returned no bill" in d for d in out["degraded"])
 
 
 def test_policy_missing_congress_key_is_named_as_a_degradation(monkeypatch):
