@@ -58,6 +58,11 @@ CAVEATS = (
     "not measured at all",
     "prices are stamped at their own session, which assumes a day's prices "
     "were known that evening; true of prices, and the only thing assumed",
+    "scaled to 595 names the cross-sectional variant returns 340 trades, hit "
+    "55%, mean +195bp and median +184bp at t=+2.04 -- which clears a bar of "
+    "2.00 and not the 2.50 that four variants tried against these same names "
+    "requires. Reported uncalibrated for that reason rather than for want of "
+    "a sample",
     "the timing hypothesis was tested and not supported: the same "
     "cross-sectional signal entered at the earnings release returned t=+1.12 "
     "over 74 trades, and entered at the 10-Q a median of eight days later "
@@ -216,7 +221,8 @@ def _refresh_universe_for(tickers: Sequence[str], as_of: str) -> int:
 
 def run(dates: Sequence[str], horizon_days: int = 20,
         tickers: Optional[Sequence[str]] = None,
-        signal_for: Any = _MISSING) -> Dict[str, Any]:
+        signal_for: Any = _MISSING,
+        comparisons: int = 1) -> Dict[str, Any]:
     """Scan on each date, then score what those decisions did.
 
     Uses the scanner unmodified. That is the point of building a store rather
@@ -248,13 +254,16 @@ def run(dates: Sequence[str], horizon_days: int = 20,
             if period:
                 acted.add((candidate["ticker"], period))
 
-    scored = _score(orders, horizon_days)
+    # How many variants have been tried against these names. A t-statistic
+    # from the best of several is not a t-statistic from one, and the caller
+    # is the only thing that knows the count.
+    scored = _score(orders, horizon_days, comparisons=comparisons)
     return {"dates": len(dates), "orders": len(orders), **scored,
             "caveats": list(CAVEATS)}
 
 
-def _score(orders: List[Dict[str, Any]],
-           horizon_days: int) -> Dict[str, Any]:
+def _score(orders: List[Dict[str, Any]], horizon_days: int,
+           comparisons: int = 1) -> Dict[str, Any]:
     """`scoring.fill` applied to replay orders rather than filed ones.
 
     One implementation, deliberately: the two paths differ only in where the
@@ -309,10 +318,10 @@ def _score(orders: List[Dict[str, Any]],
     by_timing = {}
     for hour in sorted({r.get("timing") or "unknown" for r in scored}):
         subset = [r for r in scored if (r.get("timing") or "unknown") == hour]
-        by_timing[hour] = scoring._summarise(subset)
+        by_timing[hour] = scoring._summarise(subset, comparisons=comparisons)
 
     return {"scored": scored, "skipped": skipped, "by_timing": by_timing,
-            **scoring._summarise(scored)}
+            **scoring._summarise(scored, comparisons=comparisons)}
 
 
 def summarise(scored: List[Dict[str, Any]],

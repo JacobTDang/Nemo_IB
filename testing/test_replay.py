@@ -374,3 +374,44 @@ def test_a_replayed_trade_carries_the_hour_it_was_announced(store, monkeypatch):
 
     assert out["scored"][0]["timing"] == "bmo"
     assert out["by_timing"]["bmo"]["sample"] == 1
+
+
+# --- the replay has to declare how many variants were tried -----------------
+#
+# scoring._summarise takes a comparison count and moves the significance bar
+# out with it. The replay never passed one, so a 340-trade run came back
+# "calibrated: True" against a bar of 2.00 -- on the fourth variant tried
+# against the same names. The guard existed and the caller that most needed it
+# was not using it.
+
+def test_the_replay_passes_its_comparison_count_through(store, monkeypatch):
+    import yfinance
+    monkeypatch.setattr(yfinance, "download",
+                        lambda *a, **k: _frame(k["tickers"].split(), DAYS[:40]))
+    replay.build_store(["AAA"], start=DAYS[0], end=DAYS[39])
+
+    orders = [{"ticker": "AAA", "side": "long", "sue": 2.0, "cost_bps": 0.0,
+               "fiscal_period": "2026Q1", "target_dollars": 5000.0,
+               "as_of_date": DAYS[19], "intended_session": DAYS[20]}]
+
+    alone = replay._score(orders, horizon_days=5)
+    searched = replay._score(orders, horizon_days=5, comparisons=4)
+
+    assert alone["comparisons"] == 1
+    assert searched["comparisons"] == 4
+    assert searched["t_threshold"] > alone["t_threshold"]
+
+
+def test_run_carries_the_count_to_the_summary(store, monkeypatch):
+    import yfinance
+    monkeypatch.setattr(yfinance, "download",
+                        lambda *a, **k: _frame(k["tickers"].split(), DAYS[:80]))
+    monkeypatch.setattr(replay.daily_job, "_fetch_sec_tickers",
+                        lambda: [{"ticker": "AAA", "cik": "1", "name": "A"}])
+    replay.build_store(["AAA"], start=DAYS[0], end=DAYS[79])
+    monkeypatch.setattr(replay, "_signal_for", lambda t, a: {
+        "ticker": t, "success": False, "error": "no filings", "sue": None})
+
+    out = replay.run([DAYS[70]], horizon_days=5, tickers=["AAA"],
+                     comparisons=4)
+    assert out["comparisons"] == 4
