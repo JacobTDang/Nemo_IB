@@ -115,11 +115,36 @@ def score_orders(as_of: Optional[str] = None,
             unfilled.append({**_stub(order),
                              "reason": "a price on the path is missing"})
             continue
-        scored.append({**row, "expected_edge_bps": order["expected_edge_bps"]})
+        scored.append({**row,
+                       "expected_edge_bps": order["expected_edge_bps"],
+                       "timing": _timing_of(order, as_of)})
+
+    by_timing = {}
+    for hour in sorted({r.get("timing") or "unknown" for r in scored}):
+        subset = [r for r in scored if (r.get("timing") or "unknown") == hour]
+        by_timing[hour] = _summarise(subset)
 
     return {"as_of": as_of, "horizon_days": horizon_days,
             "scored": scored, "pending": pending, "unfilled": unfilled,
-            **_summarise(scored)}
+            "by_timing": by_timing, **_summarise(scored)}
+
+
+def _timing_of(order: Dict[str, Any], as_of: str) -> str:
+    """Whether the print landed before the open or after the close.
+
+    A nightly scan decides on the evening of D and enters at D+1's open. For a
+    print after the close on D that is entering after the gap, which is what
+    drift means. For one before the open on D the gap was that morning, so by
+    D+1's open a day of the effect has already gone. The two are not the same
+    trade and an average over both hides it.
+    """
+    period = order.get("fiscal_period")
+    if not period:
+        return "unknown"
+    for row in pit_store.announcements_as_of(order["ticker"], as_of):
+        if row["fiscal_period"] == period:
+            return row.get("timing") or "unknown"
+    return "unknown"
 
 
 def _exchange_shut(session: str, as_of: str) -> bool:

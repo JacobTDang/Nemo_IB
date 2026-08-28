@@ -59,7 +59,7 @@ def _bars(store, ticker, prices, recorded_at=None, days=None):
 
 
 def _order(store, ticker="AAA", side="long", sue=3.0, cost_bps=10.0,
-           decided=None, session=None, dollars=5000.0):
+           decided=None, session=None, dollars=5000.0):  # noqa: D401
     decided = decided or DAYS[0]
     session = session or DAYS[1]
     store.record_paper_orders(
@@ -418,3 +418,61 @@ def test_a_strong_enough_result_survives_the_correction():
     out = scoring._summarise(_scored(_at_t(60, 3.10)), comparisons=3)
     assert out["calibrated"] is True
     assert out["t_threshold"] == pytest.approx(2.394, abs=0.01)
+
+
+# --- before the open and after the close are not the same trade -------------
+#
+# A nightly scan decides on the evening of day D and enters at D+1's open.
+#
+# For a print after the close on D, the gap is the D-to-D+1 overnight move, and
+# entering at D+1's open is entering after it -- which is what post-earnings
+# drift means: the move that follows the reaction, not the reaction.
+#
+# For a print before the open on D, the gap was that morning. By D+1's open the
+# reaction is a day old and a day of drift has already been given away. So bmo
+# names are systematically entered later in the effect than amc ones, and an
+# average over both hides it.
+
+def _with_timing(store, ticker, period, announced, timing):
+    store.record_announcement(ticker, period, announced, timing=timing,
+                              recorded_at=f"{announced}T21:00:00Z")
+
+
+def test_a_score_carries_the_hour_the_print_landed(store):
+    _with_timing(store, "MISS", "2026Q1", DAYS[0], "amc")
+    _order(store, ticker="MISS", session=DAYS[1], cost_bps=0.0)
+    _bars(store, "MISS", [100.0] * 3 + [110.0] * 5)
+
+    row = scoring.score_orders(as_of=DAYS[20], horizon_days=4)["scored"][0]
+    assert row["timing"] == "amc"
+
+
+def test_a_trade_with_no_announcement_on_record_says_unknown(store):
+    _order(store, ticker="MISS", session=DAYS[1], cost_bps=0.0)
+    _bars(store, "MISS", [100.0] * 3 + [110.0] * 5)
+
+    row = scoring.score_orders(as_of=DAYS[20], horizon_days=4)["scored"][0]
+    assert row["timing"] == "unknown"
+
+
+def test_the_summary_splits_by_the_hour(store):
+    """One number over both hides a difference that is structural rather than
+    incidental, and the split is free -- the field is already on the row."""
+    for i, (t, timing, move) in enumerate([
+            ("A", "amc", 110.0), ("B", "amc", 112.0),
+            ("C", "bmo", 98.0), ("D", "bmo", 99.0)]):
+        _with_timing(store, t, "2026Q1", DAYS[0], timing)
+        _order(store, ticker=t, session=DAYS[1], cost_bps=0.0)
+        _bars(store, t, [100.0] * 3 + [move] * 5)
+
+    out = scoring.score_orders(as_of=DAYS[20], horizon_days=4)
+    assert out["sample"] == 4
+    assert out["by_timing"]["amc"]["sample"] == 2
+    assert out["by_timing"]["bmo"]["sample"] == 2
+    assert out["by_timing"]["amc"]["mean_net_bps"] > 0
+    assert out["by_timing"]["bmo"]["mean_net_bps"] < 0
+
+
+def test_the_split_is_absent_rather_than_empty_when_nothing_scored(store):
+    out = scoring.score_orders(as_of=DAYS[20], horizon_days=4)
+    assert out["by_timing"] == {}
