@@ -33,7 +33,7 @@ def test_openrouter_raises_the_same_type(monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_NEMOTRON", raising=False)
     with pytest.raises(CredentialsMissing):
-        ot.OpenRouterModel(model_name="vendor/model:free")._resolve_api_key()
+        ot.OpenRouterModel(model_name="vendor/model:free")._resolve_credential()
 
 
 def test_classify_propagates_a_missing_credential(monkeypatch):

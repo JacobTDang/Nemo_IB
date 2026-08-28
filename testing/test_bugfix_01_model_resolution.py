@@ -8,7 +8,7 @@ import os, sys
 
 import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from agent.openrouter_template import _verify_model_alive
+from agent.openrouter_template import _openrouter_credential, _verify_model_alive
 
 def _primary_model():
     """Resolved inside the test, not at import.
@@ -43,7 +43,7 @@ def test_a_model_is_resolved():
 _CONTROL_DEAD_MODEL = "nemo-control/definitely-not-a-model:free"
 
 
-def _probe_can_tell_dead_from_alive(api_key: str) -> bool:
+def _probe_can_tell_dead_from_alive() -> bool:
   """Does _verify_model_alive discriminate on this machine right now?
 
   It answers True for any non-404 -- a 401, a rate limit, a timeout -- because
@@ -57,8 +57,12 @@ def _probe_can_tell_dead_from_alive(api_key: str) -> bool:
   So probe a control id that cannot exist. If even that reads as alive, the
   probe is telling us nothing and the tests below skip saying so, rather than
   passing on a 401 or failing on one.
+
+  The credential is not passed in. It used to be, and pytest prints a frame's
+  arguments in every traceback -- so a failing run of this file wrote the live
+  OpenRouter key to stdout (issue #17). The probe reads it itself now.
   """
-  return not _verify_model_alive(_CONTROL_DEAD_MODEL, api_key)
+  return not _verify_model_alive(_CONTROL_DEAD_MODEL)
 
 
 @requires_openrouter
@@ -72,9 +76,8 @@ def test_resolved_model_is_alive():
   run without a single packet leaving the machine. requires_openrouter skips
   it offline and, under NEMO_REQUIRE_SERVICES=1, fails instead of skipping.
   """
-  api_key = os.getenv("OPENROUTER_API_KEY")
-  assert api_key, "requires_openrouter let through a run with no key"
-  if not _probe_can_tell_dead_from_alive(api_key):
+  assert _openrouter_credential(), "requires_openrouter let through a run with no key"
+  if not _probe_can_tell_dead_from_alive():
     pytest.skip(f"the liveness probe reports {_CONTROL_DEAD_MODEL} as alive, "
                 "so it is not answering 404 for anything -- most likely the "
                 "OpenRouter key is being rejected. Nothing here is decidable.")
@@ -84,7 +87,7 @@ def test_resolved_model_is_alive():
   # rather than checking anything. Being network-gated, it skipped instead of
   # failing, for as long as the name was wrong.
   model = _primary_model()
-  assert _verify_model_alive(model, api_key), \
+  assert _verify_model_alive(model), \
     f"resolved model {model} is not alive (404)"
   print(f"PASS: resolved model {model!r} is alive")
 
@@ -103,13 +106,12 @@ def test_old_dead_model_still_dead():
   answering again and belongs back in the candidate list in
   agent/openrouter_template.py. Delete this test when you re-add it.
   """
-  api_key = os.getenv("OPENROUTER_API_KEY")
-  assert api_key, "requires_openrouter let through a run with no key"
-  if not _probe_can_tell_dead_from_alive(api_key):
+  assert _openrouter_credential(), "requires_openrouter let through a run with no key"
+  if not _probe_can_tell_dead_from_alive():
     pytest.skip(f"the liveness probe reports {_CONTROL_DEAD_MODEL} as alive, "
                 "so it is not answering 404 for anything -- most likely the "
                 "OpenRouter key is being rejected. Nothing here is decidable.")
-  alive = _verify_model_alive("deepseek/deepseek-r1-0528:free", api_key)
+  alive = _verify_model_alive("deepseek/deepseek-r1-0528:free")
   assert not alive, (
     "deepseek/deepseek-r1-0528:free answers again -- this is good news. "
     "Consider re-adding it to the candidate list in "

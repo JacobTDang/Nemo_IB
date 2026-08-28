@@ -50,7 +50,69 @@ class CredentialRejected(RuntimeError):
     """
 
 
-def _verify_model_alive(model_id: str, api_key: str, timeout: float = 10.0) -> bool:
+class Secret:
+  """A credential that renders as a placeholder instead of as itself.
+
+  pytest prints a frame's arguments at the head of every traceback entry, and
+  every local under --showlocals. So a key sitting in a parameter or a variable
+  is written to stdout by the first test that fails anywhere below it: the live
+  OpenRouter key went into CI logs, pasted terminals and captured artefacts
+  that way (issue #17).
+
+  Suppressing frame rendering in pytest configuration would have fixed pytest
+  and nothing else -- a log line, a debugger, a crash reporter and a print
+  written next year are the same disclosure by another route. Keeping the value
+  behind reveal() leaves nothing renderable to render, which closes all of them
+  at once.
+  """
+  __slots__ = ("_value",)
+
+  PLACEHOLDER = "<redacted>"
+
+  def __init__(self, value: str = ""):
+    self._value = value or ""
+
+  def reveal(self) -> str:
+    """The raw credential.
+
+    Call this at the point of use -- an SDK constructor, a request header --
+    and never bind the result to a name, or the value is back in a frame.
+    """
+    return self._value
+
+  def scrub(self, text: str) -> str:
+    """`text` with the credential replaced by the placeholder.
+
+    Provider error bodies are quoted into the messages we raise and print. A
+    provider that echoed the offending credential back would otherwise put it
+    straight into our own diagnostics.
+    """
+    if not self._value:
+      return text
+    return text.replace(self._value, self.PLACEHOLDER)
+
+  def __repr__(self) -> str:
+    return self.PLACEHOLDER
+
+  __str__ = __repr__
+
+  def __bool__(self) -> bool:
+    return bool(self._value)
+
+
+def _openrouter_credential() -> Secret:
+  """The configured OpenRouter key, wrapped so it cannot be rendered.
+
+  Reading the key here rather than accepting it as an argument is the other
+  half of the fix: a credential that never crosses a function boundary cannot
+  be printed as that function's arguments.
+  """
+  load_dotenv()
+  return Secret(os.getenv("OPENROUTER_API_KEY") or "")
+
+
+def _verify_model_alive(model_id: str, credential: 'Secret | None' = None,
+                        timeout: float = 10.0) -> bool:
   """Send a 1-token completion to check the model endpoint exists.
 
   Returns False immediately — without any network call — for an id that is not
@@ -60,14 +122,36 @@ def _verify_model_alive(model_id: str, api_key: str, timeout: float = 10.0) -> b
   Otherwise returns True if alive, or if the error is non-404 (auth, rate limit,
   timeout all indicate the model name itself is at least known and none of them
   prove the model is dead). Returns False on explicit 404 NotFoundError.
+
+  `credential` is a `Secret`, never a bare string, and may be omitted to read
+  the configured key here. A bare string is refused rather than quietly
+  wrapped, because wrapping it on this side would leave the raw value in the
+  *caller's* frame -- which is where it leaked from.
   """
+  if credential is not None and not isinstance(credential, Secret):
+    raise TypeError(
+      f"_verify_model_alive needs a Secret, got {type(credential).__name__}. "
+      f"Wrap the credential with Secret(...) where it is read, or omit the "
+      f"argument and let the probe read OPENROUTER_API_KEY itself.")
   if not _is_valid_model_id(model_id):
     print(f"[OpenRouter] Rejecting malformed model id {model_id!r} "
           f"(expected 'vendor/model[:tag]'); not adding it to the pool.",
           file=sys.stderr, flush=True)
     return False
+  if credential is None:
+    credential = _openrouter_credential()
+  if not credential:
+    # Refused here rather than handed on. An empty key makes the SDK's own
+    # constructor raise, the generic handler below reads any non-404 as "keep
+    # it in the pool", and the model is then marked verified without having
+    # been probed -- the same fiction CredentialRejected exists to prevent,
+    # arriving through a missing key instead of a rejected one.
+    raise CredentialsMissing(
+      "OPENROUTER_API_KEY is not set, so no model can be probed. Set it in "
+      "your .env file -- a valid key begins 'sk-or-v1-'.")
   try:
-    client = OpenAI(api_key=api_key, base_url="https://openrouter.ai/api/v1", timeout=timeout)
+    client = OpenAI(api_key=credential.reveal(),
+                    base_url="https://openrouter.ai/api/v1", timeout=timeout)
     client.chat.completions.create(
       model=model_id,
       messages=[{"role": "user", "content": "ping"}],
@@ -87,7 +171,8 @@ def _verify_model_alive(model_id: str, api_key: str, timeout: float = 10.0) -> b
     # when zero were verified is our own outage wearing a fact about the
     # world.
     raise CredentialRejected(
-      f"OpenRouter rejected the API key while probing {model_id}: {exc}. "
+      f"OpenRouter rejected the API key while probing {model_id}: "
+      f"{credential.scrub(str(exc))}. "
       f"No model can be verified with a credential the provider will not "
       f"accept, so the pool is not built rather than filled with unverified "
       f"entries. Check OPENROUTER_API_KEY -- a valid key begins 'sk-or-v1-'."
@@ -95,8 +180,8 @@ def _verify_model_alive(model_id: str, api_key: str, timeout: float = 10.0) -> b
   except Exception as exc:
     # Rate limit, timeout etc. don't prove the model is dead, so it stays
     # in the pool -- but report what happened rather than swallowing it.
-    print(f"[OpenRouter] {model_id} probe hit {type(exc).__name__}: {exc}. "
-          f"Not a 404, so keeping it in the pool.",
+    print(f"[OpenRouter] {model_id} probe hit {type(exc).__name__}: "
+          f"{credential.scrub(str(exc))}. Not a 404, so keeping it in the pool.",
           file=sys.stderr, flush=True)
     return True
 
@@ -119,11 +204,10 @@ def _build_reasoning_pool() -> list:
   Reads OPENROUTER_API_KEY. If unset, returns the ultimate fallback only.
   Honors PRIMARY_REASONING_MODEL env var as a top-priority override.
   """
-  load_dotenv()
-  api_key = os.getenv("OPENROUTER_API_KEY")
+  credential = _openrouter_credential()
   ultimate_fallback = 'z-ai/glm-4.5-air:free'
 
-  if not api_key:
+  if not credential:
     return [ultimate_fallback]
 
   # An explicit override stays at the top of the pool, but only if it is
@@ -151,7 +235,7 @@ def _build_reasoning_pool() -> list:
   seen = set()
   for c in candidates:
     try:
-      ok = _verify_model_alive(c, api_key)
+      ok = _verify_model_alive(c, credential)
     except CredentialRejected as exc:
       # Recorded, not raised here. Importing this module for a helper or a
       # type must not explode because a credential is bad -- but resolving a
@@ -297,22 +381,29 @@ class OpenRouterModel:
     self.model_name = model_name
     self.conversatoin_history = []
 
-  def _resolve_api_key(self) -> str:
-    api_key = os.getenv(self._api_key_env) or os.getenv("OPENROUTER_API_KEY")
-    if not api_key:
+  def _resolve_credential(self) -> Secret:
+    """The configured key, wrapped. See Secret for why it is never bare.
+
+    Building the Secret in the same expression that reads the environment is
+    deliberate: an intermediate `api_key = os.getenv(...)` would put the raw
+    value in this frame, which is exactly what a rendered traceback prints.
+    """
+    credential = Secret(os.getenv(self._api_key_env)
+                        or os.getenv("OPENROUTER_API_KEY") or "")
+    if not credential:
       raise CredentialsMissing(
         f"No API key found. Set OPENROUTER_API_KEY (or {self._api_key_env}) in your .env file.")
-    return api_key
+    return credential
 
   def validate_credentials(self) -> None:
     """Fail fast at process start. See GroqModel.validate_credentials."""
-    self._resolve_api_key()
+    self._resolve_credential()
 
   @property
   def client(self) -> OpenAI:
     if self._client is None:
       self._client = OpenAI(
-        api_key=self._resolve_api_key(),
+        api_key=self._resolve_credential().reveal(),
         base_url="https://openrouter.ai/api/v1",
         timeout=self.CLIENT_TIMEOUT
       )
@@ -321,13 +412,14 @@ class OpenRouterModel:
   @property
   def fallback_client(self) -> OpenAI:
     # Prefer OPENROUTER_GLM, otherwise reuse the main key. Reusing it is fine --
-    # the fallback only triggers when the primary model fails. _resolve_api_key
-    # is still called when OPENROUTER_GLM is absent so the fallback path cannot
-    # become a way to skip the credential check.
+    # the fallback only triggers when the primary model fails.
+    # _resolve_credential is still called when OPENROUTER_GLM is absent so the
+    # fallback path cannot become a way to skip the credential check.
     if self._fallback_client is None:
-      fallback_key = os.getenv("OPENROUTER_GLM") or self._resolve_api_key()
+      credential = (Secret(os.getenv("OPENROUTER_GLM") or "")
+                    or self._resolve_credential())
       self._fallback_client = OpenAI(
-        api_key=fallback_key,
+        api_key=credential.reveal(),
         base_url="https://openrouter.ai/api/v1",
         timeout=self.CLIENT_TIMEOUT
       )

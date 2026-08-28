@@ -21,6 +21,7 @@ Rate limits and timeouts keep the existing benefit of the doubt.
 import pytest
 
 import agent.openrouter_template as ort
+from agent.openrouter_template import Secret
 
 
 class _Boom:
@@ -45,7 +46,7 @@ class _Boom:
 
 def _probe_raising(monkeypatch, exc):
     monkeypatch.setattr(ort, "OpenAI", lambda **kw: _Boom(exc))
-    return ort._verify_model_alive("vendor/model:free", api_key="test-key")
+    return ort._verify_model_alive("vendor/model:free", Secret("test-key"))
 
 
 def test_a_rejected_credential_is_not_a_live_model(monkeypatch):

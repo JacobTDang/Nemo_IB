@@ -17,6 +17,7 @@ from openai import AuthenticationError, NotFoundError, RateLimitError
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import agent.openrouter_template as ort
+from agent.openrouter_template import Secret
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -107,13 +108,13 @@ def test_malformed_id_is_not_alive_and_makes_no_network_call(monkeypatch):
   """A malformed id must be rejected before any client is constructed."""
   monkeypatch.setattr(ort, "OpenAI", _ExplodingOpenAI)
   bad = "# optional override; if unset, pool auto-resolves"
-  assert ort._verify_model_alive(bad, "fake-key") is False
+  assert ort._verify_model_alive(bad, Secret("fake-key")) is False
 
 
 @pytest.mark.parametrize("bad", MALFORMED_IDS)
 def test_no_malformed_id_reaches_the_network(monkeypatch, bad):
   monkeypatch.setattr(ort, "OpenAI", _ExplodingOpenAI)
-  assert ort._verify_model_alive(bad, "fake-key") is False
+  assert ort._verify_model_alive(bad, Secret("fake-key")) is False
 
 
 def test_not_found_means_dead(monkeypatch):
@@ -121,7 +122,7 @@ def test_not_found_means_dead(monkeypatch):
   monkeypatch.setattr(
     ort, "OpenAI", _client_raising(_http_error(NotFoundError, 404))
   )
-  assert ort._verify_model_alive("vendor/model:free", "fake-key") is False
+  assert ort._verify_model_alive("vendor/model:free", Secret("fake-key")) is False
 
 
 @pytest.mark.parametrize(
@@ -132,7 +133,7 @@ def test_not_found_means_dead(monkeypatch):
 def test_transient_errors_still_count_as_alive(monkeypatch, exc):
   """A 429 says the model is known and busy, not absent — keep it in the pool."""
   monkeypatch.setattr(ort, "OpenAI", _client_raising(exc))
-  assert ort._verify_model_alive("vendor/model:free", "fake-key") is True
+  assert ort._verify_model_alive("vendor/model:free", Secret("fake-key")) is True
 
 
 def test_a_rejected_credential_is_not_a_live_model(monkeypatch):
@@ -146,7 +147,7 @@ def test_a_rejected_credential_is_not_a_live_model(monkeypatch):
     ort, "OpenAI", _client_raising(_http_error(AuthenticationError, 401))
   )
   with pytest.raises(ort.CredentialRejected):
-    ort._verify_model_alive("vendor/model:free", "fake-key")
+    ort._verify_model_alive("vendor/model:free", Secret("fake-key"))
 
 
 def test_successful_ping_is_alive(monkeypatch):
@@ -162,7 +163,7 @@ def test_successful_ping_is_alive(monkeypatch):
       self.chat = _OkChat()
 
   monkeypatch.setattr(ort, "OpenAI", _OkOpenAI)
-  assert ort._verify_model_alive("vendor/model:free", "fake-key") is True
+  assert ort._verify_model_alive("vendor/model:free", Secret("fake-key")) is True
 
 
 # ---------------------------------------------------------------------------
