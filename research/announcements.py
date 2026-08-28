@@ -28,7 +28,7 @@ Two things come out of the 8-K and neither is a guess:
 """
 from __future__ import annotations
 
-from datetime import time
+from datetime import date, time, timedelta
 from typing import Any, Dict, List, Optional, Sequence
 from zoneinfo import ZoneInfo
 
@@ -37,6 +37,45 @@ from research import pit_store
 EXCHANGE_TZ = ZoneInfo("America/New_York")
 MARKET_OPEN = time(9, 30)
 MARKET_CLOSE = time(16, 0)
+
+# US equities close at 13:00 on about three sessions a year, and this used to
+# be a fixed 16:00 -- so a release at 14:30 on one of them read as `dmh`, the
+# market open, when it had been shut for ninety minutes. `timing` decides
+# which session an order may enter and `scoring` splits its results on it, so
+# the release landed in the wrong bucket on both sides.
+HALF_DAY_CLOSE = time(13, 0)
+
+
+def _half_day_candidates(year: int) -> "set[date]":
+    """The three dates NYSE closes early on, before the weekday test.
+
+    Computed rather than tabulated so this does not expire: a table would go
+    stale silently, which is the failure being fixed rather than a new one.
+    """
+    november = date(year, 11, 1)
+    # 4th Thursday: the first Thursday, plus three weeks. Thanksgiving itself
+    # is a holiday; the early close is the Friday after it.
+    first_thursday = november + timedelta(days=(3 - november.weekday()) % 7)
+    return {
+        first_thursday + timedelta(weeks=3, days=1),
+        date(year, 12, 24),
+        date(year, 7, 3),
+    }
+
+
+def _closes_early(day: date) -> bool:
+    """Whether the exchange shut at 13:00 on this date.
+
+    The weekday test is the whole rule. In years where one of these falls
+    beside an observed holiday the exchange is shut all day rather than half
+    of it -- 24 December on a Friday when Christmas is the Saturday, 3 July
+    when Independence Day is the Saturday -- and this returns True for those
+    too. That is deliberate and cannot make an answer worse: on a day the
+    market never opened, `dmh` is definitely wrong and `amc` is the closer of
+    the two. Being exactly right about a fully-closed day needs the session
+    calendar, which lives in the store rather than here.
+    """
+    return day.weekday() < 5 and day in _half_day_candidates(day.year)
 
 # "Results of Operations and Financial Condition". The only 8-K item that is an
 # earnings release; 5.02 is a director leaving and 8.01 is anything else.
@@ -108,10 +147,11 @@ def classify(accepted_at) -> str:
         return "unknown"
     if accepted_at.tzinfo is None or accepted_at.utcoffset() is None:
         return "unknown"
-    local = accepted_at.astimezone(EXCHANGE_TZ).time()
-    if local < MARKET_OPEN:
+    local = accepted_at.astimezone(EXCHANGE_TZ)
+    close = HALF_DAY_CLOSE if _closes_early(local.date()) else MARKET_CLOSE
+    if local.time() < MARKET_OPEN:
         return "bmo"
-    if local >= MARKET_CLOSE:
+    if local.time() >= close:
         return "amc"
     return "dmh"
 

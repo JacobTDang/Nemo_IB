@@ -358,3 +358,80 @@ def test_it_still_fetches_when_nothing_is_supplied(monkeypatch):
     monkeypatch.setattr(announcements, "_fetch_8k", lambda t, **kw: [
         Filing("2026-02-11", "2.02", "2026-02-11T21:05:00")])
     assert announcements.for_quarters("AAA", "2026-03-20")["2026Q1"]
+
+
+# --------------------------------------------------------------- half days
+#
+# US equities close at 13:00 ET on about three sessions a year. `classify`
+# used a fixed 16:00, so a release in that window read as `dmh` -- during
+# market hours -- when the market had been shut for over an hour. `timing`
+# decides which session an order may enter and `scoring` splits its results
+# on it, so the release lands in the wrong bucket on both sides.
+
+from zoneinfo import ZoneInfo
+
+_ET = ZoneInfo("America/New_York")
+
+
+def _et(year, month, day, hour, minute=0):
+    return datetime(year, month, day, hour, minute, tzinfo=_ET)
+
+
+def test_afternoon_on_the_day_after_thanksgiving_is_after_the_close():
+    """2026-11-27. Thanksgiving is the 4th Thursday, so the Friday after."""
+    assert announcements.classify(_et(2026, 11, 27, 14, 30)) == "amc"
+
+
+def test_afternoon_on_christmas_eve_is_after_the_close():
+    """2026-12-24 is a Thursday, so a trading day with a 13:00 close."""
+    assert announcements.classify(_et(2026, 12, 24, 14, 0)) == "amc"
+
+
+def test_afternoon_on_july_third_is_after_the_close():
+    """2025-07-03 is a Thursday. In 2027 it is a Saturday and not a session,
+    which is why the year matters here rather than the month and day."""
+    assert announcements.classify(_et(2025, 7, 3, 13, 30)) == "amc"
+
+
+def test_july_third_on_a_weekend_is_not_treated_as_an_early_close():
+    """2027-07-03 is a Saturday. The weekday test is what keeps the three
+    candidate dates from firing on days that are not sessions at all."""
+    assert announcements.classify(_et(2027, 7, 3, 14, 30)) == "dmh"
+
+
+def test_a_half_day_morning_is_still_during_market_hours():
+    """The open does not move, only the close."""
+    assert announcements.classify(_et(2026, 11, 27, 11, 0)) == "dmh"
+
+
+def test_a_half_day_before_the_open_is_still_bmo():
+    assert announcements.classify(_et(2026, 11, 27, 8, 0)) == "bmo"
+
+
+def test_a_full_session_afternoon_is_unaffected():
+    """The same clock time on an ordinary Friday still reads as in-session."""
+    assert announcements.classify(_et(2026, 11, 20, 14, 30)) == "dmh"
+
+
+def test_the_half_day_rule_is_read_in_new_york_not_utc():
+    """19:30 UTC is 14:30 ET -- after a 13:00 close, before a 16:00 one."""
+    moment = datetime(2026, 11, 27, 19, 30, tzinfo=timezone.utc)
+    assert announcements.classify(moment) == "amc"
+
+
+def test_thanksgiving_arithmetic_holds_for_sixteen_years():
+    """The 4th-Thursday computation, against an independently derived date.
+
+    The rule is computed rather than tabulated so it cannot expire, which
+    only helps if the computation is right in years the author did not try.
+    """
+    import calendar as _calendar
+    from datetime import date as _date, timedelta as _timedelta
+
+    for year in range(2020, 2036):
+        thursdays = [day for day in range(1, 31)
+                     if _date(year, 11, day).weekday() == 3]
+        expected = _date(year, 11, thursdays[3]) + _timedelta(days=1)
+        computed = sorted(c for c in announcements._half_day_candidates(year)
+                          if c.month == 11)
+        assert computed == [expected], f"{year}: {computed} != {expected}"
