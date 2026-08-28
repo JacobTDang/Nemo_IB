@@ -18,6 +18,15 @@ from state.schema import init_schema, get_connection
 from state.positions import open_position, get_order, recent_orders
 
 
+# Synthetic credentials of a realistic length. These stood at 'k' and 's' until
+# Execution_Agent started scrubbing its own credentials out of the broker error
+# text it returns: a one-character key is found inside ordinary prose, and
+# "broker unavailable" came back as "bro<redacted>er unavailable". Nothing that
+# is actually a credential is one character long.
+_FAKE_KEY = 'PKtestonly0000execution0000key'
+_FAKE_SECRET = 'testonly0000execution0000secret0000value'
+
+
 def _clean():
   conn = get_connection()
   try:
@@ -80,7 +89,7 @@ def test_construction_requires_paper_creds():
 
 
 def test_construction_requires_live_creds_separately():
-  with patch.dict(os.environ, {'ALPACA_PAPER_KEY': 'k', 'ALPACA_PAPER_SECRET': 's'}, clear=False):
+  with patch.dict(os.environ, {'ALPACA_PAPER_KEY': _FAKE_KEY, 'ALPACA_PAPER_SECRET': _FAKE_SECRET}, clear=False):
     os.environ.pop('ALPACA_LIVE_KEY', None)
     os.environ.pop('ALPACA_LIVE_SECRET', None)
     from agent.Execution_Agent import Execution_Agent
@@ -95,7 +104,7 @@ def test_construction_requires_live_creds_separately():
 def test_place_market_order_success():
   init_schema(); _clean()
   mocks = _make_alpaca_mock()
-  with patch.dict(os.environ, {'ALPACA_PAPER_KEY': 'k', 'ALPACA_PAPER_SECRET': 's'}, clear=False), \
+  with patch.dict(os.environ, {'ALPACA_PAPER_KEY': _FAKE_KEY, 'ALPACA_PAPER_SECRET': _FAKE_SECRET}, clear=False), \
        patch.dict('sys.modules', mocks):
     from agent.Execution_Agent import Execution_Agent
     ea = Execution_Agent(paper=True)
@@ -116,7 +125,7 @@ def test_place_market_order_success():
 
 def test_place_limit_order_requires_price():
   mocks = _make_alpaca_mock()
-  with patch.dict(os.environ, {'ALPACA_PAPER_KEY': 'k', 'ALPACA_PAPER_SECRET': 's'}, clear=False), \
+  with patch.dict(os.environ, {'ALPACA_PAPER_KEY': _FAKE_KEY, 'ALPACA_PAPER_SECRET': _FAKE_SECRET}, clear=False), \
        patch.dict('sys.modules', mocks):
     from agent.Execution_Agent import Execution_Agent
     ea = Execution_Agent(paper=True)
@@ -129,7 +138,7 @@ def test_place_limit_order_requires_price():
 
 def test_invalid_side_rejected():
   mocks = _make_alpaca_mock()
-  with patch.dict(os.environ, {'ALPACA_PAPER_KEY': 'k', 'ALPACA_PAPER_SECRET': 's'}, clear=False), \
+  with patch.dict(os.environ, {'ALPACA_PAPER_KEY': _FAKE_KEY, 'ALPACA_PAPER_SECRET': _FAKE_SECRET}, clear=False), \
        patch.dict('sys.modules', mocks):
     from agent.Execution_Agent import Execution_Agent
     ea = Execution_Agent(paper=True)
@@ -142,7 +151,7 @@ def test_broker_failure_recorded_as_rejected():
   init_schema(); _clean()
   mocks = _make_alpaca_mock()
   mocks['_client'].submit_order.side_effect = Exception("broker unavailable")
-  with patch.dict(os.environ, {'ALPACA_PAPER_KEY': 'k', 'ALPACA_PAPER_SECRET': 's'}, clear=False), \
+  with patch.dict(os.environ, {'ALPACA_PAPER_KEY': _FAKE_KEY, 'ALPACA_PAPER_SECRET': _FAKE_SECRET}, clear=False), \
        patch.dict('sys.modules', mocks):
     from agent.Execution_Agent import Execution_Agent
     ea = Execution_Agent(paper=True)
@@ -161,7 +170,7 @@ def test_idempotency_via_existing_client_id():
   """If a duplicate client_order_id slips through, the second call must reject."""
   init_schema(); _clean()
   mocks = _make_alpaca_mock()
-  with patch.dict(os.environ, {'ALPACA_PAPER_KEY': 'k', 'ALPACA_PAPER_SECRET': 's'}, clear=False), \
+  with patch.dict(os.environ, {'ALPACA_PAPER_KEY': _FAKE_KEY, 'ALPACA_PAPER_SECRET': _FAKE_SECRET}, clear=False), \
        patch.dict('sys.modules', mocks), \
        patch('uuid.uuid4') as mock_uuid:
     # Force the same uuid each time
@@ -191,7 +200,7 @@ def test_rejected_order_id_includes_unique_suffix():
   mocks = _make_alpaca_mock()
   mocks['_client'].submit_order.side_effect = Exception("broker unavailable")
 
-  with patch.dict(os.environ, {'ALPACA_PAPER_KEY': 'k', 'ALPACA_PAPER_SECRET': 's'}, clear=False), \
+  with patch.dict(os.environ, {'ALPACA_PAPER_KEY': _FAKE_KEY, 'ALPACA_PAPER_SECRET': _FAKE_SECRET}, clear=False), \
        patch.dict('sys.modules', mocks):
     from agent.Execution_Agent import Execution_Agent
     ea = Execution_Agent(paper=True)
@@ -217,7 +226,7 @@ def test_rejected_order_id_includes_unique_suffix():
 
 def test_account_summary_returns_floats():
   mocks = _make_alpaca_mock()
-  with patch.dict(os.environ, {'ALPACA_PAPER_KEY': 'k', 'ALPACA_PAPER_SECRET': 's'}, clear=False), \
+  with patch.dict(os.environ, {'ALPACA_PAPER_KEY': _FAKE_KEY, 'ALPACA_PAPER_SECRET': _FAKE_SECRET}, clear=False), \
        patch.dict('sys.modules', mocks):
     from agent.Execution_Agent import Execution_Agent
     ea = Execution_Agent(paper=True)
@@ -231,7 +240,7 @@ def test_account_summary_returns_floats():
 def test_account_summary_handles_broker_error():
   mocks = _make_alpaca_mock()
   mocks['_client'].get_account.side_effect = Exception("API down")
-  with patch.dict(os.environ, {'ALPACA_PAPER_KEY': 'k', 'ALPACA_PAPER_SECRET': 's'}, clear=False), \
+  with patch.dict(os.environ, {'ALPACA_PAPER_KEY': _FAKE_KEY, 'ALPACA_PAPER_SECRET': _FAKE_SECRET}, clear=False), \
        patch.dict('sys.modules', mocks):
     from agent.Execution_Agent import Execution_Agent
     ea = Execution_Agent(paper=True)
@@ -243,7 +252,7 @@ def test_account_summary_handles_broker_error():
 def test_close_position_when_none_open():
   init_schema(); _clean()
   mocks = _make_alpaca_mock()
-  with patch.dict(os.environ, {'ALPACA_PAPER_KEY': 'k', 'ALPACA_PAPER_SECRET': 's'}, clear=False), \
+  with patch.dict(os.environ, {'ALPACA_PAPER_KEY': _FAKE_KEY, 'ALPACA_PAPER_SECRET': _FAKE_SECRET}, clear=False), \
        patch.dict('sys.modules', mocks):
     from agent.Execution_Agent import Execution_Agent
     ea = Execution_Agent(paper=True)
@@ -258,7 +267,7 @@ def test_close_position_submits_opposing_order():
   init_schema(); _clean()
   open_position("TST_CLS", "long", 10, 200.0, thesis_id=7)
   mocks = _make_alpaca_mock(broker_order_id="alp-close-1")
-  with patch.dict(os.environ, {'ALPACA_PAPER_KEY': 'k', 'ALPACA_PAPER_SECRET': 's'}, clear=False), \
+  with patch.dict(os.environ, {'ALPACA_PAPER_KEY': _FAKE_KEY, 'ALPACA_PAPER_SECRET': _FAKE_SECRET}, clear=False), \
        patch.dict('sys.modules', mocks):
     from agent.Execution_Agent import Execution_Agent
     ea = Execution_Agent(paper=True)

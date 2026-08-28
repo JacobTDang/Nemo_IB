@@ -18,6 +18,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from state.schema import init_schema, get_connection
 from state.events_store import seen, store_event
 import daemons.news_watcher as nw
+# The daemon reads the client's key through Secret.reveal(), so the mocked
+# client has to carry a Secret rather than a bare string.
+from tools.news_agregator.finnhub_utils import Secret
 
 
 def _clean():
@@ -100,7 +103,7 @@ def test_finnhub_loop_one_round_writes_classified_events():
   with patch('daemons.news_watcher.get_watchlist', return_value=['AAPL']), \
        patch('daemons.news_watcher.FinnhubClient') as MockClient, \
        patch('aiohttp.ClientSession', return_value=FakeSession()):
-    MockClient.return_value._api_key = 'fake'
+    MockClient.return_value._api_key = Secret('fake-finnhub-token')
     classifier = FakeClassifier()
 
     async def run_one_round():
@@ -158,7 +161,7 @@ def test_finnhub_loop_dedups_on_second_pass():
   with patch('daemons.news_watcher.get_watchlist', return_value=['AAPL']), \
        patch('daemons.news_watcher.FinnhubClient') as MockClient, \
        patch('aiohttp.ClientSession', return_value=FakeSession()):
-    MockClient.return_value._api_key = 'fake'
+    MockClient.return_value._api_key = Secret('fake-finnhub-token')
 
     async def run_two_rounds():
       nw._running = True
@@ -199,7 +202,7 @@ def test_finnhub_loop_recovers_from_http_error():
   with patch('daemons.news_watcher.get_watchlist', return_value=['AAPL']), \
        patch('daemons.news_watcher.FinnhubClient') as MockClient, \
        patch('aiohttp.ClientSession', return_value=FakeSession()):
-    MockClient.return_value._api_key = 'fake'
+    MockClient.return_value._api_key = Secret('fake-finnhub-token')
 
     async def run():
       nw._running = True
@@ -236,7 +239,7 @@ def test_finnhub_loop_recovers_from_connection_exception():
   with patch('daemons.news_watcher.get_watchlist', return_value=['AAPL', 'MSFT']), \
        patch('daemons.news_watcher.FinnhubClient') as MockClient, \
        patch('aiohttp.ClientSession', return_value=FakeSession()):
-    MockClient.return_value._api_key = 'fake'
+    MockClient.return_value._api_key = Secret('fake-finnhub-token')
 
     async def run():
       nw._running = True
@@ -359,7 +362,7 @@ def test_max_per_ticker_caps_articles():
   with patch('daemons.news_watcher.get_watchlist', return_value=['AAPL']), \
        patch('daemons.news_watcher.FinnhubClient') as MockClient, \
        patch('aiohttp.ClientSession', return_value=FakeSession()):
-    MockClient.return_value._api_key = 'fake'
+    MockClient.return_value._api_key = Secret('fake-finnhub-token')
 
     async def run_one_round():
       nw._running = True
@@ -399,7 +402,7 @@ def test_shutdown_flag_terminates_loop_promptly():
   with patch('daemons.news_watcher.get_watchlist', return_value=['AAPL']), \
        patch('daemons.news_watcher.FinnhubClient') as MockClient, \
        patch('aiohttp.ClientSession', return_value=FakeSession()):
-    MockClient.return_value._api_key = 'fake'
+    MockClient.return_value._api_key = Secret('fake-finnhub-token')
 
     async def run():
       nw._running = True

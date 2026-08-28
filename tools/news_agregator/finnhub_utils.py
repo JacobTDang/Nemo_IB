@@ -15,13 +15,71 @@ from dotenv import load_dotenv
 _DOTENV_PATH = Path(__file__).resolve().parents[2] / ".env"
 
 
-def get_api_key() -> str:
-  """Load FINNHUB_API_KEY from .env file."""
+class Secret:
+  """A credential that renders as a placeholder instead of as itself.
+
+  pytest prints a frame's arguments at the head of every traceback entry, and
+  every local under --showlocals, so a key bound to a name is written to
+  stdout by the first test that fails anywhere below it. This key is worse
+  placed than most: it travels as a *query parameter*, so it is in the URL
+  aiohttp builds, in the error text aiohttp renders from that URL, and from
+  there in the `error` field this client returns to its MCP caller -- which
+  leaves the process entirely rather than merely reaching a log.
+
+  Mirrored from agent/openrouter_template.py (issue #17) rather than imported
+  from it. Nothing under tools/news_agregator imports from agent/ today, and
+  agent.openrouter_template is the LLM layer: importing it here would put
+  openai, ollama and httpx into a data-source image that will never run any of
+  them, which is the coupling testing/test_agent_package_boundary.py exists to
+  prevent. See that file for the full reasoning behind the type.
+  """
+  __slots__ = ("_value",)
+
+  PLACEHOLDER = "<redacted>"
+
+  def __init__(self, value: str = ""):
+    self._value = value or ""
+
+  def reveal(self) -> str:
+    """The raw credential.
+
+    Call this at the point of use -- inside the request call -- and never bind
+    the result to a name, or the value is back in a frame.
+    """
+    return self._value
+
+  def scrub(self, text: str) -> str:
+    """`text` with the credential replaced by the placeholder.
+
+    Provider and transport error text is returned to the caller, so this runs
+    before that text is put in an `error` field.
+    """
+    if not self._value:
+      return text
+    return text.replace(self._value, self.PLACEHOLDER)
+
+  def __repr__(self) -> str:
+    return self.PLACEHOLDER
+
+  __str__ = __repr__
+
+  def __bool__(self) -> bool:
+    return bool(self._value)
+
+
+def get_api_key() -> Secret:
+  """Load FINNHUB_API_KEY from .env file, wrapped so it cannot be rendered.
+
+  Building the Secret in the same expression that reads the environment is
+  deliberate: an intermediate `key = os.getenv(...)` would put the raw value
+  in this frame, and returning a bare `str` would put it in every caller's
+  frame as well.
+  """
   load_dotenv(dotenv_path=_DOTENV_PATH)
-  key = os.getenv("FINNHUB_API_KEY")
-  if not key:
+  credential = Secret(os.getenv("FINNHUB_API_KEY") or "")
+  if not credential:
     raise RuntimeError("FINNHUB_API_KEY not found in environment. Add it to .env")
-  return key
+  return credential
 
 
 class RateLimiter:
@@ -84,7 +142,6 @@ class FinnhubClient:
       Parsed JSON dict, or {"error": "..."} on failure
     """
     params = dict(params) if params else {}
-    params["token"] = self._api_key
     url = f"{self.BASE_URL}{endpoint}"
 
     session = await self._get_session()
@@ -92,7 +149,11 @@ class FinnhubClient:
     for attempt in range(2):
       await self._rate_limiter.acquire()
       try:
-        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+        # The credential is revealed into the call itself and never bound
+        # to a name: a `params` dict holding it is a local, and a local is
+        # what a rendered traceback prints.
+        async with session.get(url, params={**params, "token": self._api_key.reveal()},
+                               timeout=aiohttp.ClientTimeout(total=30)) as resp:
           if resp.status == 429:
             if attempt == 0:
               await asyncio.sleep(2)
@@ -100,12 +161,15 @@ class FinnhubClient:
             return {"error": f"Rate limited (429) after retry"}
           if resp.status != 200:
             text = await resp.text()
-            return {"error": f"HTTP {resp.status}: {text[:200]}"}
+            return {"error": self._api_key.scrub(f"HTTP {resp.status}: {text[:200]}")}
           return await resp.json()
       except asyncio.TimeoutError:
         return {"error": "Request timed out (15s)"}
       except aiohttp.ClientError as e:
-        return {"error": f"HTTP client error: {str(e)}"}
+        # aiohttp renders the request URL into several of its errors, and the
+        # credential is a query parameter of that URL. Scrubbed before it goes
+        # back to the caller, which is further than a log line travels.
+        return {"error": self._api_key.scrub(f"HTTP client error: {str(e)}")}
 
     return {"error": "Unexpected: exhausted retries"}
 

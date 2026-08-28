@@ -13,16 +13,77 @@ from typing import Dict, List, Optional
 from datetime import datetime
 
 
+class Secret:
+    """A credential that renders as a placeholder instead of as itself.
+
+    A key bound to a name is rendered by anything that dumps the frame or the
+    module it lives in -- pytest under --showlocals, a debugger, a crash
+    reporter. Keeping the value behind reveal() leaves nothing renderable to
+    render, which closes all of those at once.
+
+    Mirrored from agent/openrouter_template.py (issue #17) rather than
+    imported from it. Nothing under tools/news_agregator or tools/alpaca_server
+    imports from agent/ today, and agent.openrouter_template is the LLM layer:
+    importing it here would put openai, ollama and httpx into a data-source
+    image that will never run any of them, which is the coupling
+    testing/test_agent_package_boundary.py exists to prevent. See that file
+    for the full reasoning behind the type.
+    """
+    __slots__ = ("_value",)
+
+    PLACEHOLDER = "<redacted>"
+
+    def __init__(self, value: str = ""):
+        self._value = value or ""
+
+    def reveal(self) -> str:
+        """The raw credential.
+
+        Call this at the point of use -- an SDK constructor -- and never bind
+        the result to a name, or the value is back in a frame.
+        """
+        return self._value
+
+    def scrub(self, text: str) -> str:
+        """`text` with the credential replaced by the placeholder."""
+        if not self._value:
+            return text
+        return text.replace(self._value, self.PLACEHOLDER)
+
+    def __repr__(self) -> str:
+        return self.PLACEHOLDER
+
+    __str__ = __repr__
+
+    def __bool__(self) -> bool:
+        return bool(self._value)
+
+
 class alpaca_client:
     def __init__(self):
         self.trading_client, self.stock_history_client = self.setup_clients()
 
     def setup_clients(self) -> tuple[TradingClient, StockHistoricalDataClient]:
         load_dotenv()
-        API_KEY = os.getenv("ALPACA_API_KEY")
-        API_SECRET = os.getenv("ALPACA_SECRET")
-        return (TradingClient(api_key=API_KEY, secret_key=API_SECRET, paper=True),
-                StockHistoricalDataClient(api_key=API_KEY, secret_key=API_SECRET),
+        # Wrapped in the same expression that reads the environment: an
+        # intermediate `API_KEY = os.getenv(...)` is what any frame dump
+        # prints, and a name in this shape is picked up by a debugger or a
+        # crash reporter walking the scope as readily as by pytest.
+        key = Secret(os.getenv("ALPACA_API_KEY") or "")
+        secret = Secret(os.getenv("ALPACA_SECRET") or "")
+        if not key or not secret:
+            # Refused here rather than handed on. alpaca-py accepts a bare
+            # api_key and only complains about the missing partner, so a half
+            # configured .env used to surface either as its ValueError or,
+            # worse, as a 401 several calls later with nothing naming the
+            # cause.
+            raise RuntimeError(
+                "Missing Alpaca credentials. Set ALPACA_API_KEY and "
+                "ALPACA_SECRET in .env")
+        return (TradingClient(api_key=key.reveal(), secret_key=secret.reveal(),
+                              paper=True),
+                StockHistoricalDataClient(api_key=key.reveal(),
+                                          secret_key=secret.reveal()),
                 )
  
     def order(self, ticker: str,

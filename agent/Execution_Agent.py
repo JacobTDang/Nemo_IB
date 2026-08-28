@@ -25,33 +25,94 @@ from state.positions import (
 )
 
 
+class Secret:
+  """A credential that renders as a placeholder instead of as itself.
+
+  pytest prints a frame's arguments at the head of every traceback entry, and
+  every local under --showlocals. A key sitting in a variable is therefore
+  written to stdout by the first test that fails anywhere below it -- and the
+  keys here are the *broker* credentials, which can move money.
+
+  Mirrored from agent/openrouter_template.py (issue #17) rather than imported
+  from it. This module is a 112-module import today; agent.openrouter_template
+  drags in the LLM layer -- openai, ollama, httpx -- for 1146, and the one
+  thing in the codebase that talks to the broker should not need any of it to
+  reach a value class. See that file for the full reasoning behind the type.
+  """
+  __slots__ = ("_value",)
+
+  PLACEHOLDER = "<redacted>"
+
+  def __init__(self, value: str = ""):
+    self._value = value or ""
+
+  def reveal(self) -> str:
+    """The raw credential.
+
+    Call this at the point of use -- the TradingClient constructor -- and
+    never bind the result to a name, or the value is back in a frame.
+    """
+    return self._value
+
+  def scrub(self, text: str) -> str:
+    """`text` with the credential replaced by the placeholder.
+
+    Broker error text is returned to the caller in the `error` field of every
+    method below. A broker that quoted the offending credential back would
+    otherwise put it into a result that travels further than any log line.
+    """
+    if not self._value:
+      return text
+    return text.replace(self._value, self.PLACEHOLDER)
+
+  def __repr__(self) -> str:
+    return self.PLACEHOLDER
+
+  __str__ = __repr__
+
+  def __bool__(self) -> bool:
+    return bool(self._value)
+
+
 class Execution_Agent:
   """Thin wrapper over alpaca-py. Use only one instance per process."""
 
   def __init__(self, paper: bool = True):
     load_dotenv()
     self.paper = paper
+    # Wrapped in the same expression that reads the environment. An
+    # intermediate `key = os.getenv(...)` is exactly what --showlocals prints,
+    # and the refusal below is reached by a half-configured .env -- key set,
+    # secret missing -- which is precisely the case where that local is still
+    # live when the traceback is built.
     if paper:
-      key = os.getenv("ALPACA_PAPER_KEY")
-      secret = os.getenv("ALPACA_PAPER_SECRET")
+      self._key = Secret(os.getenv("ALPACA_PAPER_KEY") or "")
+      self._secret = Secret(os.getenv("ALPACA_PAPER_SECRET") or "")
     else:
-      key = os.getenv("ALPACA_LIVE_KEY")
-      secret = os.getenv("ALPACA_LIVE_SECRET")
-    if not key or not secret:
+      self._key = Secret(os.getenv("ALPACA_LIVE_KEY") or "")
+      self._secret = Secret(os.getenv("ALPACA_LIVE_SECRET") or "")
+    if not self._key or not self._secret:
       raise RuntimeError(
         f"Missing Alpaca {'paper' if paper else 'LIVE'} credentials. "
         f"Set ALPACA_{'PAPER' if paper else 'LIVE'}_KEY and SECRET in .env"
       )
-    self._key = key
-    self._secret = secret
     self._client = None  # Lazy — only construct on first call
+
+  def _scrub(self, text: str) -> str:
+    """Broker error text with both credentials taken back out.
+
+    Every method below returns the broker's own words in an `error` field, and
+    a returned error travels further than a log line does.
+    """
+    return self._secret.scrub(self._key.scrub(text))
 
   def _get_client(self):
     if self._client is None:
       try:
         from alpaca.trading.client import TradingClient
         self._client = TradingClient(
-          api_key=self._key, secret_key=self._secret, paper=self.paper
+          api_key=self._key.reveal(), secret_key=self._secret.reveal(),
+          paper=self.paper
         )
       except ImportError as e:
         raise RuntimeError(f"alpaca-py not installed: {e}")
@@ -73,7 +134,8 @@ class Execution_Agent:
         'status': a.status if isinstance(a.status, str) else str(a.status),
       }
     except Exception as e:
-      return {'error': f"{type(e).__name__}: {e}", 'paper': self.paper}
+      return {'error': self._scrub(f"{type(e).__name__}: {e}"),
+              'paper': self.paper}
 
   # ---- Order placement --------------------------------------------------
 
@@ -144,8 +206,9 @@ class Execution_Agent:
         status='rejected', thesis_id=thesis_id,
         arbiter_verdict_id=arbiter_verdict_id, paper=self.paper,
       )
-      print(f"[Execution] order submission failed: {e}", file=sys.stderr, flush=True)
-      return {'success': False, 'error': str(e),
+      print(f"[Execution] order submission failed: {self._scrub(str(e))}",
+            file=sys.stderr, flush=True)
+      return {'success': False, 'error': self._scrub(str(e)),
               'client_order_id': client_order_id}
 
     # Persist
@@ -174,7 +237,7 @@ class Execution_Agent:
       update_order_status(broker_order_id, status, filled)
       return {'order_id': broker_order_id, 'status': status, 'filled_at': filled}
     except Exception as e:
-      return {'error': str(e), 'order_id': broker_order_id}
+      return {'error': self._scrub(str(e)), 'order_id': broker_order_id}
 
   def close_position_for(self, ticker: str, reason: str = 'manual') -> Dict[str, Any]:
     """Close an open position by submitting an opposing market order."""
