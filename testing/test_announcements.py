@@ -261,3 +261,72 @@ def test_a_naive_acceptance_time_is_not_assumed_to_be_utc(monkeypatch):
     monkeypatch.setattr(announcements, "_fetch_8k", lambda t, **kw: [Naive()])
     assert announcements.earnings_releases("AAA", "2026-03-01")[0]["timing"] \
         == "unknown"
+
+
+# --- two writers, one table -------------------------------------------------
+#
+# The daily job records an announcement from the vendor's calendar; this module
+# records one from the filing. They can disagree about the same quarter, and
+# INSERT OR IGNORE keeps whichever arrived first -- which is whichever job ran
+# first, not whichever is right.
+#
+# The filing is the primary source. The vendor is reading the same 8-K and
+# labelling it, sometimes with a calendar bucket for a date and sometimes with
+# a timing it inferred. Where they differ, the filing wins.
+
+def test_the_filing_wins_over_a_vendor_row_for_the_same_quarter(store,
+                                                                monkeypatch):
+    pit_store.record_announcement("AAA", "2026Q1", "2026-02-14",
+                                  timing="unknown",
+                                  recorded_at="2026-02-14T21:00:00Z")
+
+    monkeypatch.setattr(announcements, "_fetch_8k", lambda t, **kw: [
+        Filing("2026-02-11", "2.02", "2026-02-11T21:05:00")])
+    monkeypatch.setattr(announcements, "_quarters",
+                        lambda t, as_of=None: QUARTERS)
+    announcements.backfill(["AAA"], as_of="2026-03-20")
+
+    got = pit_store.announcements_as_of("AAA", "2026-03-01")
+    assert len(got) == 1, f"two rows for one quarter: {got}"
+    assert got[0]["announced_date"] == "2026-02-11"
+    assert got[0]["timing"] == "amc"
+    assert got[0]["source"] == "filing"
+
+
+def test_a_vendor_row_stands_where_no_filing_was_found(store, monkeypatch):
+    """The 8-K is better evidence when there is one. There is not always one."""
+    pit_store.record_announcement("AAA", "2026Q1", "2026-02-14", timing="bmo",
+                                  recorded_at="2026-02-14T21:00:00Z")
+    monkeypatch.setattr(announcements, "_fetch_8k", lambda t, **kw: [])
+    monkeypatch.setattr(announcements, "_quarters",
+                        lambda t, as_of=None: QUARTERS)
+    announcements.backfill(["AAA"], as_of="2026-03-20")
+
+    got = pit_store.announcements_as_of("AAA", "2026-03-01")
+    assert [(a["announced_date"], a["timing"]) for a in got] == \
+        [("2026-02-14", "bmo")]
+
+
+def test_a_filing_row_is_not_replaced_by_a_later_vendor_row(store):
+    """The other order. Whichever job runs second must not undo the better
+    source."""
+    pit_store.record_announcement("AAA", "2026Q1", "2026-02-11", timing="amc",
+                                  source="filing",
+                                  recorded_at="2026-02-11T21:00:00Z")
+    pit_store.record_announcement("AAA", "2026Q1", "2026-02-14",
+                                  timing="unknown",
+                                  recorded_at="2026-02-14T21:00:00Z")
+
+    got = pit_store.announcements_as_of("AAA", "2026-03-01")
+    assert len(got) == 1
+    assert got[0]["announced_date"] == "2026-02-11"
+    assert got[0]["source"] == "filing"
+
+
+def test_re_running_the_backfill_changes_nothing(store, monkeypatch):
+    monkeypatch.setattr(announcements, "_fetch_8k", lambda t, **kw: [
+        Filing("2026-02-11", "2.02", "2026-02-11T21:05:00")])
+    monkeypatch.setattr(announcements, "_quarters",
+                        lambda t, as_of=None: QUARTERS)
+    assert announcements.backfill(["AAA"], "2026-03-20")["written"] == 1
+    assert announcements.backfill(["AAA"], "2026-03-20")["written"] == 0

@@ -494,6 +494,11 @@ def universe_as_of(as_of_date: str) -> List[Dict[str, Any]]:
 
 # ------------------------------------------------------------ announcements
 
+# The filing itself, as opposed to a vendor's reading of it. Ranked above
+# everything else when two jobs disagree about the same quarter.
+PRIMARY_SOURCE = "filing"
+
+
 def record_announcement(ticker: str, fiscal_period: str, announced_date: str,
                         timing: str = "unknown",
                         source: Optional[str] = None,
@@ -508,6 +513,13 @@ def record_announcement(ticker: str, fiscal_period: str, announced_date: str,
     so the move is on 14 August, and using the filing date instead measures
     -2.48% against a real -6.57%. It defaults to "unknown" rather than to a
     guess, because a guess here is a wrong number with no warning attached.
+
+    Two jobs write here: the nightly run, from the vendor's calendar, and the
+    backfill, from the Item 2.02 filing. They disagree about the same quarter
+    often enough to matter, and INSERT OR IGNORE alone keeps whichever ran
+    first rather than whichever is right. The filing is the primary source --
+    the vendor is reading that same 8-K and relabelling it -- so a filing row
+    replaces a vendor one, and nothing replaces a filing row.
     """
     with connect() as conn:
         cur = conn.execute(
@@ -517,6 +529,16 @@ def record_announcement(ticker: str, fiscal_period: str, announced_date: str,
                VALUES (?,?,?,?,?,?)""",
             (ticker, fiscal_period, announced_date, timing or "unknown",
              source, recorded_at or _now()))
+        if not cur.rowcount and source == PRIMARY_SOURCE:
+            cur = conn.execute(
+                """UPDATE announcement
+                   SET announced_date = ?, timing = ?, source = ?,
+                       recorded_at = ?
+                   WHERE ticker = ? AND fiscal_period = ?
+                     AND (source IS NULL OR source != ?)""",
+                (announced_date, timing or "unknown", source,
+                 recorded_at or _now(), ticker, fiscal_period,
+                 PRIMARY_SOURCE))
     # Reported like every other recorder here, so a caller can tell a
     # write from a rerun that found the row already present.
     return cur.rowcount or 0

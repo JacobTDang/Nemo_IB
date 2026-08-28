@@ -189,7 +189,7 @@ def backfill(tickers: Sequence[str],
         for period, row in found.items():
             written += pit_store.record_announcement(
                 ticker.upper(), period, row["announced_date"],
-                timing=row["timing"],
+                timing=row["timing"], source=pit_store.PRIMARY_SOURCE,
                 recorded_at=f"{row['announced_date']}T21:00:00Z")
 
     return {"tickers": len(tickers), "covered": covered, "written": written,
