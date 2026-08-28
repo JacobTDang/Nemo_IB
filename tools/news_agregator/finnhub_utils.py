@@ -11,60 +11,15 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 from dotenv import load_dotenv
 
+# This key travels as a *query parameter*, so it reaches the URL aiohttp builds,
+# the error text aiohttp renders from that URL, and from there the `error` field
+# this client returns to its MCP caller -- which leaves the process rather than
+# merely reaching a log. Secret keeps it out of all three, and common/secret.py
+# imports nothing, so importing it here crosses no package boundary.
+from common.secret import Secret
+
 
 _DOTENV_PATH = Path(__file__).resolve().parents[2] / ".env"
-
-
-class Secret:
-  """A credential that renders as a placeholder instead of as itself.
-
-  pytest prints a frame's arguments at the head of every traceback entry, and
-  every local under --showlocals, so a key bound to a name is written to
-  stdout by the first test that fails anywhere below it. This key is worse
-  placed than most: it travels as a *query parameter*, so it is in the URL
-  aiohttp builds, in the error text aiohttp renders from that URL, and from
-  there in the `error` field this client returns to its MCP caller -- which
-  leaves the process entirely rather than merely reaching a log.
-
-  Mirrored from agent/openrouter_template.py (issue #17) rather than imported
-  from it. Nothing under tools/news_agregator imports from agent/ today, and
-  agent.openrouter_template is the LLM layer: importing it here would put
-  openai, ollama and httpx into a data-source image that will never run any of
-  them, which is the coupling testing/test_agent_package_boundary.py exists to
-  prevent. See that file for the full reasoning behind the type.
-  """
-  __slots__ = ("_value",)
-
-  PLACEHOLDER = "<redacted>"
-
-  def __init__(self, value: str = ""):
-    self._value = value or ""
-
-  def reveal(self) -> str:
-    """The raw credential.
-
-    Call this at the point of use -- inside the request call -- and never bind
-    the result to a name, or the value is back in a frame.
-    """
-    return self._value
-
-  def scrub(self, text: str) -> str:
-    """`text` with the credential replaced by the placeholder.
-
-    Provider and transport error text is returned to the caller, so this runs
-    before that text is put in an `error` field.
-    """
-    if not self._value:
-      return text
-    return text.replace(self._value, self.PLACEHOLDER)
-
-  def __repr__(self) -> str:
-    return self.PLACEHOLDER
-
-  __str__ = __repr__
-
-  def __bool__(self) -> bool:
-    return bool(self._value)
 
 
 def get_api_key() -> Secret:

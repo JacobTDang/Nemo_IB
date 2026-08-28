@@ -133,6 +133,14 @@ silently absent at runtime. `tools/mcp_http.py` was missed exactly this way on
 its first run. The build-time import check now covers it, so the build fails
 rather than the container.
 
+A new top-level *package* is the same hazard twice over, because the build has
+two stages and each names what it copies. `common/` — two files, no imports,
+holding the `Secret` credential wrapper that `finnhub`, `fred` and `altdata`
+all read a key through — has a `COPY` line in each.
+`testing/test_server_dependencies_are_declared.py` now walks the shipped
+servers' imports against both lists, so a package added to one and not the
+other fails a test rather than a container.
+
 Proxmox VE is x86-64 only, so a homelab image must be built for `linux/amd64`.
 Building on Apple Silicon without `--platform` produces an arm64 image that will
 not run there.
@@ -315,8 +323,8 @@ docker compose --env-file ../.env run --rm research-scan
 Cron lines, in the order they should run:
 
 ```cron
-30 22 * * 1-5 cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-daily.lock docker compose --env-file ../.env run --rm research-daily
- 0 23 * * 1-5 cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-scan.lock docker compose --env-file ../.env run --rm research-scan
+CRON_TZ=UTC
+30 22 * * 1-5 cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-daily.lock docker compose --env-file ../.env run --rm research-daily && flock -n /var/lock/nemo-research-scan.lock docker compose --env-file ../.env run --rm research-scan
 */20 13-23 * * 1-5 cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-watch.lock docker compose --env-file ../.env run --rm research-watch
  0  7 * * 6 cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-score.lock docker compose --env-file ../.env run --rm research-score
  0  9 * * 6 cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-announce.lock docker compose --env-file ../.env run --rm research-announce
@@ -353,8 +361,63 @@ A reboot mid-job does **not** block the next run, and that part is well built:
 started-but-unfinished row as a gap. There is no lock file or run marker to go
 stale.
 
-Order matters between the first two: the scan reads the universe and the prices
-the recorder wrote that evening, so a scan that runs first sees yesterday.
+### Both clocks are UTC, and the block above says so
+
+Every service in the compose file sets `TZ=UTC`, written out rather than
+interpolated. `research/daily_job._today()` is UTC unconditionally and
+`python:3.12-slim` sets no `TZ` at all, so a container's local time used to be
+UTC by accident; `${TZ:-UTC}` would have left the operator's environment able to
+move it, which is the same mismatch by another route.
+
+That pin stops inside the container. The cron lines run on the **host**, in
+host-local time, and nothing in this repo can reach the host's crontab — which
+is why the block opens with `CRON_TZ=UTC`. Vixie-derived crons (cronie on
+RHEL-alikes, Debian's `cron`) read it and interpret every line below it as UTC.
+If yours does not — `busybox` crond ignores it, and a systemd timer never sees
+it — set the host itself to UTC with `timedatectl set-timezone UTC` and read the
+times below as UTC either way.
+
+The cost of getting it wrong is issue #28, and it is not a small one. On an
+`America/New_York` host, 22:30 is 02:30 UTC the next day, so `as_of` is
+tomorrow, `_fetch_bars` returns SPY through today, and the recorder concludes
+the exchange was shut. Zero bars, `status="closed"`, exit 0, and `missing_days`
+counting the night as covered — every night, indefinitely. The recorder now
+refuses a session that has not happened yet rather than filing it as a holiday,
+so this fails loudly now; pinning both clocks is what stops it arising.
+
+`research-backup` gets the pin for a smaller reason of the same shape: it names
+its file `pit-<date>.db` from `date.today()`, which is local, so a container an
+hour the wrong side of midnight writes a name for a day nobody backed up and
+the fourteen-file window then keeps the wrong ones.
+
+### Why the scan is chained to the recorder rather than timed after it
+
+The first line runs two jobs, joined by `&&`. That used to be two lines thirty
+minutes apart — `30 22` and `0 23` — which is a guess, not a dependency.
+
+The recorder does 15+ yfinance batches with up to three retries at 5s and 10s
+backoff, then screens all 10,388 registrants with one `sqlite3.connect()` per
+name, then consensus. On the four `--bootstrap` nights it also pulls 730 days
+for 3,000 of them. Overrunning half an hour there is close to certain, and
+nothing about the second line noticed.
+
+What a scan that starts early does is the part worth stating, because every
+piece of it is behaving correctly. `universe_as_of` returns the last membership
+row on or before the date, so a store without tonight's row answers with
+yesterday's — which is exactly what a point-in-time read is for. `record_scan`
+is append-only, so the book filed off that stale universe cannot be corrected
+later; a re-run only reports `superseded`. Two right decisions, and between them
+a permanently wrong book logged `status="ok"`.
+
+The scanner now consults the run log and raises `RecorderNotRunning` rather than
+filing that book, which turns a wrong record into a failed run. That is better
+and it is not enough: a failed run every bootstrap night is still an outage.
+`&&` is what makes "after" mean after — the scan cannot start until the recorder
+has exited, and does not start at all if it exited non-zero.
+
+Both halves keep their own `flock`. The chain holds the recorder's lock for the
+whole evening, and the scan's lock is what stops a hand-started re-run against a
+past date from opening a second container on the same database.
 
 `research-announce` reads Item 2.02 filings for the announcement date and the
 hour it landed, which is what decides whether the reaction is that session or

@@ -1,5 +1,11 @@
 from openai import OpenAI, APIError, AuthenticationError, RateLimitError, APIConnectionError, APITimeoutError, NotFoundError
 from .groq_template import CredentialsMissing
+
+# The redacting credential wrapper this module introduced (issue #17). It now
+# lives in common/secret.py, which imports nothing -- so the six other modules
+# that hold a credential can reach it without reaching this one, and its
+# openai/ollama/httpx imports and stdout reconfiguration.
+from common.secret import Secret
 import httpx
 import os, sys, json, re, time
 from threading import Lock
@@ -48,56 +54,6 @@ class CredentialRejected(RuntimeError):
     Distinct from a model being absent. Raised rather than returned so a pool
     cannot be assembled out of failed probes.
     """
-
-
-class Secret:
-  """A credential that renders as a placeholder instead of as itself.
-
-  pytest prints a frame's arguments at the head of every traceback entry, and
-  every local under --showlocals. So a key sitting in a parameter or a variable
-  is written to stdout by the first test that fails anywhere below it: the live
-  OpenRouter key went into CI logs, pasted terminals and captured artefacts
-  that way (issue #17).
-
-  Suppressing frame rendering in pytest configuration would have fixed pytest
-  and nothing else -- a log line, a debugger, a crash reporter and a print
-  written next year are the same disclosure by another route. Keeping the value
-  behind reveal() leaves nothing renderable to render, which closes all of them
-  at once.
-  """
-  __slots__ = ("_value",)
-
-  PLACEHOLDER = "<redacted>"
-
-  def __init__(self, value: str = ""):
-    self._value = value or ""
-
-  def reveal(self) -> str:
-    """The raw credential.
-
-    Call this at the point of use -- an SDK constructor, a request header --
-    and never bind the result to a name, or the value is back in a frame.
-    """
-    return self._value
-
-  def scrub(self, text: str) -> str:
-    """`text` with the credential replaced by the placeholder.
-
-    Provider error bodies are quoted into the messages we raise and print. A
-    provider that echoed the offending credential back would otherwise put it
-    straight into our own diagnostics.
-    """
-    if not self._value:
-      return text
-    return text.replace(self._value, self.PLACEHOLDER)
-
-  def __repr__(self) -> str:
-    return self.PLACEHOLDER
-
-  __str__ = __repr__
-
-  def __bool__(self) -> bool:
-    return bool(self._value)
 
 
 def _openrouter_credential() -> Secret:

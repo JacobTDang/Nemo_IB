@@ -64,6 +64,26 @@ x-filing-cache-env: &filing-cache-env
   NEMO_FILING_CACHE_CAP_MB: ${NEMO_FILING_CACHE_CAP_MB:-360}
   NEMO_FILING_CACHE_INTERVAL_S: ${NEMO_FILING_CACHE_INTERVAL_S:-300}
 
+# The clock, pinned on every service in the file.
+#
+# research/daily_job._today() is UTC unconditionally, and python:3.12-slim sets
+# no TZ, so a container's local time was UTC by accident rather than by
+# instruction. Issue #28 is what an unpinned clock costs: the cron line runs on
+# the HOST, in host-local time, so on an America/New_York box a 22:30 run is
+# 02:30 UTC the next day, as_of comes out as tomorrow, and the recorder writes
+# zero bars and reports "the exchange was closed" -- every night, exiting 0.
+#
+# Pinning here does not reach the host's crontab, and that half is documented
+# in deploy/README.md (CRON_TZ, and what to do if your cron ignores it). What
+# it does fix is everything inside the container that reads a local time, so
+# there is exactly one clock in play rather than two.
+#
+# Written out rather than ${TZ:-UTC}. An interpolated default is not a pin: it
+# leaves the operator's environment able to move the container's clock away
+# from the UTC the code assumes, which is the same mismatch by another route.
+x-clock-env: &clock-env
+  TZ: "UTC"
+
 # What every server gets, and no more. Merged into each service's own
 # `environment:` with a nested `<<:`, not inherited from the *server anchor
 # below: a YAML merge key is shallow, so a service that writes its own
@@ -71,7 +91,7 @@ x-filing-cache-env: &filing-cache-env
 # adding SEC_EMAIL to one server would silently drop MCP_AUTH_TOKEN from it and
 # the container would refuse to start.
 x-server-env: &server-env
-  <<: *filing-cache-env
+  <<: [*filing-cache-env, *clock-env]
   # Set MCP_LOG_RESPONSES=1 to echo response payloads into `docker logs`.
   # Off by default: bodies are large and the logs land on the host disk.
   MCP_LOG_RESPONSES: ${MCP_LOG_RESPONSES:-0}
@@ -249,7 +269,7 @@ services:
   # batch job is a loop that re-reads the House Clerk forever.
   #
   #   docker compose --env-file ../.env run --rm congress-sync                  # incremental
-  #   docker compose --env-file ../.env run --rm congress-sync --house 2024 2025 2026 --senate
+  #   docker compose --env-file ../.env run --rm congress-sync --house 2024 2025 2026 --senate --senate-annual
   #   docker compose --env-file ../.env run --rm congress-sync --status
   #
   # Safe to re-run and safe to cron: filings already parsed are never
@@ -266,9 +286,21 @@ services:
     profiles: ["sync"]
     restart: "no"
     entrypoint: ["python", "-m", "tools.altdata_server.congress_sync"]
-    command: ["--house", "2026", "--senate", "--days", "90"]
+    # `--house` with no years, deliberately. The Clerk's PTR archives are per
+    # calendar year, so the `2026` that used to be written here would have
+    # stopped fetching House filings on 2027-01-01 -- and quietly, because
+    # coverage() reports complete when every filing the job knows about is
+    # parsed, and it would no longer know about any. main() reads the years off
+    # the clock instead: this year, and the one before it for the January
+    # carry-over, since a PTR for a December trade is filed into the previous
+    # year's archive.
+    #
+    # `--senate-annual` is here because the holdings are otherwise whatever the
+    # first backfill left behind: without it the nightly run refreshes the
+    # trades and never the positions they move.
+    command: ["--house", "--senate", "--senate-annual", "--days", "90"]
     environment:
-      <<: *filing-cache-env
+      <<: [*filing-cache-env, *clock-env]
       NEMO_CONGRESS_DB: /app/data/congress.db
       SEC_EMAIL: ${SEC_EMAIL:-}
     volumes:
@@ -303,15 +335,26 @@ services:
   # does not run is a hole no later run can fill, which is why it exits
   # non-zero on a failed stage -- so the scheduler can say so.
   #
-  # After the close, allowing for late consolidated prints:
-  #   30 22 * * 1-5 cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-daily.lock docker compose --env-file ../.env run --rm research-daily
+  # After the close, allowing for late consolidated prints -- with the scan
+  # chained onto the same line rather than given a clock time of its own:
+  #   30 22 * * 1-5 cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-daily.lock docker compose --env-file ../.env run --rm research-daily && flock -n /var/lock/nemo-research-scan.lock docker compose --env-file ../.env run --rm research-scan
+  #
+  # This was two lines thirty minutes apart, which is a guess rather than a
+  # dependency. The recorder does 15+ yfinance batches with retries, screens
+  # 10,388 registrants one connection at a time and then does consensus; on a
+  # --bootstrap night it also pulls 730 days for 3,000 names, and overrunning
+  # half an hour there is close to certain. A scan that starts early reads
+  # yesterday's universe -- correctly, because that is what a point-in-time
+  # read does -- and files a book that record_scan will never let anyone
+  # rewrite. `&&` is what makes "after" mean after; it also means a recorder
+  # that exited non-zero stops the scan instead of feeding it half a night.
   research-daily:
     image: ${NEMO_IMAGE:-nemo-data:local}
     profiles: ["sync"]
     restart: "no"
     entrypoint: ["python", "-m", "research.daily_job"]
     environment:
-      <<: *filing-cache-env
+      <<: [*filing-cache-env, *clock-env]
       NEMO_PIT_DB: /app/data/pit.db
       SEC_EMAIL: ${SEC_EMAIL:-}
       FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
@@ -333,15 +376,18 @@ services:
   #   docker compose --env-file ../.env run --rm research-scan
   #   docker compose --env-file ../.env run --rm research-scan --as-of 2026-08-26
   #
-  # After the recorder, which it reads:
-  #   0 23 * * 1-5 cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-scan.lock docker compose --env-file ../.env run --rm research-scan
+  # It has no cron line of its own. The recorder's line above runs it, chained
+  # with `&&`, because "after the recorder" is a dependency and a second clock
+  # time cannot express one. Keeping its own flock in that chain still matters:
+  # a re-run against a past date, started by hand while the nightly chain is
+  # working, is a second container on the same database.
   research-scan:
     image: ${NEMO_IMAGE:-nemo-data:local}
     profiles: ["sync"]
     restart: "no"
     entrypoint: ["python", "-m", "research.scanner"]
     environment:
-      <<: *filing-cache-env
+      <<: [*filing-cache-env, *clock-env]
       NEMO_PIT_DB: /app/data/pit.db
       SEC_EMAIL: ${SEC_EMAIL:-}
     volumes:
@@ -373,7 +419,7 @@ services:
     restart: "no"
     entrypoint: ["python", "-m", "research.activist_watch"]
     environment:
-      <<: *filing-cache-env
+      <<: [*filing-cache-env, *clock-env]
       NEMO_PIT_DB: /app/data/pit.db
       SEC_EMAIL: ${SEC_EMAIL:-}
       NAME: ${NAME:-}
@@ -407,6 +453,7 @@ services:
     restart: "no"
     entrypoint: ["python", "-m", "research.scoring"]
     environment:
+      <<: *clock-env
       NEMO_PIT_DB: /app/data/pit.db
     volumes:
       - research-data:/app/data
@@ -446,7 +493,7 @@ services:
     restart: "no"
     entrypoint: ["python", "-m", "research.seed_consensus"]
     environment:
-      <<: *filing-cache-env
+      <<: [*filing-cache-env, *clock-env]
       NEMO_PIT_DB: /app/data/pit.db
       SEC_EMAIL: ${SEC_EMAIL:-}
       FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
@@ -478,7 +525,7 @@ services:
     restart: "no"
     entrypoint: ["python", "-m", "research.announcements"]
     environment:
-      <<: *filing-cache-env
+      <<: [*filing-cache-env, *clock-env]
       NEMO_PIT_DB: /app/data/pit.db
       SEC_EMAIL: ${SEC_EMAIL:-}
       FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
@@ -540,6 +587,12 @@ services:
             path.unlink()
         print(f"wrote {dest} ({dest.stat().st_size} bytes), "
               f"removed {len(stale)} older than the last 14")
+    # The only key it gets, and the only one it reads: the backup file is named
+    # `pit-<date>.db` off `datetime.date.today()`, which is local time. On a
+    # container an hour the other side of midnight that is a name for a day
+    # nobody backed up, and the fourteen-file window then keeps the wrong ones.
+    environment:
+      <<: *clock-env
     volumes:
       - research-data:/app/data
       - ${NEMO_BACKUP_DIR:-/srv/nemo/backups}:/backups

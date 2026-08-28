@@ -47,14 +47,24 @@ _BODY = "synthetic0000"
 
 
 # ---------------------------------------------------------------------------
-# Secret, in each module that carries one
+# Secret, in each module that holds one
 # ---------------------------------------------------------------------------
-# `Secret` is mirrored into each module rather than imported: agent/groq_template
-# is imported *by* agent/openrouter_template (importing back is a cycle),
-# Execution_Agent is a 112-module import that must not grow the 1146-module LLM
-# layer to reach a value class, and tools/news_agregator + tools/alpaca_server
-# import nothing from agent/ today. Mirrored or not, every copy must behave
-# identically, so they are tested as one.
+# `Secret` was mirrored into each of these modules rather than imported:
+# agent/groq_template is imported *by* agent/openrouter_template (importing
+# back is a cycle), Execution_Agent is a 112-module import that must not grow
+# the 1146-module LLM layer to reach a value class, and tools/news_agregator +
+# tools/alpaca_server import nothing from agent/. Every one of those is an
+# objection to importing that *module*, not to importing the type, so issue #61
+# moved it to `common/secret.py`, which imports nothing and can therefore be
+# imported from anywhere.
+#
+# The list stays. It is no longer five implementations to compare -- the
+# fixture asserts they are one object, and that a module has not quietly grown
+# a local one back -- but it is still five modules that each have to keep
+# *naming* the type, because `mod.Secret` is what their own callers and the
+# tests below reach for. Where the single definition lives, and the two
+# properties that let it, are held by
+# testing/test_the_credential_type_has_one_home.py.
 
 _SECRET_HOMES = [
   "agent.Execution_Agent",
@@ -67,14 +77,19 @@ _SECRET_HOMES = [
 
 @pytest.fixture(params=_SECRET_HOMES)
 def secret_cls(request):
-  """The `Secret` mirror carried by one of the modules in the issue.
+  """The `Secret` each of these modules names, which must be the shared one.
 
-  Imported here rather than at module scope so a module that has not grown one
-  yet fails this fixture's tests instead of erroring collection for the file.
+  Imported here rather than at module scope so a module that has lost the name
+  fails this fixture's tests instead of erroring collection for the file.
   """
+  from common.secret import Secret as Shared
+
   module = importlib.import_module(request.param)
   cls = getattr(module, "Secret", None)
   assert cls is not None, f"{request.param} carries no Secret"
+  assert cls is Shared, (
+    f"{request.param} carries a Secret of its own again. Two implementations "
+    f"of a redaction primitive drift, and the drift shows up as the leak.")
   return cls
 
 

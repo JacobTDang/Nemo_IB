@@ -61,6 +61,12 @@ COPY agent/exposure_analyzer.py ./agent/
 COPY agent/backtest_engine.py ./agent/
 COPY state/ ./state/
 COPY knowledge/ ./knowledge/
+# Two files, no imports, and every server that reads a credential needs one of
+# them: `Secret` used to be copied into each module for the same reason this
+# image copies only three files out of agent/ -- reaching the original would
+# have dragged openai and ollama in behind it. Small enough to copy wholesale,
+# and it must be here or finnhub, fred and altdata all fail to import.
+COPY common/ ./common/
 
 # The tool cache lives here; mount a volume so it survives container replacement.
 RUN mkdir -p /app/db_cache
@@ -101,6 +107,7 @@ COPY --from=base /app/.venv /app/.venv
 COPY --from=base /app/tools /app/tools
 COPY --from=base /app/research /app/research
 COPY --from=base /app/agent /app/agent
+COPY --from=base /app/common /app/common
 COPY --from=base /app/state /app/state
 COPY --from=base /app/knowledge /app/knowledge
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh

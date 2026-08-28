@@ -17,6 +17,7 @@ Neither is dropped. A filing absent from the store and a filing that could not
 be read look identical to a query and mean opposite things.
 
 Usage:
+    python -m tools.altdata_server.congress_sync --house           # this year and last
     python -m tools.altdata_server.congress_sync --house 2026
     python -m tools.altdata_server.congress_sync --house 2024 2025 2026
     python -m tools.altdata_server.congress_sync --senate --days 90
@@ -328,7 +329,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                     "local store. Safe to re-run: nothing already parsed is "
                     "fetched twice.")
     parser.add_argument("--house", nargs="*", type=int, metavar="YEAR",
-                        help="House PTR years to ingest, e.g. --house 2025 2026")
+                        help="House PTR years to ingest, e.g. --house 2025 2026. "
+                             "With no years: the current calendar year and the "
+                             "one before it")
     parser.add_argument("--senate", action="store_true",
                         help="Ingest recent Senate PTRs (trades)")
     parser.add_argument("--senate-annual", action="store_true",
@@ -363,6 +366,25 @@ def main(argv: Optional[List[str]] = None) -> int:
                 count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
                 print(f"{table+':':10} {count}")
         return 0
+
+    # `--house` with no years, which is what the nightly cron line runs. A
+    # literal year here is a pipeline with an expiry date: the Clerk's PTR
+    # archives are per calendar year, so a hard-coded 2026 stops fetching on
+    # 2027-01-01 while coverage() goes on reporting complete -- every filing
+    # the job knows about was parsed, and it no longer knows about any.
+    #
+    # The prior year is asked for as well, not out of caution. A PTR for a
+    # December trade is filed in January and lands in the *previous* year's
+    # archive, so a run that asked only for the current year would miss every
+    # January carry-over. Re-reading a year already ingested costs one index
+    # fetch: nothing already parsed is fetched twice.
+    #
+    # `None` is the flag absent; `[]` is the flag present with no years. Only
+    # the second gets a default, so `--senate` alone still means the Senate
+    # alone.
+    if args.house == []:
+        this_year = datetime.now(timezone.utc).year
+        args.house = [this_year - 1, this_year]
 
     if not args.house and not args.senate and not args.senate_annual:
         parser.error("nothing to do: pass --house YEAR..., --senate, "

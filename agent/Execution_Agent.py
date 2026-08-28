@@ -24,54 +24,11 @@ from state.positions import (
   open_position, close_position, position_for_ticker,
 )
 
-
-class Secret:
-  """A credential that renders as a placeholder instead of as itself.
-
-  pytest prints a frame's arguments at the head of every traceback entry, and
-  every local under --showlocals. A key sitting in a variable is therefore
-  written to stdout by the first test that fails anywhere below it -- and the
-  keys here are the *broker* credentials, which can move money.
-
-  Mirrored from agent/openrouter_template.py (issue #17) rather than imported
-  from it. This module is a 112-module import today; agent.openrouter_template
-  drags in the LLM layer -- openai, ollama, httpx -- for 1146, and the one
-  thing in the codebase that talks to the broker should not need any of it to
-  reach a value class. See that file for the full reasoning behind the type.
-  """
-  __slots__ = ("_value",)
-
-  PLACEHOLDER = "<redacted>"
-
-  def __init__(self, value: str = ""):
-    self._value = value or ""
-
-  def reveal(self) -> str:
-    """The raw credential.
-
-    Call this at the point of use -- the TradingClient constructor -- and
-    never bind the result to a name, or the value is back in a frame.
-    """
-    return self._value
-
-  def scrub(self, text: str) -> str:
-    """`text` with the credential replaced by the placeholder.
-
-    Broker error text is returned to the caller in the `error` field of every
-    method below. A broker that quoted the offending credential back would
-    otherwise put it into a result that travels further than any log line.
-    """
-    if not self._value:
-      return text
-    return text.replace(self._value, self.PLACEHOLDER)
-
-  def __repr__(self) -> str:
-    return self.PLACEHOLDER
-
-  __str__ = __repr__
-
-  def __bool__(self) -> bool:
-    return bool(self._value)
+# The credentials read below are the *live* broker ones. Secret was mirrored
+# here to avoid reaching openrouter_template -- a 112-module import growing to
+# 1146 for a value class. common/secret.py imports nothing, so it costs this
+# module two modules and no LLM SDK.
+from common.secret import Secret
 
 
 class Execution_Agent:

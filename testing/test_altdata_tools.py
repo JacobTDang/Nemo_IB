@@ -766,19 +766,23 @@ def test_no_way_of_rendering_the_credential_shows_its_value(render):
         "part of the value survived rendering"
 
 
-def test_the_credential_type_matches_the_one_it_was_copied_from():
-    """`Secret` is defined twice on purpose, so this pins the copy to the
-    original. Two implementations of a redaction primitive that drift apart
-    are worse than one, and the divergence would only show up in the leak."""
-    from agent.openrouter_template import Secret as Shared
-    from tools.altdata_server.server import Secret as Local
+def test_the_credential_type_is_the_shared_one_and_not_a_copy():
+    """This used to compare a local copy against the original field by field,
+    because `Secret` was defined twice on purpose: the original lives in
+    `agent/openrouter_template.py`, which hangs two LLM SDKs off the import
+    graph and calls `sys.stdout.reconfigure()` on the way past -- and this is
+    an MCP stdio server, where stdout is the wire.
 
-    assert Local(_CONGRESS_SENTINEL).reveal() == Shared(_CONGRESS_SENTINEL).reveal()
-    assert repr(Local(_CONGRESS_SENTINEL)) == repr(Shared(_CONGRESS_SENTINEL))
-    assert bool(Local("")) is bool(Shared("")) is False
-    echoed = f"401: key {_CONGRESS_SENTINEL} rejected"
-    assert (Local(_CONGRESS_SENTINEL).scrub(echoed)
-            == Shared(_CONGRESS_SENTINEL).scrub(echoed))
+    Issue #61 gave the type a home that imports nothing (`common/secret.py`),
+    so there is no copy left to pin. Identity is the stronger assertion: a
+    field-by-field comparison only catches drift in the fields someone thought
+    to compare.
+    """
+    from common.secret import Secret as Shared
+    from tools.altdata_server.server import Secret as Here
+
+    assert Here is Shared, (
+        "tools/altdata_server/server.py carries its own Secret again")
 
 
 def test_the_server_binds_no_unwrapped_congress_credential():

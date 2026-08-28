@@ -44,24 +44,41 @@ FIRST_PARTY = {"tools", "research", "agent", "state", "knowledge"}
 
 # Keys set on a service ahead of the code that would read them.
 #
-# `tools/filing_cache.py` is the only module that reads either, and it is
+# `tools/filing_cache.py` is the only module that reads either, and it was
 # imported by `tools/mcp_http.py` -- the HTTP app -- and by nothing the batch
 # jobs run. The jobs drive edgartools into the same 512MB `/root/.edgar` tmpfs
-# that filled on the servers, so the cap is declared on them too; what is still
-# missing is the interval prune call from the jobs themselves. Until that
-# lands, these two are configuration that nothing reads, which is exactly what
-# the rest of this file exists to forbid -- so they are listed here by name
-# rather than waved through by a pattern.
+# that filled on the servers, so the cap was declared on them too, ahead of any
+# code to honour it.
+#
+# `research-watch` and `research-announce` now do: both call
+# `filing_cache.prune_if_due()` between names, so both have left this list. The
+# three below still have no prune call, and until they get one these are
+# configuration that nothing reads -- which is exactly what the rest of this
+# file exists to forbid, so they are listed here by name rather than waved
+# through by a pattern.
 DECLARED_AHEAD_OF_THE_CODE = {
     "NEMO_FILING_CACHE_CAP_MB": {
-        "congress-sync", "research-daily", "research-scan", "research-watch",
-        "research-announce",
+        "congress-sync", "research-daily", "research-scan",
     },
     "NEMO_FILING_CACHE_INTERVAL_S": {
-        "congress-sync", "research-daily", "research-scan", "research-watch",
-        "research-announce",
+        "congress-sync", "research-daily", "research-scan",
     },
 }
+
+# Read by the platform rather than by any module here, so the import walk below
+# will never find it and is not the right question to ask about it.
+#
+# `TZ` is what the C library consults when it turns a timestamp into a local
+# one -- `datetime.date.today()`, `time.localtime()` and everything under them.
+# It carries no credential and grants no access, so the reasoning that makes an
+# unread key dangerous does not apply: an unread key is a secret handed out for
+# nothing, and this one is a setting. It is checked by
+# `test_every_service_pins_the_clock` instead, which is a stronger question --
+# not "does something read it" but "is it the same value everywhere".
+#
+# Deliberately a named set of one rather than a pattern. The next key that
+# wants in has to be argued for here.
+READ_BY_THE_PLATFORM = {"TZ"}
 
 
 # --------------------------------------------------------------- the compose file
@@ -235,7 +252,7 @@ def test_no_service_is_handed_the_whole_env_file(services):
     COMPOSE.read_text())["services"]))
 def test_a_service_declares_only_keys_its_own_code_reads(name, services):
     service = services[name]
-    declared = _declared(service)
+    declared = _declared(service) - READ_BY_THE_PLATFORM
     if not declared:
         return
     module = _module_run_by(service)
@@ -352,3 +369,32 @@ def test_the_batch_services_write_nowhere_uncapped(services):
         assert {"/root/.edgar", "/app/db_cache"} <= mounts, (
             f"`{name}` has no tmpfs for {sorted({'/root/.edgar', '/app/db_cache'} - mounts)}, "
             f"so it writes to the container's writable layer on host disk")
+
+
+# ---------------------------------------------------------------- the clock
+#
+# Not a credential, and the only key in this file no first-party module reads:
+# the C library reads TZ when it turns a timestamp into a local one. It is
+# still the compose file's to declare, because nothing else here pins it.
+#
+# `research/daily_job._today()` is UTC unconditionally, and `python:3.12-slim`
+# has no TZ set, so a container's local time is UTC by accident rather than by
+# instruction. Issue #28 is what an unpinned clock costs: the cron line runs on
+# the host in host-local time, so on an America/New_York box a 22:30 run is
+# 02:30 UTC the next day, `as_of` is tomorrow, and every night records zero
+# bars and reports `closed`. The code now refuses that rather than filing it,
+# and this pins the half the code cannot reach.
+
+def test_every_service_pins_the_clock(services):
+    """One value, written out, not `${TZ:-UTC}`.
+
+    An interpolated default is not a pin: it leaves the operator's environment
+    able to move the container's clock away from the UTC the code assumes,
+    which is the same class of mismatch as the host timezone.
+    """
+    unpinned = sorted(name for name, service in services.items()
+                      if (service.get("environment") or {}).get("TZ") != "UTC")
+    assert not unpinned, (
+        f"these services do not pin TZ to UTC: {unpinned}. The recorder dates "
+        f"its rows off a UTC clock; a container on another one dates them "
+        f"wrong and says nothing")

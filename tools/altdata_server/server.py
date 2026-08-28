@@ -58,6 +58,13 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
+# The redacting credential wrapper, imported rather than copied. This is an
+# MCP *stdio* server -- stdout is its wire -- and agent.openrouter_template,
+# where Secret used to live, hangs two LLM SDKs off the import graph and calls
+# sys.stdout.reconfigure() on the way past. common/secret.py imports nothing
+# and touches no stream.
+from common.secret import Secret
+
 from tools.altdata_server.text_utils import (
     text_contains, count_matches, extract_dollar_amounts, parse_news_date,
     # The same compiled pattern and units that produce the VALUES, borrowed so
@@ -1882,54 +1889,6 @@ def _govtrack_fetch_bills(keywords: List[str], congress: int,
                           "total_count": (data.get("meta") or {}).get("total_count")}
 
     return _fetch_keywords(one, keywords)
-
-
-class Secret:
-    """A credential that renders as a placeholder instead of as itself.
-
-    pytest prints a frame's arguments at the head of every traceback entry, and
-    every local under --showlocals. So a key sitting in a parameter or a variable
-    is written to stdout by the first test that fails anywhere below it. Keeping
-    the value behind reveal() leaves nothing renderable to render, which closes
-    a log line, a debugger and a crash reporter at the same time.
-
-    Copied from agent.openrouter_template rather than imported. `tools/` does
-    import from `agent/` elsewhere, so the layering allows it -- but that module
-    pulls in the openai and ollama SDKs at import time and calls
-    sys.stdout.reconfigure(errors='replace') as a side effect of being imported.
-    This is an MCP stdio server: stdout is its wire. A credential helper must not
-    reach into the transport or hang two LLM SDKs off a data server's import
-    graph. testing/test_altdata_tools.py pins this copy to the original so the
-    two cannot drift.
-    """
-    __slots__ = ("_value",)
-
-    PLACEHOLDER = "<redacted>"
-
-    def __init__(self, value: str = ""):
-        self._value = value or ""
-
-    def reveal(self) -> str:
-        """The raw credential.
-
-        Call this at the point of use and never bind the result to a name, or the
-        value is back in a frame.
-        """
-        return self._value
-
-    def scrub(self, text: str) -> str:
-        """`text` with the credential replaced by the placeholder."""
-        if not self._value:
-            return text
-        return text.replace(self._value, self.PLACEHOLDER)
-
-    def __repr__(self) -> str:
-        return self.PLACEHOLDER
-
-    __str__ = __repr__
-
-    def __bool__(self) -> bool:
-        return bool(self._value)
 
 
 def _congress_credential() -> Secret:

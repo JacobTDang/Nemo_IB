@@ -430,3 +430,106 @@ def test_what_was_read_is_recorded_beside_the_filing(db, house):
             "SELECT content_hash, fetched_at FROM filings").fetchone()
     assert content_hash == "hash-of-0"
     assert fetched_at
+
+
+# ------------------------------------------------- the years the nightly run asks for
+#
+# The nightly cron line passes no arguments, so whatever `main()` defaults to
+# is what actually runs. It defaulted to the literal 2026 written into
+# `deploy/docker-compose.yml`, which means every House PTR filed from
+# 2027-01-01 lands in an annual ZIP nobody fetches -- while `coverage.complete`
+# stays true, because every filing the job *knows about* was parsed. A store
+# that is frozen and reports itself healthy is the failure these two tests
+# exist to prevent.
+
+@pytest.fixture
+def years_asked_for(monkeypatch):
+    """Record the House years `main()` asks for, fetching nothing."""
+    asked = []
+
+    def sync_house(year, **kwargs):
+        asked.append(year)
+        return {"blocked": False}
+
+    monkeypatch.setattr(sync, "sync_house_ptrs", sync_house)
+    monkeypatch.setattr(sync, "sync_senate_ptrs",
+                        lambda **kwargs: {"blocked": False})
+    monkeypatch.setattr(sync, "sync_senate_annuals",
+                        lambda **kwargs: {"blocked": False})
+    return asked
+
+
+def test_house_with_no_years_asks_for_this_year_and_the_one_before(
+        db, years_asked_for):
+    """`--house` with no years is what the cron line runs.
+
+    This year because that is where today's filings are; last year because the
+    Clerk's ZIPs are per calendar year and a PTR for a December trade is filed
+    in January, into the *previous* year's ZIP. Dropping the prior year would
+    lose every January carry-over.
+    """
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    assert sync.main(["--house"]) == 0
+    assert years_asked_for == [now.year - 1, now.year]
+
+
+def test_house_with_years_given_asks_for_exactly_those(db, years_asked_for):
+    """The default must not be added to an explicit backfill."""
+    assert sync.main(["--house", "2024", "2025"]) == 0
+    assert years_asked_for == [2024, 2025]
+
+
+def test_a_run_with_no_house_flag_asks_for_no_house_year(db, years_asked_for):
+    """`--senate` alone still means the Senate alone."""
+    assert sync.main(["--senate"]) == 0
+    assert years_asked_for == []
+
+
+def test_a_run_with_nothing_to_do_is_still_refused(db, years_asked_for):
+    """Defaulting the years must not turn an argument-less run into a backfill
+    of everything: a bare invocation is a mistake and has always said so."""
+    with pytest.raises(SystemExit):
+        sync.main([])
+
+
+# ------------------------------------------------- what the nightly line runs
+#
+# `main()`'s default is only the nightly default if the compose command lets it
+# be one. `command: ["--house", "2026", "--senate", "--days", "90"]` overrode it
+# with the same expiring literal, and the cron line passes no arguments of its
+# own, so the compose file is the last place the year could be pinned.
+
+def test_the_composed_default_pins_no_calendar_year():
+    """A year written into the compose command is a pipeline with an expiry
+    date, and it expires silently -- see main()'s default above."""
+    import re
+
+    command = _composed_congress_sync_command()
+    years = [word for word in command if re.fullmatch(r"(19|20)\d\d", str(word))]
+    assert not years, (
+        f"the congress-sync command pins {years}; House filings stop being "
+        f"fetched the January after")
+
+
+def test_the_composed_default_asks_for_holdings_as_well_as_trades():
+    """Without `--senate-annual` the holdings are whatever the backfill left:
+    the nightly run refreshes the trades and never the positions behind them.
+    """
+    command = _composed_congress_sync_command()
+    assert "--senate-annual" in command, (
+        "the nightly run ingests no annual reports, so holdings never refresh "
+        "after the initial backfill")
+    assert "--senate" in command and "--house" in command
+
+
+def _composed_congress_sync_command():
+    import pathlib
+
+    import yaml
+
+    compose = pathlib.Path(__file__).resolve().parent.parent \
+        / "deploy" / "docker-compose.yml"
+    service = yaml.safe_load(compose.read_text())["services"]["congress-sync"]
+    return [str(word) for word in service["command"]]

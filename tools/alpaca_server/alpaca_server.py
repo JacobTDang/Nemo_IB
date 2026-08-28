@@ -12,51 +12,11 @@ from typing import Dict, List, Optional
 
 from datetime import datetime
 
-
-class Secret:
-    """A credential that renders as a placeholder instead of as itself.
-
-    A key bound to a name is rendered by anything that dumps the frame or the
-    module it lives in -- pytest under --showlocals, a debugger, a crash
-    reporter. Keeping the value behind reveal() leaves nothing renderable to
-    render, which closes all of those at once.
-
-    Mirrored from agent/openrouter_template.py (issue #17) rather than
-    imported from it. Nothing under tools/news_agregator or tools/alpaca_server
-    imports from agent/ today, and agent.openrouter_template is the LLM layer:
-    importing it here would put openai, ollama and httpx into a data-source
-    image that will never run any of them, which is the coupling
-    testing/test_agent_package_boundary.py exists to prevent. See that file
-    for the full reasoning behind the type.
-    """
-    __slots__ = ("_value",)
-
-    PLACEHOLDER = "<redacted>"
-
-    def __init__(self, value: str = ""):
-        self._value = value or ""
-
-    def reveal(self) -> str:
-        """The raw credential.
-
-        Call this at the point of use -- an SDK constructor -- and never bind
-        the result to a name, or the value is back in a frame.
-        """
-        return self._value
-
-    def scrub(self, text: str) -> str:
-        """`text` with the credential replaced by the placeholder."""
-        if not self._value:
-            return text
-        return text.replace(self._value, self.PLACEHOLDER)
-
-    def __repr__(self) -> str:
-        return self.PLACEHOLDER
-
-    __str__ = __repr__
-
-    def __bool__(self) -> bool:
-        return bool(self._value)
+# Imported rather than mirrored: common/secret.py imports nothing, so it crosses
+# no boundary. Reaching agent.openrouter_template for the same class would put
+# openai, ollama and httpx into a data-source image that runs none of them --
+# the coupling testing/test_agent_package_boundary.py exists to prevent.
+from common.secret import Secret
 
 
 class alpaca_client:

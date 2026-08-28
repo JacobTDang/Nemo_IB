@@ -46,3 +46,36 @@ def test_submodule_imports_still_work():
     """The pattern real consumers use must keep working."""
     loaded = _loaded_after("from agent import cache")
     assert any(m == "agent.cache" for m in loaded)
+
+
+# --- the shared credential type, which crosses the boundary on purpose ------
+#
+# `Secret` was copied into seven modules rather than imported, and the reason
+# given for four of them was this file: importing `agent.openrouter_template`
+# for a value class would have put openai, ollama and httpx into a data-source
+# image that runs none of them. Issue #61 removed the copies by removing the
+# reason -- `common/secret.py` imports nothing, so importing it imports
+# nothing. That claim is the one this file is here to check, and it is checked
+# the same way: in a clean interpreter, by measurement.
+
+def test_the_shared_credential_type_imports_nothing_at_all():
+    """Not "nothing heavy" -- nothing. It is imported by every module that
+    holds a credential, on both sides of the boundary, so whatever it pulled in
+    they would all pull in."""
+    loaded = _loaded_after("import common.secret")
+    assert loaded <= {"common", "common.secret"}, (
+        f"common.secret pulled in {sorted(loaded - {'common', 'common.secret'})}")
+
+
+def test_a_data_source_module_reaching_it_still_loads_no_llm_layer():
+    """The property the copies existed to preserve, now that they are gone."""
+    for module in ("tools.news_agregator.fred_utils",
+                   "tools.news_agregator.finnhub_utils",
+                   "tools.altdata_server.server"):
+        loaded = _loaded_after(f"import {module}")
+        llm = {m for m in loaded
+               if m.split(".")[0] in ("openai", "ollama", "langgraph",
+                                      "langchain")
+               or "groq_template" in m or "openrouter_template" in m
+               or m.endswith("_Agent")}
+        assert not llm, f"{module} now pulls in the LLM layer: {sorted(llm)}"

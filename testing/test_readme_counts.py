@@ -285,3 +285,52 @@ def test_every_named_volume_the_page_mentions_exists(deploy_doc, compose):
         assert re.search(rf"^  {volume}:$", compose, re.M), (
             f"the page names the volume `{volume}`, which compose does not "
             f"declare")
+
+
+# --- the one ordering the stack cannot express as two clock times -----------
+#
+# `research-daily` at 30 22 and `research-scan` at 0 23 is a thirty-minute
+# guess, not a dependency. The recorder does 15+ yfinance batches with retries,
+# then screens 10,388 registrants one connection at a time, then consensus --
+# and on a `--bootstrap` night it pulls 730 days for 3,000 names as well, where
+# overrunning half an hour is close to certain.
+#
+# `universe_as_of` answers a scan that starts early with yesterday's
+# membership, because falling back to the last row on or before the date is
+# what a point-in-time read is *for*. `record_scan` is append-only for an
+# equally good reason: a filed decision cannot be rewritten later. Both are
+# right; together they file a permanently wrong book off a half-written store
+# and log it `ok`. The scanner now refuses (`RecorderNotRunning`), which turns
+# a wrong book into a failed run -- and a failed run every bootstrap night is
+# still an outage. The schedule is the other half.
+
+def _cron_lines(page):
+    return [(" ".join(schedule.split()), command)
+            for schedule, command in CRON.findall(page)]
+
+
+def test_the_scan_is_chained_behind_the_recorder_not_timed_after_it(deploy_doc):
+    """One line, `&&`, so the scan cannot start until the recorder has
+    finished -- and does not start at all if the recorder failed."""
+    scan_lines = [(schedule, command) for schedule, command in
+                  _cron_lines(deploy_doc) if "research-scan" in command]
+    assert scan_lines, "nothing on the page schedules research-scan"
+    for schedule, command in scan_lines:
+        services = RUNS.findall(command)
+        assert services == ["research-daily", "research-scan"], (
+            f"'{schedule} {command}' runs {services}; the scan has to be "
+            f"chained behind the recorder in one line")
+        assert " && " in command.split("research-daily", 1)[1], (
+            "the two commands are not joined by `&&`, so the scan runs "
+            "whatever the recorder did")
+
+
+def test_nothing_schedules_the_recorder_and_the_scan_at_two_clock_times(
+        deploy_doc):
+    """The failure this replaces: two wall-clock times and no dependency."""
+    timed = [schedule for schedule, command in _cron_lines(deploy_doc)
+             if RUNS.findall(command) in (["research-daily"], ["research-scan"])]
+    assert not timed, (
+        f"{timed} still schedules the recorder or the scan on its own clock "
+        f"time; a recorder that overruns is then a scan on a half-written "
+        f"store")
