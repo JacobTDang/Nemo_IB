@@ -36,8 +36,30 @@ SCREEN_LOOKBACK_SESSIONS = 60
 _SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _today() -> str:
-    return datetime.now(timezone.utc).date().isoformat()
+    return _utc_now().date().isoformat()
+
+
+def _session_is_pending(as_of: str) -> bool:
+    """Whether this run has dated itself ahead of the session it is recording.
+
+    `_today()` is UTC and the schedule is host-local, so a 22:30 run in New
+    York is stamped with tomorrow's date. A day that has not happened hands
+    back exactly what a holiday hands back -- the canary's last bar is the
+    previous session either way -- so no amount of vendor data separates the
+    two and the clock has to. 21:00Z is the end of a session everywhere else
+    in this module and is the end of one here.
+
+    Only a run that took its date from the clock can be wrong about it, which
+    is why a replay's explicit `as_of` is not second-guessed.
+    """
+    if as_of != _today():
+        return False
+    return _utc_now() < datetime.fromisoformat(f"{as_of}T21:00:00+00:00")
 
 
 def _stamp(as_of: str) -> str:
@@ -163,6 +185,7 @@ def _fetch_bars(tickers: Iterable[str], start: Optional[str] = None,
         return {}
 
     out: Dict[str, List[Dict[str, Any]]] = {}
+    canary: List[Dict[str, Any]] = []
     lost: List[str] = []
     batches = [tickers[i:i + FETCH_BATCH_SIZE]
                for i in range(0, len(tickers), FETCH_BATCH_SIZE)]
@@ -186,6 +209,13 @@ def _fetch_bars(tickers: Iterable[str], start: Optional[str] = None,
                 if attempt + 1 < FETCH_RETRIES and FETCH_RETRY_BACKOFF:
                     time.sleep(FETCH_RETRY_BACKOFF * (attempt + 1))
                 continue
+            # Kept from the first batch that answers, not only from the batch
+            # that happens to own it. The canary is appended to the end of the
+            # ask, so the batch that owns it is a batch of one name -- the most
+            # fragile request in the run, and losing it took the market-closed
+            # check and the regime's own price series down with it.
+            if not canary:
+                canary = rows.get(FETCH_CANARY) or []
             if FETCH_CANARY not in batch:
                 rows.pop(FETCH_CANARY, None)
             out.update(rows)
@@ -198,11 +228,29 @@ def _fetch_bars(tickers: Iterable[str], start: Optional[str] = None,
         if FETCH_BATCH_PAUSE and index + 1 < len(batches):
             time.sleep(FETCH_BATCH_PAUSE)
 
+    # A caller who asked for it by name gets it from whichever batch answered.
+    if FETCH_CANARY in tickers and FETCH_CANARY not in out and canary:
+        out[FETCH_CANARY] = canary
     if lost and not out:
         raise RuntimeError(f"every batch failed; first: {lost[0]}")
     if failures is not None:
         failures.extend(lost)
     return out
+
+
+def _quantity(value: Any) -> float:
+    """A count of something, or zero -- never NaN.
+
+    The vendor leaves NaN in the action columns on ordinary sessions, and NaN
+    is truthy: `NaN or 0.0` is NaN, which sails through the
+    `if row.get("split")` guard in `_record_ticker` and then fails
+    `record_corporate_action`'s
+    `value > 0` check, taking the night down mid-list. `_to_as_traded` beside
+    it already ignores the same value, so the two paths disagreed about one
+    number and only one of them said so.
+    """
+    number = float(value or 0.0)
+    return 0.0 if number != number else number
 
 
 def _rows_from_frame(frame: Any, tickers: List[str]
@@ -225,9 +273,9 @@ def _rows_from_frame(frame: Any, tickers: List[str]
                 "trade_date": str(stamp.date()),
                 "open": float(row["Open"]), "high": float(row["High"]),
                 "low": float(row["Low"]), "close": float(row["Close"]),
-                "volume": float(row.get("Volume") or 0.0),
-                "split": float(row.get("Stock Splits") or 0.0),
-                "dividend": float(row.get("Dividends") or 0.0),
+                "volume": _quantity(row.get("Volume")),
+                "split": _quantity(row.get("Stock Splits")),
+                "dividend": _quantity(row.get("Dividends")),
             })
         if rows:
             out[ticker] = rows
@@ -274,35 +322,43 @@ def _to_as_traded(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def _record_ticker(ticker: str, rows: List[Dict[str, Any]], stamp: str,
                    keep=None) -> int:
-    """Actions first, then the bars they explain.
+    """Actions first, then the bars they explain, in one transaction.
 
     Order matters on a cold store: a reader that finds bars without the split
     that shaped them has no way to tell an as-traded series from an adjusted
     one, and this is the only moment both are in hand.
+
+    One connection for both because that order is only worth anything if it
+    cannot be interrupted. Committed separately, a crash in between leaves
+    exactly the state the paragraph above says must never exist -- and on a
+    volume six jobs write to, the interruption is a lock, not a power cut.
     """
-    for row in rows:
-        # Never earlier than the action's own ex-date. On a backfill the window
-        # runs past `as_of` to catch intervening splits, and stamping those at
-        # `as_of` would claim a 2025 split was known in 2024. For a bootstrap
-        # every ex-date is at or before the stamp, so this changes nothing.
-        when = max(stamp, f"{row['trade_date']}T21:00:00Z")
-        if row.get("split"):
-            pit_store.record_corporate_action(
-                ticker, row["trade_date"], "split", float(row["split"]),
-                recorded_at=when)
-        if row.get("dividend"):
-            pit_store.record_corporate_action(
-                ticker, row["trade_date"], "dividend", float(row["dividend"]),
-                recorded_at=when)
-    as_traded = _to_as_traded(rows)
-    if keep is not None:
-        # A past-dated run fetches beyond `as_of` only so the conversion above
-        # can see the splits in between. Those later sessions belong to their
-        # own days, with their own stamps, and writing them under this one
-        # would both misdate them and hand the reader a session that had not
-        # happened yet.
-        as_traded = [r for r in as_traded if keep(r["trade_date"])]
-    return pit_store.record_bars(ticker, as_traded, recorded_at=stamp)
+    with pit_store.connect() as conn:
+        for row in rows:
+            # Never earlier than the action's own ex-date. On a backfill the
+            # window runs past `as_of` to catch intervening splits, and
+            # stamping those at `as_of` would claim a 2025 split was known in
+            # 2024. For a bootstrap every ex-date is at or before the stamp, so
+            # this changes nothing.
+            when = max(stamp, f"{row['trade_date']}T21:00:00Z")
+            if row.get("split"):
+                pit_store.record_corporate_action(
+                    ticker, row["trade_date"], "split", float(row["split"]),
+                    recorded_at=when, conn=conn)
+            if row.get("dividend"):
+                pit_store.record_corporate_action(
+                    ticker, row["trade_date"], "dividend",
+                    float(row["dividend"]), recorded_at=when, conn=conn)
+        as_traded = _to_as_traded(rows)
+        if keep is not None:
+            # A past-dated run fetches beyond `as_of` only so the conversion
+            # above can see the splits in between. Those later sessions belong
+            # to their own days, with their own stamps, and writing them under
+            # this one would both misdate them and hand the reader a session
+            # that had not happened yet.
+            as_traded = [r for r in as_traded if keep(r["trade_date"])]
+        return pit_store.record_bars(ticker, as_traded, recorded_at=stamp,
+                                     conn=conn)
 
 
 def _fetch_calendar(start: str, end: str) -> List[Dict[str, Any]]:
@@ -437,6 +493,20 @@ def record_daily_bars(tickers: List[str],
     # nothing, not a failure, and must not sit in missing_days for years.
     index_rows = fetched.get(FETCH_CANARY) or []
     if index_rows and not any(r["trade_date"] == as_of for r in index_rows):
+        last_session = max(r["trade_date"] for r in index_rows)
+        if _session_is_pending(as_of):
+            # Not a holiday: a session that has not happened yet. Read as a
+            # closed exchange it records nothing, exits 0 and counts the night
+            # as covered -- and on a US-timezone host that is every night, for
+            # as long as nobody reads the run log.
+            detail = (f"this run is dated {as_of} but that session has not "
+                      f"closed yet; {FETCH_CANARY}'s last is {last_session}. "
+                      f"The date came from a UTC clock and the schedule is "
+                      f"host-local")
+            pit_store.finish_run(rows_written=0, status="failed", error=detail)
+            return {"status": "failed", "error": detail, "written": 0,
+                    "covered": 0, "requested": len(tickers),
+                    "failures": failures}
         pit_store.finish_run(
             rows_written=0, status="closed",
             error=f"{FETCH_CANARY} has no session on {as_of}; the exchange "
@@ -458,17 +528,32 @@ def record_daily_bars(tickers: List[str],
             # than the session being recorded, so this is the same absence as
             # above rather than coverage.
             continue
+        # One ticker's write is one ticker's problem. A locked database or a
+        # value the recorder refuses used to propagate out of here, which
+        # abandoned every name after it in the list, left the run log open,
+        # and cost the universe screen and the consensus snapshot that had not
+        # run yet -- and consensus is the one series no later run can refetch.
+        try:
+            written += _record_ticker(ticker, rows, _stamp(as_of),
+                                      keep=lambda d, _o=as_of: d == _o)
+        except Exception as exc:  # noqa: BLE001 - reported, never masked
+            failures.append(f"{ticker}: {type(exc).__name__}: {exc}")
+            continue
+        # After the write, not before it: a session nothing recorded is not
+        # coverage, and counting it here is what would let a night of failed
+        # writes report itself complete.
         covered += 1
-        written += _record_ticker(ticker, rows, _stamp(as_of),
-                                  keep=lambda d, _o=as_of: d == _o)
 
-    _record_probe(fetched, _stamp(as_of),
-                  lambda d, _o=as_of: d == _o, list(tickers))
+    try:
+        _record_probe(fetched, _stamp(as_of),
+                      lambda d, _o=as_of: d == _o, list(tickers))
+    except Exception as exc:  # noqa: BLE001 - reported, never masked
+        failures.append(f"{FETCH_CANARY}: {type(exc).__name__}: {exc}")
 
     status = coverage_status(covered, len(tickers))
-    detail = f"{covered} of {len(tickers)} tickers returned data"
+    detail = f"{covered} of {len(tickers)} tickers recorded"
     if failures:
-        detail = f"{detail}; {len(failures)} batch(es) lost: " \
+        detail = f"{detail}; {len(failures)} lost: " \
                  + " | ".join(failures[:3])
     pit_store.finish_run(rows_written=written, status=status,
                          error=None if status == "ok" and not failures
@@ -512,21 +597,35 @@ def bootstrap_history(tickers: List[str], lookback_days: int = 730,
 
     written = 0
     covered = 0
+    failures: List[str] = []
     for ticker in tickers:
         rows = fetched.get(ticker) or []
         if not rows:
             continue
+        # Guarded for the same reason the nightly loop is, and more so: a
+        # two-year window is where the splits actually are, so this is the loop
+        # a refused action value stops first.
+        try:
+            written += _record_ticker(ticker, rows, _stamp(as_of),
+                                      keep=lambda d, _o=as_of: d <= _o)
+        except Exception as exc:  # noqa: BLE001 - reported, never masked
+            failures.append(f"{ticker}: {type(exc).__name__}: {exc}")
+            continue
         covered += 1
-        written += _record_ticker(ticker, rows, _stamp(as_of),
-                                  keep=lambda d, _o=as_of: d <= _o)
 
-    _record_probe(fetched, _stamp(as_of),
-                  lambda d, _o=as_of: d <= _o, list(tickers))
+    try:
+        _record_probe(fetched, _stamp(as_of),
+                      lambda d, _o=as_of: d <= _o, list(tickers))
+    except Exception as exc:  # noqa: BLE001 - reported, never masked
+        failures.append(f"{FETCH_CANARY}: {type(exc).__name__}: {exc}")
 
     status = coverage_status(covered, len(tickers))
+    detail = f"{covered} of {len(tickers)} returned history"
+    if failures:
+        detail = f"{detail}; {len(failures)} lost: " + " | ".join(failures[:3])
     pit_store.finish_run(rows_written=written, status=status,
-                         error=None if status == "ok"
-                         else f"{covered} of {len(tickers)} returned history")
+                         error=None if status == "ok" and not failures
+                         else detail)
     return {"status": status, "written": written, "covered": covered}
 
 
@@ -648,7 +747,11 @@ def record_consensus_snapshots(as_of: Optional[str] = None,
             # Without a fiscal identity there is nothing to join this to
             # later; the vendor's calendar bucket is not one.
             continue
-        pit_store.record_consensus(
+        # The recorder's own count, not one per row seen. `rows_written` is
+        # the only evidence a night was captured, and consensus is the series
+        # where that matters most -- a replay that changed nothing must not
+        # read like a capture.
+        written += pit_store.record_consensus(
             as_of, row["ticker"], row["fiscal_period"],
             eps_estimate=row.get("eps_estimate"),
             eps_actual=row.get("eps_actual"),
@@ -657,7 +760,6 @@ def record_consensus_snapshots(as_of: Optional[str] = None,
             # Stamped `now`, a consensus run for a past date is invisible to
             # that date and visible to every date after it.
             recorded_at=_stamp(as_of))
-        written += 1
 
         # The announcement itself, once it has happened. `timing` is what makes
         # the table worth having: bmo or amc decides which session is the
@@ -740,12 +842,26 @@ def run_all(as_of: Optional[str] = None,
     asked = nightly_tickers(as_of, registrants)
     results["asked"] = len(asked)
 
+    stages: List[Any] = []
     if bootstrap:
-        results["bootstrap"] = bootstrap_history(asked, as_of=as_of)
+        stages.append(("bootstrap", lambda: bootstrap_history(asked,
+                                                              as_of=as_of)))
+    stages += [("daily_bars", lambda: record_daily_bars(asked, as_of=as_of)),
+               ("universe", lambda: refresh_universe(as_of=as_of)),
+               ("consensus", lambda: record_consensus_snapshots(as_of=as_of))]
 
-    results["daily_bars"] = record_daily_bars(asked, as_of=as_of)
-    results["universe"] = refresh_universe(as_of=as_of)
-    results["consensus"] = record_consensus_snapshots(as_of=as_of)
+    # In order, but not on each other's success. Called as bare statements, an
+    # exception anywhere in the first stage ended the process, and the stage
+    # that never ran was consensus -- the one series that cannot be fetched
+    # again later. A stage that raises is reported as a failed stage, which is
+    # what `main` turns into a non-zero exit; its run-log row stays unfinished,
+    # which `missing_days` already reads as the night it was.
+    for name, stage in stages:
+        try:
+            results[name] = stage()
+        except Exception as exc:  # noqa: BLE001 - reported, never masked
+            results[name] = {"status": "failed",
+                             "error": f"{type(exc).__name__}: {exc}"}
     return results
 
 
@@ -770,6 +886,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--bootstrap", action="store_true",
                         help="pull history first; needed once on a cold store")
     args = parser.parse_args(argv)
+
+    # Nothing else does. The container entry point every batch service
+    # overrides initialises a different database, so the first run on a fresh
+    # volume died on "no such table: run_log" before it fetched anything --
+    # while the suite stayed green, because every test builds the schema in a
+    # fixture. Cheap and idempotent, so it runs every night rather than once.
+    pit_store.init_schema()
 
     kwargs: Dict[str, Any] = {"as_of": args.as_of}
     if args.bootstrap:

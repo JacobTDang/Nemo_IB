@@ -934,3 +934,262 @@ def test_a_row_with_no_announcement_date_is_not_recorded(store, monkeypatch):
 
     daily_job.record_consensus_snapshots(as_of="2026-05-02")
     assert store.announcements_as_of("XYZ", as_of="2026-05-03") == []
+
+
+# --- the first run on a fresh volume ----------------------------------------
+#
+# Nothing in production ever created the tables. Every test here builds them in
+# a fixture, which is exactly why the suite was green while the first
+# `docker compose run --rm research-daily` on a new homelab died on
+# "no such table: run_log" before it fetched anything.
+
+
+def test_a_fresh_store_is_created_by_the_job_itself(tmp_path, monkeypatch):
+    monkeypatch.setenv("NEMO_PIT_DB", str(tmp_path / "fresh.db"))
+    monkeypatch.setattr(daily_job, "_fetch_sec_tickers",
+                        lambda: [{"ticker": "AAPL", "cik": "320193",
+                                  "name": "Apple Inc."}])
+    monkeypatch.setattr(daily_job, "_fetch_bars", lambda tickers, **kw: {
+        "AAPL": _bars("2026-03-03"),
+        daily_job.FETCH_CANARY: _bars("2026-03-03")})
+    monkeypatch.setattr(daily_job, "_fetch_calendar", lambda start, end: [
+        {"ticker": "AAPL", "fiscal_period": "2026Q1", "eps_estimate": 1.0}])
+
+    assert daily_job.main(["--as-of", "2026-03-03"]) == 0
+    assert len(pit_store.bars_as_of("AAPL", "2026-03-04")) == 1
+
+
+# --- a session that has not happened is not a holiday ------------------------
+#
+# `_today()` is UTC and cron is host-local, so on an America/New_York host the
+# 22:30 run is dated tomorrow. The canary then returns a window ending
+# yesterday, no bar carries the run's date, and "the exchange was shut" is the
+# wrong reading of it: the job records nothing, exits 0, and `missing_days`
+# counts the night as covered. A year of that reads as a year of holidays.
+#
+# The two cases are identical in the data -- a holiday leaves the canary's last
+# bar on the previous session too -- so only the clock separates them, and both
+# tests here run the job the way cron does, letting it date itself.
+
+
+def _clock(monkeypatch, moment):
+    from datetime import datetime, timezone
+    monkeypatch.setattr(daily_job, "_utc_now",
+                        lambda: datetime.fromisoformat(moment).replace(
+                            tzinfo=timezone.utc))
+
+
+def test_a_session_that_has_not_happened_is_not_a_holiday(store, monkeypatch):
+    # 22:30 on Monday in New York, which is 02:30 Tuesday in UTC.
+    _clock(monkeypatch, "2026-03-03T02:30:00")
+    monkeypatch.setattr(daily_job, "_fetch_bars", lambda tickers, **kw: {
+        daily_job.FETCH_CANARY: _bars("2026-03-02"),
+        "AAPL": _bars("2026-03-02")})
+
+    result = daily_job.record_daily_bars(["AAPL"])
+
+    assert result["status"] == "failed", (
+        "a run dated ahead of the market was logged as a holiday")
+    run = daily_job.last_run("daily_bars")
+    assert run["status"] == "failed"
+    assert "2026-03-02" in str(run["error"]), (
+        f"the error does not say what the last session was: {run['error']!r}")
+    assert store.missing_days("daily_bars", "2026-03-03", "2026-03-03") == \
+        ["2026-03-03"], "a night that recorded nothing counted as coverage"
+
+
+def test_a_real_holiday_is_still_a_complete_run_over_nothing(store,
+                                                             monkeypatch):
+    """The other side of it. The exchange shuts about ten weekdays a year, and
+    listing those as permanent holes is how the one real gap stops being
+    noticed."""
+    # Thanksgiving evening, after the session that did not happen would have
+    # closed. Nothing is pending: the day is over and the exchange was shut.
+    _clock(monkeypatch, "2026-11-26T22:30:00")
+    monkeypatch.setattr(daily_job, "_fetch_bars", lambda tickers, **kw: {
+        daily_job.FETCH_CANARY: _bars("2026-11-24", "2026-11-25")})
+
+    result = daily_job.record_daily_bars(["AAPL"])
+
+    assert result["status"] == "closed"
+    assert store.missing_days("daily_bars", "2026-11-26", "2026-11-26") == []
+
+
+# --- the write loop, and what one bad ticker costs ---------------------------
+#
+# The try/except covered the fetch and stopped there. A single ticker whose
+# write raised -- a locked database at 22:40, a vendor NaN reaching a validator
+# -- took the process down mid-list, left the run log open, and cost the
+# universe screen and the consensus snapshot that had not run yet. Consensus is
+# the one series that cannot be refetched later.
+
+
+def test_one_ticker_that_cannot_be_written_does_not_cost_the_night(
+        store, monkeypatch):
+    import sqlite3
+
+    monkeypatch.setattr(daily_job, "_fetch_bars", lambda tickers, **kw: {
+        "AAPL": _bars("2026-03-03"), "MSFT": _bars("2026-03-03"),
+        daily_job.FETCH_CANARY: _bars("2026-03-03")})
+
+    real = daily_job._record_ticker
+
+    def flaky(ticker, rows, stamp, keep=None):
+        if ticker == "MSFT":
+            raise sqlite3.OperationalError("database is locked")
+        return real(ticker, rows, stamp, keep=keep)
+
+    monkeypatch.setattr(daily_job, "_record_ticker", flaky)
+
+    result = daily_job.record_daily_bars(["AAPL", "MSFT"], as_of="2026-03-03")
+
+    assert result["status"] == "partial"
+    assert len(store.bars_as_of("AAPL", "2026-03-04")) == 1, (
+        "the ticker before the bad one was lost with it")
+    run = daily_job.last_run("daily_bars")
+    assert run["finished_at"], "the run log was left open"
+    assert "MSFT" in str(run["error"]) and "locked" in str(run["error"]), (
+        f"the ticker that failed is not in the run log: {run['error']!r}")
+
+
+def test_a_stage_that_dies_does_not_cost_the_consensus_snapshot(
+        store, monkeypatch):
+    import sqlite3
+    ran = []
+
+    def boom(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(daily_job, "_fetch_sec_tickers",
+                        lambda: [{"ticker": "AAPL", "cik": "1", "name": "A"}])
+    monkeypatch.setattr(daily_job, "record_daily_bars", boom)
+    monkeypatch.setattr(
+        daily_job, "refresh_universe",
+        lambda **kw: ran.append("universe") or {"status": "ok"})
+    monkeypatch.setattr(
+        daily_job, "record_consensus_snapshots",
+        lambda **kw: ran.append("consensus") or {"status": "ok"})
+
+    result = daily_job.run_all(as_of="2026-03-03")
+
+    assert ran == ["universe", "consensus"], (
+        "one stage's exception cost the series that cannot be refetched")
+    assert result["daily_bars"]["status"] == "failed"
+    assert "locked" in result["daily_bars"]["error"]
+
+
+def test_a_vendor_nan_is_not_a_corporate_action(store, monkeypatch):
+    """NaN is truthy, so `NaN or 0.0` is NaN, which passes the `if split`
+    guard and then fails `record_corporate_action`'s `value > 0` check. The
+    as-traded conversion beside it already ignores the same value, so the two
+    paths disagreed about one number."""
+    import pandas as pd
+
+    fields = {"Open": 1.0, "High": 1.0, "Low": 1.0, "Close": 1.0,
+              "Volume": 100.0, "Stock Splits": float("nan"),
+              "Dividends": float("nan")}
+    frame = pd.DataFrame({("AAPL", f): [v] for f, v in fields.items()},
+                         index=pd.to_datetime(["2026-08-26"]))
+    frame.columns = pd.MultiIndex.from_tuples(frame.columns)
+
+    rows = daily_job._rows_from_frame(frame, ["AAPL"])
+    assert rows["AAPL"][0]["split"] == 0.0
+    assert rows["AAPL"][0]["dividend"] == 0.0
+
+    daily_job._record_ticker("AAPL", rows["AAPL"], "2026-08-26T21:00:00Z")
+    assert store.corporate_actions_as_of("AAPL", "2026-08-27") == []
+
+
+def test_a_split_and_the_bars_it_explains_land_together(store, monkeypatch):
+    """The order is documented as an invariant: a reader that finds bars
+    without the split that shaped them cannot tell an as-traded series from an
+    adjusted one. Written in two transactions, a crash between them leaves
+    exactly the state the invariant forbids."""
+    import sqlite3
+
+    rows = [{"trade_date": "2026-06-10", "open": 10.0, "high": 10.0,
+             "low": 10.0, "close": 10.0, "volume": 1000.0, "split": 10.0,
+             "dividend": 0.0}]
+
+    def boom(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(pit_store, "record_bars", boom)
+    with pytest.raises(sqlite3.OperationalError):
+        daily_job._record_ticker("NVDA", rows, "2026-06-10T21:00:00Z")
+
+    assert store.corporate_actions_as_of("NVDA", "2026-06-11") == [], (
+        "the split outlived the bars it exists to explain")
+
+
+# --- the canary belongs to the run, not to one batch -------------------------
+#
+# It is appended to every batch's request and kept only from the batch that
+# owned it -- which, since it is appended to the end of the ask, is a batch of
+# exactly one name. Fetched sixteen times, discarded fifteen, and the copy
+# retained comes from the single most fragile request in the run. Lose it and
+# the market-closed check is skipped and the regime series gains a hole.
+
+
+def test_the_canary_survives_the_batch_that_owned_it_failing(monkeypatch):
+    import pandas as pd
+
+    def fake_download(*args, **kwargs):
+        asked = kwargs["tickers"].split()
+        if asked == [daily_job.FETCH_CANARY]:
+            raise ConnectionError("Yahoo returned 502")
+        data = {}
+        for t in asked:
+            for field in ("Open", "High", "Low", "Close", "Volume",
+                          "Stock Splits", "Dividends"):
+                data[(t, field)] = [1.0]
+        frame = pd.DataFrame(data, index=pd.to_datetime(["2026-08-26"]))
+        frame.columns = pd.MultiIndex.from_tuples(frame.columns)
+        return frame
+
+    import yfinance
+    monkeypatch.setattr(yfinance, "download", fake_download)
+    monkeypatch.setattr(daily_job, "FETCH_RETRY_BACKOFF", 0.0)
+    monkeypatch.setattr(daily_job, "FETCH_BATCH_PAUSE", 0.0)
+
+    asked = [f"T{i}" for i in range(daily_job.FETCH_BATCH_SIZE)]
+    got = daily_job._fetch_bars([*asked, daily_job.FETCH_CANARY],
+                                start="2026-08-26", end="2026-08-27")
+
+    assert daily_job.FETCH_CANARY in got, (
+        "the canary was answered by every other batch and kept from none")
+    assert got[daily_job.FETCH_CANARY][0]["trade_date"] == "2026-08-26"
+
+
+def test_a_holiday_is_still_recognised_when_the_canarys_batch_failed(
+        store, monkeypatch):
+    """The determination is about the exchange, not about which request
+    happened to succeed."""
+    def fetch(tickers, **kw):
+        kw.get("failures", []).append("batch 2 of 2 failed: 502")
+        return {daily_job.FETCH_CANARY: _bars("2026-03-02", "2026-03-04")}
+
+    monkeypatch.setattr(daily_job, "_fetch_bars", fetch)
+    result = daily_job.record_daily_bars(["AAPL"], as_of="2026-03-03")
+
+    assert result["status"] == "closed"
+
+
+# --- a rerun must not report rows it did not write ---------------------------
+
+def test_a_rerun_reports_the_rows_it_actually_wrote(store, monkeypatch):
+    """`rows_written` is the only evidence a night was captured, and consensus
+    is the series where that matters most. A replay that changed nothing must
+    not look like a capture."""
+    monkeypatch.setattr(daily_job, "_fetch_calendar", lambda start, end: [
+        {"ticker": "MSFT", "fiscal_period": "2026Q2", "eps_estimate": 4.02,
+         "eps_actual": None, "analyst_count": 30}])
+
+    first = daily_job.record_consensus_snapshots(as_of="2026-08-01")
+    second = daily_job.record_consensus_snapshots(as_of="2026-08-01")
+
+    assert first["written"] == 1
+    assert second["written"] == 0, (
+        f"the rerun reported {second['written']} rows it did not write")
+    assert second["seen"] == 1, "the rows it saw are still worth reporting"
+    assert daily_job.last_run("consensus")["rows_written"] == 0

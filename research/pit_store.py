@@ -54,6 +54,19 @@ CREATE TABLE IF NOT EXISTS universe_snapshot (
     PRIMARY KEY (as_of_date, ticker)
 );
 
+-- The same escape valve `bar_revision` is: a rerun's verdict is evidence
+-- that a second answer was computed, and INSERT OR IGNORE alone threw it away.
+-- Text rather than numeric because the two fields it covers are a flag and a
+-- sentence.
+CREATE TABLE IF NOT EXISTS universe_revision (
+    as_of_date TEXT NOT NULL,
+    ticker     TEXT NOT NULL,
+    field      TEXT NOT NULL,
+    old_value  TEXT,
+    new_value  TEXT,
+    noticed_at TEXT NOT NULL
+);
+
 -- Raw only. No adjusted column, by design: see the module docstring.
 CREATE TABLE IF NOT EXISTS daily_bar (
     trade_date  TEXT NOT NULL,
@@ -199,11 +212,21 @@ def _now() -> str:
 
 
 def connect() -> sqlite3.Connection:
+    """A connection to the store, in WAL and willing to wait for a lock.
+
+    Six jobs share this one file on one volume and the schedule overlaps -- the
+    watcher fires at 22:40 while the 22:30 recorder is still fetching. Under
+    SQLite's default rollback journal a writer takes an EXCLUSIVE lock that
+    readers cannot pass, and five seconds later the loser raises "database is
+    locked" in the middle of a nightly write loop. WAL lets the reader through,
+    and thirty seconds is longer than any single write here takes.
+    """
     path = db_path()
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -231,46 +254,57 @@ def init_schema() -> None:
 # ---------------------------------------------------------------- bars
 
 def record_bars(ticker: str, rows: Iterable[Dict[str, Any]],
-                recorded_at: Optional[str] = None) -> int:
+                recorded_at: Optional[str] = None,
+                conn: Optional[sqlite3.Connection] = None) -> int:
     """Append sessions for one ticker. Returns the count newly written.
 
     A session already present is left exactly as it was. If the incoming values
     differ, the difference is filed in `bar_revision` -- the original is what we
     acted on, and the fact that the vendor now disagrees is separate
     information rather than a reason to lose the original.
+
+    `conn` lets a caller put these writes inside a transaction it already
+    holds, which is how the split and the bars it explains reach the store
+    together or not at all.
     """
     stamp = recorded_at or _now()
+    if conn is not None:
+        return _write_bars(conn, ticker, rows, stamp)
+    with connect() as own:
+        return _write_bars(own, ticker, rows, stamp)
+
+
+def _write_bars(conn: sqlite3.Connection, ticker: str,
+                rows: Iterable[Dict[str, Any]], stamp: str) -> int:
     written = 0
-    with connect() as conn:
-        for row in rows:
-            existing = conn.execute(
-                "SELECT * FROM daily_bar WHERE trade_date = ? AND ticker = ?",
-                (row["trade_date"], ticker)).fetchone()
+    for row in rows:
+        existing = conn.execute(
+            "SELECT * FROM daily_bar WHERE trade_date = ? AND ticker = ?",
+            (row["trade_date"], ticker)).fetchone()
 
-            if existing is None:
-                conn.execute(
-                    """INSERT INTO daily_bar
-                       (trade_date, ticker, open, high, low, close, volume,
-                        recorded_at)
-                       VALUES (?,?,?,?,?,?,?,?)""",
-                    (row["trade_date"], ticker, row.get("open"),
-                     row.get("high"), row.get("low"), row.get("close"),
-                     row.get("volume"), stamp))
-                written += 1
+        if existing is None:
+            conn.execute(
+                """INSERT INTO daily_bar
+                   (trade_date, ticker, open, high, low, close, volume,
+                    recorded_at)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (row["trade_date"], ticker, row.get("open"), row.get("high"),
+                 row.get("low"), row.get("close"), row.get("volume"), stamp))
+            written += 1
+            continue
+
+        for field in _BAR_FIELDS:
+            before, after = existing[field], row.get(field)
+            if after is None or before is None:
                 continue
-
-            for field in _BAR_FIELDS:
-                before, after = existing[field], row.get(field)
-                if after is None or before is None:
-                    continue
-                if abs(float(before) - float(after)) > 1e-9:
-                    conn.execute(
-                        """INSERT INTO bar_revision
-                           (trade_date, ticker, field, old_value, new_value,
-                            noticed_at)
-                           VALUES (?,?,?,?,?,?)""",
-                        (row["trade_date"], ticker, field, float(before),
-                         float(after), stamp))
+            if abs(float(before) - float(after)) > 1e-9:
+                conn.execute(
+                    """INSERT INTO bar_revision
+                       (trade_date, ticker, field, old_value, new_value,
+                        noticed_at)
+                       VALUES (?,?,?,?,?,?)""",
+                    (row["trade_date"], ticker, field, float(before),
+                     float(after), stamp))
     return written
 
 
@@ -401,12 +435,17 @@ def revisions(ticker: Optional[str] = None) -> List[Dict[str, Any]]:
 
 def record_corporate_action(ticker: str, ex_date: str, action_type: str,
                             value: float,
-                            recorded_at: Optional[str] = None) -> int:
+                            recorded_at: Optional[str] = None,
+                            conn: Optional[sqlite3.Connection] = None) -> int:
     """A split ratio or a dividend per share, kept apart from the prices.
 
     Storing the action rather than a pre-adjusted price is what lets the
     adjustment in force on any past date be rebuilt. A vendor's adjusted close
     only tells you about today.
+
+    `conn` is for the recorder that writes an action and the bars it explains
+    in one go: passed a connection, this joins that transaction instead of
+    opening and committing one of its own.
     """
     if not (value > 0):
         # A zero split ratio divides by zero at read time and a negative one
@@ -417,13 +456,16 @@ def record_corporate_action(ticker: str, ex_date: str, action_type: str,
             f"{ticker} on {ex_date}. An unapplicable action recorded now is a "
             f"read that fails or silently skips it every time after")
 
-    with connect() as conn:
-        cur = conn.execute(
-            """INSERT OR IGNORE INTO corporate_action
-               (ex_date, ticker, action_type, value, recorded_at)
-               VALUES (?,?,?,?,?)""",
-            (ex_date, ticker, action_type, float(value),
-             recorded_at or _now()))
+    sql = """INSERT OR IGNORE INTO corporate_action
+             (ex_date, ticker, action_type, value, recorded_at)
+             VALUES (?,?,?,?,?)"""
+    params = (ex_date, ticker, action_type, float(value),
+              recorded_at or _now())
+    if conn is not None:
+        cur = conn.execute(sql, params)
+    else:
+        with connect() as own:
+            cur = own.execute(sql, params)
     # Reported like every other recorder here, so a caller can tell a
     # write from a rerun that found the row already present.
     return cur.rowcount or 0
@@ -441,6 +483,12 @@ def corporate_actions_as_of(ticker: str, as_of: str) -> List[Dict[str, Any]]:
 
 # ---------------------------------------------------------------- universe
 
+# The verdict, and only the verdict. The registrant's own details change under
+# us for reasons that are not disagreements -- SEC re-cases a company name
+# often enough that filing those would bury the one row that matters.
+_UNIVERSE_FIELDS = ("eligible", "exclusion_reason")
+
+
 def record_universe(as_of_date: str,
                     entries: Iterable[Dict[str, Any]],
                     recorded_at: Optional[str] = None) -> int:
@@ -450,6 +498,12 @@ def record_universe(as_of_date: str,
     qualify next quarter, and a study that only ever sees the survivors cannot
     tell the difference between a screen that worked and a screen that was
     never applied.
+
+    A rerun's verdict is filed the way a vendor's revised bar is: the first
+    answer is the one the scanner acted on and it stands, but the second one
+    was computed and disagreeing is a fact about the screen. The natural
+    response to a partial night is to run it again, on fuller history, so the
+    disagreement dropped silently here was usually the better answer.
     """
     stamp = recorded_at or _now()
     written = 0
@@ -463,8 +517,49 @@ def record_universe(as_of_date: str,
                 (as_of_date, e["ticker"], e.get("cik"), e.get("name"),
                  1 if e.get("eligible") else 0, e.get("exclusion_reason"),
                  stamp))
-            written += cur.rowcount
+            if cur.rowcount:
+                written += 1
+                continue
+
+            existing = conn.execute(
+                """SELECT eligible, exclusion_reason FROM universe_snapshot
+                   WHERE as_of_date = ? AND ticker = ?""",
+                (as_of_date, e["ticker"])).fetchone()
+            if existing is None:
+                # OR IGNORE swallows a constraint violation as readily as a
+                # duplicate key, and a row that neither inserted nor is
+                # already there was refused, not deduplicated.
+                raise ValueError(
+                    f"universe entry for {e['ticker']!r} on {as_of_date} was "
+                    f"neither written nor already present; the row was "
+                    f"refused: {e!r}")
+            incoming = {"eligible": 1 if e.get("eligible") else 0,
+                        "exclusion_reason": e.get("exclusion_reason")}
+            for field in _UNIVERSE_FIELDS:
+                before, after = existing[field], incoming[field]
+                if before == after:
+                    continue
+                conn.execute(
+                    """INSERT INTO universe_revision
+                       (as_of_date, ticker, field, old_value, new_value,
+                        noticed_at)
+                       VALUES (?,?,?,?,?,?)""",
+                    (as_of_date, e["ticker"], field,
+                     None if before is None else str(before),
+                     None if after is None else str(after), stamp))
     return written
+
+
+def universe_revisions(ticker: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Every time a rerun's screen disagreed with the verdict already filed."""
+    sql = "SELECT * FROM universe_revision"
+    params: tuple = ()
+    if ticker:
+        sql += " WHERE ticker = ?"
+        params = (ticker,)
+    sql += " ORDER BY noticed_at, rowid"
+    with connect() as conn:
+        return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
 
 def universe_as_of(as_of_date: str) -> List[Dict[str, Any]]:

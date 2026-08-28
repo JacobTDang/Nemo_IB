@@ -466,3 +466,77 @@ def test_the_migration_is_idempotent(tmp_path, monkeypatch):
                                eps_estimate=1.10,
                                recorded_at="2026-03-01T21:00:00Z")
     assert pit_store.consensus_as_of("AAPL", "2026Q2", "2026-03-02")
+
+
+# --- six jobs, one file ------------------------------------------------------
+#
+# The store is a single SQLite file on a shared volume and the published cron
+# overlaps: the watcher fires at 22:40 while the 22:30 recorder is still
+# fetching. Under a rollback journal a writer takes an EXCLUSIVE lock and the
+# loser gets "database is locked" after five seconds -- in the middle of the
+# nightly write loop, which is the one place a raise costs the whole night.
+
+
+def test_the_store_survives_a_concurrent_writer(store, tmp_path):
+    """A reader must not be locked out by a writer holding a transaction.
+
+    Under a rollback journal it is, which is the whole failure. WAL is what
+    makes an overlapping cron a slow night rather than a lost one.
+    """
+    with store.connect() as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] >= 30_000
+
+    writer = store.connect()
+    writer.execute("BEGIN IMMEDIATE")
+    writer.execute(
+        "INSERT INTO run_log (job, as_of_date, started_at) VALUES (?,?,?)",
+        ("slow", "2026-03-03", "2026-03-03T21:00:00Z"))
+    try:
+        rows = store.bars_as_of("AAPL", "2026-03-03")
+    finally:
+        writer.rollback()
+        writer.close()
+    assert rows == []
+
+
+# --- a rerun's verdict is evidence too ---------------------------------------
+#
+# The natural response to a partial night is to run it again. The second pass
+# has fuller history to screen against, so its verdict is the better one --
+# and INSERT OR IGNORE dropped it on the floor with nothing to show a second
+# answer had ever been computed. `record_bars` already had the answer to this:
+# the original stands, and the disagreement is filed as its own fact.
+
+
+def test_a_rerun_that_changes_a_verdict_is_not_silently_discarded(store):
+    store.record_universe("2026-03-03", [
+        {"ticker": "AAPL", "cik": "320193", "eligible": False,
+         "exclusion_reason": "insufficient history: 12 sessions recorded"}],
+                          recorded_at="2026-03-03T21:00:00Z")
+    store.record_universe("2026-03-03", [
+        {"ticker": "AAPL", "cik": "320193", "eligible": True,
+         "exclusion_reason": None}],
+                          recorded_at="2026-03-03T22:30:00Z")
+
+    member = store.universe_as_of("2026-03-03")[0]
+    assert member["eligible"] is False, "the original verdict was overwritten"
+
+    filed = store.universe_revisions("AAPL")
+    assert [r["field"] for r in filed] == ["eligible", "exclusion_reason"], (
+        "the rerun disagreed and left no record that it had run at all")
+    assert filed[0]["old_value"] == "0" and filed[0]["new_value"] == "1"
+    assert filed[0]["noticed_at"] == "2026-03-03T22:30:00Z"
+
+
+def test_a_rerun_that_agrees_files_nothing(store):
+    """Reruns are routine. A revision row per agreeing rerun would bury the
+    one disagreement that matters under ten thousand that do not."""
+    entries = [{"ticker": "AAPL", "cik": "320193", "eligible": True}]
+    store.record_universe("2026-03-03", entries,
+                          recorded_at="2026-03-03T21:00:00Z")
+    written = store.record_universe("2026-03-03", entries,
+                                    recorded_at="2026-03-03T22:30:00Z")
+
+    assert written == 0
+    assert store.universe_revisions("AAPL") == []
