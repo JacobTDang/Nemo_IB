@@ -176,3 +176,88 @@ def test_a_name_edgar_refuses_is_reported_not_swallowed(store, monkeypatch):
     out = announcements.backfill(["AAA"], as_of="2026-03-20")
     assert out["written"] == 0
     assert "503" in out["failed"][0]
+
+
+# --- the awkward filings ----------------------------------------------------
+
+def test_a_company_that_files_2_02_for_something_else(monkeypatch):
+    """2.02 is 'Results of Operations and Financial Condition', which is
+    normally the earnings release and occasionally a mid-quarter update or a
+    restatement. Two inside one window means the earlier one is the release
+    the market reacted to; a later correction does not move the announcement.
+    """
+    monkeypatch.setattr(announcements, "_fetch_8k", lambda t, **kw: [
+        Filing("2026-02-11", "2.02", "2026-02-11T21:05:00"),
+        Filing("2026-02-26", "2.02,4.02", "2026-02-26T14:00:00"),
+    ])
+    monkeypatch.setattr(announcements, "_quarters",
+                        lambda t, as_of=None: QUARTERS)
+
+    got = announcements.for_quarters("AAA", as_of="2026-03-20")
+    assert got["2026Q1"]["announced_date"] == "2026-02-11"
+
+
+def test_a_release_on_the_period_end_itself_is_not_this_quarters(monkeypatch):
+    """A quarter cannot be reported on the day it closes. Anything dated at
+    the close belongs to the quarter before it."""
+    monkeypatch.setattr(announcements, "_fetch_8k", lambda t, **kw: [
+        Filing("2026-01-31", "2.02", "2026-01-31T21:05:00")])
+    monkeypatch.setattr(announcements, "_quarters",
+                        lambda t, as_of=None: QUARTERS)
+    assert "2026Q1" not in announcements.for_quarters("AAA", "2026-03-20")
+
+
+def test_a_release_on_the_filing_date_itself_counts(monkeypatch):
+    """Plenty of companies file the 8-K and the 10-Q the same day -- MSFT,
+    NVDA. Excluding the boundary would lose them entirely."""
+    monkeypatch.setattr(announcements, "_fetch_8k", lambda t, **kw: [
+        Filing("2026-03-11", "2.02", "2026-03-11T21:05:00")])
+    monkeypatch.setattr(announcements, "_quarters",
+                        lambda t, as_of=None: QUARTERS)
+    got = announcements.for_quarters("AAA", "2026-03-20")
+    assert got["2026Q1"]["announced_date"] == "2026-03-11"
+
+
+def test_a_release_after_the_read_date_is_invisible(monkeypatch):
+    """The lookahead rule, at the one place this module could break it."""
+    monkeypatch.setattr(announcements, "_fetch_8k", lambda t, **kw: [
+        Filing("2026-02-11", "2.02", "2026-02-11T21:05:00"),
+        Filing("2026-05-20", "2.02", "2026-05-20T21:05:00"),
+    ])
+    got = announcements.earnings_releases("AAA", as_of="2026-03-01")
+    assert [r["announced_date"] for r in got] == ["2026-02-11"]
+
+
+def test_the_item_string_is_matched_on_the_whole_code(monkeypatch):
+    """'12.02' and '2.021' are not item 2.02, and a substring test would take
+    them. No such item exists today, which is exactly why it is worth pinning
+    before one does."""
+    monkeypatch.setattr(announcements, "_fetch_8k", lambda t, **kw: [
+        Filing("2026-02-11", "12.02", "2026-02-11T21:05:00"),
+        Filing("2026-02-12", "2.021", "2026-02-12T21:05:00"),
+    ])
+    assert announcements.earnings_releases("AAA", "2026-03-01") == []
+
+
+def test_items_arriving_as_a_list_are_handled(monkeypatch):
+    """edgartools returns a comma-joined string today. A list would silently
+    match nothing, and 'not one release anywhere' is indistinguishable from a
+    company that files none."""
+    monkeypatch.setattr(announcements, "_fetch_8k", lambda t, **kw: [
+        Filing("2026-02-11", ["2.02", "9.01"], "2026-02-11T21:05:00")])
+    got = announcements.earnings_releases("AAA", "2026-03-01")
+    assert [r["announced_date"] for r in got] == ["2026-02-11"]
+
+
+def test_a_naive_acceptance_time_is_not_assumed_to_be_utc(monkeypatch):
+    """A timestamp with no zone cannot be placed on the clock that matters, and
+    guessing puts the boundary an hour or five out."""
+    class Naive:
+        filing_date = "2026-02-11"
+        items = "2.02"
+        accession_no = "x"
+        acceptance_datetime = __import__("datetime").datetime(2026, 2, 11, 21, 5)
+
+    monkeypatch.setattr(announcements, "_fetch_8k", lambda t, **kw: [Naive()])
+    assert announcements.earnings_releases("AAA", "2026-03-01")[0]["timing"] \
+        == "unknown"

@@ -52,6 +52,21 @@ def _today() -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
 
+def _is_earnings(items: Any) -> bool:
+    """Whether this filing carries item 2.02, matched whole.
+
+    A substring test takes "12.02" and "2.021" as well. Neither exists today,
+    which is the moment to pin it rather than after one does. edgartools joins
+    the codes with commas; a list is accepted too, because a shape change
+    upstream would otherwise match nothing and read as a company that files no
+    earnings releases at all.
+    """
+    if items is None:
+        return False
+    codes = items if isinstance(items, (list, tuple, set)) else str(items).split(",")
+    return any(str(c).strip() == EARNINGS_ITEM for c in codes)
+
+
 def _fetch_8k(ticker: str, limit: int = _MAX_FILINGS) -> List[Any]:
     import os
 
@@ -83,8 +98,15 @@ def classify(accepted_at) -> str:
     Read locally rather than in UTC because the boundary is 16:00 exchange time
     and the offset from UTC moves with daylight saving: 21:05 UTC is 16:05 in
     January and 17:05 in July, and only one of those is after the close.
+
+    A timestamp with no zone is refused rather than assumed. `astimezone` on a
+    naive datetime reads it in the machine's own zone, so the same filing would
+    classify one way on a laptop in New York and another on a server in UTC --
+    a result that depends on where it ran is worse than no result.
     """
     if accepted_at is None:
+        return "unknown"
+    if accepted_at.tzinfo is None or accepted_at.utcoffset() is None:
         return "unknown"
     local = accepted_at.astimezone(EXCHANGE_TZ).time()
     if local < MARKET_OPEN:
@@ -99,8 +121,7 @@ def earnings_releases(ticker: str,
     """Every Item 2.02 filing this company has made, newest first."""
     out = []
     for filing in _fetch_8k(ticker):
-        items = getattr(filing, "items", None) or ""
-        if EARNINGS_ITEM not in items:
+        if not _is_earnings(getattr(filing, "items", None)):
             continue
         day = str(filing.filing_date)
         if as_of and day > as_of:
