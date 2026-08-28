@@ -136,13 +136,23 @@ def cohort(as_of: Optional[str] = None,
 
 
 def surprise_rank(ticker: str, as_of: Optional[str] = None,
-                  window_days: int = COHORT_WINDOW_DAYS) -> Dict[str, Any]:
-    """Where this name's surprise sits among the ones already reported."""
+                  window_days: int = COHORT_WINDOW_DAYS,
+                  peers: Optional[List[Dict[str, Any]]] = None
+                  ) -> Dict[str, Any]:
+    """Where this name's surprise sits among the ones already reported.
+
+    `peers` takes a cohort the caller already built. It is the same list for
+    every name on a given date, by construction, and rebuilding it per name is
+    quadratic: on the real store a cohort of 305 takes 386ms to assemble, so a
+    date with 305 reporters spent two minutes rebuilding one list, and a replay
+    over 652 dates would have run for about twenty-one hours.
+    """
     as_of = as_of or _today()
     ticker = ticker.upper()
     result = _shell(ticker, as_of)
 
-    peers = cohort(as_of, window_days=window_days)
+    if peers is None:
+        peers = cohort(as_of, window_days=window_days)
     result["cohort_size"] = len(peers)
     result["cohort_tickers"] = [p["ticker"] for p in peers]
 

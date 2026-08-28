@@ -253,3 +253,69 @@ def test_the_real_output_satisfies_the_scanner_gate(store):
     assert real["success"] is True, real["error"]
     assert scanner._signal_problem(real, "2026-03-03") is None, (
         scanner._signal_problem(real, "2026-03-03"))
+
+
+# --- the cohort is one thing per date, not one per name ---------------------
+#
+# surprise_rank rebuilt the whole cohort for every name it ranked. On the real
+# store a cohort of 305 takes 386ms to assemble, so a date with 305 reporters
+# spent 118 seconds rebuilding the same list 305 times -- and a replay over 652
+# dates would have taken about twenty-one hours.
+#
+# It is the same list for every name on that date, by construction.
+
+def test_a_supplied_cohort_is_not_rebuilt(store, monkeypatch):
+    _cohort(store, n=12)
+    _reported(store, "AAA", "2026Q1", "2026-03-02", estimate=1.0, actual=1.4)
+
+    peers = sue_cs.cohort(as_of="2026-03-03")
+    monkeypatch.setattr(sue_cs, "cohort",
+                        lambda *a, **k: pytest.fail("the cohort was rebuilt"))
+
+    out = sue_cs.surprise_rank("AAA", as_of="2026-03-03", peers=peers)
+    assert out["success"] is True
+    assert out["cohort_size"] == len(peers)
+
+
+def test_a_supplied_cohort_gives_the_same_answer_as_building_it(store):
+    _cohort(store, n=14)
+    _reported(store, "AAA", "2026Q1", "2026-03-02", estimate=1.0, actual=1.4)
+
+    built = sue_cs.surprise_rank("AAA", as_of="2026-03-03")
+    passed = sue_cs.surprise_rank("AAA", as_of="2026-03-03",
+                                  peers=sue_cs.cohort(as_of="2026-03-03"))
+    assert built == passed
+
+
+def test_the_scan_builds_the_cohort_once_for_all_its_names(store, monkeypatch):
+    """The scanner is where the saving lands: one build per date rather than
+    one per candidate."""
+    from research import scanner, spread
+
+    builds = []
+    real = sue_cs.cohort
+
+    def counted(*a, **k):
+        builds.append(1)
+        return real(*a, **k)
+
+    monkeypatch.setattr(sue_cs, "cohort", counted)
+    monkeypatch.setattr(scanner, "SIGNAL_VARIANT", "cs")
+
+    days = [f"2026-02-{d:02d}" for d in range(1, 29)]
+    for t in ("AAA", "BBB", "CCC", spread.REFERENCE_TICKER):
+        store.record_bars(t, [{"trade_date": d, "open": 100.0, "high": 100.0,
+                               "low": 100.0, "close": 100.0, "volume": 5e6}
+                              for d in days],
+                          recorded_at=f"{days[-1]}T21:00:00Z")
+    store.record_universe(days[-1], [
+        {"ticker": t, "cik": str(i), "eligible": True}
+        for i, t in enumerate(("AAA", "BBB", "CCC"))],
+        recorded_at=f"{days[-1]}T21:00:00Z")
+    for t in ("AAA", "BBB", "CCC"):
+        store.record_consensus(days[-1], t, "2026Q1", eps_estimate=1.0,
+                               eps_actual=1.2,
+                               recorded_at=f"{days[-1]}T21:00:00Z")
+
+    scanner.scan(as_of="2026-03-02")
+    assert len(builds) == 1, f"the cohort was built {len(builds)} times"

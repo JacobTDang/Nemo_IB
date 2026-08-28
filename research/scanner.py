@@ -131,6 +131,23 @@ def _next_session(as_of: str) -> str:
 
 # --- seams, so the decision logic can be tested without a network -----------
 
+# The cohort for one date, held only for the length of a scan. It is the same
+# list for every name on that date by construction, and rebuilding it per name
+# is quadratic: on the real store a cohort of 305 takes 386ms, so a date with
+# 305 reporters spent two minutes rebuilding one list and a replay over 652
+# dates would have run for about twenty-one hours.
+_COHORT: Dict[str, Any] = {}
+
+
+def _peers_for(as_of: str):
+    from research import sue_cs
+
+    if _COHORT.get("as_of") != as_of:
+        _COHORT["as_of"] = as_of
+        _COHORT["peers"] = sue_cs.cohort(as_of)
+    return _COHORT["peers"]
+
+
 def _signal_for(ticker: str, as_of: str) -> Dict[str, Any]:
     """The surprise, from whichever variant `SIGNAL_VARIANT` names.
 
@@ -148,7 +165,9 @@ def _signal_for(ticker: str, as_of: str) -> Dict[str, Any]:
         return {**sue.sue_ts(ticker, as_of=as_of), "variant": "ts"}
     if SIGNAL_VARIANT == "cs":
         from research import sue_cs
-        return {**sue_cs.surprise_rank(ticker, as_of=as_of), "variant": "cs"}
+        return {**sue_cs.surprise_rank(ticker, as_of=as_of,
+                                       peers=_peers_for(as_of)),
+                "variant": "cs"}
     raise ValueError(
         f"SIGNAL_VARIANT must be 'ts', 'af', 'af_or_ts' or 'cs'; got "
         f"{SIGNAL_VARIANT!r}")
@@ -350,6 +369,8 @@ def scan(as_of: Optional[str] = None,
     module's seam, which works only until something rebinds it back.
     """
     as_of = as_of or _today()
+    # A new scan must not inherit a cohort assembled for another date.
+    _COHORT.clear()
     signal_for = signal_for or _signal_for
     if already_acted is None:
         already_acted = pit_store.filed_periods(as_of)
