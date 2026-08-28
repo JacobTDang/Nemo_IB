@@ -303,9 +303,15 @@ def _score(orders: List[Dict[str, Any]],
         if row is None:
             skip(order, "a price on the path is missing")
             continue
-        scored.append({**row, "as_of_date": order["as_of_date"]})
+        scored.append({**row, "as_of_date": order["as_of_date"],
+                       "timing": scoring._timing_of(order, as_of)})
 
-    return {"scored": scored, "skipped": skipped,
+    by_timing = {}
+    for hour in sorted({r.get("timing") or "unknown" for r in scored}):
+        subset = [r for r in scored if (r.get("timing") or "unknown") == hour]
+        by_timing[hour] = scoring._summarise(subset)
+
+    return {"scored": scored, "skipped": skipped, "by_timing": by_timing,
             **scoring._summarise(scored)}
 
 

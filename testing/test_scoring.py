@@ -476,3 +476,20 @@ def test_the_summary_splits_by_the_hour(store):
 def test_the_split_is_absent_rather_than_empty_when_nothing_scored(store):
     out = scoring.score_orders(as_of=DAYS[20], horizon_days=4)
     assert out["by_timing"] == {}
+
+
+def test_one_malformed_order_does_not_stop_the_run(store):
+    """`fill` read side and cost tolerantly while the identifying fields were
+    hard-indexed, so an order missing one raised out of the whole scoring run
+    instead of being reported as the one bad row it is."""
+    _bars(store, "AAA", [100.0] * 3 + [110.0] * 5)
+    store.record_paper_orders(
+        DAYS[0],
+        [{"ticker": "AAA", "fiscal_period": "2026Q1", "side": "long",
+          "sue": 2.0, "intended_session": DAYS[1]}],   # no target_dollars
+        recorded_at=f"{DAYS[0]}T21:00:00Z")
+
+    out = scoring.score_orders(as_of=DAYS[20], horizon_days=4)
+    assert out["sample"] == 1
+    assert out["scored"][0]["target_dollars"] is None
+    assert out["scored"][0]["gross_bps"] == pytest.approx(1000.0)

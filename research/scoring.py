@@ -192,9 +192,18 @@ def fill(order: Dict[str, Any], entry: Dict[str, Any],
 
 
 def _stub(order: Dict[str, Any]) -> Dict[str, Any]:
-    return {"ticker": order["ticker"], "as_of_date": order["as_of_date"],
-            "side": order["side"], "sue": order["sue"],
-            "target_dollars": order["target_dollars"]}
+    """The identifying fields, read tolerantly.
+
+    `fill` reads side and cost with .get and this hard-indexed three more, so
+    one order missing a field took down the whole scoring run rather than that
+    order. None of these enter the arithmetic -- they name the trade -- so an
+    absent one is worth reporting, not worth stopping for.
+    """
+    return {"ticker": order.get("ticker"),
+            "as_of_date": order.get("as_of_date"),
+            "side": order.get("side"), "sue": order.get("sue"),
+            "fiscal_period": order.get("fiscal_period"),
+            "target_dollars": order.get("target_dollars")}
 
 
 def _summarise(scored: List[Dict[str, Any]],

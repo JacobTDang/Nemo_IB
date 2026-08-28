@@ -354,3 +354,23 @@ def test_the_entry_timing_caveat_is_stated(store):
     assert "10-q" in text or "filing" in text
     assert "announce" in text
     assert "8" in text
+
+
+def test_a_replayed_trade_carries_the_hour_it_was_announced(store, monkeypatch):
+    """The live scorer splits on it; the replay is where the split matters
+    most, because that is where the sample is large enough to see whether
+    entering a day later costs anything."""
+    import yfinance
+    monkeypatch.setattr(yfinance, "download",
+                        lambda *a, **k: _frame(k["tickers"].split(), DAYS[:40]))
+    replay.build_store(["AAA"], start=DAYS[0], end=DAYS[39])
+    pit_store.record_announcement("AAA", "2026Q1", DAYS[18], timing="bmo",
+                                  recorded_at=f"{DAYS[18]}T21:00:00Z")
+
+    out = replay._score([{"ticker": "AAA", "side": "long", "sue": 2.0,
+                          "cost_bps": 5.0, "fiscal_period": "2026Q1",
+                          "target_dollars": 5000.0, "as_of_date": DAYS[19],
+                          "intended_session": DAYS[20]}], horizon_days=5)
+
+    assert out["scored"][0]["timing"] == "bmo"
+    assert out["by_timing"]["bmo"]["sample"] == 1
