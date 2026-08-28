@@ -401,7 +401,6 @@ class OpenRouterModel:
     If the stream started producing content before dropping, skips remaining
     retries and goes straight to fallback (retrying will just repeat the drop)."""
     last_error = None
-    got_partial = False  # True if we received any content before a drop
 
     # Try primary model
     for attempt in range(1, self.MAX_RETRIES + 1):
@@ -439,7 +438,6 @@ class OpenRouterModel:
         # If we got thinking or content before the drop, retrying the same model
         # will likely produce the same result. Skip to fallback immediately.
         if assistant_response or thinking_started:
-          got_partial = True
           print(f"\n[Partial stream drop] {error_type} after receiving content. "
                 f"Skipping to fallback.", file=sys.stderr, flush=True)
           break

@@ -1673,7 +1673,7 @@ warnings_per_tool={
           self.server.create_initialization_options(),
         )
         print("Successfully created web_client process", file=sys.stderr, flush=True)
-    except Exception as e:
+    except Exception:
       import traceback
       traceback.print_exc(file=sys.stderr)
       raise

@@ -78,9 +78,15 @@ def test_resolved_model_is_alive():
     pytest.skip(f"the liveness probe reports {_CONTROL_DEAD_MODEL} as alive, "
                 "so it is not answering 404 for anything -- most likely the "
                 "OpenRouter key is being rejected. Nothing here is decidable.")
-  assert _verify_model_alive(PRIMARY_REASONING_MODEL, api_key), \
-    f"resolved model {PRIMARY_REASONING_MODEL} is not alive (404)"
-  print(f"PASS: resolved model {_primary_model()!r} is alive")
+  # Resolved once, so the assertion and the message name the same model. The
+  # module-level import these two lines used to read was removed on purpose --
+  # see `_primary_model` -- and they were missed, so this raised NameError
+  # rather than checking anything. Being network-gated, it skipped instead of
+  # failing, for as long as the name was wrong.
+  model = _primary_model()
+  assert _verify_model_alive(model, api_key), \
+    f"resolved model {model} is not alive (404)"
+  print(f"PASS: resolved model {model!r} is alive")
 
 
 @requires_openrouter

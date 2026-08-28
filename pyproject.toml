@@ -251,3 +251,27 @@ server = [
 rag = [
   "sqlite-vec==0.1.6",
 ]
+
+[tool.ruff]
+# Two indent styles live here: `tools/` is two-space, `research/` and
+# `testing/` are four. Neither is wrong, and reformatting one to match the
+# other would bury real history in whitespace -- so no layout rules are on.
+line-length = 100
+
+[tool.ruff.lint]
+# Only rules that catch defects. A linter reporting 465 things is one nobody
+# reads, and the point of having one is that a real finding stands out. F821
+# earned its place immediately: two tests referenced a constant removed in a
+# refactor, and both were network-gated, so they skipped rather than failed
+# for as long as the name was wrong.
+#
+# F401 is deliberately absent. Running it found 54 unused imports and several
+# were re-exports -- `shared_filings` names that `earnings_quality` republishes
+# for the timeout tests, with a comment above them saying so. Removing an
+# import that exists to be imported elsewhere is a runtime break that a green
+# suite need not catch, and unused imports are worth less than that risk.
+select = ["F811", "F821", "F841", "E711", "E712", "E713", "E714", "E722", "E741"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests bind names they assert on rather than use.
+"testing/*" = ["F841", "E712"]

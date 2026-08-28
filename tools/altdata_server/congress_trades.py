@@ -227,10 +227,12 @@ def _house_records(text: str) -> List[str]:
     wrapped asset name, the ticker and the upper bound of the bracket.
     """
     lines = _normalise(text).split("\n")
-    start = next((i + 1 for i, l in enumerate(lines) if _TABLE_START.match(l)), None)
+    start = next((i + 1 for i, line in enumerate(lines)
+                  if _TABLE_START.match(line)), None)
     if start is None:
         return []
-    end = next((i for i, l in enumerate(lines) if _TABLE_END.match(l)), len(lines))
+    end = next((i for i, line in enumerate(lines)
+                if _TABLE_END.match(line)), len(lines))
 
     records: List[str] = []
     current: List[str] = []

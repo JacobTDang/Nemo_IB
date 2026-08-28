@@ -856,12 +856,12 @@ COMMON MISTAKES TO AVOID:
             lines.append("")
 
         if 'lbo' in model_outputs:
-            l = model_outputs['lbo']
+            lbo = model_outputs['lbo']
             lines.append("LBO ANALYSIS:")
-            lines.append(f"  Entry EV: ${l.get('entry_ev', 0)/1e9:.2f}B | Entry EBITDA multiple: {l.get('entry_ebitda_multiple', 0):.1f}x")
-            lines.append(f"  IRR: {l.get('irr_pct', 0):.1f}% | MOIC: {l.get('moic', 0):.2f}x")
-            lines.append(f"  Achieves 20%+ IRR: {l.get('achieves_20pct_irr', False)}")
-            lines.append(f"  Exit equity: ${l.get('exit_equity', 0)/1e9:.2f}B over {l.get('hold_years', 5)} years")
+            lines.append(f"  Entry EV: ${lbo.get('entry_ev', 0)/1e9:.2f}B | Entry EBITDA multiple: {lbo.get('entry_ebitda_multiple', 0):.1f}x")
+            lines.append(f"  IRR: {lbo.get('irr_pct', 0):.1f}% | MOIC: {lbo.get('moic', 0):.2f}x")
+            lines.append(f"  Achieves 20%+ IRR: {lbo.get('achieves_20pct_irr', False)}")
+            lines.append(f"  Exit equity: ${lbo.get('exit_equity', 0)/1e9:.2f}B over {lbo.get('hold_years', 5)} years")
             lines.append("")
 
         lines.append("")

@@ -108,7 +108,7 @@ def check_completeness(layers: List[Dict[str, Any]],
     """The research must actually be assembled: synthesis + eval row are
     required; direction and asymmetry components missing -> warn with fix."""
     out = []
-    comps = {l.get("component", "") for l in layers}
+    comps = {layer.get("component", "") for layer in layers}
     if "synthesis" not in comps:
         out.append(_r("completeness", "fail", "no synthesis layer persisted",
                       "run /preearnings-research Layer 3"))
@@ -279,7 +279,8 @@ def run_manifest(layers: List[Dict[str, Any]],
     """Resume-state for a run: which components exist, which are missing, which
     are stale. Lets a FRESH context pick up a half-finished run from the DB
     instead of conversation memory (the persist-as-you-go environment)."""
-    comps = {l.get("component", "") for l in layers if l.get("component")}
+    comps = {layer.get("component", "") for layer in layers
+              if layer.get("component")}
 
     def _has(expected: str) -> bool:
         if expected == "kpi":
@@ -314,7 +315,8 @@ def run_review(
 ) -> Dict[str, Any]:
     """Run every check and aggregate. dispersion (optional):
     {eps_a, eps_b, label_a, label_b} fetched live by the orchestrating skill."""
-    synthesis = next((l for l in layers if l.get("component") == "synthesis"), None)
+    synthesis = next((layer for layer in layers
+                     if layer.get("component") == "synthesis"), None)
     syn_payload = (synthesis or {}).get("payload") or {}
     # the implied move lives on the eval row; surface it to hard rules — also
     # when the synthesis payload carries an explicit None (failed options fetch)

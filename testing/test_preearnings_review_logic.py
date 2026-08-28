@@ -135,7 +135,7 @@ def test_completeness_pass_full():
 
 
 def test_completeness_fail_without_synthesis():
-    layers = [l for l in _full_layers() if l["component"] != "synthesis"]
+    layers = [x for x in _full_layers() if x["component"] != "synthesis"]
     out = check_completeness(layers, _eval_row())
     assert any(c["status"] == "fail" for c in out)
 
@@ -146,7 +146,7 @@ def test_completeness_fail_without_eval_row():
 
 
 def test_completeness_warn_missing_reaction():
-    layers = [l for l in _full_layers() if l["component"] != "reaction"]
+    layers = [x for x in _full_layers() if x["component"] != "reaction"]
     out = check_completeness(layers, _eval_row())
     assert any(c["status"] == "warn" and "reaction" in c["detail"] for c in out)
 

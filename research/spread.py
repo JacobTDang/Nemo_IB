@@ -227,23 +227,23 @@ def _moments(open: Sequence[float], high: Sequence[float],
              close: Sequence[float]) -> Optional[Dict[str, float]]:
     o = np.asarray(open, dtype=float)
     h = np.asarray(high, dtype=float)
-    l = np.asarray(low, dtype=float)
+    lo = np.asarray(low, dtype=float)
     c = np.asarray(close, dtype=float)
 
     nobs = len(o)
-    if len(h) != nobs or len(l) != nobs or len(c) != nobs:
+    if len(h) != nobs or len(lo) != nobs or len(c) != nobs:
         raise ValueError(
             f"open/high/low/close must be the same length; got "
-            f"{nobs}/{len(h)}/{len(l)}/{len(c)}")
+            f"{nobs}/{len(h)}/{len(lo)}/{len(c)}")
     if nobs < 3:
         return None
 
     with np.errstate(divide="ignore", invalid="ignore"):
-        o, h, l, c = np.log(o), np.log(h), np.log(l), np.log(c)
-    m = (h + l) / 2.0
+        o, h, lo, c = np.log(o), np.log(h), np.log(lo), np.log(c)
+    m = (h + lo) / 2.0
 
-    h1, l1, c1, m1 = h[:-1], l[:-1], c[:-1], m[:-1]
-    o, h, l, c, m = o[1:], h[1:], l[1:], c[1:], m[1:]
+    h1, l1, c1, m1 = h[:-1], lo[:-1], c[:-1], m[:-1]
+    o, h, lo, c, m = o[1:], h[1:], lo[1:], c[1:], m[1:]
 
     r1 = m - o
     r2 = o - m1
@@ -254,10 +254,10 @@ def _moments(open: Sequence[float], high: Sequence[float],
     # tau marks the bars on which the price moved. A bar whose high, low and
     # previous close are all equal carries no information about a spread, and
     # counting it would drag every probability below toward zero.
-    tau = np.where(np.isnan(h) | np.isnan(l) | np.isnan(c1), np.nan,
-                   (h != l) | (l != c1))
+    tau = np.where(np.isnan(h) | np.isnan(lo) | np.isnan(c1), np.nan,
+                   (h != lo) | (lo != c1))
     po1 = tau * np.where(np.isnan(o) | np.isnan(h), np.nan, o != h)
-    po2 = tau * np.where(np.isnan(o) | np.isnan(l), np.nan, o != l)
+    po2 = tau * np.where(np.isnan(o) | np.isnan(lo), np.nan, o != lo)
     pc1 = tau * np.where(np.isnan(c1) | np.isnan(h1), np.nan, c1 != h1)
     pc2 = tau * np.where(np.isnan(c1) | np.isnan(l1), np.nan, c1 != l1)
 
@@ -363,7 +363,7 @@ def _window(ticker: str, as_of: str,
     n = len(bars)
     o = np.full(n, np.nan)
     h = np.full(n, np.nan)
-    l = np.full(n, np.nan)
+    lo = np.full(n, np.nan)
     c = np.full(n, np.nan)
     dollar: List[float] = []
     splits_hit = 0
@@ -383,7 +383,7 @@ def _window(ticker: str, as_of: str,
             splits_hit += 1
 
         if usable:
-            o[i], h[i], l[i], c[i] = bo, bh, bl, bc
+            o[i], h[i], lo[i], c[i] = bo, bh, bl, bc
 
         close, volume = bar.get("close"), bar.get("volume")
         if (close is not None and volume is not None
@@ -412,7 +412,7 @@ def _window(ticker: str, as_of: str,
 
     finite = c[np.isfinite(c)]
     out.update({
-        "open": o, "high": h, "low": l, "close": c,
+        "open": o, "high": h, "low": lo, "close": c,
         "last_price": float(finite[-1]),
         "median_dollar_volume": float(statistics.median(dollar)),
         "sessions_counted": n,

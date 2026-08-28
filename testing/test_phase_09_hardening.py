@@ -314,8 +314,6 @@ def test_audit_order_without_thesis_still_returns():
 
 
 if __name__ == "__main__":
-  test_pre_mortem_produces_structured_output()
-  test_pre_mortem_failure_modes_are_specific()
   test_correlation_handles_single_ticker_panel_no_crash()
   test_correlation_panel_returns_none_on_degenerate_multi_ticker()
   test_correlation_matrix_returns_dataframe()

@@ -19,7 +19,6 @@ import os
 import statistics
 import time
 from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from research import _DOTENV_PATH, pit_store  # noqa: F401 - .env on import

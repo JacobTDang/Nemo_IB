@@ -320,7 +320,10 @@ class ExcelMCPServer:
         type="text",
         text=json.dumps({
           'success': False,
-          "error": "Failed to read file path"
+          # Which failure. One sentence covers a missing file, a permission
+          # denial and a corrupt workbook alike, and the caller can act on
+          # exactly one of those.
+          "error": f"Failed to read file path: {type(e).__name__}: {e}"
         })
       )]
 
