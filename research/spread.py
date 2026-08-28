@@ -650,9 +650,11 @@ def spread_basis(ticker: str, as_of: str,
       the tick. Charging EDGE's number here would charge the estimator's bias:
       40bp for SPY, whose market is a cent wide.
 
-      `unknown` -- the reference is not in the store for this window, so there
-      is no yardstick. Picking one of the other two silently is how 40bp
-      becomes a fact.
+      `unknown` -- there is no yardstick, or nothing to hold against it: the
+      reference is not in the store for this window, or the estimator refused
+      this name outright. Picking one of the other two silently is how 40bp
+      becomes a fact, and how a name nobody could measure becomes the cheapest
+      one on the book.
     """
     own = estimate_spread(ticker, as_of, window)
     tick_floor = own.get("tick_floor")
@@ -668,7 +670,21 @@ def spread_basis(ticker: str, as_of: str,
                            f"against: {reference.get('reason') or 'no data'}")}
 
     own_level = own.get("spread")
-    if own_level is not None and own_level > ref_level * RESOLUTION_MULTIPLE:
+    if own_level is None:
+        # A refusal, not a small number. "Below what daily bars can resolve" is
+        # a claim about this name, and it needs an estimate to stand on: with
+        # none, flooring at the tick hands the cheapest cost in the universe to
+        # precisely the names nobody could measure, in a book ranked on edge
+        # net of cost.
+        return {"ticker": ticker, "as_of": as_of, "window": window,
+                "basis": "unknown", "spread": None, "tick_floor": tick_floor,
+                "reference_spread": ref_level,
+                "reason": (f"the estimator returned no spread for {ticker} on "
+                           f"this window, so there is nothing to compare "
+                           f"against the {ref_level * 1e4:.1f}bp the reference "
+                           f"produces: {own.get('reason') or 'no estimate'}")}
+
+    if own_level > ref_level * RESOLUTION_MULTIPLE:
         return {"ticker": ticker, "as_of": as_of, "window": window,
                 "basis": "measured", "spread": own_level,
                 "tick_floor": tick_floor, "reference_spread": ref_level,
@@ -682,14 +698,14 @@ def spread_basis(ticker: str, as_of: str,
                 "reference_spread": ref_level,
                 "reason": "no last price, so there is no tick to floor at"}
 
-    shown = f"{own_level * 1e4:.1f}bp" if own_level is not None else "no estimate"
     return {"ticker": ticker, "as_of": as_of, "window": window,
             "basis": "at_resolution_floor", "spread": tick_floor,
             "tick_floor": tick_floor, "reference_spread": ref_level,
-            "reason": (f"{shown} is not clear of the {ref_level * 1e4:.1f}bp "
-                       f"the reference produces on the same window, so this is "
-                       f"the estimator's floor rather than this name's spread; "
-                       f"charging one tick ({tick_floor * 1e4:.2f}bp) instead")}
+            "reason": (f"{own_level * 1e4:.1f}bp is not clear of the "
+                       f"{ref_level * 1e4:.1f}bp the reference produces on the "
+                       f"same window, so this is the estimator's floor rather "
+                       f"than this name's spread; charging one tick "
+                       f"({tick_floor * 1e4:.2f}bp) instead")}
 
 
 def round_trip_cost(ticker: str, as_of: str, position_dollars: float,
@@ -720,7 +736,9 @@ def round_trip_cost(ticker: str, as_of: str, position_dollars: float,
     `cost` is None with a `reason` whenever the spread could not be measured.
     There is no house average and no last-known value to fall back to, because
     a fallback here is a number nobody can check that gets subtracted from
-    every trade in the study.
+    every trade in the study. `reason` belongs to the cost: when one was
+    charged it is None, and why the point estimate is missing -- which is a
+    different question, and still worth knowing -- is under `estimate_reason`.
     """
     if not (position_dollars > 0):
         raise ValueError(
@@ -733,7 +751,13 @@ def round_trip_cost(ticker: str, as_of: str, position_dollars: float,
 
     base = _window(ticker, as_of, window)
     est = _estimate(base, ticker, as_of, window)
-    result = {**est, "position_dollars": position_dollars,
+    # `est`'s refusal explains why there is no point estimate, and a cost
+    # charged on a different basis is not refused. Carried under `reason` it
+    # sat beside a live `cost` and a `spread` of None, where it reads as this
+    # cost's own provenance -- and every caller tests `cost is None`, so none
+    # of them ever saw it.
+    result = {**est, "estimate_reason": est["reason"],
+              "position_dollars": position_dollars,
               "spread_basis": basis, "resolution": None, "spread_used": None,
               "half_spread": None, "spread_cost": None, "impact_cost": None,
               "cost": None, "participation": None,
@@ -777,6 +801,7 @@ def round_trip_cost(ticker: str, as_of: str, position_dollars: float,
         participation)
 
     result.update({
+        "reason": None,
         "spread_used": charged,
         "half_spread": charged / 2.0,
         "spread_cost": spread_cost,

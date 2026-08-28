@@ -61,8 +61,13 @@ from typing import Any, Dict, List, Optional
 from research import pit_store
 
 # Below this the cohort is not a distribution and a percentile against it says
-# nothing. Deliberately not "more than one".
-MIN_COHORT = 8
+# nothing. Deliberately not "more than one", and no longer eight: the scanner
+# acts on names a fixed 0.8 into a tail, which is the top and bottom decile of
+# whatever cohort it is handed. A decile of eight is one name a side, so the
+# largest of eight arbitrary prints was priced as a full tail every season. At
+# twenty it is two, and the rank starts to carry information about where the
+# surprise sits rather than about how few names reported.
+MIN_COHORT = 20
 
 # How far back a print still counts as this season's. The same window the
 # scanner treats a signal as fresh over.
@@ -183,9 +188,17 @@ def surprise_rank(ticker: str, as_of: Optional[str] = None,
             f"scaled surprise, so there is nothing to rank against")
         return result
 
+    # A midrank, not the minimum rank of the tie cluster. Every company that
+    # reports exactly in line has a scaled surprise of 0.0 whatever its price,
+    # so a tie cluster is guaranteed and is usually the largest group in the
+    # cohort -- and counting only strictly-lower values put all of them at the
+    # bottom of the distribution. Six in-line prints came back at percentile
+    # 0.0 in one live cohort: a full tail each, and a maximum-conviction short
+    # each, on a z of -0.56.
     below = sum(1 for v in values if v < mine["scaled_surprise"])
+    ties = sum(1 for v in values if v == mine["scaled_surprise"])
     result["z"] = (mine["scaled_surprise"] - statistics.fmean(values)) / spread
-    result["percentile"] = below / (len(values) - 1)
+    result["percentile"] = (below + 0.5 * ties) / len(values)
 
     # 1.4826 makes the median absolute deviation an unbiased estimate of the
     # standard deviation for a normal sample, so the two scales are comparable

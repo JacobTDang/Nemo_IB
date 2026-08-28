@@ -540,3 +540,66 @@ def test_a_rerun_that_agrees_files_nothing(store):
 
     assert written == 0
     assert store.universe_revisions("AAPL") == []
+
+
+# --- what quantity is in the sue column -------------------------------------
+#
+# SIGNAL_VARIANT chooses between a time-series sigma, an analyst sigma, and a
+# cross-sectional rank. Switching it is a one-line edit and the intended way to
+# change variants, and nothing in the store said which one a row came from --
+# so a book spanning a change mixed two incomparable quantities under one
+# column and the scorer averaged over both.
+
+def test_an_order_records_which_variant_produced_its_number(store):
+    store.record_paper_orders(
+        "2026-03-03",
+        [{"ticker": "AAA", "side": "long", "sue": 0.45, "variant": "cs",
+          "drift_coefficient": 40.0, "drift_calibrated": False,
+          "seeded_quarters": 2, "recorded_quarters": 6,
+          "intended_session": "2026-03-04"}],
+        recorded_at="2026-03-03T21:00:00Z")
+
+    row = store.paper_orders_as_of("2026-03-03")[0]
+    assert row["variant"] == "cs"
+    assert row["drift_coefficient"] == 40.0
+    assert row["drift_calibrated"] is False
+    assert row["seeded_quarters"] == 2
+    assert row["recorded_quarters"] == 6
+
+
+def test_an_order_that_said_nothing_about_calibration_does_not_claim_false(
+        store):
+    """Rows written before the column existed have no answer, and False is an
+    answer."""
+    store.record_paper_orders(
+        "2026-03-03", [{"ticker": "AAA", "sue": 2.0}],
+        recorded_at="2026-03-03T21:00:00Z")
+
+    row = store.paper_orders_as_of("2026-03-03")[0]
+    assert row["drift_calibrated"] is None
+    assert row["variant"] is None
+
+
+def test_the_store_says_when_a_job_last_finished_successfully(store):
+    """Six jobs write to one run log and nothing read it. "The recorder is
+    still running" is a question the log can answer and every reader was
+    guessing at."""
+    store.start_run("daily_bars", as_of_date="2026-03-02")
+    store.finish_run(rows_written=500, status="ok")
+    store.start_run("daily_bars", as_of_date="2026-03-03")
+    store.finish_run(rows_written=0, status="failed", error="vendor timeout")
+
+    assert store.last_successful_run("daily_bars", "2026-03-04") == "2026-03-02"
+    assert store.last_successful_run("consensus", "2026-03-04") is None
+
+
+def test_a_later_run_is_invisible_to_an_earlier_date(store):
+    store.start_run("daily_bars", as_of_date="2026-03-10")
+    store.finish_run(rows_written=1, status="ok")
+    assert store.last_successful_run("daily_bars", "2026-03-04") is None
+
+
+def test_a_run_that_never_finished_is_not_coverage(store):
+    """A crashed process leaves a started row with no finish."""
+    store.start_run("daily_bars", as_of_date="2026-03-02")
+    assert store.last_successful_run("daily_bars", "2026-03-04") is None

@@ -799,3 +799,92 @@ def test_the_cost_report_carries_its_inputs(store):
         assert key in cost, f"the cost report does not say {key}"
     assert cost["as_of"] == "2026-12-31"
     assert cost["ticker"] == "MID"
+
+
+# --- a refusal is not the cheapest name in the universe ---------------------
+#
+# `estimate_spread` returns spread=None with a reason whenever the squared
+# spread comes out non-positive -- "a refusal, not a zero". `spread_basis`
+# tested only whether the estimate stood clear of the reference, so a None fell
+# through to the resolution floor and was charged one tick: the LOWEST cost
+# available, in a book ranked on edge net of cost. The names nobody can measure
+# sorted to the top of it.
+
+def _unmeasurable(store, ticker, days=40):
+    """A live series EDGE refuses: the squared spread comes out negative.
+
+    Not a frozen price -- that has no volatility either, so the cost refuses
+    further downstream and the test would pass without measuring anything.
+    This one has everything a cost needs except the spread itself.
+    """
+    for seed in range(60):
+        ohlc = _simulate_ohlc(0.0, days=days, seed=seed)
+        if spread.edge(**ohlc, signed=True) < 0:
+            break
+    else:  # pragma: no cover
+        pytest.fail("no seed produced a refused sample")
+    dates = _sessions(days)
+    store.record_bars(ticker, _rows(dates, ohlc, 200_000.0),
+                      recorded_at=f"{dates[0]}T21:00:00Z")
+    return dates
+
+
+def test_a_name_with_no_estimate_is_not_charged_the_tick(store):
+    _record_simulated(store, spread.REFERENCE_TICKER, 0.01, days=40,
+                      volume=100_000.0, price0=50.0)
+    _unmeasurable(store, "FOGGY")
+
+    refused = spread.estimate_spread("FOGGY", as_of="2026-12-31", window=40)
+    assert refused["spread"] is None and refused["tick_floor"] is not None
+    reference = spread.estimate_spread(spread.REFERENCE_TICKER,
+                                       as_of="2026-12-31", window=40)
+    assert reference["spread"] or reference["spread_upper"], (
+        "the reference has no estimate either, so this measures nothing")
+
+    decided = spread.spread_basis("FOGGY", as_of="2026-12-31", window=40)
+    assert decided["basis"] == "unknown", (
+        "a name the estimator refused was floored at one tick, which is the "
+        "cheapest cost in the universe")
+    assert decided["spread"] is None
+    assert decided["reason"]
+
+
+def test_an_unmeasurable_name_gets_no_adaptive_cost_at_all(store):
+    """Which is what the scanner reads. A cost of None is a rejection with a
+    reason; a tick is a recommendation."""
+    _record_simulated(store, spread.REFERENCE_TICKER, 0.01, days=40,
+                      volume=100_000.0, price0=50.0)
+    _unmeasurable(store, "FOGGY")
+
+    on_bound = spread.round_trip_cost("FOGGY", as_of="2026-12-31",
+                                      position_dollars=1_000.0, window=40)
+    assert on_bound["cost"] is not None, "the upper bound is still chargeable"
+
+    adaptive = spread.round_trip_cost("FOGGY", as_of="2026-12-31",
+                                      position_dollars=1_000.0, window=40,
+                                      basis="adaptive")
+    assert adaptive["cost"] is None
+    assert adaptive["cost"] != on_bound["cost"]
+    assert adaptive["reason"]
+
+
+def test_a_charged_cost_does_not_read_a_refusal_as_its_provenance(store):
+    """`result = {**est, ...}` left the point estimate's refusal text sitting
+    beside a live cost, with `spread` None and `cost` a number. A caller that
+    tests `cost is None` -- which is every caller -- never sees it, and a
+    reader who looks at the row reads the refusal as this cost's own."""
+    _record_simulated(store, spread.REFERENCE_TICKER, 0.01, days=40,
+                      volume=100_000.0, price0=50.0)
+    _unmeasurable(store, "FOGGY")
+
+    est = spread.estimate_spread("FOGGY", as_of="2026-12-31", window=40)
+    assert est["spread"] is None and est["reason"]
+
+    cost = spread.round_trip_cost("FOGGY", as_of="2026-12-31",
+                                  position_dollars=1_000.0, window=40)
+    assert cost["cost"] is not None
+    assert cost["reason"] is None, (
+        "a refusal rode along with a cost that was successfully charged")
+    assert cost["estimate_reason"] == est["reason"], (
+        "the refusal was dropped rather than relabelled; why the point "
+        "estimate is absent is still worth knowing")

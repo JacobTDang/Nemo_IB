@@ -67,7 +67,11 @@ def _signal(ticker, sue, known_at="2026-03-02", period="2026Q1", **over):
     out = {"ticker": ticker, "success": True, "error": None, "sue": sue,
            "fiscal_period": period, "known_at": known_at, "sigma": 0.10,
            "sigma_quarters": 8, "basis_changes": [], "eps": 1.0,
-           "eps_year_ago": 0.9, "concept": "EarningsPerShareDiluted"}
+           "eps_year_ago": 0.9, "concept": "EarningsPerShareDiluted",
+           # `_signal_for` attaches this to every answer it returns, and a
+           # stub without it lets a row reach the store saying nothing about
+           # which quantity its number is.
+           "variant": "ts"}
     out.update(over)
     return out
 
@@ -560,6 +564,11 @@ def _reported(store, ticker, period, as_of, actual=1.0):
                            recorded_at=f"{as_of}T21:00:00Z")
 
 
+def _recorder_ran(store, as_of, job="daily_bars"):
+    store.start_run(job, as_of_date=as_of)
+    store.finish_run(rows_written=1, status="ok")
+
+
 def test_only_names_that_recently_reported_are_asked_about(liquid_universe,
                                                            monkeypatch):
     _reported(liquid_universe, "AAA", "2026Q1", "2026-03-02")
@@ -644,6 +653,10 @@ def test_a_scan_that_had_nothing_to_do_leaves_a_record_saying_why(
     paper_order table, because both are empty. The run log is the only place
     the difference can live, so the reason goes there."""
     _reported(liquid_universe, "AAA", "2026Q1", "2026-01-01")
+    # And the recorder was running, which is what makes an empty window a fact
+    # about the tape rather than a fact about the recorder.
+    for job in ("daily_bars", "consensus"):
+        _recorder_ran(liquid_universe, "2026-03-03", job=job)
 
     monkeypatch.setattr(scanner, "_signal_for", lambda t, a: _signal(t, 3.0))
     monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0010))
@@ -968,3 +981,227 @@ def test_a_cross_sectional_signal_that_refused_is_still_a_rejection(
     out = scanner.scan(as_of="2026-03-03")
     assert out["candidates"] == []
     assert "required" in out["rejected"][0]["reason"]
+
+
+def test_a_filed_order_says_whether_the_charge_was_measured(liquid_universe,
+                                                            monkeypatch):
+    """`spread_resolved` was filed from EDGE's `resolved` flag, which asks only
+    whether the estimate differs from zero -- SPY passes that at 41bp against a
+    market a cent wide. The charge came from `resolution`, and the comment in
+    the ranking loop says the two must not be confused. The stored row confused
+    them."""
+    _patch_signals(monkeypatch, {"AAA": _signal("AAA", 3.0)})
+    monkeypatch.setattr(scanner, "_cost_for",
+                        lambda t, as_of, dollars: {
+                            "cost": 0.0001, "cost_floor": 0.0001,
+                            "reason": None, "spread": 0.0001,
+                            # Resolved says "not zero"; the charge was the tick.
+                            "resolved": True,
+                            "resolution": "at_resolution_floor"})
+
+    candidate = scanner.scan(as_of="2026-03-03")["candidates"][0]
+
+    assert candidate["spread_resolved"] is False, (
+        "an order charged at the tick floor was filed as a measured spread")
+
+
+# --- what the record actually holds -----------------------------------------
+#
+# paper_order is keyed on (as_of_date, ticker) and written with INSERT OR
+# IGNORE, so the first row a date files for a name is the only one it will ever
+# hold. A name rejected on the first scan of a date therefore cannot be
+# accepted for that date by any re-run -- and `already` was computed over
+# accepted rows only, so a first run that accepted nothing left the supersede
+# report looking at an empty set and short-circuiting.
+
+def test_a_candidate_blocked_by_an_earlier_rejection_is_reported(
+        liquid_universe, monkeypatch):
+    """The scan returned AAA as a candidate, the store held it as a rejection,
+    and the run finished ok. Returning candidates the record does not contain
+    is how someone reads one book and holds another."""
+    _patch_signals(monkeypatch, {"AAA": _signal("AAA", 1.2)})
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0001))
+
+    monkeypatch.setattr(scanner, "MIN_ABS_SUE", 2.0)
+    first = scanner.record_scan(as_of="2026-03-03")
+    assert first["candidates"] == []
+
+    # The threshold moved at lunchtime, which is the whole scenario.
+    monkeypatch.setattr(scanner, "MIN_ABS_SUE", 1.0)
+    second = scanner.record_scan(as_of="2026-03-03")
+
+    assert [c["ticker"] for c in second["candidates"]] == ["AAA"]
+    filed = [o["ticker"] for o in
+             pit_store.paper_orders_as_of("2026-03-03", accepted_only=True)]
+    assert filed == [], "the fixture no longer reproduces the blocked write"
+    assert second.get("superseded"), (
+        "a candidate the store does not contain was returned without saying so")
+    assert "AAA" in str(second["superseded"])
+
+
+def test_a_rerun_whose_answer_changed_still_reports_the_filed_one(
+        liquid_universe, monkeypatch):
+    """The filed decision stands -- it is the one that would have been acted
+    on -- and the re-run has to say that its own answer is not what the record
+    holds."""
+    _patch_signals(monkeypatch, {"AAA": _signal("AAA", 3.0),
+                                 "BBB": _signal("BBB", 3.0)})
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0001))
+    scanner.record_scan(as_of="2026-03-03")
+
+    _patch_signals(monkeypatch, {"AAA": _signal("AAA", 3.0)})
+    second = scanner.record_scan(as_of="2026-03-03")
+
+    assert second["superseded"]["filed"] == ["AAA", "BBB"]
+    assert second["superseded"]["proposed"] == ["AAA"]
+
+
+def test_a_tail_of_almost_nothing_is_not_a_trade(liquid_universe):
+    """Nothing in the cross-sectional path floored the surprise itself. A
+    cohort whose largest beat was a hundredth of a cent still had a top
+    decile, and the name sitting in it was priced at a full 40bp of drift on
+    the strength of being the biggest of twenty rounding errors."""
+    trivial = {"ticker": "AAA", "success": True, "error": None, "variant": "cs",
+               "fiscal_period": "2026Q1", "known_at": "2026-03-02", "sue": None,
+               "percentile": 0.98, "scaled_surprise": 0.000001}
+
+    problem = scanner._signal_problem(trivial, "2026-03-03")
+    assert problem and "surprise" in problem.lower()
+
+    real = {**trivial, "scaled_surprise": 0.004}
+    assert scanner._signal_problem(real, "2026-03-03") is None
+
+
+def test_a_filed_order_carries_the_coefficient_it_was_priced_with(
+        liquid_universe, monkeypatch):
+    """Every net edge is a coefficient times a signal, and the coefficient is a
+    module constant that will change the day it is calibrated. Nothing on the
+    row said which one it was, so a book spanning that change is a book of
+    rows priced differently with nothing saying so."""
+    _patch_signals(monkeypatch, {"AAA": _signal("AAA", 3.0)})
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0001))
+
+    scanner.record_scan(as_of="2026-03-03")
+
+    row = pit_store.paper_orders_as_of("2026-03-03", accepted_only=True)[0]
+    assert row["variant"] == "ts"
+    assert row["drift_coefficient"] == scanner.DRIFT_BPS_PER_SUE
+    assert row["drift_calibrated"] is scanner.DRIFT_CALIBRATED
+
+
+def test_a_cross_sectional_order_is_priced_with_the_other_coefficient(
+        liquid_universe, monkeypatch):
+    """A sigma and a rank are different quantities and the two coefficients
+    are deliberately different numbers. The row has to say which it got."""
+    monkeypatch.setattr(scanner, "SIGNAL_VARIANT", "cs")
+    monkeypatch.setattr(scanner, "_signal_for", lambda t, a: {
+        "ticker": t, "success": True, "error": None, "variant": "cs",
+        "fiscal_period": "2026Q1", "known_at": "2026-03-02", "sue": None,
+        "percentile": 0.98, "scaled_surprise": 0.004})
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0001))
+
+    scanner.record_scan(as_of="2026-03-03")
+
+    row = pit_store.paper_orders_as_of("2026-03-03", accepted_only=True)[0]
+    assert row["variant"] == "cs"
+    assert row["drift_coefficient"] == scanner.DRIFT_BPS_PER_TAIL
+
+
+def test_a_filed_order_says_how_much_of_its_signal_was_reconstructed(
+        liquid_universe, monkeypatch):
+    """`sue_af` reports how many of the quarters its sigma spans were
+    reconstructed by the seeder rather than watched by the recorder. Nothing
+    read either field, so an order resting on four reconstructions and two
+    observations was indistinguishable from one resting on six observations --
+    in the record built to answer that question later."""
+    _patch_signals(monkeypatch, {"AAA": _signal("AAA", 3.0, seeded_quarters=3,
+                                                recorded_quarters=5)})
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0001))
+
+    scanner.record_scan(as_of="2026-03-03")
+
+    row = pit_store.paper_orders_as_of("2026-03-03", accepted_only=True)[0]
+    assert row["seeded_quarters"] == 3
+    assert row["recorded_quarters"] == 5
+
+
+# --- a quiet tape and a dead recorder are not the same thing ----------------
+#
+# `has_consensus_history` is True if any consensus row was ever written, and
+# the scan read that as "the recorder has been running, so an empty window is
+# information". A recorder that stopped in January therefore produced, every
+# night from February onward: zero EDGAR calls, an empty book, status ok, exit
+# 0, and a run-log line byte-identical to a genuinely quiet tape.
+
+def test_an_empty_window_over_a_dead_recorder_is_refused(liquid_universe,
+                                                         monkeypatch):
+    _reported(liquid_universe, "AAA", "2026Q1", "2026-01-01")
+    monkeypatch.setattr(scanner, "_signal_for", lambda t, a: _signal(t, 3.0))
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0010))
+
+    with pytest.raises(scanner.RecorderNotRunning):
+        scanner.record_scan(as_of="2026-03-03")
+
+    from research import daily_job
+    run = daily_job.last_run("scan")
+    assert run["status"] == "failed"
+    assert pit_store.paper_orders_as_of("2026-03-03") == [], (
+        "an empty book was filed over a recorder nobody had checked on")
+
+
+def test_an_empty_window_over_a_live_recorder_is_information(liquid_universe,
+                                                             monkeypatch):
+    """The other half. When the recorder is known to have run, nothing
+    reported is a fact about the tape and the scan says so and exits 0."""
+    _reported(liquid_universe, "AAA", "2026Q1", "2026-01-01")
+    for job in ("daily_bars", "consensus"):
+        _recorder_ran(liquid_universe, "2026-03-03", job=job)
+    monkeypatch.setattr(scanner, "_signal_for", lambda t, a: _signal(t, 3.0))
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0010))
+
+    out = scanner.record_scan(as_of="2026-03-03")
+    assert out["candidates"] == []
+
+    from research import daily_job
+    assert daily_job.last_run("scan")["status"] == "ok"
+
+
+def test_a_recorder_that_ran_over_the_weekend_is_still_live(liquid_universe,
+                                                            monkeypatch):
+    """A tolerance, because the recorder does not run on a Sunday and a
+    Tuesday scan after a long weekend is not an emergency."""
+    _reported(liquid_universe, "AAA", "2026Q1", "2026-01-01")
+    for job in ("daily_bars", "consensus"):
+        _recorder_ran(liquid_universe, "2026-02-27", job=job)
+    monkeypatch.setattr(scanner, "_signal_for", lambda t, a: _signal(t, 3.0))
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0010))
+
+    out = scanner.record_scan(as_of="2026-03-02")
+    assert out["candidates"] == []
+
+
+def test_a_window_with_prints_in_it_does_not_consult_the_run_log(
+        liquid_universe, monkeypatch):
+    """The gate is on the empty answer, not on every scan. A window with names
+    in it is evidence the recorder is working, and asking twice would refuse
+    every scan run on a store restored from a backup."""
+    _reported(liquid_universe, "AAA", "2026Q1", "2026-03-02")
+    monkeypatch.setattr(scanner, "_signal_for", lambda t, a: _signal(t, 3.0))
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0010))
+
+    out = scanner.record_scan(as_of="2026-03-03")
+    assert [c["ticker"] for c in out["candidates"]] == ["AAA"]
+
+
+# --- the first run on a fresh volume ----------------------------------------
+#
+# Every test here builds the schema in a fixture, which is why the suite stayed
+# green while `docker compose run --rm research-watch` on a new volume died on
+# "no such table" before it did anything. `research-daily` normally runs first
+# and creates the store, and nothing in the compose file or the cron block
+# enforces that ordering.
+
+def test_a_fresh_store_is_created_by_the_scan_itself(tmp_path, monkeypatch):
+    monkeypatch.setenv("NEMO_PIT_DB", str(tmp_path / "fresh.db"))
+    assert scanner.main(["--as-of", "2026-03-03"]) == 0
+    assert pit_store.paper_orders_as_of("2026-03-03") == []

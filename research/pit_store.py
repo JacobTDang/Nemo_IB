@@ -172,6 +172,23 @@ CREATE TABLE IF NOT EXISTS paper_order (
     side             TEXT,
     fiscal_period    TEXT,
     sue              REAL,
+    -- WHICH surprise that number is. "ts" and "af" are sigmas; "cs" is a rank
+    -- carried as percentile-0.5, so |sue| there is always in (0, 0.5]. One
+    -- column holding both is two incomparable quantities under one name, and a
+    -- coefficient fitted over the mixture describes neither.
+    variant          TEXT,
+    -- The drift coefficient this row's expected edge was priced with, and
+    -- whether it had been measured. Both are module constants at decision
+    -- time and neither is recoverable afterwards -- a book spanning a change
+    -- to either is a book of rows priced differently with nothing saying so.
+    drift_coefficient REAL,
+    drift_calibrated INTEGER,
+    -- How much of the signal rests on quarters `research-seed` reconstructed
+    -- rather than ones the recorder watched. An order built on four
+    -- reconstructions and two observations must not read like one built on
+    -- six observations, in the record that exists to answer exactly that.
+    seeded_quarters  INTEGER,
+    recorded_quarters INTEGER,
     expected_edge_bps REAL,
     cost_bps         REAL,
     net_edge_bps     REAL,
@@ -237,6 +254,11 @@ def connect() -> sqlite3.Connection:
 _MIGRATIONS = (
     ("consensus_snapshot", "eps_actual", "REAL"),
     ("consensus_snapshot", "source", "TEXT NOT NULL DEFAULT 'recorded'"),
+    ("paper_order", "variant", "TEXT"),
+    ("paper_order", "drift_coefficient", "REAL"),
+    ("paper_order", "drift_calibrated", "INTEGER"),
+    ("paper_order", "seeded_quarters", "INTEGER"),
+    ("paper_order", "recorded_quarters", "INTEGER"),
 )
 
 
@@ -938,6 +960,11 @@ def has_consensus_history(as_of: str) -> bool:
     return row is not None
 
 
+def _tri_state(value: Any) -> Optional[bool]:
+    """None stays None; anything else is a yes or a no."""
+    return None if value is None else bool(value)
+
+
 def record_paper_orders(as_of_date: str, candidates: Iterable[Dict[str, Any]],
                         rejected: Iterable[Dict[str, Any]] = (),
                         regime: Optional[str] = None,
@@ -958,12 +985,17 @@ def record_paper_orders(as_of_date: str, candidates: Iterable[Dict[str, Any]],
             cur = conn.execute(
                 """INSERT OR IGNORE INTO paper_order
                    (as_of_date, ticker, accepted, reason, side, fiscal_period,
-                    sue, expected_edge_bps, cost_bps, net_edge_bps,
+                    sue, variant, drift_coefficient, drift_calibrated,
+                    seeded_quarters, recorded_quarters,
+                    expected_edge_bps, cost_bps, net_edge_bps,
                     target_dollars, participation, spread, spread_resolved,
                     rank, regime, gross_target, intended_session, recorded_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (as_of_date, row["ticker"], accepted, row.get("reason"),
                  row.get("side"), row.get("fiscal_period"), row.get("sue"),
+                 row.get("variant"), row.get("drift_coefficient"),
+                 _tri_state(row.get("drift_calibrated")),
+                 row.get("seeded_quarters"), row.get("recorded_quarters"),
                  row.get("expected_edge_bps"), row.get("cost_bps"),
                  row.get("net_edge_bps"), row.get("target_dollars"),
                  row.get("participation"), row.get("spread"),
@@ -989,7 +1021,12 @@ def paper_orders_as_of(as_of: str, accepted_only: bool = False
     with connect() as conn:
         rows = conn.execute(sql, params).fetchall()
     return [{**dict(r), "accepted": bool(r["accepted"]),
-             "spread_resolved": bool(r["spread_resolved"])} for r in rows]
+             "spread_resolved": bool(r["spread_resolved"]),
+             # Three states, not two. A row written before the column existed
+             # never said whether the coefficient was calibrated, and False is
+             # an answer to a question it was not asked.
+             "drift_calibrated": _tri_state(r["drift_calibrated"])}
+            for r in rows]
 
 
 def start_run(job: str, as_of_date: Optional[str] = None) -> int:
@@ -1014,6 +1051,27 @@ def finish_run(rows_written: int = 0, status: str = "ok",
                SET finished_at = ?, rows_written = ?, status = ?, error = ?
                WHERE run_id = ?""",
             (_now(), rows_written, status, error, rid))
+
+
+def last_successful_run(job: str, as_of: str) -> Optional[str]:
+    """The most recent date `job` finished successfully for, on or before
+    `as_of`.
+
+    "Has anything been watching lately" is a question this log can answer and
+    that every reader of the store was guessing at. Only a finished run counts,
+    for the same reason `missing_days` says so: a crashed process leaves a
+    started row with no finish, and a failed fetch leaves a finish with no
+    data, and neither is coverage. 'closed' counts alongside 'ok' -- the
+    exchange shuts about ten weekdays a year and a holiday is not a gap.
+    """
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT MAX(as_of_date) AS last FROM run_log
+               WHERE job = ? AND status IN ('ok', 'closed')
+                 AND finished_at IS NOT NULL
+                 AND as_of_date IS NOT NULL AND as_of_date <= ?""",
+            (job, as_of)).fetchone()
+    return row["last"] if row and row["last"] else None
 
 
 def missing_days(job: str, start: str, end: str) -> List[str]:
