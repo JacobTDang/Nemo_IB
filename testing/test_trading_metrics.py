@@ -9,6 +9,8 @@ import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from unittest.mock import patch
+
 import pandas as pd
 import pytest
 
@@ -336,6 +338,21 @@ def test_a_mega_cap_and_a_micro_cap_are_orders_of_magnitude_apart():
     assert micro is not None and micro < mega / 100, f"BOOM ADV ${micro:,.0f}"
 
 
+def _metrics_or_skip(ticker: str) -> dict:
+    """Fetch, or skip naming the vendor's own reason.
+
+    These are @network tests, so a transient vendor failure is not a finding
+    about the calculation. Reading straight through a refusal is how a clean
+    run failed with `KeyError: 'atr'` and pointed at the ATR band rather than
+    at the fetch that never happened.
+    """
+    result = tm.get_trading_metrics(ticker)
+    if not result.get("success"):
+        pytest.skip(f"{ticker}: the vendor did not answer -- "
+                    f"{result.get('error')}")
+    return result
+
+
 @network
 def test_share_volume_agrees_with_yfinances_own_three_month_average():
     """An independent check on the volume path.
@@ -346,7 +363,7 @@ def test_share_volume_agrees_with_yfinances_own_three_month_average():
     """
     import yfinance as yf
 
-    ours = tm.get_trading_metrics("MSFT")["adv"]["60d"]["share_volume"]
+    ours = _metrics_or_skip("MSFT")["adv"]["60d"]["share_volume"]
     theirs = yf.Ticker("MSFT").info.get("averageVolume")
 
     assert theirs, "yfinance did not return averageVolume; cannot cross-check"
@@ -361,7 +378,7 @@ def test_atr_percent_lands_in_a_plausible_band_for_a_mega_cap():
     asserts the band that any correct implementation must land inside and
     that an off-by-100 scaling error cannot.
     """
-    result = tm.get_trading_metrics("MSFT")
+    result = _metrics_or_skip("MSFT")
 
     atr_pct = result["atr"]["atr_pct_of_price"]
     assert 0.3 < atr_pct < 10.0, f"MSFT ATR is {atr_pct}% of price"
@@ -378,3 +395,45 @@ def test_rvol_of_a_liquid_name_sits_near_one_on_an_ordinary_day():
 
     assert result["rvol"]["ratio"] is not None
     assert 0.05 < result["rvol"]["ratio"] < 20.0, result["rvol"]
+
+
+# ------------------------------------------------------- refusal shape
+#
+# A clean full-suite run failed these two tests with `KeyError: 'atr'` rather
+# than with a value disagreement, while both passed in isolation -- so the
+# trigger is a transient vendor failure, and what the caller met was a refusal
+# missing the keys the success path documents.
+
+_REFUSAL_PATHS = (
+    ("fetch raised", lambda: patch.object(
+        tm, "fetch_daily_bars", side_effect=RuntimeError("vendor throttled"))),
+    ("empty frame", lambda: patch.object(
+        tm, "fetch_daily_bars", return_value=pd.DataFrame())),
+)
+
+
+@pytest.mark.parametrize("label,make_patch", _REFUSAL_PATHS,
+                         ids=[p[0] for p in _REFUSAL_PATHS])
+def test_a_refusal_still_carries_the_documented_keys(label, make_patch):
+    """`result["atr"]` must not raise on a fetch that never happened.
+
+    The success path returns `atr`; every transport refusal returned only
+    ticker/success/error. A caller reaching for it got a KeyError instead of
+    the refusal it was handed, and one writing `.get("atr", {})` read "no ATR
+    for this name" out of a vendor timeout.
+
+    `None` is not a claim about the security -- an `atr_pct_of_price` of 0.0
+    would be. The module already returns `"atr": None` for the
+    insufficient-data case; these paths just did not use it.
+    """
+    with make_patch():
+        result = tm.get_trading_metrics("MSFT")
+
+    assert result["success"] is False, "this fixture should produce a refusal"
+    assert result.get("error"), "a refusal must say what went wrong"
+    for key in ("atr", "rvol", "adv"):
+        assert key in result, (
+            f"{label}: the refusal drops {key!r}, which the success path "
+            f"documents; a caller reading it gets a KeyError")
+        assert result[key] is None, (
+            f"{label}: {key!r} carries a value on a fetch that never happened")

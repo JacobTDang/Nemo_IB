@@ -187,6 +187,20 @@ def _adv_block(complete: "pd.DataFrame", windows: Tuple[int, ...],
     return block
 
 
+# The blocks the success path always publishes. A refusal that drops them
+# hands a caller a KeyError instead of the refusal it was given, and a caller
+# writing .get("atr", {}) reads "no ATR for this name" out of a fetch that
+# never happened. None is not a claim about the security; an
+# atr_pct_of_price of 0.0 would be.
+_REFUSAL_BLOCKS = ("rvol", "adv", "atr")
+
+
+def _refusal(ticker: str, error: str) -> Dict[str, Any]:
+    """A failed lookup, in the shape a successful one has."""
+    return {"ticker": ticker.upper(), "success": False, "error": error,
+            **{block: None for block in _REFUSAL_BLOCKS}}
+
+
 def get_trading_metrics(ticker: str, period: str = '1y',
                         rvol_lookback: int = 20,
                         atr_period: int = 14) -> Dict[str, Any]:
@@ -198,25 +212,22 @@ def get_trading_metrics(ticker: str, period: str = '1y',
     try:
         frame = fetch_daily_bars(ticker, period)
     except Exception as exc:  # noqa: BLE001 - reported, not swallowed
-        return {
-            "ticker": ticker.upper(),
-            "success": False,
-            "error": f"yfinance history fetch failed: {type(exc).__name__}: {exc}",
-        }
+        return _refusal(
+            ticker,
+            f"yfinance history fetch failed: {type(exc).__name__}: {exc}")
 
     if frame is None or frame.empty:
-        return {"ticker": ticker.upper(), "success": False,
-                "error": "no price history returned"}
+        return _refusal(ticker, "no price history returned")
 
     absent = [column for column in _REQUIRED_COLUMNS if column not in frame.columns]
     if absent:
-        return {"ticker": ticker.upper(), "success": False,
-                "error": f"price history is missing column(s): {', '.join(absent)}"}
+        return _refusal(
+            ticker, f"price history is missing column(s): {', '.join(absent)}")
 
     bars = frame.dropna(subset=list(_REQUIRED_COLUMNS))
     if bars.empty:
-        return {"ticker": ticker.upper(), "success": False,
-                "error": "no price history returned with complete OHLCV"}
+        return _refusal(
+            ticker, "no price history returned with complete OHLCV")
 
     partial = _is_partial_session(bars.index[-1])
     complete = bars.iloc[:-1] if partial else bars
