@@ -267,6 +267,15 @@ line-length = 100
 # suite need not catch, and unused imports are worth less than that risk.
 select = ["F811", "F821", "F841", "E711", "E712", "E713", "E714", "E722", "E741"]
 
+# F811 and F841 both skip anything matching dummy-variable-rgx, and its default
+# treats every leading underscore as a throwaway -- so `_helper` defined twice
+# was not reported, while `helper` was. This repo has 819 distinct `_`-prefixed
+# definitions, which is exactly where a duplicate hides: one arrived during a
+# refactor, silently shadowed the corrected version, and ruff called the file
+# clean. Narrowed to bare underscores, which is what a throwaway actually looks
+# like. Scanned the tree at the time of the change: no existing violations.
+dummy-variable-rgx = "^_+$"
+
 [tool.ruff.lint.per-file-ignores]
 # Tests bind names they assert on rather than use.
 "testing/*" = ["F841", "E712"]
