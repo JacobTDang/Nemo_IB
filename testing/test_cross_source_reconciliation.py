@@ -118,6 +118,40 @@ PERIOD_MATCH_DAYS = 7
 
 ADJUDICATED: Dict[tuple, str] = {
 
+    # ---- A revenue step change, not an extraction defect. Both vendors read
+    # a trailing twelve months; the filer's own revenue stepped 28% between
+    # fiscal years, so a TTM window that straddles the step differs by roughly
+    # the step times the fraction of quarters the two disagree about. This
+    # entry should clear itself once four quarters have passed on the new
+    # base -- and because an entry that starts agreeing fails too, it will say
+    # so rather than sitting here.
+    # ---- Same cause as DKS below, driven by growth rather than by an
+    # acquisition, and the arithmetic settles it outright: NVDA's own adjacent
+    # TTM windows differ by more than the two vendors do, so a one-quarter
+    # difference in cutoff is a sufficient explanation and no extraction error
+    # is needed to produce this gap.
+    ("NVDA", "revenue_ttm"): (
+        "vendor timing on a steep ramp, both defensible. us-gaap:Revenues on "
+        "the 10-K for FY ended 2026-01-25 is 215.938bn and get_revenue_base "
+        "returns it to the dollar. Quarterly Revenues run 46.743, 57.006, "
+        "81.615, 96.221bn, so TTM through 2026-07-26 is 281.585bn against "
+        "229.426bn one quarter earlier -- adjacent windows 22.7% apart, wider "
+        "than the 19.5% between the vendors here (market_data 302.970bn, "
+        "finnhub_metric 253.490bn), and both of those sit in that band. "
+        "Measured 2026-08-29."),
+
+    ("DKS", "revenue_ttm"): (
+        "vendor timing across a revenue step, both defensible. SEC XBRL "
+        "RevenueFromContractWithCustomerExcludingAssessedTax on the 10-K: "
+        "13.443bn for FY ended 2025-02-01, 17.215bn for FY ended 2026-01-31, "
+        "a 28% step. get_revenue_base returns the 17.215bn to the dollar, so "
+        "our own reading of the primary source is right. The two figures in "
+        "this check are both TTM and both above the completed fiscal year -- "
+        "market_data 21.145bn, finnhub_metric 19.206bn -- because they roll "
+        "through different quarter cutoffs on either side of the step. "
+        "Measured 2026-08-28; the tolerance was deliberately not widened, "
+        "since it is doing its job catching a real 10% gap."),
+
     # ---- get_revenue_base returns us-gaap:Revenues undimensioned. Nine filers
     # used to disagree here, from two compounding causes -- the ASC 606 element
     # tried ahead of us-gaap:Revenues, and filter_annual_data taking the largest
