@@ -214,3 +214,69 @@ def test_the_check_above_can_actually_fail():
     "the detector no longer recognises `os.getenv(self._api_key_env)`, so the "
     "rule above is vacuous on every module that reads its key indirectly")
   assert os.path.exists(gt.__file__)
+
+
+# --------------------------------------------------- the rule, everywhere
+#
+# The check above reads one module. That was deliberate while the codebase had
+# unwrapped reads elsewhere -- a repo-wide rule would have been red on day one
+# and switched off. Every known site is wrapped now, so the sweep is the more
+# valuable half: it is what stops the next one appearing unnoticed.
+
+_SWEEP_ROOTS = ("agent", "tools", "research", "daemons", "data", "state",
+                "common")
+
+# Reading a credential to decide whether it is present, without binding it, is
+# not the hazard this rule is about. Nothing is exempt today; the list exists
+# so an exemption has to be written down with a reason rather than assumed.
+_SWEEP_EXEMPT: dict = {}
+
+
+def _unwrapped_credential_reads(path):
+  """(read, line) for every credential assigned without Secret(...) in a file."""
+  try:
+    tree = ast.parse(open(path, encoding="utf-8").read())
+  except SyntaxError:
+    return []
+  found = []
+  for assignment in ast.walk(tree):
+    if not isinstance(assignment, ast.Assign):
+      continue
+    wrapped = set()
+    for node in ast.walk(assignment.value):
+      if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+          and node.func.id == "Secret"):
+        wrapped.update(id(n) for n in ast.walk(node))
+    for node in ast.walk(assignment.value):
+      if _is_credential_read(node) and id(node) not in wrapped:
+        found.append((ast.unparse(node), assignment.lineno))
+  return found
+
+
+def test_no_module_anywhere_binds_a_credential_unwrapped():
+  """The same rule, over the whole tree rather than one file."""
+  import pathlib
+
+  root = pathlib.Path(__file__).resolve().parent.parent
+  offenders = {}
+  for package in _SWEEP_ROOTS:
+    for path in sorted((root / package).rglob("*.py")):
+      rel = str(path.relative_to(root))
+      if rel in _SWEEP_EXEMPT:
+        continue
+      hits = _unwrapped_credential_reads(path)
+      if hits:
+        offenders[rel] = hits
+
+  assert not offenders, (
+    "these bind a credential without wrapping it at the read, so it renders "
+    f"in a traceback, a debugger or a crash reporter: {offenders}")
+
+
+def test_the_sweep_actually_reaches_the_tree():
+  """A sweep that walks nothing passes everything."""
+  import pathlib
+
+  root = pathlib.Path(__file__).resolve().parent.parent
+  seen = sum(len(list((root / p).rglob("*.py"))) for p in _SWEEP_ROOTS)
+  assert seen > 50, f"the sweep only found {seen} modules; its roots are wrong"

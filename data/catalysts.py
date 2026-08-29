@@ -13,6 +13,7 @@ from typing import List, Dict, Any, Optional
 import calendar
 import os
 import sys
+from common.secret import Secret
 
 
 # FOMC meeting dates 2026 (final two-day meetings, statement on day 2).
@@ -119,7 +120,10 @@ def upcoming_catalysts(ticker: str, days_out: int = 60) -> List[Dict[str, Any]]:
 
 def _earnings_finnhub(ticker: str, start: datetime, end: datetime) -> List[Dict[str, Any]]:
   """Pull next earnings date from Finnhub /calendar/earnings."""
-  api_key = os.getenv("FINNHUB_API_KEY")
+  # Wrapped at the read. A bare string here renders under --showlocals and in
+  # any crash reporter that dumps this frame, and the requests call below puts
+  # it in a query parameter, so provider error text can carry it too.
+  api_key = Secret(os.getenv("FINNHUB_API_KEY") or "")
   if not api_key:
     return []
   import requests
@@ -128,7 +132,7 @@ def _earnings_finnhub(ticker: str, start: datetime, end: datetime) -> List[Dict[
     'symbol': ticker.upper(),
     'from': start.date().isoformat(),
     'to':   end.date().isoformat(),
-    'token': api_key,
+    'token': api_key.reveal(),
   }
   resp = requests.get(url, params=params, timeout=10)
   if resp.status_code != 200:
