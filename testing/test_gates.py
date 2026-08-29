@@ -23,15 +23,15 @@ def _online(monkeypatch):
 def test_missing_key_is_reported(monkeypatch):
     from testing import _gates
     _online(monkeypatch)
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    assert _gates.service_missing("openrouter") is not None
+    monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
+    assert _gates.service_missing("finnhub") is not None
 
 
 def test_present_key_is_not_reported(monkeypatch):
     from testing import _gates
     _online(monkeypatch)
-    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key-not-real")
-    assert _gates.service_missing("openrouter") is None
+    monkeypatch.setenv("FINNHUB_API_KEY", "test-key-not-real")
+    assert _gates.service_missing("finnhub") is None
 
 
 def test_empty_key_counts_as_missing(monkeypatch):
@@ -40,8 +40,8 @@ def test_empty_key_counts_as_missing(monkeypatch):
     in .env for exactly this reason; Groq is gone and the rule is not."""
     from testing import _gates
     _online(monkeypatch)
-    monkeypatch.setenv("OPENROUTER_API_KEY", "")
-    assert _gates.service_missing("openrouter") is not None
+    monkeypatch.setenv("FINNHUB_API_KEY", "")
+    assert _gates.service_missing("finnhub") is not None
 
 
 def test_an_unknown_service_is_refused_rather_than_passed(monkeypatch):
@@ -62,8 +62,8 @@ def test_offline_run_counts_as_missing(monkeypatch):
     them and an offline run still spent real time on live LLM calls."""
     from testing import _gates
     monkeypatch.setenv("SKIP_NETWORK_TESTS", "1")
-    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key-not-real")
-    reason = _gates.service_missing("openrouter")
+    monkeypatch.setenv("FINNHUB_API_KEY", "test-key-not-real")
+    reason = _gates.service_missing("finnhub")
     assert reason is not None and "SKIP_NETWORK_TESTS" in reason
 
 
@@ -80,8 +80,8 @@ def test_reason_names_the_missing_dependency(monkeypatch):
     """A skip with no reason is how a broken test hides."""
     from testing import _gates
     _online(monkeypatch)
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    assert "OPENROUTER_API_KEY" in _gates.service_missing("openrouter")
+    monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
+    assert "FINNHUB_API_KEY" in _gates.service_missing("finnhub")
 
 
 def test_unknown_service_raises(monkeypatch):
@@ -104,11 +104,11 @@ def _run_probe(env_extra):
     """
     probe = textwrap.dedent("""
         import pytest
-        from testing._gates import requires_openrouter
+        from testing._gates import requires_finnhub
 
-        pytestmark = requires_openrouter
+        pytestmark = requires_finnhub
 
-        def test_needs_openrouter():
+        def test_needs_finnhub():
             assert True
     """)
     testing_dir = pathlib.Path(__file__).resolve().parent
@@ -182,8 +182,8 @@ def test_gates_resolve_dotenv_like_the_code_they_gate(tmp_path, monkeypatch):
         "gates resolves through load_dotenv()")
 
 
-def test_openrouter_gate_sees_a_dotenv_key(monkeypatch):
-    """The concrete case: OPENROUTER_API_KEY is set in this repo's .env, and
+def test_a_gate_sees_a_dotenv_key(monkeypatch):
+    """The concrete case: FINNHUB_API_KEY is set in this repo's .env, and
     the offline suite was skipping OpenRouter tests that would have run."""
     import importlib
     import pathlib
@@ -191,16 +191,16 @@ def test_openrouter_gate_sees_a_dotenv_key(monkeypatch):
     repo_env = pathlib.Path(__file__).resolve().parent.parent / ".env"
     if not repo_env.exists():
         pytest.skip("no .env in this checkout")
-    if "OPENROUTER_API_KEY" not in repo_env.read_text():
-        pytest.skip("OPENROUTER_API_KEY not configured in .env")
+    if "FINNHUB_API_KEY" not in repo_env.read_text():
+        pytest.skip("FINNHUB_API_KEY not configured in .env")
 
     # SKIP_NETWORK_TESTS deliberately counts as "service unavailable" for
     # network gates, so it has to be cleared to test credential resolution.
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
     monkeypatch.delenv("SKIP_NETWORK_TESTS", raising=False)
     import testing._gates as gates
     importlib.reload(gates)
-    assert gates.service_missing("openrouter") is None, (
+    assert gates.service_missing("finnhub") is None, (
         "gate reports OpenRouter unavailable while .env configures it")
 
 
@@ -228,3 +228,37 @@ def test_finnhub_and_fred_gates_respect_the_offline_flag(monkeypatch):
     for service in ("finnhub", "fred"):
         reason = _gates.service_missing(service)
         assert reason is not None and "SKIP_NETWORK_TESTS" in reason, service
+
+
+def test_every_gate_guards_at_least_one_test():
+    """A gate nothing applies is the same defect this module exists to stop.
+
+    `_gates` opens by saying a gate that cannot fail is not a gate. One that
+    guards no test cannot fail either: it passes forever, it is exercised only
+    by the tests written for it, and it reads as coverage of a path that is
+    gone. `requires_openrouter` became exactly that when the agent layer was
+    retired and every test using it was deleted with the module.
+    """
+    import importlib
+    import pathlib
+    import re
+
+    _gates = importlib.import_module("testing._gates")
+    here = pathlib.Path(__file__).resolve().parent
+    gates = {name for name in dir(_gates) if name.startswith("requires_")}
+    assert gates, "no gates found; this test is looking in the wrong place"
+
+    used = set()
+    for path in here.glob("test_*.py"):
+        if path.name in ("test_gates.py",):
+            continue          # its own tests name every gate by construction
+        text = path.read_text(encoding="utf-8")
+        for name in gates:
+            if re.search(rf"\b{name}\b", text):
+                used.add(name)
+
+    unused = sorted(gates - used)
+    assert not unused, (
+        f"these gates guard no test, so they cannot fail and stand for "
+        f"coverage that no longer exists: {unused}. Remove the gate and its "
+        f"env var, or apply it.")

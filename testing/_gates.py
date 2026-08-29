@@ -8,10 +8,14 @@ Two rules:
    and a gated test fails instead of skipping, so a run with full credentials
    proves the gated tests still work rather than merely still exist.
 
-The LLM gates are split by provider because the providers are separately
-configured and separately broken: OPENROUTER_API_KEY is set on this machine
-while GROQ_API_KEY is present with an empty value. A single `requires_llm`
-would skip OpenRouter-backed tests that can actually run.
+Gates are split by provider because providers are separately configured and
+separately broken -- one key present and another empty is the ordinary case,
+and a single `requires_llm` would skip tests that can actually run.
+
+3. A gate must guard at least one test. One that guards none cannot fail
+   either, and reads as coverage of a path that is gone -- which is what
+   `requires_openrouter` became when the agent layer was retired and every
+   test using it was deleted with the module. Enforced by test_gates.
 
 SKIP_NETWORK_TESTS=1 counts as "unavailable" for every gate that reaches a
 live service. That is the whole point of the offline run: an LLM call or a
@@ -86,11 +90,6 @@ _OFFLINE_REASON = (
 def service_missing(name: str) -> str | None:
     _load_env_once()
     """Return a human-readable reason the service is unavailable, or None."""
-    if name == "openrouter":
-        if _offline():
-            return _OFFLINE_REASON.format(service="the OpenRouter API")
-        return None if _env_key("OPENROUTER_API_KEY") else (
-            "OPENROUTER_API_KEY is unset or empty; set it in .env to run this test")
     if name == "searxng":
         if _offline():
             return _OFFLINE_REASON.format(service="SearXNG")
@@ -158,7 +157,6 @@ def _gate(name: str):
     return pytest.mark.skipif(True, reason=reason)
 
 
-requires_openrouter = _gate("openrouter")
 requires_searxng = _gate("searxng")
 requires_playbook = _gate("playbook")
 requires_sec = _gate("sec")
