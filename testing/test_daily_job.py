@@ -1581,3 +1581,67 @@ def test_backfill_cannot_be_pointed_at_today(store, monkeypatch):
     daily_job.main(["--backfill", "--as-of", "2026-08-06"])
 
     assert replayed == ["2026-08-04", "2026-08-05"]
+
+
+def test_a_pending_session_stops_the_whole_night(tmp_path, monkeypatch):
+    """Not just the stage that records bars.
+
+    `_session_is_pending` guarded `record_daily_bars` only, so on a host whose
+    clock has rolled past UTC midnight the night's other three stages ran
+    anyway. Observed end to end: `daily_bars` refused, and `newcomers`,
+    `universe` and `consensus` wrote 242,890 bars, a full universe snapshot
+    and 417 consensus rows -- all dated to a Saturday that never traded, and
+    all reported `ok`.
+
+    A `universe_snapshot` for a non-session is the part that outlives the run:
+    `universe_as_of` reads "as it last stood on or before", so it becomes the
+    answer for every read until the next real night.
+
+    Stage isolation is right for a stage that *failed* -- that is what keeps a
+    broken fetch from costing the consensus snapshot. A session that has not
+    happened is a different thing: the whole night is premature.
+    """
+    monkeypatch.setenv("NEMO_PIT_DB", str(tmp_path / "pit.db"))
+    import importlib
+    from research import pit_store as store
+    importlib.reload(store)
+    store.init_schema()
+
+    pending = "2026-08-29"
+    monkeypatch.setattr(daily_job, "_today", lambda: pending)
+    monkeypatch.setattr(daily_job, "_session_is_pending", lambda a: a == pending)
+    monkeypatch.setattr(daily_job, "_fetch_sec_tickers",
+                        lambda: [{"ticker": "AAA"}, {"ticker": "BBB"}])
+
+    def _must_not_run(*a, **k):
+        raise AssertionError("a stage ran for a session that has not happened")
+
+    for name in ("record_daily_bars", "bootstrap_history", "refresh_universe",
+                 "record_consensus_snapshots"):
+        monkeypatch.setattr(daily_job, name, _must_not_run)
+
+    result = daily_job.run_all()
+
+    assert result.get("status") == "pending", (
+        f"the night should refuse as a whole; got {result.get('status')!r}")
+    with store.connect() as conn:
+        conn.row_factory = None
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM universe_snapshot WHERE as_of_date = ?",
+            (pending,)).fetchone()[0]
+    assert rows == 0, f"{rows} universe rows written for a non-session"
+
+
+def test_a_pending_night_still_exits_non_zero(tmp_path, monkeypatch):
+    """The scheduler only ever learns from the exit code."""
+    monkeypatch.setenv("NEMO_PIT_DB", str(tmp_path / "pit.db"))
+    import importlib
+    from research import pit_store as store
+    importlib.reload(store)
+
+    pending = "2026-08-29"
+    monkeypatch.setattr(daily_job, "_today", lambda: pending)
+    monkeypatch.setattr(daily_job, "_session_is_pending", lambda a: a == pending)
+    monkeypatch.setattr(daily_job, "_fetch_sec_tickers", lambda: [{"ticker": "AAA"}])
+
+    assert daily_job.main([]) == 1

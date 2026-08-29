@@ -955,6 +955,26 @@ def run_all(as_of: Optional[str] = None,
     as_of = as_of or _today()
     results: Dict[str, Any] = {"as_of": as_of}
 
+    # Before anything is fetched or written. The stage guard below catches this
+    # for a direct record_daily_bars call, and catching it only there let the
+    # other three stages run on a night that had not happened: measured on a
+    # host whose clock had rolled past UTC midnight, daily_bars refused while
+    # newcomers, universe and consensus wrote 242,890 bars, a full snapshot and
+    # 417 consensus rows, all dated to a Saturday and all reported ok. The
+    # universe row is the one that outlives the run, because universe_as_of
+    # reads "as it last stood on or before" and would serve it until the next
+    # real night.
+    #
+    # Stages deliberately do not depend on each other's success -- that is what
+    # stops a broken fetch costing the consensus snapshot. A session that has
+    # not happened is not a failed stage; it is the whole night arriving early.
+    if _session_is_pending(as_of):
+        detail = (f"this run is dated {as_of} but that session has not "
+                  f"happened yet; nothing was recorded")
+        pit_store.start_run("daily_bars", as_of_date=as_of)
+        pit_store.finish_run(rows_written=0, status="failed", error=detail)
+        return {**results, "status": "pending", "error": detail}
+
     try:
         registrants = [r["ticker"] for r in _fetch_sec_tickers()]
     except Exception as exc:  # noqa: BLE001
