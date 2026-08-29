@@ -33,6 +33,12 @@ from tools.web_search_server.web_search import _searxng_reachable
 # through a subprocess for exactly this reason.
 STRICT = os.environ.get("NEMO_REQUIRE_SERVICES") == "1"
 
+# What the RAG suite needs to mean anything. Its own bootstrap smoke test asks
+# for more than a hundred chunks, and the retrieval tests seed a handful of
+# their own on top -- so an index below this answers their queries with an
+# empty result and no error, which is a failure that looks like a finding.
+_MIN_RAG_CHUNKS = 100
+
 
 def _offline() -> bool:
     """True when the run has declared itself offline."""
@@ -113,6 +119,30 @@ def service_missing(name: str) -> str | None:
             return _OFFLINE_REASON.format(service="the FRED API")
         return None if _env_key("FRED_API_KEY") else (
             "FRED_API_KEY is unset or empty; set it in .env to run this test")
+    if name == "rag":
+        # Not a credential and not a network service: a corpus somebody
+        # ingested. `rag_search` and `rag_ingest` are declared tools, hidden in
+        # the image only because the RAG stack is not installed there, so a
+        # machine that has both the package and an index can really run these.
+        # Sized rather than merely present, because an empty index answers
+        # every query with an empty result and no error -- which is what made
+        # these five fail rather than skip.
+        try:
+            from agent.rag import store
+        except Exception as exc:      # noqa: BLE001 - reported, not hidden
+            return (f"the RAG stack is not importable ({type(exc).__name__}); "
+                    f"install it to run this test")
+        try:
+            chunks = store.count_chunks()
+        except Exception as exc:      # noqa: BLE001 - a missing table is a
+            # missing corpus, and saying which is more use than a traceback.
+            return (f"the RAG index cannot be read ({type(exc).__name__}: "
+                    f"{exc}); ingest a corpus to run this test")
+        if chunks < _MIN_RAG_CHUNKS:
+            return (f"the RAG corpus holds {chunks} chunks, under the "
+                    f"{_MIN_RAG_CHUNKS} these tests need; run the ingest "
+                    f"bootstrap to populate it")
+        return None
     raise ValueError(f"unknown service gate: {name!r}")
 
 
@@ -134,6 +164,7 @@ requires_playbook = _gate("playbook")
 requires_sec = _gate("sec")
 requires_finnhub = _gate("finnhub")
 requires_fred = _gate("fred")
+requires_rag = _gate("rag")
 
 
 def skip_if_provider_unavailable(result: dict, provider: str = "") -> None:

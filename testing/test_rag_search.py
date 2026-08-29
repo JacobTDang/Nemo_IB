@@ -28,6 +28,11 @@ import pytest
 # is not in the homelab image either -- `rag_search` and `rag_ingest` are
 # capability-gated and hidden there -- so an offline run has neither the model
 # nor the tools.
+# Retrieval against a corpus somebody ingested. Without one every query
+# returns an empty result and no error, so these fail rather than skip --
+# and a permanently red test is one nobody reads.
+from testing._gates import requires_rag  # noqa: E402
+
 pytestmark = pytest.mark.network
 
 import asyncio
@@ -227,6 +232,7 @@ def _seed_corpus():
 # 1. Known-fact retrieval
 # ---------------------------------------------------------------------------
 
+@requires_rag
 def test_known_fact_retrieval():
   _section("1. Known-fact retrieval")
 
@@ -284,6 +290,7 @@ def test_negative_case():
 # 3. Ticker filter
 # ---------------------------------------------------------------------------
 
+@requires_rag
 def test_ticker_filter():
   _section("3. Ticker filter")
 
@@ -306,6 +313,7 @@ def test_ticker_filter():
 # 4. Doc-type filter
 # ---------------------------------------------------------------------------
 
+@requires_rag
 def test_doc_type_filter():
   _section("4. doc_type filter")
 
@@ -357,6 +365,7 @@ async def _mcp_roundtrip_async() -> Dict[str, Any]:
               'payload': json.loads(payload_text)}
 
 
+@requires_rag
 def test_mcp_roundtrip():
   _section("5. MCP roundtrip — server stdio")
 

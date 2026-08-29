@@ -39,3 +39,4 @@ tools/slack_channel/node_modules/
 testing/test_zz_env_probe_generated.py
 testing/test_zz_cache_a_generated.py
 testing/test_zz_cache_b_generated.py
+testing/test_zz_rag_gate_probe.py
