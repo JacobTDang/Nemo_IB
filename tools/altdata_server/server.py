@@ -138,7 +138,7 @@ def _run_subprocess(runner_path: str, tool_name: str, kwargs: dict,
 
 def _envelope(data: Any, tool: str, ticker: str = "",
                errors: Optional[List[str]] = None) -> Dict[str, Any]:
-    return {
+    payload = {
         "domain": "alt_data",
         "ticker": ticker,
         "tool": tool,
@@ -147,6 +147,15 @@ def _envelope(data: Any, tool: str, ticker: str = "",
         "data": data,
         "metadata": {"errors": errors or []},
     }
+    if errors:
+        # Beside `success`, where a caller looks. The reason was already here
+        # in metadata.errors and in data.error, and neither is the key anyone
+        # reaches for: a sweep of every tool found two of these reporting
+        # `error: None` on a lookup that had failed for a well-described
+        # reason. The nested copies stay -- `data` is the diagnostic payload,
+        # this is the contract.
+        payload["error"] = errors[0]
+    return payload
 
 
 def _ok(tool: str, data: Any, ticker: str = "") -> List[TextContent]:

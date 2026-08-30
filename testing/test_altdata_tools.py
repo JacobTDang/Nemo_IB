@@ -939,3 +939,49 @@ def test_companion_bills_sharing_a_title_are_counted_separately(monkeypatch):
     assert {b["link"] for b in bills} == {
         "https://api.congress.gov/v3/bill/119/hr/1234",
         "https://api.congress.gov/v3/bill/119/s/567"}
+
+
+# ------------------------------------------------------- refusal envelope
+#
+# A sweep of all 98 tools found two here returning `success: False` with no
+# top-level `error`. The reason existed and was a good one -- "No public job
+# board answered for 'microsoft'. Tried Greenhouse … This is a failed lookup,
+# not a count of zero" -- but it sat in `data.error` and `metadata.errors`,
+# so a caller doing `result.get("error")` got None from a failed lookup.
+
+def test_a_refused_lookup_carries_its_reason_at_the_top_level():
+    """Where a caller looks, not one level down."""
+    from tools.altdata_server import server as alt
+
+    failed = {"success": False, "coverage": "not_covered",
+              "reason": "no_provider",
+              "error": "No public job board answered for 'acme'."}
+    payload = json.loads(alt._dispatch("get_job_postings_count", failed,
+                                       "ACME")[0].text)
+
+    assert payload["success"] is False
+    assert payload.get("error"), (
+        "a refusal with no top-level error is indistinguishable from a "
+        "malformed response")
+    assert "job board" in payload["error"]
+
+
+def test_a_successful_lookup_carries_no_error():
+    """The other direction: `error` present on a success would read as one."""
+    from tools.altdata_server import server as alt
+
+    payload = json.loads(alt._dispatch("get_congress_trades",
+                                       {"success": True, "rows": []}, "AAPL")[0].text)
+    assert payload["success"] is True
+    assert not payload.get("error")
+
+
+def test_the_reason_is_kept_where_it_already_was():
+    """Lifting it must not remove it -- `data` is the diagnostic payload."""
+    from tools.altdata_server import server as alt
+
+    failed = {"success": False, "error": "no provider answered",
+              "coverage": "not_covered"}
+    payload = json.loads(alt._dispatch("get_job_postings_count", failed, "X")[0].text)
+    assert payload["data"]["error"] == "no provider answered"
+    assert payload["metadata"]["errors"] == ["no provider answered"]
