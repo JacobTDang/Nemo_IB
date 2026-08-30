@@ -1162,6 +1162,26 @@ class TestEdgeCases:
 # =============================================================================
 
 class TestErrorHandling:
+    @pytest.fixture(autouse=True)
+    def _cold_filing_cache(self):
+        """A cold cache, because these tests observe what a mocked call does.
+
+        `get_latest_filing` returns a cache hit before it constructs `Company`,
+        so patching `sec_utils.Company` here reached nothing once an earlier
+        class in this file had fetched the same ticker -- TestGetLatestFiling
+        asks for AAPL, and these two then read that filing instead of their own
+        mock. 9/9 green run alone, two failures in a full run, with only
+        collection order between them.
+
+        Scoped to this class rather than cleared globally per test: the cache
+        is what keeps the rest of the file from re-fetching the same filings
+        out of SEC EDGAR, and EDGAR throttles a suite that does.
+        """
+        from tools.web_search_server import sec_utils
+        sec_utils._filing_cache_lru.clear()
+        yield
+        sec_utils._filing_cache_lru.clear()
+
     """Tests for error handling and recovery."""
 
     def test_network_error_handling(self):

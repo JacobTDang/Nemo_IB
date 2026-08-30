@@ -44,17 +44,43 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Sequence
 
 from research import pit_store
+from tools import filing_cache
 
 SOURCE = "seeded"
 
 
+def _finnhub_server():
+    from tools.news_agregator.finnhub_server import FinnhubServer
+
+    return FinnhubServer()
+
+
 def _fetch_surprises(ticker: str) -> List[Dict[str, Any]]:
+    """One name's four quarters, with the session closed before the loop ends.
+
+    `asyncio.run` opens a loop, runs the call and closes the loop; a session
+    created inside it survives, holding a connector bound to a loop that no
+    longer exists. Nothing notices for a while. Then the collector reaches one,
+    its destructor schedules cleanup on that dead loop, and the run dies with
+    "Event loop is closed" -- which is what happened partway through seeding
+    six hundred names, after twelve had worked fine in a test.
+
+    Only the loop that made the session can close it, so it is closed here.
+    """
     import asyncio
     import json
 
-    from tools.news_agregator.finnhub_server import FinnhubServer
+    async def pull():
+        server = _finnhub_server()
+        try:
+            return await server.get_earnings_surprises(ticker)
+        finally:
+            client = getattr(server, "client", None)
+            close = getattr(client, "close", None)
+            if close is not None:
+                await close()
 
-    raw = asyncio.run(FinnhubServer().get_earnings_surprises(ticker))
+    raw = asyncio.run(pull())
     payload = json.loads(raw[0].text)
     if payload.get("data", {}).get("error"):
         raise RuntimeError(f"{ticker}: {payload['data']['error']}")
@@ -63,6 +89,20 @@ def _fetch_surprises(ticker: str) -> List[Dict[str, Any]]:
 
 def _stamp(day: str) -> str:
     return f"{day}T21:00:00Z"
+
+
+def _announcements(ticker: str, as_of: Optional[str] = None,
+                   quarters: Optional[Dict[str, Dict]] = None
+                   ) -> Dict[str, Dict[str, Any]]:
+    """When the market learned each quarter, from the Item 2.02 filing.
+
+    Takes the series the caller already fetched for the filing dates rather
+    than fetching it again -- over 595 names that was 1,190 EDGAR requests for
+    one set of quarters.
+    """
+    from research import announcements
+
+    return announcements.for_quarters(ticker, as_of=as_of, quarters=quarters)
 
 
 def _filing_dates(ticker: str,
@@ -93,6 +133,8 @@ def seed(tickers: Sequence[str],
     written = 0
     incomplete = 0
     undated = 0
+    announcement_dated = 0
+    filing_dated = 0
     # Which quarters had no matching filing, by name. A count alone hides the
     # difference between one derived quarter that did not resolve and a filer
     # whose vendor labels are a year off its own -- the second can never be
@@ -103,9 +145,18 @@ def seed(tickers: Sequence[str],
     seen = 0
 
     for ticker in tickers:
+        # A vendor job that reaches EDGAR twice per name on the way: the filer
+        # dates below and the Item 2.02 release after them. Both cache their
+        # documents under /root/.edgar, the same 512MB tmpfs the watcher fills,
+        # and nothing removes one -- the eviction that keeps the servers alive
+        # is an asyncio task in the HTTP app's lifespan and this process never
+        # starts it. Between names is the only place a job with no event loop
+        # can prune; the gate keeps it to one walk per interval.
+        filing_cache.prune_if_due()
         try:
             rows = _fetch_surprises(ticker)
             dates = _filing_dates(ticker, as_of=as_of)
+            announced = _announcements(ticker, as_of=as_of, quarters=dates)
         except Exception as exc:  # noqa: BLE001 - counted and reported
             failed.append(f"{ticker}: {type(exc).__name__}: {exc}")
             continue
@@ -161,15 +212,30 @@ def seed(tickers: Sequence[str],
             written += pit_store.record_consensus(
                 period_end, ticker, fiscal, eps_estimate=estimate,
                 recorded_at=_stamp(period_end), source=SOURCE) or 0
+
+            # The actual is known when the market learned it, which is the
+            # Item 2.02 release rather than the 10-Q -- a median of eight days
+            # earlier on the names measured, twenty-three for JPM. Everything
+            # downstream takes its timing from this row, and eight days into a
+            # drift that is largest in its first days is most of the drift.
+            # With no release on record the filing date stands, because late
+            # is the safe direction.
+            release = announced.get(fiscal) or {}
+            learned = release.get("announced_date") or known_at
+            if release.get("announced_date"):
+                announcement_dated += 1
+            else:
+                filing_dated += 1
             written += pit_store.record_consensus(
-                known_at, ticker, fiscal, eps_estimate=estimate,
-                eps_actual=actual, recorded_at=_stamp(known_at),
+                learned, ticker, fiscal, eps_estimate=estimate,
+                eps_actual=actual, recorded_at=_stamp(learned),
                 source=SOURCE) or 0
 
     return {"tickers": len(tickers), "quarters_seen": seen,
             "written": written, "incomplete": incomplete, "undated": undated,
             "unmatched": unmatched, "duplicates": duplicates,
-            "failed": failed}
+            "announcement_dated": announcement_dated,
+            "filing_dated": filing_dated, "failed": failed}
 
 
 # ------------------------------------------------------------- entry point
@@ -177,6 +243,14 @@ def seed(tickers: Sequence[str],
 def main(argv: Optional[List[str]] = None) -> int:
     import argparse
     import json
+
+    # Nothing else does, and the ordering that hides it is not enforced
+    # anywhere: the recorder normally runs first and creates the store, so the
+    # first command against a fresh volume dies on "no such table" instead.
+    # Seeding is the likeliest job to be that first command -- a cold store is
+    # exactly what it exists for. Cheap and idempotent, so it runs every time
+    # rather than once.
+    pit_store.init_schema()
 
     parser = argparse.ArgumentParser(
         prog="seed_consensus",

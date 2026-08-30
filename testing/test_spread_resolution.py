@@ -70,11 +70,21 @@ def test_the_reference_instrument_is_the_yardstick(store):
 
 def test_a_name_indistinguishable_from_the_reference_is_priced_at_the_tick(
         store):
-    """Both series carry the same (near-zero) bounce, so EDGE sees the same
-    noise in each. That is not a measurement of a 40bp spread, it is the
-    estimator's floor -- and the honest number for such a name is the tick."""
-    as_of = _series(store, spread.REFERENCE_TICKER, spread_bp=0.0, seed=1)
-    _series(store, "LIQUID", spread_bp=0.0, seed=1)
+    """A measured bounce that does not stand clear of the reference's own.
+
+    Both series are estimated at a positive spread -- 8bp for the reference,
+    6bp here -- so EDGE resolved each of them. What it cannot say is that this
+    name is wider than the yardstick, and the honest number for that is the
+    tick.
+
+    The fixture used to hand both series a zero spread, which makes EDGE
+    return a *refusal* (a non-positive squared-spread estimate) rather than a
+    small measurement. This test then asserted that the refusal was priced at
+    the tick, which is exactly the defect it now guards against: the estimator
+    failing to measure is not the same as the tick being the truth.
+    """
+    as_of = _series(store, spread.REFERENCE_TICKER, spread_bp=8.0, seed=1)
+    _series(store, "LIQUID", spread_bp=6.0, seed=2)
 
     out = spread.spread_basis("LIQUID", as_of, window=252)
 
@@ -99,7 +109,7 @@ def test_a_genuinely_wide_name_keeps_its_measurement(store):
 def test_the_reference_itself_is_priced_at_its_tick(store):
     """Not a special case -- it falls out of the same rule, and it had better,
     because SPY at 40bp is the absurdity that started this."""
-    as_of = _series(store, spread.REFERENCE_TICKER, spread_bp=0.0, seed=1)
+    as_of = _series(store, spread.REFERENCE_TICKER, spread_bp=8.0, seed=1)
 
     out = spread.spread_basis(spread.REFERENCE_TICKER, as_of, window=252)
     assert out["basis"] == "at_resolution_floor"
@@ -118,8 +128,8 @@ def test_a_missing_reference_refuses_rather_than_guessing(store):
 
 
 def test_the_cost_model_can_use_the_adaptive_basis(store):
-    as_of = _series(store, spread.REFERENCE_TICKER, spread_bp=0.0, seed=1)
-    _series(store, "LIQUID", spread_bp=0.0, seed=1)
+    as_of = _series(store, spread.REFERENCE_TICKER, spread_bp=8.0, seed=1)
+    _series(store, "LIQUID", spread_bp=6.0, seed=2)
 
     adaptive = spread.round_trip_cost("LIQUID", as_of, 5_000.0, window=252,
                                       basis="adaptive")
@@ -130,3 +140,33 @@ def test_the_cost_model_can_use_the_adaptive_basis(store):
         "the adaptive basis charged as much as the 95% bound")
     assert adaptive["spread_basis"] == "adaptive"
     assert adaptive["resolution"] == "at_resolution_floor"
+
+
+def test_an_estimator_refusal_is_not_the_tick(store):
+    """A zero-spread series makes EDGE return a non-positive squared-spread
+    estimate -- a refusal, not a small number.
+
+    Three tests above used to build exactly this and assert `at_resolution_floor`,
+    so the refusal path was covered and mislabelled. Charging the tick there
+    hands the cheapest cost in the universe to precisely the names nobody could
+    measure, in a book ranked on edge net of cost.
+    """
+    as_of = _series(store, spread.REFERENCE_TICKER, spread_bp=0.0, seed=1)
+    _series(store, "UNMEASURABLE", spread_bp=0.0, seed=1)
+
+    assert spread.estimate_spread("UNMEASURABLE", as_of,
+                                  window=252)["spread"] is None
+
+    out = spread.spread_basis("UNMEASURABLE", as_of, window=252)
+    assert out["basis"] == "unknown"
+    assert out["spread"] is None
+
+
+def test_a_refused_estimate_gets_no_adaptive_cost(store):
+    """The consequence that matters: no cost at all, rather than the cheapest."""
+    as_of = _series(store, spread.REFERENCE_TICKER, spread_bp=0.0, seed=1)
+    _series(store, "UNMEASURABLE", spread_bp=0.0, seed=1)
+
+    out = spread.round_trip_cost("UNMEASURABLE", as_of, 5_000.0, window=252,
+                                 basis="adaptive")
+    assert out["cost"] is None, "an unmeasurable name was given a cost"

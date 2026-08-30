@@ -29,6 +29,12 @@ from typing import Any, Dict, List, Optional
 import httpx
 from dotenv import load_dotenv
 
+# Imported rather than mirrored: common/secret.py imports nothing, so it
+# crosses no boundary and cannot drag a layer in behind it. The same import
+# sits at the head of tools/alpaca_server/alpaca_server.py, which is this
+# module's sibling on the sync path.
+from common.secret import Secret
+
 
 _DOTENV_PATH = Path(__file__).resolve().parents[2] / ".env"
 load_dotenv(dotenv_path=_DOTENV_PATH)
@@ -57,17 +63,31 @@ class AsyncBroker:
 
   Always use via `async with AsyncBroker() as broker:` so the underlying
   httpx.AsyncClient is closed properly.
+
+  The credentials are held as `Secret`, not as strings. This object outlives
+  the constructor that read them, so anything that walks it — a debugger, a
+  crash reporter, pytest's --showlocals on a frame holding the broker — would
+  otherwise find a live broker key in the instance dict (issue #64).
   """
 
   def __init__(self, paper: bool = True, timeout: Optional[httpx.Timeout] = None):
     self.paper = paper
+    # Wrapped inside the expression that reads the environment, not after it.
+    # An intermediate `key = os.getenv(...)` is a local, and --showlocals, a
+    # debugger and a crash reporter render a local exactly as they render a
+    # parameter — so the value would be disclosed before the wrapper was ever
+    # reached. The `or` chains are the env-var precedence
+    # testing/test_phase_B3a_alpaca_env_fallback.py pins, kept whole inside
+    # the wrapper so no step of the fallback lands on a name of its own.
     if paper:
-      self.key = os.getenv("ALPACA_PAPER_KEY") or os.getenv("ALPACA_API_KEY")
-      self.secret = os.getenv("ALPACA_PAPER_SECRET") or os.getenv("ALPACA_SECRET")
+      self._key = Secret(os.getenv("ALPACA_PAPER_KEY")
+                         or os.getenv("ALPACA_API_KEY") or "")
+      self._secret = Secret(os.getenv("ALPACA_PAPER_SECRET")
+                            or os.getenv("ALPACA_SECRET") or "")
     else:
-      self.key = os.getenv("ALPACA_LIVE_KEY")
-      self.secret = os.getenv("ALPACA_LIVE_SECRET")
-    if not self.key or not self.secret:
+      self._key = Secret(os.getenv("ALPACA_LIVE_KEY") or "")
+      self._secret = Secret(os.getenv("ALPACA_LIVE_SECRET") or "")
+    if not self._key or not self._secret:
       if paper:
         hint = ("Set ALPACA_PAPER_KEY + ALPACA_PAPER_SECRET (preferred) or "
                 "ALPACA_API_KEY + ALPACA_SECRET (legacy) in .env")
@@ -80,13 +100,23 @@ class AsyncBroker:
     self._timeout = timeout or _DEFAULT_TIMEOUT
     self._client: Optional[httpx.AsyncClient] = None
 
+  # `key` and `secret` were the raw attributes this class used to store, and
+  # testing/test_phase_A9_async_broker.py builds its own mock httpx client out
+  # of them. They stay, as reveals under the old name rather than as stored
+  # values: a property is not in the instance dict, so everything that renders
+  # an object automatically — --showlocals, a debugger, a crash reporter —
+  # now finds a `Secret` and nothing else. New code should say
+  # `self._key.reveal()`, which greps as the deliberate act it is.
   async def __aenter__(self) -> "AsyncBroker":
     self._client = httpx.AsyncClient(
       base_url=self.base_url,
       timeout=self._timeout,
       headers={
-        "APCA-API-KEY-ID": self.key,
-        "APCA-API-SECRET-KEY": self.secret,
+        # Revealed at the point of use and never bound to a name, which is the
+        # whole discipline: the value exists only for as long as httpx takes
+        # to copy it into its own header store.
+        "APCA-API-KEY-ID": self._key.reveal(),
+        "APCA-API-SECRET-KEY": self._secret.reveal(),
         "accept": "application/json",
       },
     )
@@ -189,12 +219,29 @@ class AsyncBroker:
 
   # --- Internals -------------------------------------------------------
 
-  @staticmethod
-  def _raise_for_status(resp: httpx.Response) -> None:
+  def _raise_for_status(self, resp: httpx.Response) -> None:
+    """Turn a non-2xx into AsyncBrokerError, with the credentials taken out.
+
+    An instance method rather than a static one because scrubbing needs the
+    credentials to remove. The text matters more here than in a log line:
+    `tools/alpaca/server.py` puts `str(e)` from this exception straight into
+    the `error` field of the MCP result it returns, so a provider that echoed
+    the offending key back would send it out of the process entirely. Alpaca's
+    401 body does not quote the key today; nothing here should depend on it
+    never starting to.
+
+    Scrubbed in the same expression that reads the body, for the same reason
+    the credentials are wrapped at the read: a `msg = resp.text` cleaned only
+    on the next line has already put the untouched text on a local, where
+    --showlocals prints it.
+    """
     if resp.status_code >= 400:
       try:
-        body = resp.json()
-        msg = body.get("message", resp.text)
+        detail = self._scrub(str(resp.json().get("message", resp.text)))
       except Exception:
-        msg = resp.text
-      raise AsyncBrokerError(f"HTTP {resp.status_code}: {msg}")
+        detail = self._scrub(resp.text)
+      raise AsyncBrokerError(f"HTTP {resp.status_code}: {detail}")
+
+  def _scrub(self, text: str) -> str:
+    """`text` with either credential replaced by the placeholder."""
+    return self._secret.scrub(self._key.scrub(text))

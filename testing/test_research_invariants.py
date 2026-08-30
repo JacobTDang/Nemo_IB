@@ -112,6 +112,10 @@ def test_every_as_of_reader_in_the_store_is_covered_here():
         "universe_as_of", "announcements_as_of", "paper_orders_as_of",
         "activist_filings_as_of", "consensus_as_of", "actual_as_of",
         "reporters_since", "filed_periods", "has_consensus_history",
+        # Reads the run log, which records what the process did rather than
+        # what the market did; see the test below for why it is keyed on the
+        # date a run was FOR rather than on when it finished.
+        "last_successful_run",
     }
     found = {n for n, fn in vars(pit_store).items()
              if callable(fn) and not n.startswith("_")
@@ -122,6 +126,24 @@ def test_every_as_of_reader_in_the_store_is_covered_here():
     assert not missing, (
         f"these readers take an as_of and are not in the lookahead sweep: "
         f"{sorted(missing)}")
+
+
+def test_the_run_log_reader_is_keyed_on_the_date_a_run_was_for(store):
+    """And is deliberately outside the sweep above.
+
+    Every other reader answers "what did the market look like on this date",
+    where a row learned later is a leak. This one answers "was anything
+    watching on this date", and a night recorded late still covers the night it
+    was recorded for -- `missing_days` has counted it that way since it was
+    written. Keying it on `finished_at` instead would report a backfilled night
+    as a hole forever.
+    """
+    store.start_run("daily_bars", as_of_date="2026-03-02")
+    store.finish_run(rows_written=1, status="ok")
+
+    assert pit_store.last_successful_run("daily_bars", PAST) == "2026-03-02"
+    assert pit_store.missing_days("daily_bars", "2026-03-02",
+                                  "2026-03-02") == []
 
 
 # --- a refusal is empty -----------------------------------------------------

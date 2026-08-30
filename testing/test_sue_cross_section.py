@@ -49,7 +49,7 @@ def _reported(store, ticker, period, day, estimate, actual, price=100.0):
                       recorded_at=f"{day}T21:00:00Z")
 
 
-def _cohort(store, day="2026-03-02", n=12):
+def _cohort(store, day="2026-03-02", n=sue_cs.MIN_COHORT):
     """A spread of surprises, so a percentile means something."""
     for i in range(n):
         _reported(store, f"N{i:02d}", "2026Q1", day,
@@ -184,7 +184,7 @@ def test_a_single_outlier_does_not_compress_everyone_elses_z(store):
 
 
 def test_the_robust_z_still_orders_names_the_same_way(store):
-    _cohort(store, n=16)
+    _cohort(store)
     _reported(store, "BIG", "2026Q1", "2026-03-02", estimate=1.00, actual=1.40)
     _reported(store, "MID", "2026Q1", "2026-03-02", estimate=1.00, actual=1.10)
 
@@ -195,7 +195,7 @@ def test_the_robust_z_still_orders_names_the_same_way(store):
 
 def test_a_cohort_with_no_spread_refuses_the_robust_z_too(store):
     """Every name beating by exactly the same amount leaves nothing to rank."""
-    for i in range(10):
+    for i in range(sue_cs.MIN_COHORT):
         _reported(store, f"S{i}", "2026Q1", "2026-03-02", estimate=1.0,
                   actual=1.1)
 
@@ -211,9 +211,170 @@ def test_the_module_says_which_statistic_to_rank_on(store):
     -260. Both are arithmetic, neither is a sigma, and the difference between
     them is the point -- a reader handed one number would take it for a
     standard deviation. The rank is the one that behaves."""
-    _cohort(store, n=16)
+    _cohort(store)
     _reported(store, "AAA", "2026Q1", "2026-03-02", estimate=1.0, actual=1.2)
 
     out = sue_cs.surprise_rank("AAA", as_of="2026-03-03")
     assert out["rank_on"] == "percentile"
     assert 0.0 <= out["percentile"] <= 1.0
+
+
+def test_a_rank_carries_the_date_the_print_became_known(store):
+    """The scanner places every signal in time before it does anything else,
+    and a signal with no date is rejected as unplaceable. sue_cs returned
+    none: every cross-sectional candidate would have been refused in a real
+    scan while the scanner's own tests passed, because those stubbed a date
+    the module never produced."""
+    _cohort(store)
+    _reported(store, "AAA", "2026Q1", "2026-03-02", estimate=1.0, actual=1.2)
+
+    out = sue_cs.surprise_rank("AAA", as_of="2026-03-03")
+    assert out["known_at"] == "2026-03-02"
+
+
+def test_the_date_is_when_the_actual_landed_not_when_it_was_read(store):
+    _cohort(store, day="2026-03-02")
+    _reported(store, "LATE", "2026Q1", "2026-03-10", estimate=1.0, actual=1.4)
+
+    out = sue_cs.surprise_rank("LATE", as_of="2026-03-20")
+    assert out["known_at"] == "2026-03-10"
+
+
+def test_the_real_output_satisfies_the_scanner_gate(store):
+    """A contract test between the two, because the bug above was a stub that
+    had a field the module did not. Anything the scanner requires of a signal
+    has to be present on the thing the module actually returns."""
+    from research import scanner
+
+    _cohort(store, n=20)
+    _reported(store, "AAA", "2026Q1", "2026-03-02", estimate=1.0, actual=1.9)
+
+    real = {**sue_cs.surprise_rank("AAA", as_of="2026-03-03"), "variant": "cs"}
+    assert real["success"] is True, real["error"]
+    assert scanner._signal_problem(real, "2026-03-03") is None, (
+        scanner._signal_problem(real, "2026-03-03"))
+
+
+# --- the cohort is one thing per date, not one per name ---------------------
+#
+# surprise_rank rebuilt the whole cohort for every name it ranked. On the real
+# store a cohort of 305 takes 386ms to assemble, so a date with 305 reporters
+# spent 118 seconds rebuilding the same list 305 times -- and a replay over 652
+# dates would have taken about twenty-one hours.
+#
+# It is the same list for every name on that date, by construction.
+
+def test_a_supplied_cohort_is_not_rebuilt(store, monkeypatch):
+    _cohort(store)
+    _reported(store, "AAA", "2026Q1", "2026-03-02", estimate=1.0, actual=1.4)
+
+    peers = sue_cs.cohort(as_of="2026-03-03")
+    monkeypatch.setattr(sue_cs, "cohort",
+                        lambda *a, **k: pytest.fail("the cohort was rebuilt"))
+
+    out = sue_cs.surprise_rank("AAA", as_of="2026-03-03", peers=peers)
+    assert out["success"] is True
+    assert out["cohort_size"] == len(peers)
+
+
+def test_a_supplied_cohort_gives_the_same_answer_as_building_it(store):
+    _cohort(store)
+    _reported(store, "AAA", "2026Q1", "2026-03-02", estimate=1.0, actual=1.4)
+
+    built = sue_cs.surprise_rank("AAA", as_of="2026-03-03")
+    passed = sue_cs.surprise_rank("AAA", as_of="2026-03-03",
+                                  peers=sue_cs.cohort(as_of="2026-03-03"))
+    assert built == passed
+
+
+def test_the_scan_builds_the_cohort_once_for_all_its_names(store, monkeypatch):
+    """The scanner is where the saving lands: one build per date rather than
+    one per candidate."""
+    from research import scanner, spread
+
+    builds = []
+    real = sue_cs.cohort
+
+    def counted(*a, **k):
+        builds.append(1)
+        return real(*a, **k)
+
+    monkeypatch.setattr(sue_cs, "cohort", counted)
+    monkeypatch.setattr(scanner, "SIGNAL_VARIANT", "cs")
+
+    days = [f"2026-02-{d:02d}" for d in range(1, 29)]
+    for t in ("AAA", "BBB", "CCC", spread.REFERENCE_TICKER):
+        store.record_bars(t, [{"trade_date": d, "open": 100.0, "high": 100.0,
+                               "low": 100.0, "close": 100.0, "volume": 5e6}
+                              for d in days],
+                          recorded_at=f"{days[-1]}T21:00:00Z")
+    store.record_universe(days[-1], [
+        {"ticker": t, "cik": str(i), "eligible": True}
+        for i, t in enumerate(("AAA", "BBB", "CCC"))],
+        recorded_at=f"{days[-1]}T21:00:00Z")
+    for t in ("AAA", "BBB", "CCC"):
+        store.record_consensus(days[-1], t, "2026Q1", eps_estimate=1.0,
+                               eps_actual=1.2,
+                               recorded_at=f"{days[-1]}T21:00:00Z")
+
+    scanner.scan(as_of="2026-03-02")
+    assert len(builds) == 1, f"the cohort was built {len(builds)} times"
+
+
+# --- a tie is not the bottom of the cohort ----------------------------------
+#
+# percentile = below / (n - 1), counting strictly-lower values, hands every
+# member of a tie cluster the lowest rank in it. A company that reports exactly
+# in line has scaled_surprise == 0.0 whatever its price, so that cluster is
+# guaranteed to exist and is usually the largest one in the cohort. Six in-line
+# prints came out at percentile 0.0 -- the bottom of the distribution, a full
+# tail, and a maximum-conviction short each on a z of -0.56.
+
+def _flat_and_rising(store, flats=6, ups=14, day="2026-03-02"):
+    for i in range(flats):
+        _reported(store, f"FLAT{i}", "2026Q1", day, estimate=1.0, actual=1.0)
+    for i in range(ups):
+        _reported(store, f"UP{i:02d}", "2026Q1", day, estimate=1.0,
+                  actual=1.0 + (i + 1) * 0.02)
+
+
+def test_an_in_line_print_ranks_in_the_middle_of_its_tie_cluster(store):
+    _flat_and_rising(store)
+
+    out = sue_cs.surprise_rank("FLAT0", as_of="2026-03-03")
+
+    assert out["success"], out["error"]
+    # Nothing below, six tied, twenty in the cohort: (0 + 0.5*6) / 20.
+    assert out["percentile"] == pytest.approx(0.15)
+    assert sue_cs.surprise_rank("FLAT5", as_of="2026-03-03")["percentile"] == \
+        out["percentile"], "one tie cluster came back with two ranks"
+
+
+def test_an_in_line_print_is_not_a_maximum_conviction_short(store):
+    """What the rank is actually read for."""
+    from research import scanner
+
+    _flat_and_rising(store)
+    out = sue_cs.surprise_rank("FLAT0", as_of="2026-03-03")
+
+    assert scanner._tail_distance(out["percentile"]) < \
+        scanner.MIN_TAIL_DISTANCE, (
+        "a company that reported exactly in line was priced at a full tail")
+
+
+def test_a_cohort_whose_decile_is_one_name_is_refused(store):
+    """`MIN_TAIL_DISTANCE` admits the top and bottom decile of any cohort --
+    always, whatever the surprises in it. At a minimum cohort of eight that
+    decile is exactly one name a side, so the largest of eight arbitrary
+    prints was priced as a full tail."""
+    assert sue_cs.MIN_COHORT >= 20, (
+        f"a decile of {sue_cs.MIN_COHORT} is "
+        f"{sue_cs.MIN_COHORT // 10} name(s) a side")
+
+    for i in range(8):
+        _reported(store, f"N{i}", "2026Q1", "2026-03-02", estimate=1.0,
+                  actual=1.0 + i * 0.05)
+
+    out = sue_cs.surprise_rank("N0", as_of="2026-03-03")
+    assert out["success"] is False
+    assert "cohort" in out["error"].lower()

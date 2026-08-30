@@ -228,9 +228,18 @@ def test_the_sec_gating_is_described_accurately(readme):
 DEPLOY = README.parent / "deploy" / "README.md"
 COMPOSE = README.parent / "deploy" / "docker-compose.yml"
 
+# The whole command is captured, not just the service name. The line grew a
+# `flock` and an `--env-file`, and a pattern that matched only the ends of it
+# would have gone on passing while the page and the compose file disagreed
+# about the middle -- which is the entire failure this section exists to catch.
 CRON = re.compile(
     r"^\s*([0-9*/]+ +[0-9*/-]+ +[0-9*]+ +[0-9*]+ +[0-9*-]+)\s+"
-    r"cd /srv/nemo/deploy && docker compose run --rm ([a-z-]+)\s*$", re.M)
+    r"(cd /srv/nemo/deploy && \S.*?)\s*$", re.M)
+# `docker compose` and not bare `docker`: the Secrets section runs a
+# `docker run --rm -e SEEK=...` grep of the image, and `-e` is not a service.
+# The name must start with a letter for the same reason -- `--rm --entrypoint`
+# is a flag, not the service that follows it.
+RUNS = re.compile(r"docker compose\b[^\n]*?run --rm ([a-z][a-z0-9-]*)")
 
 
 @pytest.fixture(scope="module")
@@ -247,16 +256,15 @@ def test_every_schedule_on_the_page_is_the_one_in_the_compose_file(deploy_doc,
                                                                    compose):
     found = CRON.findall(deploy_doc)
     assert found, "the deploy page no longer lists any schedules"
-    for schedule, service in found:
+    for schedule, command in found:
         normalised = " ".join(schedule.split())
-        assert f"{normalised} cd /srv/nemo/deploy && docker compose run --rm " \
-               f"{service}" in compose, (
-            f"the page schedules {service} at '{normalised}'; the compose file "
+        assert f"{normalised} {command}" in compose, (
+            f"the page schedules '{normalised} {command}'; the compose file "
             f"does not")
 
 
 def test_every_service_the_page_names_exists(deploy_doc, compose):
-    named = set(re.findall(r"docker compose run --rm ([a-z-]+)", deploy_doc))
+    named = set(RUNS.findall(deploy_doc))
     assert named, "the page names no services"
     for service in named:
         assert re.search(rf"^  {service}:$", compose, re.M), (
@@ -266,10 +274,8 @@ def test_every_service_the_page_names_exists(deploy_doc, compose):
 def test_every_scheduled_service_is_on_the_page(compose, deploy_doc):
     """The other direction. A job added to the stack and left undocumented is
     one nobody schedules, and a recorder nobody schedules records nothing."""
-    scheduled = set(re.findall(
-        r"docker compose run --rm ([a-z-]+)\s*$", compose, re.M))
-    documented = set(re.findall(r"docker compose run --rm ([a-z-]+)",
-                                deploy_doc))
+    scheduled = set(re.findall(RUNS.pattern + r"\s*$", compose, re.M))
+    documented = set(RUNS.findall(deploy_doc))
     missing = scheduled - documented
     assert not missing, f"scheduled but not documented: {sorted(missing)}"
 
@@ -279,3 +285,52 @@ def test_every_named_volume_the_page_mentions_exists(deploy_doc, compose):
         assert re.search(rf"^  {volume}:$", compose, re.M), (
             f"the page names the volume `{volume}`, which compose does not "
             f"declare")
+
+
+# --- the one ordering the stack cannot express as two clock times -----------
+#
+# `research-daily` at 30 22 and `research-scan` at 0 23 is a thirty-minute
+# guess, not a dependency. The recorder does 15+ yfinance batches with retries,
+# then screens 10,388 registrants one connection at a time, then consensus --
+# and on a `--bootstrap` night it pulls 730 days for 3,000 names as well, where
+# overrunning half an hour is close to certain.
+#
+# `universe_as_of` answers a scan that starts early with yesterday's
+# membership, because falling back to the last row on or before the date is
+# what a point-in-time read is *for*. `record_scan` is append-only for an
+# equally good reason: a filed decision cannot be rewritten later. Both are
+# right; together they file a permanently wrong book off a half-written store
+# and log it `ok`. The scanner now refuses (`RecorderNotRunning`), which turns
+# a wrong book into a failed run -- and a failed run every bootstrap night is
+# still an outage. The schedule is the other half.
+
+def _cron_lines(page):
+    return [(" ".join(schedule.split()), command)
+            for schedule, command in CRON.findall(page)]
+
+
+def test_the_scan_is_chained_behind_the_recorder_not_timed_after_it(deploy_doc):
+    """One line, `&&`, so the scan cannot start until the recorder has
+    finished -- and does not start at all if the recorder failed."""
+    scan_lines = [(schedule, command) for schedule, command in
+                  _cron_lines(deploy_doc) if "research-scan" in command]
+    assert scan_lines, "nothing on the page schedules research-scan"
+    for schedule, command in scan_lines:
+        services = RUNS.findall(command)
+        assert services == ["research-daily", "research-scan"], (
+            f"'{schedule} {command}' runs {services}; the scan has to be "
+            f"chained behind the recorder in one line")
+        assert " && " in command.split("research-daily", 1)[1], (
+            "the two commands are not joined by `&&`, so the scan runs "
+            "whatever the recorder did")
+
+
+def test_nothing_schedules_the_recorder_and_the_scan_at_two_clock_times(
+        deploy_doc):
+    """The failure this replaces: two wall-clock times and no dependency."""
+    timed = [schedule for schedule, command in _cron_lines(deploy_doc)
+             if RUNS.findall(command) in (["research-daily"], ["research-scan"])]
+    assert not timed, (
+        f"{timed} still schedules the recorder or the scan on its own clock "
+        f"time; a recorder that overruns is then a scan on a half-written "
+        f"store")

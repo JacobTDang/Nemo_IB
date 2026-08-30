@@ -170,3 +170,92 @@ def test_the_interval_is_read_the_same_way(monkeypatch):
     assert filing_cache.interval_seconds() == 42
     monkeypatch.setenv("NEMO_FILING_CACHE_INTERVAL_S", "0")
     assert filing_cache.interval_seconds() == 1, "a zero interval would spin"
+
+
+# --- the batch jobs, which have no lifespan to hang a janitor off -----------
+#
+# The janitor above is an asyncio task started by the HTTP app's lifespan. The
+# batch jobs never import that app, so they ran with no eviction at all -- and
+# `research-watch`, `research-announce` and `research-seed` all drive
+# edgartools over the eligible universe, thousands of names, into the same
+# 512MB tmpfs. Nothing capped it, so a pass fills the mount and dies with
+# `[Errno 28]` partway through.
+#
+# A batch job has no event loop and no idle moment to sleep in, so it asks
+# between names whether a prune is due instead. Same pruner, same interval,
+# same cap; only the thing driving the clock differs.
+
+def test_the_first_ask_prunes_because_the_cache_may_already_be_full(monkeypatch,
+                                                                    tmp_path):
+    """The server prunes once at startup for this reason and so does a job: a
+    container started onto a tmpfs the last run left full would otherwise wait
+    a whole interval before it could fetch anything."""
+    monkeypatch.setattr(filing_cache, "_last_prune", None)
+    monkeypatch.setenv("NEMO_FILING_CACHE_INTERVAL_S", "300")
+    calls = []
+    monkeypatch.setattr(filing_cache, "prune_and_log",
+                        lambda *a, **k: calls.append(1) or {})
+
+    filing_cache.prune_if_due(tmp_path)
+    assert len(calls) == 1
+
+
+def test_a_second_ask_inside_the_interval_does_not_walk_the_cache_again(
+        monkeypatch, tmp_path):
+    """Called once per name over thousands of names, an ungated prune would
+    rglob the whole cache between every SEC request."""
+    monkeypatch.setattr(filing_cache, "_last_prune", None)
+    monkeypatch.setenv("NEMO_FILING_CACHE_INTERVAL_S", "300")
+    calls = []
+    monkeypatch.setattr(filing_cache, "prune_and_log",
+                        lambda *a, **k: calls.append(1) or {})
+
+    for _ in range(50):
+        filing_cache.prune_if_due(tmp_path)
+    assert len(calls) == 1
+    assert filing_cache.prune_if_due(tmp_path) is None, (
+        "a skipped prune must be distinguishable from one that removed "
+        "nothing")
+
+
+def test_the_interval_elapsing_makes_a_prune_due_again(monkeypatch, tmp_path):
+    monkeypatch.setattr(filing_cache, "_last_prune", None)
+    monkeypatch.setenv("NEMO_FILING_CACHE_INTERVAL_S", "300")
+    calls = []
+    monkeypatch.setattr(filing_cache, "prune_and_log",
+                        lambda *a, **k: calls.append(1) or {})
+
+    filing_cache.prune_if_due(tmp_path)
+    monkeypatch.setattr(filing_cache, "_last_prune",
+                        time.monotonic() - 301)
+    filing_cache.prune_if_due(tmp_path)
+    assert len(calls) == 2
+
+
+def test_the_interval_the_jobs_use_is_the_one_compose_sets(monkeypatch,
+                                                           tmp_path):
+    """Not a second interval of its own. The cap and the interval on the batch
+    services are the same two keys the servers read."""
+    monkeypatch.setattr(filing_cache, "_last_prune", None)
+    monkeypatch.setenv("NEMO_FILING_CACHE_INTERVAL_S", "1")
+    calls = []
+    monkeypatch.setattr(filing_cache, "prune_and_log",
+                        lambda *a, **k: calls.append(1) or {})
+
+    filing_cache.prune_if_due(tmp_path)
+    monkeypatch.setattr(filing_cache, "_last_prune", time.monotonic() - 2)
+    filing_cache.prune_if_due(tmp_path)
+    assert len(calls) == 2
+
+
+def test_a_due_prune_evicts_for_real(monkeypatch, tmp_path):
+    """The gate is the only thing added; what happens past it is the pruner
+    the servers already run."""
+    monkeypatch.setattr(filing_cache, "_last_prune", None)
+    now = time.time()
+    for i in range(10):
+        _write(tmp_path / f"f{i}.txt", 1_000, atime=now - (10 - i) * 100)
+
+    report = filing_cache.prune_if_due(tmp_path, cap=8_000)
+    assert report["removed_files"] > 0
+    assert report["bytes_after"] <= 8_000 * filing_cache.DEFAULT_TARGET_FRACTION

@@ -201,8 +201,9 @@ async def _exercise_all_tools():
       print(f"  OK: condensed analyst data")
       print(f"    consensus={data['consensus']}, trend={data['trend']}, analysts={data['total_analysts']}")
       if data["latest"]:
-        l = data["latest"]
-        print(f"    latest: SB={l['strong_buy']} B={l['buy']} H={l['hold']} S={l['sell']} SS={l['strong_sell']}")
+        latest = data["latest"]
+        print(f"    latest: SB={latest['strong_buy']} B={latest['buy']} "
+              f"H={latest['hold']} S={latest['sell']} SS={latest['strong_sell']}")
       dump_envelope(result, "get_analyst_recommendations")
       passed += 1
     else:

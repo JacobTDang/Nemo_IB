@@ -12,6 +12,12 @@ from typing import Dict, List, Optional
 
 from datetime import datetime
 
+# Imported rather than mirrored: common/secret.py imports nothing, so it crosses
+# no boundary. Reaching agent.openrouter_template for the same class would put
+# openai, ollama and httpx into a data-source image that runs none of them --
+# the coupling testing/test_agent_package_boundary.py exists to prevent.
+from common.secret import Secret
+
 
 class alpaca_client:
     def __init__(self):
@@ -19,10 +25,25 @@ class alpaca_client:
 
     def setup_clients(self) -> tuple[TradingClient, StockHistoricalDataClient]:
         load_dotenv()
-        API_KEY = os.getenv("ALPACA_API_KEY")
-        API_SECRET = os.getenv("ALPACA_SECRET")
-        return (TradingClient(api_key=API_KEY, secret_key=API_SECRET, paper=True),
-                StockHistoricalDataClient(api_key=API_KEY, secret_key=API_SECRET),
+        # Wrapped in the same expression that reads the environment: an
+        # intermediate `API_KEY = os.getenv(...)` is what any frame dump
+        # prints, and a name in this shape is picked up by a debugger or a
+        # crash reporter walking the scope as readily as by pytest.
+        key = Secret(os.getenv("ALPACA_API_KEY") or "")
+        secret = Secret(os.getenv("ALPACA_SECRET") or "")
+        if not key or not secret:
+            # Refused here rather than handed on. alpaca-py accepts a bare
+            # api_key and only complains about the missing partner, so a half
+            # configured .env used to surface either as its ValueError or,
+            # worse, as a 401 several calls later with nothing naming the
+            # cause.
+            raise RuntimeError(
+                "Missing Alpaca credentials. Set ALPACA_API_KEY and "
+                "ALPACA_SECRET in .env")
+        return (TradingClient(api_key=key.reveal(), secret_key=secret.reveal(),
+                              paper=True),
+                StockHistoricalDataClient(api_key=key.reveal(),
+                                          secret_key=secret.reveal()),
                 )
  
     def order(self, ticker: str,

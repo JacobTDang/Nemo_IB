@@ -388,42 +388,12 @@ class TestFinancialStatementsEnvelope:
         assert envelope["provider"] == "Finnhub"
 
 
-class TestTheAnalysisPromptSaysItToo:
-    """A null that reaches the prompt as "0" undoes the fix at the last step.
-
-    The analysis agent renders the tool payload into the text the model reads,
-    with `data.get('net_shares', 0):,` and `data.get('signal', 'neutral')`.
-    Nulling the fabricated fields would have re-fabricated them there -- or
-    raised a TypeError formatting None -- so the renderer states the emptiness
-    in the same words the envelope does.
-    """
-
-    @staticmethod
-    def _render(tool, data):
-        from agent.Financial_Analysis_Agent import Financial_Analysis_Agent
-        agent = Financial_Analysis_Agent.__new__(Financial_Analysis_Agent)
-        return agent._format_market_intel(tool, data)
-
-    def test_empty_insider_transactions_are_not_rendered_as_zero(self):
-        text = self._render("get_insider_transactions",
-                            _condense_insider_data({"data": []}))
-        assert "Net shares: 0" not in text, text
-        assert "no insider transactions" in text.lower(), text
-
-    def test_empty_insider_sentiment_is_not_rendered_as_neutral(self):
-        text = self._render("get_insider_sentiment",
-                            _condense_insider_sentiment({"data": []}))
-        assert "NEUTRAL" not in text, text
-        assert "no monthly mspr" in text.lower(), text
-
-    def test_a_real_insider_reading_still_renders_its_figures(self):
-        text = self._render("get_insider_transactions",
-                            _condense_insider_data({"data": [
-                                {"name": "COOK", "change": -50000,
-                                 "transactionCode": "S",
-                                 "transactionDate": "2025-12-15"}]}))
-        assert "NET SELLING" in text, text
-        assert "-50,000" in text, text
+# The renderer that turned these nulls back into "0" lived in
+# `Financial_Analysis_Agent._format_market_intel`, deleted with the
+# LangGraph/OpenRouter layer (issue #63) along with the three tests that
+# pinned it. Nothing renders a tool payload into prompt text any more, so
+# the envelope above is the last word on the emptiness rather than the
+# first of two.
 
 
 # --------------------------------------------------------------------------

@@ -117,7 +117,7 @@ class Evidence:
 
                     if abs(value - amount) / amount <= tolerance:
                         return True
-                except:
+                except Exception:
                     continue
 
         return False
@@ -130,7 +130,7 @@ class Evidence:
                 return False
             value = float(normalized)
             return abs(value - target) / target <= tolerance
-        except:
+        except Exception:
             return False
 
     def validate_label(self, label: str, check_header: bool = True) -> bool:
@@ -280,7 +280,7 @@ def safe_get_text(filing: Any) -> str:
         if hasattr(filing, 'text') and callable(filing.text):
             result = filing.text()
             return str(result) if result is not None else ""
-    except: pass
+    except Exception: pass
     return ""
 
 def safe_get_html(filing: Any) -> str:
@@ -289,7 +289,7 @@ def safe_get_html(filing: Any) -> str:
         if hasattr(filing, 'html') and callable(filing.html):
             result = filing.html()
             return str(result) if result is not None else ""
-    except: pass
+    except Exception: pass
     return ""
 
 def safe_get_filing_date(filing: Any) -> Optional[str]:
@@ -297,7 +297,7 @@ def safe_get_filing_date(filing: Any) -> Optional[str]:
     try:
         val = getattr(filing, 'filing_date', None)
         return str(val) if val is not None else None
-    except: return None
+    except Exception: return None
 
 def _find_item_anchor(full_text: str, item_num: str) -> Optional[int]:
     """NEW: Case-insensitive Item anchor finding."""
@@ -552,7 +552,7 @@ class ColumnIdentifier:
                 if re.match(r'^\d{2}$', s):
                     try:
                         if 20 <= int(s) <= 99: valid_ages += 1
-                    except: pass
+                    except Exception: pass
 
                 if _MONEY_RE.fullmatch(s):
                     valid_money += 1
@@ -714,7 +714,7 @@ class DynamicNameExtractor:
             for match in re.finditer(pattern, text):
                 name = match.group(1).strip()
                 try: age = int(match.group(2))
-                except: age = None
+                except Exception: age = None
 
                 if self._validate_name(name) and name.lower() not in seen_names:
                     seen_names.add(name.lower())
@@ -753,7 +753,7 @@ class DynamicNameExtractor:
                 age = int(age_match.group(1) or age_match.group(2))
                 if not (20 <= age <= 99):
                     age = None
-            except:
+            except Exception:
                 age = None
 
         return ExtractedName(
@@ -896,7 +896,7 @@ def run_truth_tests(executives: List[Dict[str, Any]], board_members: List[Dict[s
                 ev = Evidence(**e["evidence"])
                 if not ev.validate_name(e["name"]):
                     alerts.append(f"TRUTH TEST FAILED: Exec {e['name']} compensation without name in evidence")
-            except: pass
+            except Exception: pass
 
     # Test 2: If compensation is non-null, evidence must validate total label
     for e in executives:
@@ -905,7 +905,7 @@ def run_truth_tests(executives: List[Dict[str, Any]], board_members: List[Dict[s
                 ev = Evidence(**e["evidence"])
                 if not ev.validate_label("total"):
                     alerts.append(f"TRUTH TEST FAILED: Exec {e['name']} compensation without 'total' label")
-            except: pass
+            except Exception: pass
 
     # Test 3: Board members must not use compensation table evidence
     for m in board_members:
@@ -1346,7 +1346,7 @@ class SECFilingParser:
                             if not years.empty:
                                 target_year = int(years.max())
                                 break
-                        except: pass
+                        except Exception: pass
 
                 # Build a list of fallback column indices for `total_comp`
                 # in case the identifier picked a merged-cell duplicate that
@@ -1393,7 +1393,7 @@ class SECFilingParser:
                             try:
                                 row_year = int(float(yr_raw))
                                 if row_year != target_year: continue
-                            except: pass
+                            except Exception: pass
 
                         name_raw = str(row.iloc[cols['name']])
 
@@ -1433,13 +1433,13 @@ class SECFilingParser:
                                 'year': target_year,
                                 'evidence': asdict(evidence)
                             })
-                    except: pass
+                    except Exception: pass
 
                 if current_table and indicator_count > best_score:
                     best_score = indicator_count
                     best_execs = current_table
 
-        except Exception as e:
+        except Exception:
             pass
         return best_execs
 
@@ -1464,7 +1464,7 @@ class SECFilingParser:
                 return True
 
             return False
-        except:
+        except Exception:
             return False
 
     def _is_matrix_table(self, df: pd.DataFrame) -> bool:
@@ -1511,7 +1511,7 @@ class SECFilingParser:
                     return True
 
             return False
-        except:
+        except Exception:
             return False
 
     def _is_any_compensation_table(self, df: pd.DataFrame) -> bool:
@@ -1528,7 +1528,7 @@ class SECFilingParser:
             hits = sum(1 for k in comp_keywords if k in header_text)
 
             return hits >= 3
-        except:
+        except Exception:
             return False
 
     def _extract_compensation_from_text(self, text: str) -> List[Dict[str, Any]]:
@@ -1586,8 +1586,8 @@ class SECFilingParser:
                                             'total_compensation': val,
                                             'evidence': asdict(evidence)
                                         }
-                                except: pass
-        except: pass
+                                except Exception: pass
+        except Exception: pass
         return None
 
     def _extract_independent_directors_from_text(self, text: str) -> Dict[str, Evidence]:
@@ -1847,10 +1847,10 @@ class SECFilingParser:
 
         try:
             soup = BeautifulSoup(html, "lxml")
-        except:
+        except Exception:
             try:
                 soup = BeautifulSoup(html, "html.parser")
-            except:
+            except Exception:
                 if debug:
                     print(f"    [HTML Icon] Failed to parse HTML", file=sys.stderr)
                 return out
@@ -2049,10 +2049,10 @@ class SECFilingParser:
 
         try:
             soup = BeautifulSoup(html, "lxml")
-        except:
+        except Exception:
             try:
                 soup = BeautifulSoup(html, "html.parser")
-            except:
+            except Exception:
                 return ""
 
         tables = soup.find_all("table")
@@ -2180,7 +2180,7 @@ class SECFilingParser:
                                 age_match = re.search(r'\d+', str(row.iloc[cols['age']]))
                                 if age_match:
                                     age = int(age_match.group())
-                            except: pass
+                            except Exception: pass
 
                         tenure = None
                         if cols['since'] is not None:
@@ -2230,7 +2230,7 @@ class SECFilingParser:
                             'extraction_method': 'table',
                             'evidence': asdict(evidence)
                         })
-                    except: pass
+                    except Exception: pass
 
                 if current_table:
                     # CRITICAL: Must yield at least 5 directors to be considered "the board table"
@@ -2253,7 +2253,7 @@ class SECFilingParser:
                 fallback_candidates.sort(key=lambda x: x[0], reverse=True)
                 best_members = fallback_candidates[0][1]
 
-        except: pass
+        except Exception: pass
         return best_members, best_df
 
     def _extract_board_from_text(self, text: str) -> List[Dict[str, Any]]:
@@ -2301,7 +2301,7 @@ class SECFilingParser:
             context = section_text[start:end].lower()
 
             return 'director' in context or 'nominee' in context or 'board' in context
-        except:
+        except Exception:
             return False
 
     def _analyze_independence(self, text: str, name: str) -> Dict[str, Any]:
@@ -2313,7 +2313,7 @@ class SECFilingParser:
             if any(t in context for t in ['ceo', 'cfo', 'chief financial', 'chief executive', 'president']): score -= 0.8
             if 'executive chairman' in context: score -= 0.8
             return {'is_independent': True if score >= 0.5 else False if score <= -0.5 else None}
-        except: return {'is_independent': None}
+        except Exception: return {'is_independent': None}
 
     def _calc_gov_metrics(self, members: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not members: return {}
@@ -2343,7 +2343,7 @@ def safe_get_8k_items(filing: Any) -> Tuple[List[str], str]:
             if obj_items:
                 norm = normalize_item_numbers(list(obj_items))
                 if norm: return norm, "eightk_obj"
-    except: pass
+    except Exception: pass
     return items_list, source
 
 # Wrapper functions

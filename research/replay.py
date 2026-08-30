@@ -47,6 +47,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from research import daily_job, pit_store, scanner, spread, sue
 
+_MISSING = object()
+
 CAVEATS = (
     "survivorship: the vendor sells history only for names that still exist, "
     "so delisted companies are absent and their absence is correlated with "
@@ -56,6 +58,17 @@ CAVEATS = (
     "not measured at all",
     "prices are stamped at their own session, which assumes a day's prices "
     "were known that evening; true of prices, and the only thing assumed",
+    "scaled to 595 names the cross-sectional variant returns 340 trades, hit "
+    "55%, mean +195bp and median +184bp at t=+2.04 -- which clears a bar of "
+    "2.00 and not the 2.50 that four variants tried against these same names "
+    "requires. Reported uncalibrated for that reason rather than for want of "
+    "a sample",
+    "the timing hypothesis was tested and not supported: the same "
+    "cross-sectional signal entered at the earnings release returned t=+1.12 "
+    "over 74 trades, and entered at the 10-Q a median of eight days later "
+    "returned t=+2.47 over 71. Entering later did better, which is the "
+    "opposite of what the drift literature predicts and is most likely a small "
+    "sample rather than a finding -- the two arms do not trade the same events",
     "entry timing: the surprise is computed from XBRL, which does not exist "
     "until the 10-Q is filed -- a median of 8 days after the earnings 8-K, "
     "mean 12.1, range 0 to 45, measured across 60 filings from 20 large caps. "
@@ -98,7 +111,13 @@ def build_store(tickers: Sequence[str], start: str, end: str) -> Dict[str, Any]:
                 pit_store.record_corporate_action(
                     ticker, row["trade_date"], "dividend",
                     float(row["dividend"]), recorded_at=when)
-            written += pit_store.record_bars(ticker, [row], recorded_at=when)
+            # Every row here is a backfill by construction: the session is
+            # months past and the vendor has already dropped whatever delisted
+            # since. Taking the default would have a replayed store claim its
+            # bars were recorded on the evening they describe, which is the
+            # one thing `source` exists to deny.
+            written += pit_store.record_bars(ticker, [row], recorded_at=when,
+                                             source="backfilled")
 
     return {"tickers": len(fetched), "rows": written,
             "start": start, "end": end, "caveats": list(CAVEATS)}
@@ -165,6 +184,27 @@ def load_signals(signals: Dict[str, List[Dict[str, Any]]]) -> int:
     return sum(len(v) for v in _SIGNALS.values())
 
 
+def _changes_known_by(changes: Optional[List[Dict[str, Any]]],
+                      known_at: str) -> List[Dict[str, Any]]:
+    """The basis changes on the record when this quarter was filed.
+
+    A change is evidence of two filings disagreeing about one period, so it
+    does not exist until the later of them does. The history is fetched once
+    as of today and every row it returns carries every change the series ever
+    showed, which is the one place a replay reaches past its own date: the
+    scanner then rejected a 2020 signal for a split filed in 2024. Only
+    rejections come of it, so it does not inflate a result -- it picks the
+    sample with hindsight, which is the same defect one step removed.
+    """
+    kept = []
+    for change in changes or []:
+        between = change.get("between") or []
+        when = max(between) if between else change.get("period")
+        if when is None or str(when)[:10] <= known_at[:10]:
+            kept.append(change)
+    return kept
+
+
 def build_signals(tickers: Sequence[str],
                   as_of: Optional[str] = None) -> Dict[str, Any]:
     """One EDGAR pass per name for every quarter it ever filed."""
@@ -172,7 +212,10 @@ def build_signals(tickers: Sequence[str],
     for ticker in tickers:
         history = sue.sue_ts_history(ticker, as_of=as_of)
         rows = history.get("signals") or history.get("quarters") or []
-        table[ticker] = [r for r in rows if r.get("sue") is not None]
+        table[ticker] = [
+            {**r, "basis_changes": _changes_known_by(r.get("basis_changes"),
+                                                     r["known_at"])}
+            for r in rows if r.get("sue") is not None and r.get("known_at")]
     loaded = load_signals(table)
     return {"tickers": len(table), "signals": loaded}
 
@@ -207,13 +250,20 @@ def _refresh_universe_for(tickers: Sequence[str], as_of: str) -> int:
 
 
 def run(dates: Sequence[str], horizon_days: int = 20,
-        tickers: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+        tickers: Optional[Sequence[str]] = None,
+        signal_for: Any = _MISSING,
+        comparisons: int = 1) -> Dict[str, Any]:
     """Scan on each date, then score what those decisions did.
 
     Uses the scanner unmodified. That is the point of building a store rather
     than a special mode: if the replay needed its own ranking logic it would be
     measuring something other than the thing that will run tomorrow.
     """
+    # The precomputed time-series table by default; None lets the scanner use
+    # whichever variant it is set to, which is how the cross-sectional one --
+    # dated by the release rather than the filing -- gets replayed at all.
+    lookup = _signal_for if signal_for is _MISSING else signal_for
+
     orders: List[Dict[str, Any]] = []
     # One print is one trade. Replayed decisions never enter the filed book, so
     # the scanner cannot read this from the store the way it does live -- and
@@ -227,20 +277,23 @@ def run(dates: Sequence[str], horizon_days: int = 20,
         else:
             daily_job.refresh_universe(as_of=as_of)
         result = scanner.scan(as_of=as_of, already_acted=acted,
-                              signal_for=_signal_for)
+                              signal_for=lookup)
         for candidate in result["candidates"]:
             orders.append({**candidate, "as_of_date": as_of})
             period = candidate.get("fiscal_period")
             if period:
                 acted.add((candidate["ticker"], period))
 
-    scored = _score(orders, horizon_days)
+    # How many variants have been tried against these names. A t-statistic
+    # from the best of several is not a t-statistic from one, and the caller
+    # is the only thing that knows the count.
+    scored = _score(orders, horizon_days, comparisons=comparisons)
     return {"dates": len(dates), "orders": len(orders), **scored,
             "caveats": list(CAVEATS)}
 
 
-def _score(orders: List[Dict[str, Any]],
-           horizon_days: int) -> Dict[str, Any]:
+def _score(orders: List[Dict[str, Any]], horizon_days: int,
+           comparisons: int = 1) -> Dict[str, Any]:
     """`scoring.fill` applied to replay orders rather than filed ones.
 
     One implementation, deliberately: the two paths differ only in where the
@@ -274,35 +327,52 @@ def _score(orders: List[Dict[str, Any]],
                 and scoring._exchange_shut(entry_session, as_of):
             # A holiday. The order rests and fills at the next open, one
             # session only -- five of these were discarded in a live replay,
-            # all on Presidents Day, Memorial Day and Thanksgiving.
-            entry_session = forward[0]["trade_date"]
+            # all on Presidents Day, Memorial Day and Thanksgiving. The next
+            # open comes off the exchange calendar, never off this name's own
+            # prints: rolling to whenever it next appears is how a study buys
+            # a week after the news it was reacting to.
+            entry_session = (scoring._next_open_session(entry_session, as_of)
+                             or entry_session)
         if not forward or forward[0]["trade_date"] != entry_session:
             skip(order, f"{order['ticker']} did not trade on {entry_session}, "
                         f"so the order never filled")
             continue
-        if len(forward) <= horizon_days:
-            skip(order, f"only {max(0, len(forward) - 1)} of {horizon_days} "
-                        f"sessions elapsed, so the horizon never completed")
+        # Sessions of the exchange, not rows in the store; see
+        # `scoring._horizon_exit`. One implementation for both paths, because
+        # the two differ only in where the orders come from.
+        exit_bar, _, why = scoring._horizon_exit(forward, entry_session,
+                                                 horizon_days, as_of)
+        if exit_bar is None:
+            skip(order, why)
             continue
 
-        row = scoring.fill(order, forward[0], forward[horizon_days])
+        row = scoring.fill(order, forward[0], exit_bar)
         if row is None:
             skip(order, "a price on the path is missing")
             continue
-        scored.append({**row, "as_of_date": order["as_of_date"]})
+        scored.append({**row, "as_of_date": order["as_of_date"],
+                       "timing": scoring._timing_of(order, as_of)})
 
     return {"scored": scored, "skipped": skipped,
-            **scoring._summarise(scored)}
+            "by_timing": scoring.split_by_timing(scored, comparisons),
+            "by_variant": scoring.split_by_variant(scored, comparisons),
+            **scoring._summarise(scored, comparisons=comparisons)}
 
 
 def summarise(scored: List[Dict[str, Any]],
-              caveats_only: bool = False) -> Dict[str, Any]:
-    """The numbers, never without the caveats attached to them."""
+              caveats_only: bool = False,
+              comparisons: int = 1) -> Dict[str, Any]:
+    """The numbers, never without the caveats attached to them.
+
+    `comparisons` for the same reason `run` takes one: this scored at a bar of
+    2.00 whatever had been tried, and it is the shortest route to a number.
+    """
     from research import scoring
 
     if caveats_only:
         return {"caveats": list(CAVEATS)}
-    return {**scoring._summarise(scored), "caveats": list(CAVEATS)}
+    return {**scoring._summarise(scored, comparisons=comparisons),
+            "caveats": list(CAVEATS)}
 
 
 # ------------------------------------------------------------- entry point
@@ -311,6 +381,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     """`python -m research.replay`. Builds nothing by itself; see --help."""
     import argparse
     import json
+
+    # Nothing else does, and the ordering that hides it is not enforced
+    # anywhere: the recorder normally runs first and creates the store, so the
+    # first command against a fresh volume dies on "no such table" instead.
+    # Cheap and idempotent, so it runs every time rather than once.
+    pit_store.init_schema()
 
     parser = argparse.ArgumentParser(
         prog="replay",
@@ -321,10 +397,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--horizon-days", type=int, default=20)
     parser.add_argument("--tickers", nargs="*", default=None,
                         help="limit the universe to these names")
+    parser.add_argument("--comparisons", type=int, default=1,
+                        help="how many variants have been tried against these "
+                             "names; the significance bar moves out with it")
     args = parser.parse_args(argv)
 
     result = run(args.dates, horizon_days=args.horizon_days,
-                 tickers=args.tickers)
+                 tickers=args.tickers, comparisons=args.comparisons)
     print(json.dumps(result, indent=2, default=str))
     return 0
 

@@ -58,8 +58,23 @@ def _bars(store, ticker, prices, recorded_at=None, days=None):
                       recorded_at=recorded_at or f"{days[-1]}T21:00:00Z")
 
 
+def _calendar(store, days=None):
+    """The reference instrument's own sessions, one evening at a time.
+
+    It is the only calendar the store has. What "the exchange was open" means
+    and what a horizon counted in sessions counts are both read off it, so a
+    scoring test that scores anything has to say which days the market held.
+    """
+    from research import spread
+    for day in (days or DAYS):
+        store.record_bars(spread.REFERENCE_TICKER,
+                          [{"trade_date": day, "open": 50.0, "high": 50.5,
+                            "low": 49.5, "close": 50.0, "volume": 1_000_000}],
+                          recorded_at=f"{day}T21:00:00Z")
+
+
 def _order(store, ticker="AAA", side="long", sue=3.0, cost_bps=10.0,
-           decided=None, session=None, dollars=5000.0):
+           decided=None, session=None, dollars=5000.0):  # noqa: D401
     decided = decided or DAYS[0]
     session = session or DAYS[1]
     store.record_paper_orders(
@@ -81,6 +96,7 @@ def test_an_unfinished_horizon_is_not_scored(store):
     ones still open because they have not moved, so counting them early tilts
     every average toward nothing having happened."""
     _order(store)
+    _calendar(store)
     _bars(store, "AAA", [100.0] * 5)
 
     out = scoring.score_orders(as_of=DAYS[4], horizon_days=20)
@@ -91,6 +107,7 @@ def test_an_unfinished_horizon_is_not_scored(store):
 
 def test_a_finished_horizon_is_scored(store):
     _order(store)
+    _calendar(store)
     prices = [100.0] * 2 + [110.0] * 10
     _bars(store, "AAA", prices)
 
@@ -106,6 +123,7 @@ def test_a_name_that_did_not_trade_that_session_never_filled(store):
     """No bar on the intended session means no fill. Sliding to the next
     available price is how a backtest buys the day after bad news."""
     _order(store, session=DAYS[1])
+    _calendar(store, DAYS[:21])
     # AAA trades on day 0 and then not again until day 5.
     _bars(store, "AAA", [100.0], days=[DAYS[0]],
           recorded_at=f"{DAYS[0]}T21:00:00Z")
@@ -125,6 +143,7 @@ def test_the_return_runs_from_the_intended_session(store):
     """Entry is the open of the session the order was for -- not the close of
     the day the decision was made, which is the price that was already known."""
     _order(store, session=DAYS[1], cost_bps=0.0)
+    _calendar(store)
     _bars(store, "AAA", [50.0, 100.0, 100.0, 100.0, 100.0, 110.0, 110.0])
 
     out = scoring.score_orders(as_of=DAYS[10], horizon_days=4)
@@ -137,6 +156,7 @@ def test_the_return_runs_from_the_intended_session(store):
 
 def test_the_cost_recorded_at_decision_time_is_subtracted(store):
     _order(store, session=DAYS[1], cost_bps=40.0)
+    _calendar(store)
     _bars(store, "AAA", [100.0, 100.0, 100.0, 100.0, 100.0, 110.0, 110.0])
 
     row = scoring.score_orders(as_of=DAYS[10], horizon_days=4)["scored"][0]
@@ -147,6 +167,7 @@ def test_the_cost_recorded_at_decision_time_is_subtracted(store):
 
 def test_a_short_earns_when_the_price_falls(store):
     _order(store, side="short", sue=-3.0, session=DAYS[1], cost_bps=0.0)
+    _calendar(store)
     _bars(store, "AAA", [100.0, 100.0, 100.0, 100.0, 100.0, 90.0, 90.0])
 
     row = scoring.score_orders(as_of=DAYS[10], horizon_days=4)["scored"][0]
@@ -158,6 +179,7 @@ def test_a_split_inside_the_horizon_is_not_a_return(store):
     -90% print. Scoring the raw series would book it as the worst trade ever
     made."""
     _order(store, session=DAYS[1], cost_bps=0.0)
+    _calendar(store)
     _bars(store, "AAA", [100.0, 100.0, 100.0, 10.0, 10.0, 11.0, 11.0])
     store.record_corporate_action("AAA", DAYS[3], "split", 10.0,
                                   recorded_at=f"{DAYS[3]}T21:00:00Z")
@@ -171,6 +193,7 @@ def test_a_split_inside_the_horizon_is_not_a_return(store):
 
 def test_scoring_cannot_see_a_bar_recorded_after_its_date(store):
     _order(store, session=DAYS[1])
+    _calendar(store, DAYS[:11])
     _bars(store, "AAA", [100.0] * 10, recorded_at=f"{DAYS[30]}T21:00:00Z")
 
     out = scoring.score_orders(as_of=DAYS[10], horizon_days=4)
@@ -185,6 +208,7 @@ def test_the_realised_drift_is_measured_not_echoed(store):
     from research import scanner
 
     _order(store, ticker="AAA", sue=2.0, session=DAYS[1], cost_bps=0.0)
+    _calendar(store)
     _bars(store, "AAA", [100.0, 100.0, 100.0, 100.0, 100.0, 104.0, 104.0])
 
     out = scoring.score_orders(as_of=DAYS[10], horizon_days=4)
@@ -200,6 +224,7 @@ def test_a_calibration_from_too_few_trades_says_so(store):
     """One trade is not a coefficient, and quoting it as one is how an
     assumption gets replaced with a worse assumption."""
     _order(store, sue=2.0, session=DAYS[1], cost_bps=0.0)
+    _calendar(store)
     _bars(store, "AAA", [100.0] * 5 + [104.0, 104.0])
 
     out = scoring.score_orders(as_of=DAYS[10], horizon_days=4)
@@ -215,6 +240,7 @@ def test_the_horizon_boundary_is_exact(store):
     """
     _order(store, session=DAYS[1], cost_bps=0.0)
     # Entry session plus exactly four more: one short of a five-day hold.
+    _calendar(store, DAYS[:6])
     _bars(store, "AAA", [100.0] * 5, days=DAYS[1:6],
           recorded_at=f"{DAYS[5]}T21:00:00Z")
 
@@ -223,6 +249,7 @@ def test_the_horizon_boundary_is_exact(store):
     assert out["pending"]
 
     # One more session, and it is exactly a five-day hold.
+    _calendar(store, [DAYS[6]])
     _bars(store, "AAA", [120.0], days=[DAYS[6]],
           recorded_at=f"{DAYS[6]}T21:00:00Z")
 
@@ -239,6 +266,7 @@ def test_the_horizon_boundary_is_exact(store):
 def test_a_horizon_longer_than_the_record_stays_pending(store):
     """And does not index off the end."""
     _order(store, session=DAYS[1], cost_bps=0.0)
+    _calendar(store)
     _bars(store, "AAA", [100.0] * 6, days=DAYS[1:7],
           recorded_at=f"{DAYS[6]}T21:00:00Z")
 
@@ -363,3 +391,345 @@ def test_an_order_rolls_only_as_far_as_the_next_session(store):
     out = scoring.score_orders(as_of=DAYS[20], horizon_days=4)
     assert out["scored"] == []
     assert out["unfilled"]
+
+
+# --- a t-statistic found by searching is not a t-statistic ------------------
+#
+# Three variants were replayed on the same 82 names: the time-series signal,
+# the cross-sectional one entered at the earnings release, and the same one
+# entered at the 10-Q. The third came back t=+2.47 on 71 trades and cleared
+# every gate, which would have replaced a declared 40bp with 340.
+#
+# One of three passing at t>2 is roughly what chance produces. The gate cannot
+# tell a pre-registered test from the best of a search unless it is told how
+# many were tried, so it has to be told -- and a threshold that ignores the
+# search is a threshold that ratifies it.
+
+def _at_t(n, target_t, spread=300.0):
+    """A sample whose t-statistic is exactly `target_t`, so a test can sit
+    between two thresholds on purpose."""
+    import math
+    import statistics
+
+    base = [spread if i % 2 else -spread for i in range(n)]
+    mean = target_t * statistics.stdev(base) / math.sqrt(n)
+    return [b + mean for b in base]
+
+
+def test_a_result_picked_from_several_needs_a_higher_bar():
+    """Bonferroni is blunt and honest: three comparisons means the bar for any
+    one of them moves out, from 2.00 to 2.39. A t of 2.20 sits between."""
+    nets = _at_t(40, 2.20)
+    alone = scoring._summarise(_scored(nets))
+    searched = scoring._summarise(_scored(nets), comparisons=3)
+
+    assert alone["calibrated"] is True
+    assert searched["calibrated"] is False
+    assert "3 comparisons" in searched["calibration_note"]
+
+
+def test_one_comparison_is_the_default_and_changes_nothing():
+    nets = _at_t(40, 2.20)
+    assert scoring._summarise(_scored(nets)) == \
+        scoring._summarise(_scored(nets), comparisons=1)
+
+
+def test_the_threshold_actually_used_is_reported():
+    """A reader has to be able to see which bar the number cleared."""
+    out = scoring._summarise(_scored([50.0] * 40), comparisons=4)
+    assert out["t_threshold"] > 2.0
+    assert out["comparisons"] == 4
+
+
+def test_a_strong_enough_result_survives_the_correction():
+    """The bar moves; it does not become unreachable."""
+    out = scoring._summarise(_scored(_at_t(60, 3.10)), comparisons=3)
+    assert out["calibrated"] is True
+    assert out["t_threshold"] == pytest.approx(2.394, abs=0.01)
+
+
+# --- before the open and after the close are not the same trade -------------
+#
+# A nightly scan decides on the evening of day D and enters at D+1's open.
+#
+# For a print after the close on D, the gap is the D-to-D+1 overnight move, and
+# entering at D+1's open is entering after it -- which is what post-earnings
+# drift means: the move that follows the reaction, not the reaction.
+#
+# For a print before the open on D, the gap was that morning. By D+1's open the
+# reaction is a day old and a day of drift has already been given away. So bmo
+# names are systematically entered later in the effect than amc ones, and an
+# average over both hides it.
+
+def _with_timing(store, ticker, period, announced, timing):
+    store.record_announcement(ticker, period, announced, timing=timing,
+                              recorded_at=f"{announced}T21:00:00Z")
+
+
+def test_a_score_carries_the_hour_the_print_landed(store):
+    _with_timing(store, "MISS", "2026Q1", DAYS[0], "amc")
+    _calendar(store)
+    _order(store, ticker="MISS", session=DAYS[1], cost_bps=0.0)
+    _bars(store, "MISS", [100.0] * 3 + [110.0] * 5)
+
+    row = scoring.score_orders(as_of=DAYS[20], horizon_days=4)["scored"][0]
+    assert row["timing"] == "amc"
+
+
+def test_a_trade_with_no_announcement_on_record_says_unknown(store):
+    _calendar(store)
+    _order(store, ticker="MISS", session=DAYS[1], cost_bps=0.0)
+    _bars(store, "MISS", [100.0] * 3 + [110.0] * 5)
+
+    row = scoring.score_orders(as_of=DAYS[20], horizon_days=4)["scored"][0]
+    assert row["timing"] == "unknown"
+
+
+def test_the_summary_splits_by_the_hour(store):
+    """One number over both hides a difference that is structural rather than
+    incidental, and the split is free -- the field is already on the row."""
+    _calendar(store)
+    for i, (t, timing, move) in enumerate([
+            ("A", "amc", 110.0), ("B", "amc", 112.0),
+            ("C", "bmo", 98.0), ("D", "bmo", 99.0)]):
+        _with_timing(store, t, "2026Q1", DAYS[0], timing)
+        _order(store, ticker=t, session=DAYS[1], cost_bps=0.0)
+        _bars(store, t, [100.0] * 3 + [move] * 5)
+
+    out = scoring.score_orders(as_of=DAYS[20], horizon_days=4)
+    assert out["sample"] == 4
+    assert out["by_timing"]["amc"]["sample"] == 2
+    assert out["by_timing"]["bmo"]["sample"] == 2
+    assert out["by_timing"]["amc"]["mean_net_bps"] > 0
+    assert out["by_timing"]["bmo"]["mean_net_bps"] < 0
+
+
+def test_the_split_is_absent_rather_than_empty_when_nothing_scored(store):
+    out = scoring.score_orders(as_of=DAYS[20], horizon_days=4)
+    assert out["by_timing"] == {}
+
+
+def test_one_malformed_order_does_not_stop_the_run(store):
+    """`fill` read side and cost tolerantly while the identifying fields were
+    hard-indexed, so an order missing one raised out of the whole scoring run
+    instead of being reported as the one bad row it is."""
+    _calendar(store)
+    _bars(store, "AAA", [100.0] * 3 + [110.0] * 5)
+    store.record_paper_orders(
+        DAYS[0],
+        [{"ticker": "AAA", "fiscal_period": "2026Q1", "side": "long",
+          "sue": 2.0, "intended_session": DAYS[1]}],   # no target_dollars
+        recorded_at=f"{DAYS[0]}T21:00:00Z")
+
+    out = scoring.score_orders(as_of=DAYS[20], horizon_days=4)
+    assert out["sample"] == 1
+    assert out["scored"][0]["target_dollars"] is None
+    assert out["scored"][0]["gross_bps"] == pytest.approx(1000.0)
+
+
+# --- the correction has to be reachable from the thing that runs -------------
+#
+# The Bonferroni machinery was correct and nothing in production could get to
+# it. `score_orders` had no `comparisons` parameter at all, so the Saturday
+# scoring job scored at one comparison however many variants had been tried,
+# and it split the sample by announcement timing and judged each subgroup
+# independently at t>2.00 -- two or three simultaneous tests, each allowed the
+# bar for one.
+
+def test_score_orders_takes_a_comparison_count(store):
+    out = scoring.score_orders(as_of=DAYS[20], horizon_days=4, comparisons=3)
+    assert out["comparisons"] == 3
+    assert scoring.score_orders(as_of=DAYS[20])["comparisons"] == 1
+
+
+def test_a_timing_subgroup_is_judged_against_every_subgroup_tried(store):
+    """Splitting one sample into two and asking both at t>2.00 is two tests
+    dressed as one. The count the subgroup is judged at has to include the
+    split itself."""
+    _calendar(store, DAYS[:20])
+    for t, timing, move in [("A", "amc", 110.0), ("B", "amc", 112.0),
+                            ("C", "bmo", 98.0), ("D", "bmo", 99.0)]:
+        _with_timing(store, t, "2026Q1", DAYS[0], timing)
+        _order(store, ticker=t, session=DAYS[1], cost_bps=0.0)
+        _bars(store, t, [100.0] * 3 + [move] * 5)
+
+    out = scoring.score_orders(as_of=DAYS[19], horizon_days=4)
+    assert out["comparisons"] == 1
+    assert out["by_timing"]["amc"]["comparisons"] == 2
+    assert out["by_timing"]["bmo"]["comparisons"] == 2
+
+    searched = scoring.score_orders(as_of=DAYS[19], horizon_days=4,
+                                    comparisons=3)
+    assert searched["by_timing"]["amc"]["comparisons"] == 6
+
+
+def test_the_scoring_cli_takes_a_comparison_count(store, monkeypatch):
+    """The Saturday job is this CLI. A count it cannot be given is a count it
+    never carries."""
+    seen = {}
+
+    def fake(**kwargs):
+        seen.update(kwargs)
+        return {}
+
+    monkeypatch.setattr(scoring, "score_orders", fake)
+    assert scoring.main(["--comparisons", "4"]) == 0
+    assert seen["comparisons"] == 4
+
+
+def test_a_roll_that_would_skip_sessions_is_not_a_fill(store):
+    """The roll is one session, and the code rolled to whenever the name next
+    appeared. An order for Thanksgiving 2026 filled thirteen sessions later at
+    a price 40% lower, and scored the gap it was supposed to be holding
+    through as though the position had been open the whole time."""
+    _order(store, session=DAYS[1], cost_bps=0.0)
+    # The exchange was shut on DAYS[1] and open every session after it.
+    _calendar(store, [DAYS[0]] + DAYS[2:30])
+    # The name did not print again until DAYS[14], after a 40% gap.
+    _bars(store, "AAA", [100.0], days=[DAYS[0]],
+          recorded_at=f"{DAYS[0]}T21:00:00Z")
+    _bars(store, "AAA", [60.0] * 11, days=DAYS[14:25],
+          recorded_at=f"{DAYS[24]}T21:00:00Z")
+
+    out = scoring.score_orders(as_of=DAYS[29], horizon_days=4)
+
+    assert out["scored"] == [], (
+        f"an order rolled {out['scored'] and out['scored'][0]['entry_session']}"
+        f" past a session it could not have been filled on")
+    assert out["unfilled"]
+
+
+def test_a_missing_reference_series_is_a_gap_not_a_verdict(store):
+    """`_exchange_shut` answered "the market was open" when the reference
+    instrument had no bars at all -- so a hole in the recorder turned every
+    order dated on a session the name did not print into "never filled" and
+    deleted it from the sample, silently, with the sample selected on the
+    hole."""
+    _order(store, session=DAYS[1], cost_bps=0.0)
+    _bars(store, "AAA", [100.0], days=[DAYS[0]],
+          recorded_at=f"{DAYS[0]}T21:00:00Z")
+    _bars(store, "AAA", [100.0] * 10, days=DAYS[5:15],
+          recorded_at=f"{DAYS[14]}T21:00:00Z")
+
+    with pytest.raises(scoring.ReferenceSeriesMissing) as raised:
+        scoring.score_orders(as_of=DAYS[20], horizon_days=4)
+    assert "SPY" in str(raised.value)
+
+
+# --- one column, two quantities ---------------------------------------------
+#
+# `sue` holds a sigma when the variant is ts or af and `percentile - 0.5` when
+# it is cs, which is bounded by 0.5 however large the surprise. Averaging
+# gross/|sue| over a book containing both reads a 100bp cross-sectional winner
+# as 220 basis points per SUE against a declared 15 -- a coefficient of neither
+# signal, quoted as though it were of both.
+
+def _mixed(nets, variants):
+    return [{"ticker": f"T{i}", "sue": 2.0, "net_bps": n, "gross_bps": n,
+             "cost_bps": 0.0, "variant": v}
+            for i, (n, v) in enumerate(zip(nets, variants))]
+
+
+def test_a_book_that_mixes_variants_does_not_quote_one_coefficient():
+    nets = [20.0, 30.0, 25.0, 15.0, -5.0] * 8
+    mixed = _mixed(nets, ["ts"] * 20 + ["cs"] * 20)
+
+    out = scoring._summarise(mixed)
+
+    assert out["drift_bps_per_sue"] is None, (
+        "a coefficient was fitted over a sigma and a rank together")
+    assert out["calibrated"] is False
+    assert "variant" in out["calibration_note"]
+    assert out["variants"] == ["cs", "ts"]
+
+
+def test_one_variant_still_calibrates():
+    nets = [20.0, 30.0, 25.0, 15.0, -5.0] * 8
+    out = scoring._summarise(_mixed(nets, ["ts"] * 40))
+    assert out["calibrated"] is True
+    assert out["drift_bps_per_sue"] is not None
+
+
+def test_the_score_splits_by_variant(store):
+    """So a mixed book is still measurable -- separately, which is the only way
+    either number means anything."""
+    _calendar(store, DAYS[:20])
+    for ticker, variant, move in [("A", "ts", 110.0), ("B", "cs", 90.0)]:
+        store.record_paper_orders(
+            DAYS[0],
+            [{"ticker": ticker, "side": "long", "sue": 2.0, "variant": variant,
+              "fiscal_period": "2026Q1", "expected_edge_bps": 30.0,
+              "cost_bps": 0.0, "target_dollars": 5000.0,
+              "intended_session": DAYS[1]}],
+            recorded_at=f"{DAYS[0]}T21:00:00Z")
+        _bars(store, ticker, [100.0] * 3 + [move] * 5)
+
+    out = scoring.score_orders(as_of=DAYS[19], horizon_days=4)
+
+    assert out["sample"] == 2
+    assert out["drift_bps_per_sue"] is None, "the mixture was averaged over"
+    assert out["by_variant"]["ts"]["sample"] == 1
+    assert out["by_variant"]["cs"]["sample"] == 1
+    assert out["by_variant"]["ts"]["drift_bps_per_sue"] == pytest.approx(500.0)
+
+
+# --- twenty sessions means twenty sessions ----------------------------------
+#
+# `forward[horizon_days]` is the 21st row present in the store, not the 21st
+# session. A partial night is documented as normal on a universe this size, so
+# a name missing one bar was held for 21 sessions and a name missing three for
+# 23 -- silently, and the pending/unfilled split inherited the same error.
+
+def test_the_horizon_is_counted_in_sessions_not_in_recorded_bars(store):
+    _order(store, session=DAYS[1], cost_bps=0.0)
+    _calendar(store, DAYS[:20])
+    # One session missing from the middle of the hold.
+    days = [DAYS[1], DAYS[2], DAYS[4], DAYS[5], DAYS[6], DAYS[7], DAYS[8]]
+    _bars(store, "AAA", [100.0, 100.0, 100.0, 100.0, 110.0, 130.0, 130.0],
+          days=days, recorded_at=f"{DAYS[8]}T21:00:00Z")
+
+    row = scoring.score_orders(as_of=DAYS[19], horizon_days=5)["scored"][0]
+
+    assert row["exit_session"] == DAYS[6], (
+        f"a five-session hold from {DAYS[1]} exited on {row['exit_session']}; "
+        f"the missing bar lengthened it")
+    assert row["gross_bps"] == pytest.approx(1000.0)
+
+
+def test_a_horizon_measured_against_an_absent_bar_is_not_scored(store):
+    """The other half: if the name did not print on the exit session there is
+    no exit price, and the nearest one is a different trade."""
+    _order(store, session=DAYS[1], cost_bps=0.0)
+    _calendar(store, DAYS[:20])
+    days = [DAYS[1], DAYS[2], DAYS[3], DAYS[7], DAYS[8], DAYS[9]]
+    _bars(store, "AAA", [100.0] * 3 + [60.0] * 3, days=days,
+          recorded_at=f"{DAYS[9]}T21:00:00Z")
+
+    out = scoring.score_orders(as_of=DAYS[19], horizon_days=5)
+
+    assert out["scored"] == []
+    assert out["unfilled"]
+    assert DAYS[6] in out["unfilled"][0]["reason"]
+
+
+def test_the_pending_split_counts_sessions_too(store):
+    """A store holding four of the five sessions in a hold has not finished it,
+    and a store holding five bars spread over eight sessions has."""
+    _order(store, session=DAYS[1], cost_bps=0.0)
+    _calendar(store, DAYS[:6])
+    # Four bars, one of them missing, over five sessions of the exchange.
+    _bars(store, "AAA", [100.0] * 4, days=[DAYS[1], DAYS[2], DAYS[4], DAYS[5]],
+          recorded_at=f"{DAYS[5]}T21:00:00Z")
+
+    out = scoring.score_orders(as_of=DAYS[5], horizon_days=5)
+    assert out["scored"] == []
+    assert "4 of 5 sessions" in out["pending"][0]["reason"], (
+        out["pending"][0]["reason"])
+
+
+def test_a_fresh_store_is_created_by_the_scoring_job_itself(tmp_path,
+                                                            monkeypatch):
+    """`research-score` runs on a Saturday, and on a fresh volume it ran
+    before anything had created the tables."""
+    monkeypatch.setenv("NEMO_PIT_DB", str(tmp_path / "fresh.db"))
+    assert scoring.main(["--as-of", DAYS[10]]) == 0

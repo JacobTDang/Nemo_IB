@@ -13,8 +13,13 @@ exists to prevent.
 
 /ready reports the individual facts instead of a verdict with no evidence:
 which credentials are absent, whether the MCP layer actually started, when
-something last succeeded. It always answers 200 -- see
-test_a_not_ready_server_still_answers_200 for why a 503 would be worse.
+something last succeeded.
+
+The status code answers a narrower question than the body: can this server do
+its job at all. A missing declared credential or an MCP layer that never
+started means no, and 503 is what a healthcheck can act on. "Nothing has
+succeeded yet" means the container is thirty seconds old, and a probe that
+called that unhealthy would call every server unhealthy every morning.
 """
 import datetime as dt
 import re
@@ -59,9 +64,9 @@ def _nothing_has_succeeded_yet(monkeypatch):
 # --------------------------------------------------------------- liveness kept
 
 def test_health_still_returns_the_liveness_body_it_always_has():
-    """The compose healthcheck probes /health and nothing else. Enriching it
-    with readiness would make a container with a missing API key fail its
-    healthcheck and get restarted forever, which fixes nothing."""
+    """/health is liveness and stays liveness: the process is up and the app
+    started. The compose healthcheck moved to /ready, which is a different
+    question; this body must not drift into answering it."""
     r = TestClient(_app()).get("/health")
     assert r.status_code == 200
     assert r.json() == {"status": "ok", "transport": "streamable-http",
@@ -76,9 +81,9 @@ def test_ready_needs_no_token_but_the_mcp_endpoint_still_does():
 
     The /mcp assertion is what makes the /ready assertion mean anything:
     without it, a 200 could just as well be an app with auth switched off."""
-    client = TestClient(_app(auth_token=TOKEN))
-    assert client.get("/ready").status_code == 200
-    assert client.get("/mcp").status_code == 401
+    with TestClient(_app(auth_token=TOKEN)) as client:
+        assert client.get("/ready").status_code == 200
+        assert client.get("/mcp").status_code == 401
 
 
 # ----------------------------------------------------------------- credentials
@@ -209,7 +214,9 @@ def test_a_check_that_raises_is_reported_rather_than_propagated(monkeypatch):
 
     monkeypatch.setattr(mcp_http, "_check_credentials", boom)
     r = TestClient(_app()).get("/ready")
-    assert r.status_code == 200
+    # 503, not 500: a check that blew up is a failed check, and the body still
+    # names which one. A 500 looks identical to a crashed server.
+    assert r.status_code == 503
     body = r.json()
     assert body["checks"]["credentials"]["ok"] is False
     assert "environ is unreadable" in body["checks"]["credentials"]["error"]
@@ -219,14 +226,54 @@ def test_a_check_that_raises_is_reported_rather_than_propagated(monkeypatch):
     assert body["checks"]["process"]["ok"] is True
 
 
-def test_a_not_ready_server_still_answers_200():
-    """Not 503. Several orchestrators kill a container on a failing readiness
-    probe, and "degraded but still serving cached SEC data" is a state worth
-    keeping alive. Readiness belongs in the body, where a reader can act on
-    the detail instead of on a single status code."""
-    r = TestClient(_app(required_env=("DEFINITELY_NOT_SET_ANYWHERE",))).get("/ready")
+# ----------------------------------------------------------------- status code
+
+def test_a_missing_credential_answers_503():
+    """The compose healthcheck reads this endpoint, and a status code is the
+    only part of it a healthcheck can act on. An SEC server with no SEC_EMAIL
+    came up green with all 48 tools and failed every EDGAR call at runtime."""
+    with TestClient(_app(required_env=("DEFINITELY_NOT_SET_ANYWHERE",))) as c:
+        r = c.get("/ready")
+    assert r.status_code == 503
+    assert r.json()["blocking"] == ["credentials"]
+    assert r.json()["checks"]["credentials"]["missing"] == [
+        "DEFINITELY_NOT_SET_ANYWHERE"]
+
+
+def test_an_mcp_layer_that_never_started_answers_503():
+    """uvicorn binds the port either way. This is the state /health cannot
+    see and the reason the healthcheck moved."""
+    r = TestClient(_app()).get("/ready")
+    assert r.status_code == 503
+    assert "mcp" in r.json()["blocking"]
+
+
+def test_a_server_that_has_not_answered_anything_yet_is_still_200(monkeypatch):
+    """The one degradation that must not fail the probe.
+
+    Every container starts here, and a server nobody has queried today sits
+    here too. Gating the status code on it would mark all five unhealthy every
+    morning, which is a probe nobody reads by the time it means something."""
+    monkeypatch.setenv("FINNHUB_API_KEY", "a-real-looking-key")
+    app = _app(required_env=("FINNHUB_API_KEY",))
+    with TestClient(app) as client:
+        r = client.get("/ready")
     assert r.status_code == 200
-    assert r.json()["ready"] is False
+    body = r.json()
+    assert body["blocking"] == []
+    assert body["degraded"] == ["last_success"]
+    assert body["ready"] is False
+
+
+def test_a_fully_ready_server_answers_200(monkeypatch):
+    monkeypatch.setenv("FINNHUB_API_KEY", "a-real-looking-key")
+    mcp_http.record_success()
+    app = _app(required_env=("FINNHUB_API_KEY",))
+    with TestClient(app) as client:
+        r = client.get("/ready")
+    assert r.status_code == 200
+    assert r.json() == {**r.json(), "ready": True, "degraded": [],
+                        "blocking": []}
 
 
 # ------------------------------------------------------------------ declaration
@@ -246,3 +293,58 @@ def test_run_http_declares_which_credentials_the_server_needs(monkeypatch):
 
     body = TestClient(served["app"]).get("/ready").json()
     assert body["checks"]["credentials"]["missing"] == ["FINNHUB_API_KEY"]
+
+
+# --------------------------------------------------- what each server declares
+#
+# The endpoint above is only worth anything if a server names the keys its tools
+# cannot work without. None of the five did: all called `run_http(X().server)`
+# with the default `()`, so `credentials` reported ok on every deployment
+# regardless. The realistic case was SEC_EMAIL -- nothing builds an SEC identity
+# at startup, so the server came up green with all 48 tools and every EDGAR call
+# failed at runtime.
+#
+# Read from the source rather than by importing: the declaration is an argument
+# at a call site under `if __name__ == "__main__"`, which importing never runs.
+
+import ast
+import pathlib
+
+REPO = pathlib.Path(__file__).resolve().parent.parent
+
+# What each server's tools genuinely cannot work without, and nothing else. A
+# key with a working default (NAME falls back to "Investment Analyst") or one
+# whose absence is a documented degradation (CONGRESS_API_KEY, FINMIND_TOKEN)
+# must not be here: the compose healthcheck reads this endpoint now, so an
+# over-declaration marks a working container unhealthy forever.
+REQUIRED_ENV = {
+    "tools/web_search_server/web_search.py": {"SEC_EMAIL"},
+    "tools/news_agregator/finnhub_server.py": {"FINNHUB_API_KEY"},
+    "tools/news_agregator/fred_server.py": {"FRED_API_KEY"},
+    "tools/financial_modeling_engine/analysis_tools.py": set(),
+    "tools/altdata_server/server.py": set(),
+}
+
+
+def _run_http_required_env(relative_path):
+    """The literal names passed as `required_env=` at the run_http call site."""
+    tree = ast.parse((REPO / relative_path).read_text())
+    calls = [node for node in ast.walk(tree)
+             if isinstance(node, ast.Call)
+             and getattr(node.func, "id", None) == "run_http"]
+    assert len(calls) == 1, (
+        f"{relative_path} has {len(calls)} run_http call sites; this check "
+        f"reads one")
+    for keyword in calls[0].keywords:
+        if keyword.arg == "required_env":
+            return {element.value for element in keyword.value.elts}
+    return None
+
+
+@pytest.mark.parametrize("path", sorted(REQUIRED_ENV))
+def test_the_server_declares_the_credentials_its_tools_cannot_work_without(path):
+    declared = _run_http_required_env(path)
+    assert declared is not None, (
+        f"{path} calls run_http without required_env, so /ready reports "
+        f"credentials ok whatever the environment holds")
+    assert declared == REQUIRED_ENV[path]

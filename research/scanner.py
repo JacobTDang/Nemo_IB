@@ -104,6 +104,26 @@ DRIFT_BPS_PER_TAIL = 40.0
 # its peers, which is not news however large the beat was in isolation.
 MIN_TAIL_DISTANCE = 0.8
 
+# And how large the surprise has to be in its own right, as a fraction of the
+# share price. The tail distance is a rank, so some name is always in the top
+# decile of any cohort -- including a season where the largest beat was a
+# hundredth of a cent, which the rank cannot tell from a season of real news.
+# Five basis points of price is roughly a few percent of a quarter's earnings
+# for a typical name: small, and not a rounding error.
+MIN_SCALED_SURPRISE = 0.0005
+
+# Which jobs count as "the recorder", and how long one can be silent before an
+# empty window stops being information about the tape. Five days spans a long
+# weekend -- the recorder does not run on a Sunday and a Tuesday scan after
+# Thanksgiving is not an emergency -- and does not span a month.
+RECORDER_JOBS = ("daily_bars", "consensus")
+MAX_RECORDER_GAP_DAYS = 5
+
+
+class RecorderNotRunning(RuntimeError):
+    """An empty window that nothing was watching. Not a quiet tape."""
+
+
 # --- regime -----------------------------------------------------------------
 
 # The index, used only for its own realised volatility. It is in the store
@@ -131,6 +151,23 @@ def _next_session(as_of: str) -> str:
 
 # --- seams, so the decision logic can be tested without a network -----------
 
+# The cohort for one date, held only for the length of a scan. It is the same
+# list for every name on that date by construction, and rebuilding it per name
+# is quadratic: on the real store a cohort of 305 takes 386ms, so a date with
+# 305 reporters spent two minutes rebuilding one list and a replay over 652
+# dates would have run for about twenty-one hours.
+_COHORT: Dict[str, Any] = {}
+
+
+def _peers_for(as_of: str):
+    from research import sue_cs
+
+    if _COHORT.get("as_of") != as_of:
+        _COHORT["as_of"] = as_of
+        _COHORT["peers"] = sue_cs.cohort(as_of)
+    return _COHORT["peers"]
+
+
 def _signal_for(ticker: str, as_of: str) -> Dict[str, Any]:
     """The surprise, from whichever variant `SIGNAL_VARIANT` names.
 
@@ -148,7 +185,9 @@ def _signal_for(ticker: str, as_of: str) -> Dict[str, Any]:
         return {**sue.sue_ts(ticker, as_of=as_of), "variant": "ts"}
     if SIGNAL_VARIANT == "cs":
         from research import sue_cs
-        return {**sue_cs.surprise_rank(ticker, as_of=as_of), "variant": "cs"}
+        return {**sue_cs.surprise_rank(ticker, as_of=as_of,
+                                       peers=_peers_for(as_of)),
+                "variant": "cs"}
     raise ValueError(
         f"SIGNAL_VARIANT must be 'ts', 'af', 'af_or_ts' or 'cs'; got "
         f"{SIGNAL_VARIANT!r}")
@@ -184,6 +223,29 @@ def _cost_for(ticker: str, as_of: str, position_dollars: float) -> Dict[str, Any
     cost["cost_floor"] = (tick_floor + impact) if tick_floor is not None \
         else cost["cost"]
     return cost
+
+
+def _recorder_gap(as_of: str) -> Optional[str]:
+    """Why an empty window cannot be read as information, or None.
+
+    `has_consensus_history` says only that the recorder wrote something once,
+    ever. A recorder that died in January still satisfies it, so a scan in June
+    narrows to the names that printed in the last six weeks, finds none, files
+    an empty book and exits 0 -- a run-log line byte-identical to a genuinely
+    quiet tape, every night, forever. The run log is where the difference
+    lives, and nothing here had ever read it.
+    """
+    stale = []
+    for job in RECORDER_JOBS:
+        last = pit_store.last_successful_run(job, as_of)
+        if last is None:
+            stale.append(f"{job} has never finished successfully by {as_of}")
+            continue
+        gap = (date.fromisoformat(as_of) - date.fromisoformat(last)).days
+        if gap > MAX_RECORDER_GAP_DAYS:
+            stale.append(f"{job} last finished for {last}, {gap} days before "
+                         f"{as_of}")
+    return "; ".join(stale) if stale else None
 
 
 def _regime_scale(as_of: str) -> tuple:
@@ -279,6 +341,14 @@ def _cross_sectional_problem(signal: Dict[str, Any]) -> Optional[str]:
     distance = _tail_distance(signal.get("percentile"))
     if distance is None:
         return "no percentile computed"
+    scaled = signal.get("scaled_surprise")
+    if scaled is None:
+        return "no scaled surprise, so the rank cannot be given a size"
+    if abs(scaled) < MIN_SCALED_SURPRISE:
+        return (f"surprise of {abs(scaled) * 1e4:.2f}bp of price is under the "
+                f"{MIN_SCALED_SURPRISE * 1e4:.1f}bp floor; a rank always has a "
+                f"top decile, so without this the largest of a cohort of "
+                f"rounding errors is priced at a full tail")
     if distance < MIN_TAIL_DISTANCE:
         return (f"percentile {signal['percentile']:.2f} is "
                 f"{distance:.2f} into a tail, under the "
@@ -350,6 +420,8 @@ def scan(as_of: Optional[str] = None,
     module's seam, which works only until something rebinds it back.
     """
     as_of = as_of or _today()
+    # A new scan must not inherit a cohort assembled for another date.
+    _COHORT.clear()
     signal_for = signal_for or _signal_for
     if already_acted is None:
         already_acted = pit_store.filed_periods(as_of)
@@ -359,6 +431,7 @@ def scan(as_of: Optional[str] = None,
 
     universe = [m["ticker"] for m in pit_store.universe_as_of(as_of)
                 if m["eligible"]]
+    refusal = None
 
     # Narrow before spending a request, not after. Asking EDGAR for a signal on
     # every eligible name is 2,435 companyconcept calls and about nineteen
@@ -377,6 +450,19 @@ def scan(as_of: Optional[str] = None,
         narrowed_by = "recorded prints"
         narrowing_note = (f"{len(considered)} of {len(universe)} eligible "
                           f"names have a print recorded since {since}")
+        if not considered:
+            # Nothing to scan is a fact about the tape only if something was
+            # watching it. The gate is on the empty answer rather than on every
+            # scan: a window with names in it is its own evidence that the
+            # recorder works.
+            gap = _recorder_gap(as_of)
+            if gap:
+                refusal = (
+                    f"no eligible name has a print recorded since {since}, and "
+                    f"the recorder is not known to have been running: {gap}. "
+                    f"An empty window is information only when something was "
+                    f"watching, and this cannot tell a quiet tape from a "
+                    f"recorder that stopped")
     else:
         # Nothing recorded at all -- a young store, not a quiet tape. Scanning
         # nothing here would look identical to a market with no earnings in it,
@@ -463,9 +549,9 @@ def scan(as_of: Optional[str] = None,
                              or "cost could not be measured"})
             continue
 
-        expected_bps = strength * (DRIFT_BPS_PER_TAIL
-                                   if signal.get("variant") == "cs"
-                                   else DRIFT_BPS_PER_SUE)
+        coefficient = (DRIFT_BPS_PER_TAIL if signal.get("variant") == "cs"
+                       else DRIFT_BPS_PER_SUE)
+        expected_bps = strength * coefficient
         cost_bps = cost["cost"] * 10_000
         floor_bps = (cost.get("cost_floor") or cost["cost"]) * 10_000
         net_bps = expected_bps - cost_bps
@@ -505,13 +591,25 @@ def scan(as_of: Optional[str] = None,
             "ticker": ticker, "side": side, "sue": value,
             "fiscal_period": signal.get("fiscal_period"),
             "known_at": signal.get("known_at"),
+            # What quantity `sue` is, what it was priced with, and how much of
+            # it was reconstructed rather than watched. All three are module
+            # constants or upstream fields at decision time and none of them
+            # can be recovered from the row afterwards.
             "variant": signal.get("variant"),
+            "drift_coefficient": coefficient,
+            "drift_calibrated": DRIFT_CALIBRATED,
+            "seeded_quarters": signal.get("seeded_quarters"),
+            "recorded_quarters": signal.get("recorded_quarters"),
             "expected_edge_bps": expected_bps, "cost_bps": cost_bps,
             "cost_bps_low": floor_bps,
             "net_edge_bps": net_bps, "target_dollars": target,
             "participation": fit.get("participation"),
             "spread": cost.get("spread"),
-            "spread_resolved": bool(cost.get("resolved")),
+            # `resolved` is EDGE's flag for "not zero", which SPY passes at
+            # 41bp against a market a cent wide. What the row has to say is
+            # whether the charge was this name's measured spread or the tick it
+            # was floored to, which is what `resolution` answers.
+            "spread_resolved": resolved,
             # The session this order is for. No price: that session has not
             # happened, and the whole point of logging an intention is that
             # nobody gets to choose the fill afterwards.
@@ -536,6 +634,9 @@ def scan(as_of: Optional[str] = None,
         "considered": len(considered),
         "narrowed_by": narrowed_by,
         "narrowing_note": narrowing_note,
+        # Set when the scan cannot say what it found. Nothing downstream may
+        # file this result; see `record_scan`.
+        "refusal": refusal,
         "candidates": candidates[:MAX_NAMES],
         "rejected": rejected,
         # Names the estimator could not judge, kept apart from names the
@@ -577,17 +678,29 @@ def record_scan(as_of: Optional[str] = None) -> Dict[str, Any]:
     # re-run cannot change it -- and should not, because the filed decision is
     # the one that would have been acted on. What it must not do is return a
     # different answer without mentioning that the record holds another one.
-    already = {o["ticker"] for o in
-               pit_store.paper_orders_as_of(as_of, accepted_only=True)
-               if o["as_of_date"] == as_of}
+    #
+    # Every row, not just the accepted ones. paper_order is keyed on
+    # (as_of_date, ticker), so a rejection already occupies the key a later
+    # acceptance would need -- and asking only about acceptances meant a first
+    # run that accepted nothing looked like a date nobody had decided.
+    filed_rows = [o for o in pit_store.paper_orders_as_of(as_of)
+                  if o["as_of_date"] == as_of]
+    decided = {o["ticker"] for o in filed_rows}
+    already = {o["ticker"] for o in filed_rows if o["accepted"]}
     proposed = {c["ticker"] for c in result["candidates"]}
-    if already and already != proposed:
+    if decided and already != proposed:
         result["superseded"] = {
             "filed": sorted(already), "proposed": sorted(proposed),
             "note": (f"{as_of} was already decided and that decision stands; "
                      f"these candidates were not filed")}
 
     pit_store.start_run("scan", as_of_date=as_of)
+    if result["refusal"]:
+        # Filing an empty book here would record a decision nobody is in a
+        # position to make, and status=ok would say the night went fine.
+        pit_store.finish_run(rows_written=0, status="failed",
+                             error=result["refusal"])
+        raise RecorderNotRunning(result["refusal"])
     try:
         written = pit_store.record_paper_orders(
             as_of, result["candidates"], result["rejected"],
@@ -609,6 +722,24 @@ def record_scan(as_of: Optional[str] = None) -> Dict[str, Any]:
         note = (f"no candidates: {note}; "
                 f"{len(result['undetermined'])} undetermined, "
                 f"{len(result['rejected'])} rejected")
+
+    # What the record holds now, which is not what was proposed whenever an
+    # earlier row already owned the key. INSERT OR IGNORE drops the second
+    # write silently, so the shortfall has to be looked for rather than
+    # assumed absent.
+    held = {o["ticker"] for o in
+            pit_store.paper_orders_as_of(as_of, accepted_only=True)
+            if o["as_of_date"] == as_of}
+    dropped = sorted(proposed - held)
+    if dropped:
+        result["superseded"] = {
+            "filed": sorted(held), "proposed": sorted(proposed),
+            "dropped": dropped,
+            "note": (f"{as_of} already holds a row for "
+                     f"{', '.join(dropped)}, so nothing was filed for "
+                     f"{'them' if len(dropped) > 1 else 'it'} and the "
+                     f"decision on record is the earlier one")}
+        note = f"{note}; superseded: {result['superseded']['note']}"
     pit_store.finish_run(rows_written=written, status="ok", error=note)
     return {**result, "written": written}
 
@@ -629,6 +760,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     """
     import argparse
     import json
+
+    # Nothing else does, and the ordering that hides it is not enforced
+    # anywhere: the recorder normally runs first and creates the store, so the
+    # first command against a fresh volume dies on "no such table" instead.
+    # Cheap and idempotent, so it runs every time rather than once.
+    pit_store.init_schema()
 
     parser = argparse.ArgumentParser(
         prog="scanner",

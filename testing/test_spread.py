@@ -462,6 +462,129 @@ def test_a_split_recorded_later_does_not_alter_an_earlier_estimate(store):
     assert after["splits_excluded"] == 1
 
 
+def test_a_split_whose_ex_date_has_no_session_is_still_excluded(store):
+    """The ex-date does not have to be a session the store holds a row for.
+
+    `pit_store.adjusted_bars` keys its adjustment on "every action dated after
+    this bar" rather than on an action landing exactly on a bar's date, and its
+    comment says why: an ex-date can fall on a holiday, on a session a fetch
+    missed, or after the last bar recorded. Matching the ex-date against a
+    bar's date exactly skips the split in all three cases.
+
+    Here that miss is expensive. The -90% print stays in the cost window, EDGE
+    reads it as trading cost for the whole window, and the name is rejected
+    every night with a number that reads like a liquidity verdict -- a
+    plausible, wrong explanation, which is the failure this module is built to
+    avoid.
+
+    The discontinuity sits between the last bar before the ex-date and the
+    first bar on or after it, whether or not the ex-date itself printed.
+    """
+    dates = _sessions(200)
+    ohlc = _simulate_ohlc(0.01, days=200, seed=4, price0=10.0)
+    clean = _rows(dates, ohlc, volume=200_000.0)
+
+    raw = [dict(r) for r in clean]
+    for row in raw[:100]:  # pre-split prices, ten times higher
+        for field in ("open", "high", "low", "close"):
+            row[field] *= 10.0
+        row["volume"] /= 10.0
+
+    # The ex-date session itself never reaches the store, so nothing in
+    # `daily_bar` carries that date. Both names lose the same session, so the
+    # comparison below is like for like.
+    ex = dates[100]
+    clean = [r for r in clean if r["trade_date"] != ex]
+    raw = [r for r in raw if r["trade_date"] != ex]
+
+    store.record_bars("CLEAN", clean, recorded_at=f"{dates[0]}T21:00:00Z")
+    store.record_bars("SPLIT", raw, recorded_at=f"{dates[0]}T21:00:00Z")
+    store.record_corporate_action("SPLIT", ex, "split", 10.0,
+                                  recorded_at=f"{ex}T12:00:00Z")
+
+    as_of = dates[-1]
+    reference = spread.estimate_spread("CLEAN", as_of=as_of, window=200)
+    got = spread.estimate_spread("SPLIT", as_of=as_of, window=200)
+
+    assert got["splits_excluded"] == 1, (
+        f"the split on {ex} has no session of its own, and nothing was "
+        f"excluded for it: splits_excluded={got['splits_excluded']}")
+    assert got["spread"] == pytest.approx(reference["spread"], rel=0.05), (
+        f"a 10-for-1 split whose ex-date landed on a missing session moved "
+        f"the estimate from {reference['spread']:.4f} to {got['spread']:.4f}")
+
+    # The spread is the smaller half of the damage. A surviving -90% print is
+    # also a -90% close-to-close return, and it lands in the sigma the impact
+    # term is built on: left in, it multiplies the modelled cost of a $25k
+    # order by three, and that is the number the nightly rejection quotes.
+    ref_cost = spread.round_trip_cost("CLEAN", as_of=as_of,
+                                      position_dollars=25_000.0, window=200)
+    got_cost = spread.round_trip_cost("SPLIT", as_of=as_of,
+                                      position_dollars=25_000.0, window=200)
+    assert got_cost["daily_volatility"] == pytest.approx(
+        ref_cost["daily_volatility"], rel=0.05), (
+        f"the split survived into the volatility the impact model uses: "
+        f"{ref_cost['daily_volatility']:.4f} became "
+        f"{got_cost['daily_volatility']:.4f}")
+    assert got_cost["cost"] == pytest.approx(ref_cost["cost"], rel=0.05), (
+        f"a round trip in a name with one missed split ex-date is priced at "
+        f"{got_cost['cost'] * 1e4:.0f}bp against the same name's "
+        f"{ref_cost['cost'] * 1e4:.0f}bp")
+
+
+def test_a_split_effective_after_the_last_bar_excludes_no_session(store):
+    """The third case in `adjusted_bars`' list, and the one with nothing to do.
+
+    A split whose ex-date is known on `as_of` but falls after the last session
+    recorded has not printed yet, so no pair of bars in the window straddles
+    it. Excluding "the first bar on or after the ex-date" must find no such
+    bar and drop nothing: an exclusion here would spend a session to correct a
+    discontinuity that is not in the data.
+    """
+    dates = _sessions(201)
+    ohlc = _simulate_ohlc(0.01, days=201, seed=4, price0=10.0)
+    rows = _rows(dates, ohlc, volume=200_000.0)[:200]
+    store.record_bars("AHEAD", rows, recorded_at=f"{dates[0]}T21:00:00Z")
+
+    ex = dates[200]  # announced, effective, and no bar for it yet
+    store.record_corporate_action("AHEAD", ex, "split", 10.0,
+                                  recorded_at=f"{ex}T12:00:00Z")
+
+    got = spread.estimate_spread("AHEAD", as_of=ex, window=200)
+    assert got["splits_excluded"] == 0
+    assert got["sessions_used"] == 200
+
+
+def test_a_split_older_than_the_window_does_not_drop_its_first_session(store):
+    """The other direction, and the one a careless widening gets wrong.
+
+    A split that happened before the window opens is entirely on the far side
+    of every bar in it: the prices are all post-split and there is no
+    transition to break. Keying on "every bar on or after the ex-date" without
+    asking whether the window also holds a bar before it would drop the first
+    session of every window that follows a split, forever.
+    """
+    dates = _sessions(260)
+    ohlc = _simulate_ohlc(0.01, days=260, seed=4, price0=10.0)
+    rows = _rows(dates, ohlc, volume=200_000.0)
+
+    ex = dates[5]
+    for row in rows[:5]:  # pre-split prices, long before the window opens
+        for field in ("open", "high", "low", "close"):
+            row[field] *= 10.0
+        row["volume"] /= 10.0
+
+    store.record_bars("OLD", rows, recorded_at=f"{dates[0]}T21:00:00Z")
+    store.record_corporate_action("OLD", ex, "split", 10.0,
+                                  recorded_at=f"{ex}T12:00:00Z")
+
+    got = spread.estimate_spread("OLD", as_of=dates[-1], window=200)
+    assert got["splits_excluded"] == 0, (
+        f"the split on {ex} is 55 sessions older than the window's first bar "
+        f"({dates[60]}), and a session was dropped for it anyway")
+    assert got["sessions_used"] == 200
+
+
 def test_a_self_contradictory_bar_is_dropped(store):
     """A close outside its own high-low range is a vendor error, and the
     estimator has no way to know that: it reads the impossible range as
@@ -799,3 +922,92 @@ def test_the_cost_report_carries_its_inputs(store):
         assert key in cost, f"the cost report does not say {key}"
     assert cost["as_of"] == "2026-12-31"
     assert cost["ticker"] == "MID"
+
+
+# --- a refusal is not the cheapest name in the universe ---------------------
+#
+# `estimate_spread` returns spread=None with a reason whenever the squared
+# spread comes out non-positive -- "a refusal, not a zero". `spread_basis`
+# tested only whether the estimate stood clear of the reference, so a None fell
+# through to the resolution floor and was charged one tick: the LOWEST cost
+# available, in a book ranked on edge net of cost. The names nobody can measure
+# sorted to the top of it.
+
+def _unmeasurable(store, ticker, days=40):
+    """A live series EDGE refuses: the squared spread comes out negative.
+
+    Not a frozen price -- that has no volatility either, so the cost refuses
+    further downstream and the test would pass without measuring anything.
+    This one has everything a cost needs except the spread itself.
+    """
+    for seed in range(60):
+        ohlc = _simulate_ohlc(0.0, days=days, seed=seed)
+        if spread.edge(**ohlc, signed=True) < 0:
+            break
+    else:  # pragma: no cover
+        pytest.fail("no seed produced a refused sample")
+    dates = _sessions(days)
+    store.record_bars(ticker, _rows(dates, ohlc, 200_000.0),
+                      recorded_at=f"{dates[0]}T21:00:00Z")
+    return dates
+
+
+def test_a_name_with_no_estimate_is_not_charged_the_tick(store):
+    _record_simulated(store, spread.REFERENCE_TICKER, 0.01, days=40,
+                      volume=100_000.0, price0=50.0)
+    _unmeasurable(store, "FOGGY")
+
+    refused = spread.estimate_spread("FOGGY", as_of="2026-12-31", window=40)
+    assert refused["spread"] is None and refused["tick_floor"] is not None
+    reference = spread.estimate_spread(spread.REFERENCE_TICKER,
+                                       as_of="2026-12-31", window=40)
+    assert reference["spread"] or reference["spread_upper"], (
+        "the reference has no estimate either, so this measures nothing")
+
+    decided = spread.spread_basis("FOGGY", as_of="2026-12-31", window=40)
+    assert decided["basis"] == "unknown", (
+        "a name the estimator refused was floored at one tick, which is the "
+        "cheapest cost in the universe")
+    assert decided["spread"] is None
+    assert decided["reason"]
+
+
+def test_an_unmeasurable_name_gets_no_adaptive_cost_at_all(store):
+    """Which is what the scanner reads. A cost of None is a rejection with a
+    reason; a tick is a recommendation."""
+    _record_simulated(store, spread.REFERENCE_TICKER, 0.01, days=40,
+                      volume=100_000.0, price0=50.0)
+    _unmeasurable(store, "FOGGY")
+
+    on_bound = spread.round_trip_cost("FOGGY", as_of="2026-12-31",
+                                      position_dollars=1_000.0, window=40)
+    assert on_bound["cost"] is not None, "the upper bound is still chargeable"
+
+    adaptive = spread.round_trip_cost("FOGGY", as_of="2026-12-31",
+                                      position_dollars=1_000.0, window=40,
+                                      basis="adaptive")
+    assert adaptive["cost"] is None
+    assert adaptive["cost"] != on_bound["cost"]
+    assert adaptive["reason"]
+
+
+def test_a_charged_cost_does_not_read_a_refusal_as_its_provenance(store):
+    """`result = {**est, ...}` left the point estimate's refusal text sitting
+    beside a live cost, with `spread` None and `cost` a number. A caller that
+    tests `cost is None` -- which is every caller -- never sees it, and a
+    reader who looks at the row reads the refusal as this cost's own."""
+    _record_simulated(store, spread.REFERENCE_TICKER, 0.01, days=40,
+                      volume=100_000.0, price0=50.0)
+    _unmeasurable(store, "FOGGY")
+
+    est = spread.estimate_spread("FOGGY", as_of="2026-12-31", window=40)
+    assert est["spread"] is None and est["reason"]
+
+    cost = spread.round_trip_cost("FOGGY", as_of="2026-12-31",
+                                  position_dollars=1_000.0, window=40)
+    assert cost["cost"] is not None
+    assert cost["reason"] is None, (
+        "a refusal rode along with a cost that was successfully charged")
+    assert cost["estimate_reason"] == est["reason"], (
+        "the refusal was dropped rather than relabelled; why the point "
+        "estimate is absent is still worth knowing")

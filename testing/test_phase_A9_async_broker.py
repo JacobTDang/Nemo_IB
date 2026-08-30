@@ -31,8 +31,8 @@ async def _with_mock_broker(handler, fn):
   broker._client = httpx.AsyncClient(
     base_url=broker.base_url,
     headers={
-      "APCA-API-KEY-ID": broker.key,
-      "APCA-API-SECRET-KEY": broker.secret,
+      "APCA-API-KEY-ID": broker._key.reveal(),
+      "APCA-API-SECRET-KEY": broker._secret.reveal(),
     },
     transport=_mock_transport(handler),
   )

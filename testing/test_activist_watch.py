@@ -690,3 +690,67 @@ def test_a_failed_pass_still_reports_what_it_knew(store, monkeypatch):
     assert aw.main([]) == 1
     import json
     assert "latency" in json.loads(printed["out"])
+
+
+# --- the first run on a fresh volume ----------------------------------------
+#
+# Every test above builds the schema in a fixture, which is exactly why the
+# suite stayed green while a first `docker compose run --rm research-watch` on
+# a new volume would die on "no such table: run_log" in `start_run`, before it
+# looked at a single name. This is the job most likely to be the one that runs
+# first: it is on a twenty-minute timer of its own rather than in the nightly
+# chain, so nothing orders it after the recorder.
+
+def test_a_fresh_store_is_created_by_the_pass_itself(tmp_path, monkeypatch):
+    monkeypatch.setenv("NEMO_PIT_DB", str(tmp_path / "fresh.db"))
+    monkeypatch.setattr(activist_watch, "_watchlist", lambda as_of: ["INTC"])
+    monkeypatch.setattr(activist_watch, "_fetch_company_filings",
+                        lambda ticker: (INTC_CIK, []))
+
+    assert activist_watch.main(["--as-of", "2026-08-26"]) == 0
+    assert activist_watch.last_run()["status"] == "ok"
+
+
+# --- the tmpfs this job writes into -----------------------------------------
+#
+# A pass reads a submissions index per name and a header per candidate filing,
+# and edgartools caches every one of them under /root/.edgar -- a 512MB tmpfs
+# in the batch container, with nothing removing anything. The eviction that
+# keeps the servers alive is an asyncio task in the HTTP app's lifespan, which
+# `python -m research.activist_watch` never starts. A sweep over the eligible
+# universe is thousands of names, so the mount fills and the pass dies mid-run
+# with `[Errno 28]`.
+#
+# Between names is the only place a batch job can prune: it has no event loop
+# and no idle moment. The pruner and its interval are the servers' own.
+
+def test_a_pass_prunes_the_filing_cache_as_it_goes(store, monkeypatch):
+    from tools import filing_cache
+
+    monkeypatch.setattr(activist_watch, "_fetch_company_filings",
+                        lambda ticker: (INTC_CIK, []))
+    asked = []
+    monkeypatch.setattr(filing_cache, "prune_if_due",
+                        lambda *a, **k: asked.append(1))
+
+    activist_watch.watch_pass(["AAA", "BBB", "CCC"], as_of="2026-08-26")
+    assert len(asked) == 3, "the cache is only asked about once for the pass"
+
+
+def test_a_name_that_failed_still_left_documents_in_the_cache(store,
+                                                              monkeypatch):
+    """The fetch that raised had already written whatever it read, and over a
+    universe the failures are where an unpruned cache grows fastest."""
+    from tools import filing_cache
+
+    def boom(ticker):
+        raise ConnectionError("SEC returned 429")
+
+    monkeypatch.setattr(activist_watch, "_fetch_company_filings", boom)
+    asked = []
+    monkeypatch.setattr(filing_cache, "prune_if_due",
+                        lambda *a, **k: asked.append(1))
+
+    out = activist_watch.watch_pass(["AAA", "BBB"], as_of="2026-08-26")
+    assert out["status"] == "failed"
+    assert len(asked) == 2

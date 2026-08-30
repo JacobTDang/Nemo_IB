@@ -666,7 +666,7 @@ class FredServer:
           self.server.create_initialization_options(),
         )
         print("Successfully created fred process", file=sys.stderr, flush=True)
-    except Exception as e:
+    except Exception:
       import traceback
       traceback.print_exc(file=sys.stderr)
       raise
@@ -684,7 +684,8 @@ if __name__ == "__main__":
     # one that spawns it. stdio stays the default for local use.
     from tools.mcp_http import run_http
     print("Starting fred over streamable HTTP", file=sys.stderr, flush=True)
-    run_http(FredServer().server)
+    # Every tool here is a FRED call.
+    run_http(FredServer().server, required_env=("FRED_API_KEY",))
 
   elif sys.argv[1] == "server":
     print("Starting fred process", file=sys.stderr, flush=True)

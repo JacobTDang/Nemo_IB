@@ -14,20 +14,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 class _FakeBroker:
-  def __init__(self, account=None, raises=None):
+  # One __init__, taking both forms. There were two: the second silently
+  # replaced the first, so the signature the first advertised --
+  # _FakeBroker(account=..., raises=...) -- did nothing, and the factory below
+  # set both attributes after construction to compensate. *args absorbs the
+  # AsyncBroker(paper=True) call the code under test makes.
+  def __init__(self, *args, account=None, raises=None, **kwargs):
     self.account = account or {
       "paper": True, "equity": 100000.0, "cash": 100000.0,
       "buying_power": 200000.0, "portfolio_value": 100000.0, "status": "ACTIVE",
     }
     self.raises = raises
-
-  def __init__(self, *args, **kwargs):
-    # Default values - allows AsyncBroker(paper=True) signature
-    self.account = {
-      "paper": True, "equity": 100000.0, "cash": 100000.0,
-      "buying_power": 200000.0, "portfolio_value": 100000.0, "status": "ACTIVE",
-    }
-    self.raises = None
 
   async def __aenter__(self):
     return self

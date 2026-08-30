@@ -27,7 +27,7 @@ import os
 import re
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
@@ -80,6 +80,9 @@ CREATE_SCHEMA = [
         parse_error      TEXT,
         transaction_count INTEGER DEFAULT 0,
         holding_count    INTEGER DEFAULT 0,
+        -- What was actually read. The filing id alone cannot notice a
+        -- correction re-posted under the same DocID; the bytes can.
+        content_hash     TEXT,
         fetched_at       TEXT,
         parsed_at        TEXT
     )""",
@@ -142,15 +145,73 @@ CREATE_SCHEMA = [
 ]
 
 
+# Bumped whenever _MIGRATIONS grows, and stamped into PRAGMA user_version so
+# a database can say which shape it is rather than being inspected for it.
+SCHEMA_VERSION = 1
+
+# Columns added after the first store shipped. CREATE TABLE IF NOT EXISTS
+# leaves an existing table exactly as it was, so a column added to
+# CREATE_SCHEMA never reaches the deployed volume -- and the first write that
+# mentions it raises `no such column` for every filing in the run.
+_MIGRATIONS = (
+    ("filings", "content_hash", "TEXT"),
+)
+
+# The database paths this process has already brought up to the current
+# schema. The sync calls init_schema(); the MCP server never does, so before
+# the first sync every congress tool answered `no such table: filings` in
+# place of the empty-store guidance written for exactly that moment.
+_INITIALISED: set = set()
+
+
+def _missing_columns(conn: sqlite3.Connection) -> List[Sequence[str]]:
+    missing = []
+    for table, column, declaration in _MIGRATIONS:
+        present = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in present:
+            missing.append((table, column, declaration))
+    return missing
+
+
+def _apply_schema(conn: sqlite3.Connection) -> None:
+    for statement in CREATE_SCHEMA:
+        conn.execute(statement)
+    if not _missing_columns(conn):
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        return
+
+    # The sync and the server both open the store, and on the first run after
+    # a column is added they both find it missing. Without the write lock they
+    # both issue the ALTER and the second one fails on a column that is by
+    # then already there, so the check and the change are taken together.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for table, column, declaration in _missing_columns(conn):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
 @contextmanager
 def connect():
-    """A connection to the store, committing on clean exit."""
+    """A connection to the store, committing on clean exit.
+
+    Everything written inside one `with` block lands together or not at all,
+    which is what keeps a filing's status from being durable before the rows
+    it describes.
+    """
     path = current_db_path()
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     conn = sqlite3.connect(path, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     try:
+        if path not in _INITIALISED:
+            _apply_schema(conn)
+            _INITIALISED.add(path)
         yield conn
         conn.commit()
     finally:
@@ -158,9 +219,10 @@ def connect():
 
 
 def init_schema() -> None:
+    """Create the schema, and add to it what an older database lacks."""
     with connect() as conn:
-        for statement in CREATE_SCHEMA:
-            conn.execute(statement)
+        _apply_schema(conn)
+        _INITIALISED.add(current_db_path())
 
 
 def _now() -> str:
@@ -223,7 +285,7 @@ def upsert_member(member: Dict[str, Any]) -> None:
 
 # ------------------------------------------------------------------ filings
 
-def upsert_filing(filing: Dict[str, Any]) -> None:
+def _upsert_filing(conn: sqlite3.Connection, filing: Dict[str, Any]) -> None:
     payload = {
         "filing_id": filing["filing_id"], "chamber": filing["chamber"],
         "doc_id": filing["doc_id"], "member_id": filing.get("member_id"),
@@ -233,54 +295,100 @@ def upsert_filing(filing: Dict[str, Any]) -> None:
         "source_url": filing.get("source_url"),
         "parse_status": filing.get("parse_status", "pending"),
         "parse_error": filing.get("parse_error"),
-        "transaction_count": filing.get("transaction_count", 0),
-        "holding_count": filing.get("holding_count", 0),
+        # Left as None when the caller does not say, so a re-check that
+        # failed does not report zero rows over the rows still stored.
+        "transaction_count": filing.get("transaction_count"),
+        "holding_count": filing.get("holding_count"),
+        "content_hash": filing.get("content_hash"),
         "fetched_at": filing.get("fetched_at") or _now(),
         "parsed_at": filing.get("parsed_at"),
     }
+    conn.execute(
+        """INSERT INTO filings(filing_id, chamber, doc_id, member_id,
+                filing_type, raw_filing_type, filed_date, year, source_url,
+                parse_status, parse_error, transaction_count,
+                holding_count, content_hash, fetched_at, parsed_at)
+           VALUES(:filing_id, :chamber, :doc_id, :member_id, :filing_type,
+                  :raw_filing_type, :filed_date, :year, :source_url,
+                  :parse_status, :parse_error,
+                  COALESCE(:transaction_count, 0),
+                  COALESCE(:holding_count, 0), :content_hash,
+                  :fetched_at, :parsed_at)
+           ON CONFLICT(filing_id) DO UPDATE SET
+             member_id        = excluded.member_id,
+             filing_type      = excluded.filing_type,
+             raw_filing_type  = excluded.raw_filing_type,
+             filed_date       = excluded.filed_date,
+             year             = excluded.year,
+             source_url       = excluded.source_url,
+             parse_status     = excluded.parse_status,
+             parse_error      = excluded.parse_error,
+             transaction_count= COALESCE(:transaction_count,
+                                         filings.transaction_count),
+             holding_count    = COALESCE(:holding_count,
+                                         filings.holding_count),
+             -- A re-check that failed says nothing about the bytes already
+             -- read, so the hash of those bytes survives it.
+             content_hash     = COALESCE(excluded.content_hash,
+                                         filings.content_hash),
+             -- When the filing was last looked at, which is a different fact
+             -- from when it was first seen and the only way to tell a filing
+             -- checked this morning from one nobody has opened since 2024.
+             fetched_at       = excluded.fetched_at,
+             parsed_at        = excluded.parsed_at""", payload)
+
+
+def upsert_filing(filing: Dict[str, Any]) -> None:
     with connect() as conn:
-        conn.execute(
-            """INSERT INTO filings(filing_id, chamber, doc_id, member_id,
-                    filing_type, raw_filing_type, filed_date, year, source_url,
-                    parse_status, parse_error, transaction_count,
-                    holding_count, fetched_at, parsed_at)
-               VALUES(:filing_id, :chamber, :doc_id, :member_id, :filing_type,
-                      :raw_filing_type, :filed_date, :year, :source_url,
-                      :parse_status, :parse_error, :transaction_count,
-                      :holding_count, :fetched_at, :parsed_at)
-               ON CONFLICT(filing_id) DO UPDATE SET
-                 member_id        = excluded.member_id,
-                 filing_type      = excluded.filing_type,
-                 raw_filing_type  = excluded.raw_filing_type,
-                 filed_date       = excluded.filed_date,
-                 year             = excluded.year,
-                 source_url       = excluded.source_url,
-                 parse_status     = excluded.parse_status,
-                 parse_error      = excluded.parse_error,
-                 transaction_count= excluded.transaction_count,
-                 holding_count    = excluded.holding_count,
-                 parsed_at        = excluded.parsed_at""", payload)
+        _upsert_filing(conn, filing)
 
 
-def unparsed_filing_ids(candidates: Sequence[str]) -> List[str]:
+def unparsed_filing_ids(candidates: Sequence[str],
+                        index_filed_dates: Optional[Dict[str, str]] = None,
+                        recheck_days: Optional[int] = None) -> List[str]:
     """Which of `candidates` still need fetching.
 
     A filing already parsed is skipped. So is one recorded as a scan: it will
     not become readable on a retry, and requeueing it every run would spend
     the whole budget on filings that cannot be parsed. A failed fetch is
     transient and is offered again.
+
+    Two things reopen a settled filing, because the id alone cannot notice a
+    document that changed underneath it. `index_filed_dates` is what the
+    chamber's own index says today: a filing whose index row has moved has
+    been re-posted, and the store is holding the superseded numbers.
+    `recheck_days` re-offers anything last looked at longer ago than that,
+    which is the only way a correction that left the index row alone -- or a
+    paper filing since re-posted with a text layer -- is ever seen again.
     """
     if not candidates:
         return []
     with connect() as conn:
         placeholders = ",".join("?" * len(candidates))
         settled = {
-            row[0] for row in conn.execute(
-                f"""SELECT filing_id FROM filings
+            row[0]: (row[1], row[2]) for row in conn.execute(
+                f"""SELECT filing_id, filed_date, fetched_at FROM filings
                     WHERE filing_id IN ({placeholders})
                       AND parse_status IN ({','.join('?' * (1 + len(PERMANENTLY_UNREADABLE)))})""",
                 (*candidates, PARSED, *PERMANENTLY_UNREADABLE))}
-    return [c for c in candidates if c not in settled]
+
+    cutoff = None
+    if recheck_days is not None:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=recheck_days)
+                  ).isoformat(timespec="seconds")
+
+    pending: List[str] = []
+    for candidate in candidates:
+        if candidate not in settled:
+            pending.append(candidate)
+            continue
+        filed_date, fetched_at = settled[candidate]
+        published = (index_filed_dates or {}).get(candidate)
+        if published and filed_date and published != filed_date:
+            pending.append(candidate)
+        elif cutoff is not None and (fetched_at or "") < cutoff:
+            pending.append(candidate)
+    return pending
 
 
 # ------------------------------------------------------- rows within filings
@@ -316,6 +424,34 @@ def _sane_transaction(row: Dict[str, Any],
     return row
 
 
+def _replace_transactions(conn: sqlite3.Connection, filing_id: str,
+                          member: Optional[str],
+                          rows: Iterable[Dict[str, Any]]) -> int:
+    rows = list(rows)
+    filed_row = conn.execute(
+        "SELECT filed_date FROM filings WHERE filing_id = ?",
+        (filing_id,)).fetchone()
+    # Absence of a filing date is not evidence a trade date is wrong.
+    filed_date = filed_row[0] if filed_row else None
+    rows = [_sane_transaction(r, filed_date) for r in rows]
+    conn.execute("DELETE FROM transactions WHERE filing_id = ?", (filing_id,))
+    conn.executemany(
+        """INSERT INTO transactions(txn_id, filing_id, member_id, row_index,
+                ticker, cusip, asset_name, asset_type_code, owner,
+                transaction_type, transaction_date, notification_date,
+                amount_min, amount_max)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        [(f"{filing_id}#{i}", filing_id, member, i, r.get("ticker"),
+          r.get("cusip"), r.get("asset_name"), r.get("asset_type_code"),
+          r.get("owner"), r.get("transaction_type"),
+          r.get("transaction_date"), r.get("notification_date"),
+          r.get("amount_min"), r.get("amount_max"))
+         for i, r in enumerate(rows)])
+    conn.execute("UPDATE filings SET transaction_count = ? WHERE filing_id = ?",
+                 (len(rows), filing_id))
+    return len(rows)
+
+
 def replace_transactions(filing_id: str, member: Optional[str],
                          rows: Iterable[Dict[str, Any]]) -> int:
     """Write a filing's transactions, replacing anything held for it.
@@ -324,52 +460,61 @@ def replace_transactions(filing_id: str, member: Optional[str],
     filing id, and appending would stack a corrected filing on top of the one
     it corrects.
     """
-    rows = list(rows)
     with connect() as conn:
-        filed_row = conn.execute(
-            "SELECT filed_date FROM filings WHERE filing_id = ?",
-            (filing_id,)).fetchone()
-        # Absence of a filing date is not evidence a trade date is wrong.
-        filed_date = filed_row[0] if filed_row else None
-        rows = [_sane_transaction(r, filed_date) for r in rows]
-        conn.execute("DELETE FROM transactions WHERE filing_id = ?", (filing_id,))
-        conn.executemany(
-            """INSERT INTO transactions(txn_id, filing_id, member_id, row_index,
-                    ticker, cusip, asset_name, asset_type_code, owner,
-                    transaction_type, transaction_date, notification_date,
-                    amount_min, amount_max)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            [(f"{filing_id}#{i}", filing_id, member, i, r.get("ticker"),
-              r.get("cusip"), r.get("asset_name"), r.get("asset_type_code"),
-              r.get("owner"), r.get("transaction_type"),
-              r.get("transaction_date"), r.get("notification_date"),
-              r.get("amount_min"), r.get("amount_max"))
-             for i, r in enumerate(rows)])
-        conn.execute("UPDATE filings SET transaction_count = ? WHERE filing_id = ?",
-                     (len(rows), filing_id))
+        return _replace_transactions(conn, filing_id, member, rows)
+
+
+def _replace_holdings(conn: sqlite3.Connection, filing_id: str,
+                      member: Optional[str],
+                      rows: Iterable[Dict[str, Any]]) -> int:
+    rows = list(rows)
+    conn.execute("DELETE FROM holdings WHERE filing_id = ?", (filing_id,))
+    conn.executemany(
+        """INSERT INTO holdings(holding_id, filing_id, member_id, row_index,
+                ticker, cusip, asset_name, asset_type_code, owner,
+                value_min, value_max, income_min, income_max, income_type,
+                as_of)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        [(f"{filing_id}#{i}", filing_id, member, i, r.get("ticker"),
+          r.get("cusip"), r.get("asset_name"), r.get("asset_type_code"),
+          r.get("owner"), r.get("value_min"), r.get("value_max"),
+          r.get("income_min"), r.get("income_max"), r.get("income_type"),
+          r.get("as_of"))
+         for i, r in enumerate(rows)])
+    conn.execute("UPDATE filings SET holding_count = ? WHERE filing_id = ?",
+                 (len(rows), filing_id))
     return len(rows)
 
 
 def replace_holdings(filing_id: str, member: Optional[str],
                      rows: Iterable[Dict[str, Any]]) -> int:
-    rows = list(rows)
     with connect() as conn:
-        conn.execute("DELETE FROM holdings WHERE filing_id = ?", (filing_id,))
-        conn.executemany(
-            """INSERT INTO holdings(holding_id, filing_id, member_id, row_index,
-                    ticker, cusip, asset_name, asset_type_code, owner,
-                    value_min, value_max, income_min, income_max, income_type,
-                    as_of)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            [(f"{filing_id}#{i}", filing_id, member, i, r.get("ticker"),
-              r.get("cusip"), r.get("asset_name"), r.get("asset_type_code"),
-              r.get("owner"), r.get("value_min"), r.get("value_max"),
-              r.get("income_min"), r.get("income_max"), r.get("income_type"),
-              r.get("as_of"))
-             for i, r in enumerate(rows)])
-        conn.execute("UPDATE filings SET holding_count = ? WHERE filing_id = ?",
-                     (len(rows), filing_id))
-    return len(rows)
+        return _replace_holdings(conn, filing_id, member, rows)
+
+
+def record_parsed_filing(filing: Dict[str, Any],
+                         transactions: Optional[Iterable[Dict[str, Any]]] = None,
+                         holdings: Optional[Iterable[Dict[str, Any]]] = None
+                         ) -> int:
+    """Write a filing and its rows as one indivisible act.
+
+    Written separately, the status committed first and the rows second, so
+    anything in between -- a cron timeout, a host reboot, an OOM kill, a
+    raising row write -- left the filing durably `parse_status='parsed'` with
+    nothing in it. `unparsed_filing_ids` never offers a parsed filing again,
+    so that filing is silently and permanently empty while `coverage.complete`
+    goes on reporting true.
+    """
+    with connect() as conn:
+        _upsert_filing(conn, filing)
+        written = 0
+        if transactions is not None:
+            written += _replace_transactions(
+                conn, filing["filing_id"], filing.get("member_id"), transactions)
+        if holdings is not None:
+            written += _replace_holdings(
+                conn, filing["filing_id"], filing.get("member_id"), holdings)
+    return written
 
 
 # ----------------------------------------------------------------- coverage
@@ -396,6 +541,35 @@ def repair_impossible_rows() -> Dict[str, int]:
                                          WHERE filings.filing_id =
                                                transactions.filing_id)""").rowcount
     return {"amounts_cleared": inverted, "dates_cleared": undated}
+
+
+def requeue_empty_transaction_reports() -> int:
+    """Offer again the transaction reports recorded as read but holding nothing.
+
+    A PTR exists to report a trade, so zero rows is a parse that failed rather
+    than a member who did not trade -- a table header that shifted, an
+    extraction that moved a column, an interstitial served with status 200.
+    Three House filings reached the live store this way (20025111, 20025152,
+    20033695) and `unparsed_filing_ids` will never offer a parsed filing
+    again, so nothing else would ever look at them.
+
+    Transaction reports only: an annual report holds holdings, and having no
+    transactions is the normal shape of one. Idempotent -- a filing requeued
+    here is re-read on the next run and settles either way. Returns how many
+    were reopened, because a repair that reports nothing cannot be told from
+    one that did nothing.
+    """
+    with connect() as conn:
+        return conn.execute(
+            """UPDATE filings
+                  SET parse_status = 'error', parse_error = ?
+                WHERE parse_status = ?
+                  AND filing_type = 'ptr'
+                  AND NOT EXISTS (SELECT 1 FROM transactions t
+                                  WHERE t.filing_id = filings.filing_id)""",
+            ("recorded as parsed with no transactions; a PTR is filed to "
+             "report a trade, so this was a parse that failed",
+             PARSED)).rowcount
 
 
 def coverage(chamber: Optional[str] = None) -> Dict[str, Any]:

@@ -734,7 +734,6 @@ def _screener_should_run_today(force: bool = False) -> bool:
   if force:
     return True
   from datetime import timedelta as _td
-  today_et = (datetime.now(timezone.utc) + _td(hours=-5)).strftime('%Y-%m-%d')
   cutoff = (datetime.now(timezone.utc) + _td(hours=-5)
             - _td(days=SCREENER_CADENCE_DAYS)).strftime('%Y-%m-%d')
   conn = get_connection()

@@ -19,7 +19,12 @@ import pytest
 # is not in the homelab image either -- `rag_search` and `rag_ingest` are
 # capability-gated and hidden there -- so an offline run has neither the model
 # nor the tools.
-pytestmark = pytest.mark.network
+# The bootstrap smoke test asks for more than a hundred chunks. Without an
+# ingested corpus it fails on the count, which reads as a broken ingest
+# rather than an absent index.
+from testing._gates import requires_rag  # noqa: E402
+
+pytestmark = [pytest.mark.network, requires_rag]
 
 import os
 import subprocess

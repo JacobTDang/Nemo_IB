@@ -1056,8 +1056,13 @@ def get_depreciation(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
       }
 
   except Exception as e:
+    # Name what went wrong. "Unable to get filing" reads as a filer that does
+    # not disclose depreciation, when it may equally be a 503, a parse failure
+    # or a concept this company tags differently -- and the caller cannot tell
+    # those apart from a sentence that mentions none of them.
     return{
-      'error': f"Unable to get filing for {ticker}",
+      'error': f"Unable to read depreciation for {ticker} from its "
+               f"{form_type}: {type(e).__name__}: {e}",
       'success':False
     }
 

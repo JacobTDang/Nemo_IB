@@ -329,8 +329,6 @@ def get_data(ticker: str) -> Dict[str, Any]:
   # CONSTANT POSSIBLE KEYS
   BOOK_VAL_KEYS : List = ['Stockholders Equity', 'Total Stockholder Equity','Total Equity Gross Minority Interest', 'Common Stock Equity',]
   OPERATING_INCOME_KEYS : List = ['Operating Income','Ebit']
-  REVENUE_KEYS : List[str] = ['Total Revenue','Revenue','Net Sales']
-  NET_INCOME_KEYS: List[str] = ['Net Income','Net Income To Common', 'Net Income From Continuing Ops']
 
   # get necessary information
   info = company.info

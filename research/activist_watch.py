@@ -48,6 +48,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from research import daily_job, pit_store
+from tools import filing_cache
 
 JOB = "activist_watch"
 
@@ -238,6 +239,16 @@ def watch_pass(tickers: Optional[Sequence[str]] = None,
     disagreements: List[str] = []
 
     for ticker in requested:
+        # The submissions index and every header fetched below are cached under
+        # /root/.edgar and nothing removes one. The eviction that keeps the
+        # servers alive is an asyncio task in the HTTP app's lifespan, and this
+        # process never starts it -- so a sweep over the eligible universe
+        # fills the 512MB tmpfs and dies mid-pass with `[Errno 28]`. Between
+        # names is the only place a job with no event loop can prune; the gate
+        # keeps it to one walk per interval. Asked before the fetch, so a name
+        # that raises has still had what it already pulled counted.
+        filing_cache.prune_if_due()
+
         # One try around the whole name, not just its fetch. The names in a
         # watchlist are independent, and a filing EDGAR describes in a way we
         # cannot parse should cost that name alone -- letting it escape would
@@ -387,6 +398,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     """
     import argparse
     import json
+
+    # Nothing else does, and the ordering that hides it is not enforced
+    # anywhere: the recorder normally runs first and creates the store, so the
+    # first command against a fresh volume dies on "no such table" instead.
+    # This job is the least ordered of them all -- it runs on its own short
+    # timer rather than in the nightly chain. Cheap and idempotent, so it runs
+    # every pass rather than once.
+    pit_store.init_schema()
 
     parser = argparse.ArgumentParser(
         prog="activist_watch",

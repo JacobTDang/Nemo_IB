@@ -561,10 +561,28 @@ def test_policy_signals_returns_required_fields():
     required = ["ticker", "sector", "signal", "bill_count", "bills"]
     for field in required:
         assert field in result, f"missing field: {field}"
-    assert result["signal"] in {"bullish", "bearish", "neutral", "data_gap"}
+    assert result["signal"] in {"bullish", "bearish", "neutral", "data_gap", None}
     assert isinstance(result["bills"], list)
+
     # Regression guard: GovTrack dedup must actually return bills (the old
     # obj.get("id") key was always None and silently dropped every bill).
+    #
+    # A bare `bill_count > 0` could not tell that regression from GovTrack
+    # simply answering with nothing, so a flaky provider failed as a code
+    # change (issue #18). The fields added there separate the two:
+    # `provider_rows_returned` is what GovTrack handed over, before dedup and
+    # before the lookback filter, and `bills_before_lookback_filter` is what
+    # survived dedup. The guard is now made against those, and the count is
+    # only asserted over a provider that actually sent something.
+    if result["provider_rows_returned"] == 0:
+        pytest.skip("GovTrack returned no bill for any keyword: there is "
+                    "nothing for dedup to have dropped")
+    assert result["bills_before_lookback_filter"] > 0, (
+        f"GovTrack sent {result['provider_rows_returned']} rows and dedup "
+        f"kept none of them — dedup/fetch regression")
+    if result["bill_count"] == 0:
+        pytest.skip("every bill GovTrack returned predates the lookback "
+                    "window; dedup is intact")
     assert result["bill_count"] > 0, "no bills found — dedup/fetch regression"
 
 
@@ -578,7 +596,9 @@ def test_policy_signals_uses_govtrack_without_api_key(monkeypatch):
     skip_if_provider_unavailable(result, "GovTrack")
     # Should not error even without API key
     assert "error" not in result, result.get("error")
-    assert result["signal"] in {"bullish", "bearish", "neutral", "data_gap"}
+    # `None` is the answer when GovTrack returned nothing at all: a provider
+    # that said nothing is not a neutral legislative climate (issue #18).
+    assert result["signal"] in {"bullish", "bearish", "neutral", "data_gap", None}
 
 
 @network
@@ -605,3 +625,363 @@ def test_capex_announcements_semiconductor_has_activity():
     # (allow data_gap only if truly no news was returned)
     if result["signal"] != "data_gap":
         assert result["announcement_count"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# Policy signals: the Congress.gov credential, and telling an empty provider
+# from a filtered-out one. Issues #59 (section 1) and #18.
+#
+# Every test below stubs `requests.get`. GovTrack and Congress.gov are never
+# reached: the behaviour under test is what our own code does with what a
+# provider hands back, and pinning that to a live upstream would make it a
+# weather report.
+# ---------------------------------------------------------------------------
+
+# Shaped like a Congress.gov key -- 40 characters, alphanumeric -- but typed
+# out here, so anything matching it could only have come from this file. The
+# real key is never read: a test that loads the live credential in order to
+# prove it does not escape is itself the escape.
+#
+# Deliberately free of English words. `_leaked_fragment` below hunts for short
+# runs of it, and a sentinel containing "congress" would match the word in
+# every honest response.
+_CONGRESS_SENTINEL = "kx7q2vzhr9m4tbn6wjd8scfl3pgy5aue1oi0xzqv"
+
+
+class _FakeResponse:
+    """The two pieces of a requests.Response the bill fetchers touch."""
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+def _leaked_fragment(text, secret, minimum=4):
+    """The longest run of `secret` of at least `minimum` characters that
+    appears in `text`, or "".
+
+    Asserting only on the whole credential is the mistake the 120-character
+    truncation already made: a cut that keeps three characters of the key has
+    still disclosed three characters of the key.
+    """
+    for size in range(len(secret), minimum - 1, -1):
+        for start in range(0, len(secret) - size + 1):
+            if secret[start:start + size] in text:
+                return secret[start:start + size]
+    return ""
+
+
+def _raising_get(url, params=None, **kwargs):
+    """requests.get that fails the way raise_for_status() does.
+
+    The message that method builds renders the whole request URL, query string
+    included -- which is where the Congress.gov key travels.
+    """
+    import requests
+
+    query = "&".join(f"{k}={v}" for k, v in (params or {}).items())
+    raise requests.exceptions.HTTPError(
+        f"403 Client Error: Forbidden for url: {url}?{query}")
+
+
+def test_the_congress_fetcher_takes_no_bare_string_credential():
+    """The signature itself, so the parameter cannot come back under another
+    name. pytest prints a frame's arguments at the head of every traceback
+    entry, so a rendered credential parameter is a disclosure on the first
+    failure anywhere below it."""
+    import inspect
+    from tools.altdata_server import server as srv
+
+    params = inspect.signature(srv._congress_api_fetch_bills).parameters
+    assert "api_key" not in params, \
+        "_congress_api_fetch_bills grew a bare-string credential parameter again"
+    annotations = [str(p.annotation) for p in params.values()]
+    assert any("Secret" in a for a in annotations), \
+        "the credential parameter is no longer typed as Secret"
+
+
+@pytest.mark.parametrize("keyword", ["chips", "semiconductor export controls"])
+def test_a_congress_gov_failure_never_reports_the_key(monkeypatch, keyword):
+    """Issue #59: the key is a query parameter, so `raise_for_status()` builds
+    a message with it in the middle, and that message was truncated to 120
+    characters and returned to the caller in `partial_errors`.
+
+    The truncation was never a guard. Measured on the real URL shape, the key
+    starts at character 111 with the keyword "chips" (inside the cut) and at
+    135 with a longer one (outside it), so whether the credential shipped
+    depended on the caller's search term. Both keywords are exercised here.
+    """
+    import requests
+    from tools.altdata_server import server as srv
+
+    monkeypatch.setattr(requests, "get", _raising_get)
+    bills, errors, queried, provider = srv._congress_api_fetch_bills(
+        [keyword], 119, srv.Secret(_CONGRESS_SENTINEL))
+
+    assert bills == []
+    assert errors, "the failure was swallowed"
+    reported = " ".join(errors)
+    assert not _leaked_fragment(reported, _CONGRESS_SENTINEL), \
+        "part of the credential reached the returned error"
+    assert "api_key" not in reported and "https://" not in reported, \
+        "the request URL is still in the error, so the key is one edit away"
+    assert "HTTPError" in reported and keyword in reported, \
+        "scrubbing ate the diagnosis"
+
+
+def test_a_policy_signals_response_never_carries_the_key(monkeypatch):
+    """The end of the path: `partial_errors` is returned to the MCP caller."""
+    import requests
+    from tools.altdata_server import server as srv
+
+    monkeypatch.setenv("CONGRESS_API_KEY", _CONGRESS_SENTINEL)
+    monkeypatch.setattr(requests, "get", _raising_get)
+
+    result = srv._fetch_policy_signals("NVDA", "Technology", lookback_days=180)
+
+    assert result["success"] is False
+    assert result["reason"] == "provider_unavailable"
+    rendered = json.dumps(result)
+    assert not _leaked_fragment(rendered, _CONGRESS_SENTINEL), \
+        "part of the credential reached the caller"
+    assert "api_key" not in rendered
+
+
+@pytest.mark.parametrize(
+    "render",
+    [repr, str, lambda s: f"{s}", lambda s: f"{s!r}", lambda s: str([s]),
+     lambda s: str({"key": s})],
+    ids=["repr", "str", "fstring", "fstring_r", "in_list", "in_dict"],
+)
+def test_no_way_of_rendering_the_credential_shows_its_value(render):
+    from tools.altdata_server.server import Secret
+
+    rendered = render(Secret(_CONGRESS_SENTINEL))
+    assert not _leaked_fragment(rendered, _CONGRESS_SENTINEL), \
+        "part of the value survived rendering"
+
+
+def test_the_credential_type_is_the_shared_one_and_not_a_copy():
+    """This used to compare a local copy against the original field by field,
+    because `Secret` was defined twice on purpose: the original lives in
+    `agent/openrouter_template.py`, which hangs two LLM SDKs off the import
+    graph and calls `sys.stdout.reconfigure()` on the way past -- and this is
+    an MCP stdio server, where stdout is the wire.
+
+    Issue #61 gave the type a home that imports nothing (`common/secret.py`),
+    so there is no copy left to pin. Identity is the stronger assertion: a
+    field-by-field comparison only catches drift in the fields someone thought
+    to compare.
+    """
+    from common.secret import Secret as Shared
+    from tools.altdata_server.server import Secret as Here
+
+    assert Here is Shared, (
+        "tools/altdata_server/server.py carries its own Secret again")
+
+
+def test_the_server_binds_no_unwrapped_congress_credential():
+    """Under --showlocals a local renders exactly like a parameter, so moving
+    the key out of the signature and into a variable would have looked like a
+    fix and disclosed the same value.
+
+    Narrow on purpose: only CONGRESS_API_KEY. The other credential sites named
+    in issue #59 live in other modules and are not this change.
+    """
+    import ast
+
+    from tools.altdata_server import server as srv
+
+    source = ast.parse(open(srv.__file__).read())
+    offenders = []
+    for assignment in ast.walk(source):
+        if not isinstance(assignment, ast.Assign):
+            continue
+        wrapped = set()
+        for node in ast.walk(assignment.value):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id == "Secret"):
+                wrapped.update(id(n) for n in ast.walk(node))
+        for node in ast.walk(assignment.value):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in ("get", "getenv")
+                    and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and node.args[0].value == "CONGRESS_API_KEY"
+                    and id(node) not in wrapped):
+                offenders.append(assignment.lineno)
+
+    assert not offenders, (
+        f"CONGRESS_API_KEY is assigned unwrapped in {srv.__file__} at lines "
+        f"{offenders}. Wrap it in Secret(...) at the read.")
+
+
+# --------------------------------------------- an empty provider, issue #18
+
+def _govtrack_payload(objects, total_count=None):
+    return {"objects": objects,
+            "meta": {"total_count": total_count
+                     if total_count is not None else len(objects)}}
+
+
+def _govtrack_bill(bill_id, title, activity_date):
+    return {"title": title, "short_title": "", "current_status": "introduced",
+            "introduced_date": activity_date,
+            "current_status_date": activity_date,
+            "link": f"https://www.govtrack.us/congress/bills/{bill_id}"}
+
+
+def test_an_empty_provider_is_not_reported_as_a_neutral_climate(monkeypatch):
+    """Issue #18: GovTrack answering 200-with-zero for every keyword produced
+    `signal: "neutral"`, which a consumer reads as an affirmative claim about
+    the legislative climate. The provider said nothing; that is not a finding
+    that nothing is happening."""
+    import requests
+    from tools.altdata_server import server as srv
+
+    monkeypatch.delenv("CONGRESS_API_KEY", raising=False)
+    monkeypatch.setattr(requests, "get",
+                        lambda *a, **k: _FakeResponse(_govtrack_payload([])))
+
+    result = srv._fetch_policy_signals("NVDA", "Technology", lookback_days=180)
+
+    assert result["success"] is True
+    assert result["signal"] is None, \
+        "a provider that returned nothing was reported as a neutral climate"
+    assert result["provider_rows_returned"] == 0
+    assert result["bills_before_lookback_filter"] == 0
+    assert result["partial_errors"] == []
+    assert any("returned no bill" in d for d in result["degraded"]), \
+        f"the empty provider was not named in degraded: {result['degraded']}"
+
+
+def test_a_filtered_out_result_is_distinguishable_from_an_empty_provider(
+        monkeypatch):
+    """The other half of the pair. Forty bills, all older than the lookback
+    window, is a real answer about a real legislative record -- and it used to
+    produce a response byte-identical to the one above."""
+    import requests
+    from tools.altdata_server import server as srv
+
+    monkeypatch.delenv("CONGRESS_API_KEY", raising=False)
+    # Four distinct bills, so the fetcher does not fall through to the prior
+    # congress and the counts below describe one round.
+    stale = [_govtrack_bill(i, f"An Old Act No {i}", "2019-01-15")
+             for i in range(4)]
+    monkeypatch.setattr(requests, "get",
+                        lambda *a, **k: _FakeResponse(_govtrack_payload(stale)))
+
+    result = srv._fetch_policy_signals("NVDA", "Technology", lookback_days=30)
+
+    assert result["success"] is True
+    assert result["bill_count"] == 0
+    assert result["signal"] == "neutral"
+    assert result["provider_rows_returned"] > 0
+    assert result["bills_before_lookback_filter"] > 0, \
+        "the bills the lookback filter removed were not counted anywhere"
+
+
+def test_the_provider_row_count_survives_the_lookback_filter(monkeypatch):
+    """`meta.total_count` is what GovTrack says matched, which is not what it
+    sent: the per-keyword limit caps the page. Both travel, so a caller can
+    tell 'nothing matched' from 'more matched than fitted'."""
+    import requests
+    from tools.altdata_server import server as srv
+
+    monkeypatch.delenv("CONGRESS_API_KEY", raising=False)
+    recent = [_govtrack_bill(i, f"A Semiconductor Investment Act {i}",
+                             "2026-08-01") for i in range(3)]
+    monkeypatch.setattr(
+        requests, "get",
+        lambda *a, **k: _FakeResponse(_govtrack_payload(recent, total_count=137)))
+
+    result = srv._fetch_policy_signals("NVDA", "Technology", lookback_days=180)
+
+    keywords = len(result["keywords_searched"])
+    assert result["provider_rows_returned"] == 3 * keywords, \
+        "the rows the provider actually sent were not counted"
+    assert result["provider_total_count"] == 137 * keywords
+    assert result["bills_before_lookback_filter"] == 3, \
+        "the same three bills on every keyword must dedup to three"
+    assert result["bill_count"] == 3
+
+
+def test_companion_bills_sharing_a_title_are_counted_separately(monkeypatch):
+    """Issue #18: congress.gov rows hard-coded `link` to "", so dedup fell back
+    to the title and a House bill and its Senate companion -- which share one
+    -- were silently collapsed into one row."""
+    import requests
+    from tools.altdata_server import server as srv
+
+    payload = {"bills": [
+        {"title": "CHIPS and Science Act of 2026",
+         "url": "https://api.congress.gov/v3/bill/119/hr/1234",
+         "latestAction": {"actionDate": "2026-08-01", "text": "Referred"}},
+        {"title": "CHIPS and Science Act of 2026",
+         "url": "https://api.congress.gov/v3/bill/119/s/567",
+         "latestAction": {"actionDate": "2026-08-02", "text": "Referred"}},
+    ]}
+    monkeypatch.setattr(requests, "get",
+                        lambda *a, **k: _FakeResponse(payload))
+
+    bills, errors, queried, provider = srv._congress_api_fetch_bills(
+        ["chips"], 119, srv.Secret(_CONGRESS_SENTINEL))
+
+    assert errors == []
+    assert len(bills) == 2, \
+        "the House bill and its Senate companion were collapsed into one"
+    assert {b["link"] for b in bills} == {
+        "https://api.congress.gov/v3/bill/119/hr/1234",
+        "https://api.congress.gov/v3/bill/119/s/567"}
+
+
+# ------------------------------------------------------- refusal envelope
+#
+# A sweep of all 98 tools found two here returning `success: False` with no
+# top-level `error`. The reason existed and was a good one -- "No public job
+# board answered for 'microsoft'. Tried Greenhouse … This is a failed lookup,
+# not a count of zero" -- but it sat in `data.error` and `metadata.errors`,
+# so a caller doing `result.get("error")` got None from a failed lookup.
+
+def test_a_refused_lookup_carries_its_reason_at_the_top_level():
+    """Where a caller looks, not one level down."""
+    from tools.altdata_server import server as alt
+
+    failed = {"success": False, "coverage": "not_covered",
+              "reason": "no_provider",
+              "error": "No public job board answered for 'acme'."}
+    payload = json.loads(alt._dispatch("get_job_postings_count", failed,
+                                       "ACME")[0].text)
+
+    assert payload["success"] is False
+    assert payload.get("error"), (
+        "a refusal with no top-level error is indistinguishable from a "
+        "malformed response")
+    assert "job board" in payload["error"]
+
+
+def test_a_successful_lookup_carries_no_error():
+    """The other direction: `error` present on a success would read as one."""
+    from tools.altdata_server import server as alt
+
+    payload = json.loads(alt._dispatch("get_congress_trades",
+                                       {"success": True, "rows": []}, "AAPL")[0].text)
+    assert payload["success"] is True
+    assert not payload.get("error")
+
+
+def test_the_reason_is_kept_where_it_already_was():
+    """Lifting it must not remove it -- `data` is the diagnostic payload."""
+    from tools.altdata_server import server as alt
+
+    failed = {"success": False, "error": "no provider answered",
+              "coverage": "not_covered"}
+    payload = json.loads(alt._dispatch("get_job_postings_count", failed, "X")[0].text)
+    assert payload["data"]["error"] == "no provider answered"
+    assert payload["metadata"]["errors"] == ["no provider answered"]

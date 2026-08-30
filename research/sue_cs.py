@@ -61,8 +61,13 @@ from typing import Any, Dict, List, Optional
 from research import pit_store
 
 # Below this the cohort is not a distribution and a percentile against it says
-# nothing. Deliberately not "more than one".
-MIN_COHORT = 8
+# nothing. Deliberately not "more than one", and no longer eight: the scanner
+# acts on names a fixed 0.8 into a tail, which is the top and bottom decile of
+# whatever cohort it is handed. A decile of eight is one name a side, so the
+# largest of eight arbitrary prints was priced as a full tail every season. At
+# twenty it is two, and the rank starts to carry information about where the
+# surprise sits rather than about how few names reported.
+MIN_COHORT = 20
 
 # How far back a print still counts as this season's. The same window the
 # scanner treats a signal as fresh over.
@@ -78,6 +83,10 @@ def _shell(ticker: str, as_of: str) -> Dict[str, Any]:
     return {"ticker": ticker.upper(), "as_of": as_of, "success": False,
             "error": None, "fiscal_period": None, "estimate": None,
             "actual": None, "surprise": None, "scaled_surprise": None,
+            # When the print landed, which is what places this in time. The
+            # scanner rejects a signal it cannot date before it looks at
+            # anything else.
+            "known_at": None,
             "z": None, "robust_z": None, "percentile": None,
             # Which of the three to order on. Neither z is a sigma here; see
             # the module docstring for the numbers that settled it.
@@ -93,7 +102,8 @@ def _price_at(ticker: str, as_of: str) -> Optional[float]:
     return float(close) if close else None
 
 
-def _scaled(ticker: str, fiscal: str, as_of: str) -> Optional[Dict[str, Any]]:
+def _scaled(ticker: str, fiscal: str, as_of: str,
+            known_at: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """One name's price-scaled surprise, or None if either leg is missing."""
     actual = pit_store.actual_as_of(ticker, fiscal, as_of)
     if actual is None:
@@ -106,7 +116,7 @@ def _scaled(ticker: str, fiscal: str, as_of: str) -> Optional[Dict[str, Any]]:
     if not price or price <= 0:
         return None
     surprise = float(actual) - float(estimate)
-    return {"ticker": ticker, "fiscal_period": fiscal,
+    return {"ticker": ticker, "fiscal_period": fiscal, "known_at": known_at,
             "estimate": float(estimate), "actual": float(actual),
             "surprise": surprise, "scaled_surprise": surprise / price}
 
@@ -123,20 +133,31 @@ def cohort(as_of: Optional[str] = None,
              - timedelta(days=window_days)).isoformat()
     out = []
     for row in pit_store.reporters_since(since, as_of):
-        scaled = _scaled(row["ticker"], row["fiscal_period"], as_of)
+        scaled = _scaled(row["ticker"], row["fiscal_period"], as_of,
+                         known_at=row.get("as_of_date"))
         if scaled is not None:
             out.append(scaled)
     return out
 
 
 def surprise_rank(ticker: str, as_of: Optional[str] = None,
-                  window_days: int = COHORT_WINDOW_DAYS) -> Dict[str, Any]:
-    """Where this name's surprise sits among the ones already reported."""
+                  window_days: int = COHORT_WINDOW_DAYS,
+                  peers: Optional[List[Dict[str, Any]]] = None
+                  ) -> Dict[str, Any]:
+    """Where this name's surprise sits among the ones already reported.
+
+    `peers` takes a cohort the caller already built. It is the same list for
+    every name on a given date, by construction, and rebuilding it per name is
+    quadratic: on the real store a cohort of 305 takes 386ms to assemble, so a
+    date with 305 reporters spent two minutes rebuilding one list, and a replay
+    over 652 dates would have run for about twenty-one hours.
+    """
     as_of = as_of or _today()
     ticker = ticker.upper()
     result = _shell(ticker, as_of)
 
-    peers = cohort(as_of, window_days=window_days)
+    if peers is None:
+        peers = cohort(as_of, window_days=window_days)
     result["cohort_size"] = len(peers)
     result["cohort_tickers"] = [p["ticker"] for p in peers]
 
@@ -148,8 +169,8 @@ def surprise_rank(ticker: str, as_of: Optional[str] = None,
         return result
 
     result.update({k: mine[k] for k in
-                   ("fiscal_period", "estimate", "actual", "surprise",
-                    "scaled_surprise")})
+                   ("fiscal_period", "known_at", "estimate", "actual",
+                    "surprise", "scaled_surprise")})
 
     if len(peers) < MIN_COHORT:
         result["error"] = (
@@ -167,9 +188,17 @@ def surprise_rank(ticker: str, as_of: Optional[str] = None,
             f"scaled surprise, so there is nothing to rank against")
         return result
 
+    # A midrank, not the minimum rank of the tie cluster. Every company that
+    # reports exactly in line has a scaled surprise of 0.0 whatever its price,
+    # so a tie cluster is guaranteed and is usually the largest group in the
+    # cohort -- and counting only strictly-lower values put all of them at the
+    # bottom of the distribution. Six in-line prints came back at percentile
+    # 0.0 in one live cohort: a full tail each, and a maximum-conviction short
+    # each, on a z of -0.56.
     below = sum(1 for v in values if v < mine["scaled_surprise"])
+    ties = sum(1 for v in values if v == mine["scaled_surprise"])
     result["z"] = (mine["scaled_surprise"] - statistics.fmean(values)) / spread
-    result["percentile"] = below / (len(values) - 1)
+    result["percentile"] = (below + 0.5 * ties) / len(values)
 
     # 1.4826 makes the median absolute deviation an unbiased estimate of the
     # standard deviation for a normal sample, so the two scales are comparable

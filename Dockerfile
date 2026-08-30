@@ -51,16 +51,27 @@ COPY tools/preearnings/ ./tools/preearnings/
 # same pinned versions, and running it anywhere else means maintaining a second
 # environment that has to stay in step with this one.
 COPY research/ ./research/
-# Only the three agent modules the servers reach. Copying agent/ wholesale
-# brings workflows/ and twelve *_Agent.py files, and with them LangGraph,
-# LangChain and the OpenAI client -- none of which this image ever runs.
-# Verified by importing all five servers and recording what loads.
+# Only the three agent modules the servers reach. Retiring the
+# LangGraph/OpenRouter layer (issue #63) removed workflows/ and twelve
+# *_Agent.py files, so this list is no longer holding back LangGraph and
+# LangChain -- those are gone from the dependency set entirely. It is still
+# load-bearing for what remains: copying agent/ wholesale brings groq_template
+# (and with it the OpenAI client and ollama), Execution_Agent (the broker),
+# MCP_manager, and rag/ (sentence-transformers, and behind it torch) -- none of
+# which this image runs. Verified by importing all five servers and recording
+# what loads.
 COPY agent/__init__.py ./agent/
 COPY agent/cache.py ./agent/
 COPY agent/exposure_analyzer.py ./agent/
 COPY agent/backtest_engine.py ./agent/
 COPY state/ ./state/
 COPY knowledge/ ./knowledge/
+# Two files, no imports, and every server that reads a credential needs one of
+# them: `Secret` used to be copied into each module for the same reason this
+# image copies only three files out of agent/ -- reaching the original would
+# have dragged openai and ollama in behind it. Small enough to copy wholesale,
+# and it must be here or finnhub, fred and altdata all fail to import.
+COPY common/ ./common/
 
 # The tool cache lives here; mount a volume so it survives container replacement.
 RUN mkdir -p /app/db_cache
@@ -101,6 +112,7 @@ COPY --from=base /app/.venv /app/.venv
 COPY --from=base /app/tools /app/tools
 COPY --from=base /app/research /app/research
 COPY --from=base /app/agent /app/agent
+COPY --from=base /app/common /app/common
 COPY --from=base /app/state /app/state
 COPY --from=base /app/knowledge /app/knowledge
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh

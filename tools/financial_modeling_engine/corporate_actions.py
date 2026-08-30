@@ -126,7 +126,17 @@ def get_corporate_actions(ticker: str, years: int = 10) -> Dict[str, Any]:
         handle = _ticker(ticker)
         unresolved = _unresolved(ticker, handle)
         if unresolved is not None:
-            return unresolved
+            # The refusal carries the two collections this function documents
+            # as always present, the same way the exception path below does.
+            # Without them a caller that reached for result["splits"] after a
+            # delisted symbol got a KeyError rather than the refusal, and one
+            # writing .get("splits", []) read "no splits on record" out of a
+            # lookup that never resolved the symbol. They stay empty and stay
+            # beside success=False; the fields that would be claims about the
+            # security -- pays_dividend, ttm_dividend, the counts -- are still
+            # absent, because an unresolved lookup has nothing to say about
+            # them.
+            return {**unresolved, "dividends": [], "splits": []}
         raw_splits = getattr(handle, "splits", None)
         dividend_rows = _rows_since(getattr(handle, "dividends", None), cutoff)
         split_rows = _rows_since(raw_splits, cutoff)

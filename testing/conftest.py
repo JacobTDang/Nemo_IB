@@ -13,8 +13,56 @@ across several test functions in the same file and would break under
 per-function isolation.
 """
 import os
+import pathlib
 
 import pytest
+
+
+def pytest_sessionstart(session):
+    """Load `.env` before any test module is imported.
+
+    In the container these variables come from the container environment, so
+    the modules that read them never load `.env` themselves -- `sec_utils`
+    reads SEC_EMAIL straight from os.environ and refuses the request without
+    it. Under pytest they arrived by accident instead: `research/__init__.py`
+    calls load_dotenv() at import time, so whether the SEC tests could reach
+    EDGAR depended on whether an earlier module happened to import `research`.
+    Alphabetically it did, and the file passed; on its own it did not, and
+    20 of 295 failed with "SEC_EMAIL is not set" -- two of them error-handling
+    tests asserting on a refusal they never got far enough to produce.
+
+    override=False so anything already exported wins. CI and the container set
+    these deliberately, and a checked-out `.env` must not quietly replace them.
+    """
+    dotenv_path = pathlib.Path(__file__).resolve().parent.parent / ".env"
+    if not dotenv_path.exists():
+        return
+    from dotenv import load_dotenv
+    load_dotenv(dotenv_path, override=False)
+
+
+@pytest.fixture(autouse=True, scope="module")
+def isolated_process_caches():
+    """Clear in-process caches between test modules.
+
+    The databases below are isolated per module so later modules cannot read
+    earlier modules' rows. A module-level cache is the same leak through a
+    different door: `sec_utils` keeps an LRU of filings keyed by
+    (ticker, form_type), and `get_latest_filing` returns a hit before it ever
+    constructs `Company`. A test that patches `sec_utils.Company` to exercise
+    a failure path therefore never reached its own mock once an earlier module
+    had fetched that ticker -- it read the cached filing instead.
+
+    That is what separated TestErrorHandling's two network tests passing 9/9
+    alone from failing in a full run: nothing but collection order.
+
+    Clearing is safe -- correctness never depends on a cache being warm, only
+    speed, and the cost is one extra fetch per module that needs one.
+    """
+    from tools.web_search_server import sec_utils
+    sec_utils._filing_cache_lru.clear()
+    yield
+    sec_utils._filing_cache_lru.clear()
 
 
 @pytest.fixture(autouse=True, scope="module")

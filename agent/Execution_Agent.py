@@ -24,6 +24,12 @@ from state.positions import (
   open_position, close_position, position_for_ticker,
 )
 
+# The credentials read below are the *live* broker ones. Secret was mirrored
+# here to avoid reaching openrouter_template -- a 112-module import growing to
+# 1146 for a value class. common/secret.py imports nothing, so it costs this
+# module two modules and no LLM SDK.
+from common.secret import Secret
+
 
 class Execution_Agent:
   """Thin wrapper over alpaca-py. Use only one instance per process."""
@@ -31,27 +37,39 @@ class Execution_Agent:
   def __init__(self, paper: bool = True):
     load_dotenv()
     self.paper = paper
+    # Wrapped in the same expression that reads the environment. An
+    # intermediate `key = os.getenv(...)` is exactly what --showlocals prints,
+    # and the refusal below is reached by a half-configured .env -- key set,
+    # secret missing -- which is precisely the case where that local is still
+    # live when the traceback is built.
     if paper:
-      key = os.getenv("ALPACA_PAPER_KEY")
-      secret = os.getenv("ALPACA_PAPER_SECRET")
+      self._key = Secret(os.getenv("ALPACA_PAPER_KEY") or "")
+      self._secret = Secret(os.getenv("ALPACA_PAPER_SECRET") or "")
     else:
-      key = os.getenv("ALPACA_LIVE_KEY")
-      secret = os.getenv("ALPACA_LIVE_SECRET")
-    if not key or not secret:
+      self._key = Secret(os.getenv("ALPACA_LIVE_KEY") or "")
+      self._secret = Secret(os.getenv("ALPACA_LIVE_SECRET") or "")
+    if not self._key or not self._secret:
       raise RuntimeError(
         f"Missing Alpaca {'paper' if paper else 'LIVE'} credentials. "
         f"Set ALPACA_{'PAPER' if paper else 'LIVE'}_KEY and SECRET in .env"
       )
-    self._key = key
-    self._secret = secret
     self._client = None  # Lazy — only construct on first call
+
+  def _scrub(self, text: str) -> str:
+    """Broker error text with both credentials taken back out.
+
+    Every method below returns the broker's own words in an `error` field, and
+    a returned error travels further than a log line does.
+    """
+    return self._secret.scrub(self._key.scrub(text))
 
   def _get_client(self):
     if self._client is None:
       try:
         from alpaca.trading.client import TradingClient
         self._client = TradingClient(
-          api_key=self._key, secret_key=self._secret, paper=self.paper
+          api_key=self._key.reveal(), secret_key=self._secret.reveal(),
+          paper=self.paper
         )
       except ImportError as e:
         raise RuntimeError(f"alpaca-py not installed: {e}")
@@ -73,7 +91,8 @@ class Execution_Agent:
         'status': a.status if isinstance(a.status, str) else str(a.status),
       }
     except Exception as e:
-      return {'error': f"{type(e).__name__}: {e}", 'paper': self.paper}
+      return {'error': self._scrub(f"{type(e).__name__}: {e}"),
+              'paper': self.paper}
 
   # ---- Order placement --------------------------------------------------
 
@@ -144,8 +163,9 @@ class Execution_Agent:
         status='rejected', thesis_id=thesis_id,
         arbiter_verdict_id=arbiter_verdict_id, paper=self.paper,
       )
-      print(f"[Execution] order submission failed: {e}", file=sys.stderr, flush=True)
-      return {'success': False, 'error': str(e),
+      print(f"[Execution] order submission failed: {self._scrub(str(e))}",
+            file=sys.stderr, flush=True)
+      return {'success': False, 'error': self._scrub(str(e)),
               'client_order_id': client_order_id}
 
     # Persist
@@ -174,7 +194,7 @@ class Execution_Agent:
       update_order_status(broker_order_id, status, filled)
       return {'order_id': broker_order_id, 'status': status, 'filled_at': filled}
     except Exception as e:
-      return {'error': str(e), 'order_id': broker_order_id}
+      return {'error': self._scrub(str(e)), 'order_id': broker_order_id}
 
   def close_position_for(self, ticker: str, reason: str = 'manual') -> Dict[str, Any]:
     """Close an open position by submitting an opposing market order."""

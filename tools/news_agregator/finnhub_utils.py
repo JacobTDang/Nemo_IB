@@ -11,17 +11,30 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 from dotenv import load_dotenv
 
+# This key travels as a *query parameter*, so it reaches the URL aiohttp builds,
+# the error text aiohttp renders from that URL, and from there the `error` field
+# this client returns to its MCP caller -- which leaves the process rather than
+# merely reaching a log. Secret keeps it out of all three, and common/secret.py
+# imports nothing, so importing it here crosses no package boundary.
+from common.secret import Secret
+
 
 _DOTENV_PATH = Path(__file__).resolve().parents[2] / ".env"
 
 
-def get_api_key() -> str:
-  """Load FINNHUB_API_KEY from .env file."""
+def get_api_key() -> Secret:
+  """Load FINNHUB_API_KEY from .env file, wrapped so it cannot be rendered.
+
+  Building the Secret in the same expression that reads the environment is
+  deliberate: an intermediate `key = os.getenv(...)` would put the raw value
+  in this frame, and returning a bare `str` would put it in every caller's
+  frame as well.
+  """
   load_dotenv(dotenv_path=_DOTENV_PATH)
-  key = os.getenv("FINNHUB_API_KEY")
-  if not key:
+  credential = Secret(os.getenv("FINNHUB_API_KEY") or "")
+  if not credential:
     raise RuntimeError("FINNHUB_API_KEY not found in environment. Add it to .env")
-  return key
+  return credential
 
 
 class RateLimiter:
@@ -84,7 +97,6 @@ class FinnhubClient:
       Parsed JSON dict, or {"error": "..."} on failure
     """
     params = dict(params) if params else {}
-    params["token"] = self._api_key
     url = f"{self.BASE_URL}{endpoint}"
 
     session = await self._get_session()
@@ -92,7 +104,11 @@ class FinnhubClient:
     for attempt in range(2):
       await self._rate_limiter.acquire()
       try:
-        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+        # The credential is revealed into the call itself and never bound
+        # to a name: a `params` dict holding it is a local, and a local is
+        # what a rendered traceback prints.
+        async with session.get(url, params={**params, "token": self._api_key.reveal()},
+                               timeout=aiohttp.ClientTimeout(total=30)) as resp:
           if resp.status == 429:
             if attempt == 0:
               await asyncio.sleep(2)
@@ -100,12 +116,15 @@ class FinnhubClient:
             return {"error": f"Rate limited (429) after retry"}
           if resp.status != 200:
             text = await resp.text()
-            return {"error": f"HTTP {resp.status}: {text[:200]}"}
+            return {"error": self._api_key.scrub(f"HTTP {resp.status}: {text[:200]}")}
           return await resp.json()
       except asyncio.TimeoutError:
         return {"error": "Request timed out (15s)"}
       except aiohttp.ClientError as e:
-        return {"error": f"HTTP client error: {str(e)}"}
+        # aiohttp renders the request URL into several of its errors, and the
+        # credential is a query parameter of that URL. Scrubbed before it goes
+        # back to the caller, which is further than a log line travels.
+        return {"error": self._api_key.scrub(f"HTTP client error: {str(e)}")}
 
     return {"error": "Unexpected: exhausted retries"}
 

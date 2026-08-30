@@ -105,11 +105,8 @@ def parse_numeric_conditions(text: str) -> List[NumericCondition]:
   # Cover both math-symbol operators and English ones in a single pass.
   # The text-form operators have longer "less than"-style phrases first to
   # avoid being shadowed by single-word matches.
-  text_ops = sorted([k for k in _THRESHOLD_OPS if not k[0] in '<>='],
+  text_ops = sorted([k for k in _THRESHOLD_OPS if k[0] not in '<>='],
                     key=len, reverse=True)
-  pattern_parts = [r'(?P<op_sym>>=|<=|>|<|==)']
-  pattern_parts.append('|'.join(re.escape(o) for o in text_ops))
-  op_alternation = '|'.join(pattern_parts)
 
   # Look for: <metric phrase up to 60 chars> <op> <number> <unit?>
   combined = re.compile(

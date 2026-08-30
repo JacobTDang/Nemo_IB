@@ -106,6 +106,86 @@ TOL_VENDOR_INTERNAL = 0.10
 # net income to common differs from the consolidated figure).
 TOL_PE = 0.20
 
+# Neither vendor publishes where its TTM window ends, so on a fast-moving name
+# a flat band measures the cutoff difference rather than agreement about a
+# fact. Measured: NVDA's own adjacent windows are 229.426bn and 281.585bn,
+# 22.7% apart -- wider than the 19.5% between the two vendors, so one quarter
+# of cutoff fully explains the gap.
+#
+# This is not widening a tolerance until a check passes, which this module
+# forbids for good reason. The band is a measured property of the filer: it
+# stays at the floor for a name whose revenue is flat, and opens only for one
+# whose own quarters say a cutoff difference is worth that much. A filer whose
+# quarters cannot be read keeps the floor -- a missing measurement is not
+# licence to accept more drift.
+def _quarterly_revenue(ticker: str, record: Dict[str, Any],
+                       form: str) -> List[float]:
+    """Newest-first consolidated quarterly revenue, for the TTM band.
+
+    Two filters carry this. Only undimensioned facts, because a segment axis
+    is a part of the number and taking the largest fact for a period is the
+    mistake this module already records against `filter_annual_data` -- NVDA's
+    first fact for 2026-07-26 is its Compute and Networking segment at 88.299bn
+    against a consolidated 96.221bn. And only ~90-day durations, because a
+    10-Q also carries the year-to-date span, and summing four of those is not
+    a trailing twelve months.
+
+    The concept comes from whichever one the annual read resolved: filers
+    drift between them, and asking for the wrong one returns nothing rather
+    than raising.
+    """
+    import re
+    from datetime import date as _date
+
+    from tools.web_search_server.sec_series import fetch_concept_series
+
+    concept = (record.get("sec_revenue") or {}).get("concept_used")
+    if not concept:
+        return []
+    points = _sec_call(
+        lambda: fetch_concept_series(ticker, concept, form=form, limit=8),
+        ticker, form)
+
+    by_period_end: Dict[Any, float] = {}
+    for point in points or []:
+        for fact in getattr(point, "facts", None) or []:
+            if getattr(fact, "dimensions", None):
+                continue
+            span = re.match(r"duration_(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})$",
+                            getattr(fact, "period", "") or "")
+            if not span:
+                continue
+            start, end = (_date.fromisoformat(x) for x in span.groups())
+            if not 80 <= (end - start).days <= 100:
+                continue
+            by_period_end[end] = float(fact.value)
+    return [value for _, value in sorted(by_period_end.items(), reverse=True)]
+
+
+# Neither vendor publishes where its TTM window ends, so on a fast-moving name
+# a flat band measures the cutoff difference rather than agreement about a
+# fact. Measured: NVDA's own adjacent windows are 229.426bn and 281.585bn,
+# 22.7% apart -- wider than the 19.5% between the two vendors, so one quarter
+# of cutoff fully explains the gap.
+#
+# This is not widening a tolerance until a check passes, which this module
+# forbids for good reason. The band is a measured property of the filer: it
+# stays at the floor for a name whose revenue is flat, and opens only for one
+# whose own quarters say a cutoff difference is worth that much. A filer whose
+# quarters cannot be read keeps the floor -- a missing measurement is not
+# licence to accept more drift.
+def _ttm_growth_band(quarterly_newest_first: Sequence[float]):
+    """How far apart the filer's own adjacent TTM windows are, or None."""
+    values = [v for v in quarterly_newest_first if v is not None]
+    if len(values) < 5:
+        return None
+    latest = sum(values[:4])
+    previous = sum(values[1:5])
+    if not previous:
+        return None
+    return abs(latest / previous - 1.0)
+
+
 # A vendor period this far from the filing's period end is a different period.
 PERIOD_MATCH_DAYS = 7
 
@@ -118,6 +198,13 @@ PERIOD_MATCH_DAYS = 7
 
 ADJUDICATED: Dict[tuple, str] = {
 
+    # ---- A revenue step change, not an extraction defect. Both vendors read
+    # a trailing twelve months; the filer's own revenue stepped 28% between
+    # fiscal years, so a TTM window that straddles the step differs by roughly
+    # the step times the fraction of quarters the two disagree about. This
+    # entry should clear itself once four quarters have passed on the new
+    # base -- and because an entry that starts agreeing fails too, it will say
+    # so rather than sitting here.
     # ---- get_revenue_base returns us-gaap:Revenues undimensioned. Nine filers
     # used to disagree here, from two compounding causes -- the ASC 606 element
     # tried ahead of us-gaap:Revenues, and filter_annual_data taking the largest
@@ -402,6 +489,11 @@ def _fetch_one(ticker: str, finnhub, loop) -> Dict[str, Any]:
     _run("sec_shares", lambda: _sec_call(
         lambda: get_share_count_series(ticker, limit=3, form=interim),
         ticker, interim))
+    # The quarters behind the TTM band. Uses whichever concept the annual read
+    # resolved, because filers drift between them -- NVDA tags us-gaap:Revenues
+    # where most of the basket tags the ASC 606 element, and asking for the
+    # wrong one returns nothing rather than an error.
+    _run("sec_quarters", lambda: _quarterly_revenue(ticker, record, interim))
     _run("market_data", lambda: get_data(ticker))
     _run("yf_info", lambda: yf.Ticker(ticker).info)
 
@@ -509,9 +601,14 @@ def _reconcile(ticker: str, record: Dict[str, Any]) -> List[dict]:
                         f"yahoo books in {vendor_currency}, quote in "
                         f"{quote_currency}")
     else:
+        band = _ttm_growth_band(record.get("sec_quarters") or [])
         _check(rows, ticker, "revenue_ttm", "market_data",
                market.get("revenue_ttm"), "finnhub_metric", finnhub_revenue,
-               TOL_TTM_REVENUE, "marketCap/psTTM")
+               max(TOL_TTM_REVENUE, band) if band else TOL_TTM_REVENUE,
+               "marketCap/psTTM"
+               + (f"; band widened to {band:.1%} by this filer's own "
+                  f"adjacent TTM windows" if band and band > TOL_TTM_REVENUE
+                  else ""))
 
     # --- 3. Finnhub against itself: two TTM revenues out of one payload
     per_share = metric.get("revenuePerShareTTM")

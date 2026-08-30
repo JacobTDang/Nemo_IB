@@ -53,6 +53,11 @@ FILED = {
 def _filings(monkeypatch):
     monkeypatch.setattr(seed_consensus, "_filing_dates",
                         lambda t, as_of=None: FILED)
+    # No release on record by default, so the filing date stands and the tests
+    # written before announcement-dating keep their expectations. The ones
+    # that are about the release override this.
+    monkeypatch.setattr(seed_consensus, "_announcements",
+                        lambda t, as_of=None, **kw: {})
 
 
 def test_a_seeded_quarter_carries_both_legs(store, monkeypatch):
@@ -323,3 +328,204 @@ def test_two_vendor_rows_for_one_quarter_seed_neither(store, monkeypatch):
 def test_a_clean_payload_reports_no_duplicates(store, monkeypatch):
     monkeypatch.setattr(seed_consensus, "_fetch_surprises", lambda t: SURPRISES)
     assert seed_consensus.seed(["MSFT"])["duplicates"] == {}
+
+
+# --- dating the actual by the announcement, not the filing ------------------
+#
+# A seeded actual was stamped at the 10-Q filing date, because that was the
+# only date on hand. The market learned the figure at the Item 2.02 8-K, a
+# median of 8 days earlier on the names measured -- 23 for JPM, 28 for TGT.
+#
+# It is the single reason a replay entered late. Everything downstream reads
+# `actual_as_of`, so the stamp on this row decides when a study is allowed to
+# act, and eight days into a drift that is largest in its first days is most
+# of the effect.
+
+ANNOUNCED = {
+    "2026Q4": {"announced_date": "2026-07-14", "timing": "bmo"},
+    "2026Q3": {"announced_date": "2026-04-14", "timing": "bmo"},
+}
+
+
+def test_a_seeded_actual_is_known_on_the_announcement(store, monkeypatch):
+    monkeypatch.setattr(seed_consensus, "_fetch_surprises",
+                        lambda t: SURPRISES)
+    monkeypatch.setattr(seed_consensus, "_announcements",
+                        lambda t, as_of=None, **kw: ANNOUNCED)
+
+    seed_consensus.seed(["MSFT"], as_of="2026-08-27")
+
+    # Readable the day of the release, not three weeks later at the filing.
+    assert pit_store.actual_as_of("MSFT", "2026Q4", "2026-07-14") == 4.74
+    assert pit_store.actual_as_of("MSFT", "2026Q4", "2026-07-13") is None
+
+
+def test_the_estimate_still_predates_the_announcement(store, monkeypatch):
+    """Moving the actual earlier must not drag the estimate past the print --
+    an estimate read after the announcement is the answer to the question."""
+    monkeypatch.setattr(seed_consensus, "_fetch_surprises",
+                        lambda t: SURPRISES)
+    monkeypatch.setattr(seed_consensus, "_announcements",
+                        lambda t, as_of=None, **kw: ANNOUNCED)
+
+    seed_consensus.seed(["MSFT"], as_of="2026-08-27")
+
+    snap = pit_store.consensus_as_of("MSFT", "2026Q4", "2026-07-13")
+    assert snap is not None and snap["eps_estimate"] == 4.3274
+
+
+def test_without_an_announcement_it_falls_back_to_the_filing(store,
+                                                             monkeypatch):
+    """Late is the safe direction. A quarter with no 2.02 on record is still
+    worth seeding; it is simply timed conservatively, and the row says so."""
+    monkeypatch.setattr(seed_consensus, "_fetch_surprises",
+                        lambda t: SURPRISES)
+    monkeypatch.setattr(seed_consensus, "_announcements",
+                        lambda t, as_of=None, **kw: {})
+
+    seed_consensus.seed(["MSFT"], as_of="2026-08-27")
+    assert pit_store.actual_as_of("MSFT", "2026Q4", "2026-07-29") == 4.74
+    assert pit_store.actual_as_of("MSFT", "2026Q4", "2026-07-14") is None
+
+
+def test_the_seeding_reports_how_many_were_announcement_dated(store,
+                                                              monkeypatch):
+    """The difference between the two datings is the difference between a
+    replay that measures drift and one that measures its own lateness, so a
+    run has to say which it produced."""
+    monkeypatch.setattr(seed_consensus, "_fetch_surprises",
+                        lambda t: SURPRISES)
+    monkeypatch.setattr(seed_consensus, "_announcements",
+                        lambda t, as_of=None, **kw: {
+                            "2026Q4": ANNOUNCED["2026Q4"]})
+
+    out = seed_consensus.seed(["MSFT"], as_of="2026-08-27")
+    assert out["announcement_dated"] == 1
+    assert out["filing_dated"] == 1
+
+
+# --- one leaked session per name --------------------------------------------
+#
+# `asyncio.run` opens a loop, runs the call, and closes the loop. The aiohttp
+# session created inside it survives, holding a connector bound to a loop that
+# no longer exists. Nothing notices for a while; then the garbage collector
+# reaches one, its destructor tries to schedule cleanup on that dead loop, and
+# the run fails with "Event loop is closed".
+#
+# Twelve names in a row is fine, which is why this never showed up in a test.
+# It surfaced on the six hundredth.
+
+def test_the_client_is_closed_after_each_fetch(monkeypatch):
+    """The session has to be closed inside the loop that made it. Nothing else
+    can close it afterwards, because that loop is gone."""
+    closed = []
+
+    class Client:
+        async def close(self):
+            closed.append(True)
+
+    class Server:
+        def __init__(self):
+            self.client = Client()
+
+        async def get_earnings_surprises(self, ticker):
+            import json
+
+            from mcp.types import TextContent
+            return [TextContent(type="text", text=json.dumps(
+                {"data": {"quarters": []}}))]
+
+    monkeypatch.setattr(seed_consensus, "_finnhub_server", Server)
+
+    seed_consensus._fetch_surprises("AAPL")
+    assert closed == [True], "the session was left open"
+
+
+def test_the_client_is_closed_even_when_the_call_fails(monkeypatch):
+    """A failing name must not leak either -- over a universe the failures are
+    where the leak accumulates fastest."""
+    closed = []
+
+    class Client:
+        async def close(self):
+            closed.append(True)
+
+    class Server:
+        def __init__(self):
+            self.client = Client()
+
+        async def get_earnings_surprises(self, ticker):
+            raise ConnectionError("Finnhub returned 503")
+
+    monkeypatch.setattr(seed_consensus, "_finnhub_server", Server)
+
+    with pytest.raises(ConnectionError):
+        seed_consensus._fetch_surprises("AAPL")
+    assert closed == [True]
+
+
+# --- the first run on a fresh volume ----------------------------------------
+#
+# Every test above builds the schema in a fixture, which is exactly why the
+# suite stayed green while a first `docker compose run --rm research-seed` on a
+# new volume would die on "no such table: consensus" before it wrote anything.
+# Seeding is the job most likely to run first -- it is what a cold store needs
+# and it is not on the nightly timer -- so the ordering that hides this is the
+# one it least reliably has.
+
+def test_a_fresh_store_is_created_by_the_seed_itself(tmp_path, monkeypatch):
+    import json
+
+    monkeypatch.setenv("NEMO_PIT_DB", str(tmp_path / "fresh.db"))
+    monkeypatch.setattr(seed_consensus, "_fetch_surprises",
+                        lambda ticker: SURPRISES)
+
+    printed = {}
+    monkeypatch.setattr("builtins.print",
+                        lambda *a, **k: printed.setdefault("out", a[0]))
+
+    assert seed_consensus.main(["--tickers", "MSFT"]) == 0
+    assert json.loads(printed["out"])["written"] == 4
+    assert pit_store.consensus_as_of("MSFT", "2026Q4", "2026-07-30")
+
+
+# --- the tmpfs this job writes into -----------------------------------------
+#
+# Seeding is named in the issue as a vendor job, and it is -- but it reaches
+# EDGAR twice per name on the way: `sue.eps_series` for the filer's own dates
+# and `announcements.for_quarters` for the Item 2.02 release. Both cache their
+# documents under /root/.edgar, the same 512MB tmpfs `research-watch` and
+# `research-announce` fill, and a seed runs over the same eligible universe.
+#
+# Between names is the only place a batch job can prune: it has no event loop
+# and no idle moment. The pruner and its interval are the servers' own.
+
+def test_a_seed_prunes_the_filing_cache_as_it_goes(store, monkeypatch):
+    from tools import filing_cache
+
+    monkeypatch.setattr(seed_consensus, "_fetch_surprises", lambda ticker: [])
+    asked = []
+    monkeypatch.setattr(filing_cache, "prune_if_due",
+                        lambda *a, **k: asked.append(1))
+
+    seed_consensus.seed(["AAA", "BBB", "CCC"], as_of="2026-08-27")
+    assert len(asked) == 3, "the cache is only asked about once for the run"
+
+
+def test_a_name_that_failed_still_left_documents_in_the_cache(store,
+                                                              monkeypatch):
+    """The fetch that raised had already written whatever it read, and over a
+    universe the failures are where an unpruned cache grows fastest."""
+    from tools import filing_cache
+
+    def boom(ticker):
+        raise ConnectionError("Finnhub returned 503")
+
+    monkeypatch.setattr(seed_consensus, "_fetch_surprises", boom)
+    asked = []
+    monkeypatch.setattr(filing_cache, "prune_if_due",
+                        lambda *a, **k: asked.append(1))
+
+    out = seed_consensus.seed(["AAA", "BBB"], as_of="2026-08-27")
+    assert len(out["failed"]) == 2
+    assert len(asked) == 2

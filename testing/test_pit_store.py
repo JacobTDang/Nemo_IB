@@ -466,3 +466,209 @@ def test_the_migration_is_idempotent(tmp_path, monkeypatch):
                                eps_estimate=1.10,
                                recorded_at="2026-03-01T21:00:00Z")
     assert pit_store.consensus_as_of("AAPL", "2026Q2", "2026-03-02")
+
+
+# --- six jobs, one file ------------------------------------------------------
+#
+# The store is a single SQLite file on a shared volume and the published cron
+# overlaps: the watcher fires at 22:40 while the 22:30 recorder is still
+# fetching. Under a rollback journal a writer takes an EXCLUSIVE lock and the
+# loser gets "database is locked" after five seconds -- in the middle of the
+# nightly write loop, which is the one place a raise costs the whole night.
+
+
+def test_the_store_survives_a_concurrent_writer(store, tmp_path):
+    """A reader must not be locked out by a writer holding a transaction.
+
+    Under a rollback journal it is, which is the whole failure. WAL is what
+    makes an overlapping cron a slow night rather than a lost one.
+    """
+    with store.connect() as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] >= 30_000
+
+    writer = store.connect()
+    writer.execute("BEGIN IMMEDIATE")
+    writer.execute(
+        "INSERT INTO run_log (job, as_of_date, started_at) VALUES (?,?,?)",
+        ("slow", "2026-03-03", "2026-03-03T21:00:00Z"))
+    try:
+        rows = store.bars_as_of("AAPL", "2026-03-03")
+    finally:
+        writer.rollback()
+        writer.close()
+    assert rows == []
+
+
+# --- a rerun's verdict is evidence too ---------------------------------------
+#
+# The natural response to a partial night is to run it again. The second pass
+# has fuller history to screen against, so its verdict is the better one --
+# and INSERT OR IGNORE dropped it on the floor with nothing to show a second
+# answer had ever been computed. `record_bars` already had the answer to this:
+# the original stands, and the disagreement is filed as its own fact.
+
+
+def test_a_rerun_that_changes_a_verdict_is_not_silently_discarded(store):
+    store.record_universe("2026-03-03", [
+        {"ticker": "AAPL", "cik": "320193", "eligible": False,
+         "exclusion_reason": "insufficient history: 12 sessions recorded"}],
+                          recorded_at="2026-03-03T21:00:00Z")
+    store.record_universe("2026-03-03", [
+        {"ticker": "AAPL", "cik": "320193", "eligible": True,
+         "exclusion_reason": None}],
+                          recorded_at="2026-03-03T22:30:00Z")
+
+    member = store.universe_as_of("2026-03-03")[0]
+    assert member["eligible"] is False, "the original verdict was overwritten"
+
+    filed = store.universe_revisions("AAPL")
+    assert [r["field"] for r in filed] == ["eligible", "exclusion_reason"], (
+        "the rerun disagreed and left no record that it had run at all")
+    assert filed[0]["old_value"] == "0" and filed[0]["new_value"] == "1"
+    assert filed[0]["noticed_at"] == "2026-03-03T22:30:00Z"
+
+
+def test_a_rerun_that_agrees_files_nothing(store):
+    """Reruns are routine. A revision row per agreeing rerun would bury the
+    one disagreement that matters under ten thousand that do not."""
+    entries = [{"ticker": "AAPL", "cik": "320193", "eligible": True}]
+    store.record_universe("2026-03-03", entries,
+                          recorded_at="2026-03-03T21:00:00Z")
+    written = store.record_universe("2026-03-03", entries,
+                                    recorded_at="2026-03-03T22:30:00Z")
+
+    assert written == 0
+    assert store.universe_revisions("AAPL") == []
+
+
+# --- what quantity is in the sue column -------------------------------------
+#
+# SIGNAL_VARIANT chooses between a time-series sigma, an analyst sigma, and a
+# cross-sectional rank. Switching it is a one-line edit and the intended way to
+# change variants, and nothing in the store said which one a row came from --
+# so a book spanning a change mixed two incomparable quantities under one
+# column and the scorer averaged over both.
+
+def test_an_order_records_which_variant_produced_its_number(store):
+    store.record_paper_orders(
+        "2026-03-03",
+        [{"ticker": "AAA", "side": "long", "sue": 0.45, "variant": "cs",
+          "drift_coefficient": 40.0, "drift_calibrated": False,
+          "seeded_quarters": 2, "recorded_quarters": 6,
+          "intended_session": "2026-03-04"}],
+        recorded_at="2026-03-03T21:00:00Z")
+
+    row = store.paper_orders_as_of("2026-03-03")[0]
+    assert row["variant"] == "cs"
+    assert row["drift_coefficient"] == 40.0
+    assert row["drift_calibrated"] is False
+    assert row["seeded_quarters"] == 2
+    assert row["recorded_quarters"] == 6
+
+
+def test_an_order_that_said_nothing_about_calibration_does_not_claim_false(
+        store):
+    """Rows written before the column existed have no answer, and False is an
+    answer."""
+    store.record_paper_orders(
+        "2026-03-03", [{"ticker": "AAA", "sue": 2.0}],
+        recorded_at="2026-03-03T21:00:00Z")
+
+    row = store.paper_orders_as_of("2026-03-03")[0]
+    assert row["drift_calibrated"] is None
+    assert row["variant"] is None
+
+
+def test_the_store_says_when_a_job_last_finished_successfully(store):
+    """Six jobs write to one run log and nothing read it. "The recorder is
+    still running" is a question the log can answer and every reader was
+    guessing at."""
+    store.start_run("daily_bars", as_of_date="2026-03-02")
+    store.finish_run(rows_written=500, status="ok")
+    store.start_run("daily_bars", as_of_date="2026-03-03")
+    store.finish_run(rows_written=0, status="failed", error="vendor timeout")
+
+    assert store.last_successful_run("daily_bars", "2026-03-04") == "2026-03-02"
+    assert store.last_successful_run("consensus", "2026-03-04") is None
+
+
+def test_a_later_run_is_invisible_to_an_earlier_date(store):
+    store.start_run("daily_bars", as_of_date="2026-03-10")
+    store.finish_run(rows_written=1, status="ok")
+    assert store.last_successful_run("daily_bars", "2026-03-04") is None
+
+
+def test_a_run_that_never_finished_is_not_coverage(store):
+    """A crashed process leaves a started row with no finish."""
+    store.start_run("daily_bars", as_of_date="2026-03-02")
+    assert store.last_successful_run("daily_bars", "2026-03-04") is None
+
+
+# --- a bar filled in later is not the same evidence as one watched ----------
+#
+# `daily_job._stamp` dates a replayed run to the session it records, which is
+# defensible for prices and says nothing about provenance. Every other table
+# here draws the distinction -- `consensus_snapshot.source` is 'recorded' or
+# 'seeded', `activist_filing` derives `is_backfill` -- and a backfilled night
+# is materially worse data, because the vendor drops delisted tickers and a
+# night filled in three weeks late is missing exactly the names this store
+# exists to preserve.
+
+
+def test_a_bar_carries_where_it_came_from(store):
+    store.record_bars("AAPL", [_bar("2026-08-03", 10.0)],
+                      recorded_at="2026-08-26T21:00:00Z", source="backfilled")
+    store.record_bars("AAPL", [_bar("2026-08-26", 11.0)],
+                      recorded_at="2026-08-26T21:00:00Z")
+
+    got = {b["trade_date"]: b["source"]
+           for b in store.bars_as_of("AAPL", "2026-08-27")}
+    assert got == {"2026-08-03": "backfilled", "2026-08-26": "recorded"}
+
+
+def test_a_store_built_before_the_source_column_gains_it(tmp_path, monkeypatch):
+    """The deployed store is exactly the one that predates the column. Rows
+    already in it were written by a recorder standing on the day they describe,
+    so the migration must not relabel them as reconstructions."""
+    import sqlite3
+
+    path = tmp_path / "old_bars.db"
+    monkeypatch.setenv("NEMO_PIT_DB", str(path))
+    with sqlite3.connect(path) as conn:
+        conn.execute("""CREATE TABLE daily_bar (
+            trade_date TEXT NOT NULL, ticker TEXT NOT NULL, open REAL,
+            high REAL, low REAL, close REAL, volume REAL,
+            recorded_at TEXT NOT NULL,
+            PRIMARY KEY (trade_date, ticker))""")
+        conn.execute("INSERT INTO daily_bar VALUES "
+                     "('2026-03-03','AAPL',1.0,2.0,0.5,1.5,1000,"
+                     "'2026-03-03T21:00:00Z')")
+
+    pit_store.init_schema()
+
+    with pit_store.connect() as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(daily_bar)")}
+        row = conn.execute("SELECT * FROM daily_bar").fetchone()
+    assert "source" in cols
+    assert row["source"] == "recorded", "existing bars were relabelled"
+    assert row["close"] == 1.5
+
+    # ...and the store still writes through the migrated table.
+    pit_store.record_bars("AAPL", [_bar("2026-03-04", 2.0)],
+                          recorded_at="2026-03-04T21:00:00Z")
+    assert len(pit_store.bars_as_of("AAPL", "2026-03-05")) == 2
+
+
+def test_the_store_says_when_a_job_first_ran(store):
+    """What separates a gap from a store that did not exist yet. Without it a
+    fresh volume reports its first month as twenty-two missed nights."""
+    assert store.first_run("daily_bars") is None
+    store.start_run("daily_bars", as_of_date="2026-03-03")
+    store.finish_run(rows_written=0, status="failed", error="vendor timeout")
+    store.start_run("daily_bars", as_of_date="2026-03-04")
+    store.finish_run(rows_written=1, status="ok")
+
+    assert store.first_run("daily_bars") == "2026-03-03", (
+        "a night that ran and failed still says the store was running")
+    assert store.first_run("consensus") is None

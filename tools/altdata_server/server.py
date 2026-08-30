@@ -58,6 +58,13 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
+# The redacting credential wrapper, imported rather than copied. This is an
+# MCP *stdio* server -- stdout is its wire -- and agent.openrouter_template,
+# where Secret used to live, hangs two LLM SDKs off the import graph and calls
+# sys.stdout.reconfigure() on the way past. common/secret.py imports nothing
+# and touches no stream.
+from common.secret import Secret
+
 from tools.altdata_server.text_utils import (
     text_contains, count_matches, extract_dollar_amounts, parse_news_date,
     # The same compiled pattern and units that produce the VALUES, borrowed so
@@ -131,7 +138,7 @@ def _run_subprocess(runner_path: str, tool_name: str, kwargs: dict,
 
 def _envelope(data: Any, tool: str, ticker: str = "",
                errors: Optional[List[str]] = None) -> Dict[str, Any]:
-    return {
+    payload = {
         "domain": "alt_data",
         "ticker": ticker,
         "tool": tool,
@@ -140,6 +147,15 @@ def _envelope(data: Any, tool: str, ticker: str = "",
         "data": data,
         "metadata": {"errors": errors or []},
     }
+    if errors:
+        # Beside `success`, where a caller looks. The reason was already here
+        # in metadata.errors and in data.error, and neither is the key anyone
+        # reaches for: a sweep of every tool found two of these reporting
+        # `error: None` on a lookup that had failed for a well-described
+        # reason. The nested copies stay -- `data` is the diagnostic payload,
+        # this is the contract.
+        payload["error"] = errors[0]
+    return payload
 
 
 def _ok(tool: str, data: Any, ticker: str = "") -> List[TextContent]:
@@ -1768,34 +1784,52 @@ def _score_bill_title(title: str, status: str) -> float:
 
 
 def _fetch_keywords(fetch_one, keywords: List[str]
-                    ) -> Tuple[List[Dict], List[str], List[str]]:
+                    ) -> Tuple[List[Dict], List[str], List[str], Dict[str, Any]]:
     """Run `fetch_one(keyword)` over every keyword, concurrently.
 
-    (bills, errors, keywords_queried). Concurrent because the alternative was
-    a cap: both fetchers used `keywords[:3]` while the response reported the
-    whole mapping in `keywords_searched`, so for Industrials the response said
-    it had looked for "NDAA" and it never had. Four sequential 10s requests
-    across two congresses do not fit the handler's 30s budget; four concurrent
-    ones do.
+    (bills, errors, keywords_queried, provider_counts). Concurrent because the
+    alternative was a cap: both fetchers used `keywords[:3]` while the response
+    reported the whole mapping in `keywords_searched`, so for Industrials the
+    response said it had looked for "NDAA" and it never had. Four sequential
+    10s requests across two congresses do not fit the handler's 30s budget;
+    four concurrent ones do.
 
     A keyword whose query failed is named in `errors`. Swallowing the
     exception made "GovTrack is down" and "no bill mentions semiconductors"
     the same answer.
+
+    `provider_counts` is what the provider handed over, before dedup and
+    before any filter this module applies: `rows` is how many objects it sent,
+    `total_count` how many it says matched, `answered` how many queries came
+    back 200, and `empty` how many of those came back with nothing. Without
+    them a provider that answered every query with zero bills and a provider
+    whose forty bills all failed the lookback filter produced byte-identical
+    responses, and both were reported as a neutral legislative climate
+    (issue #18).
     """
     from concurrent.futures import ThreadPoolExecutor
 
+    empty_counts = {"rows": 0, "total_count": None, "answered": 0, "empty": 0}
     if not keywords:
-        return [], [], []
+        return [], [], [], dict(empty_counts)
     with ThreadPoolExecutor(max_workers=min(len(keywords), 6)) as pool:
         results = list(pool.map(fetch_one, keywords))
 
     bills: List[Dict] = []
     errors: List[str] = []
     seen: set = set()
+    counts = dict(empty_counts)
     # Merged in keyword order rather than completion order so the same inputs
     # produce the same list.
-    for rows, errs in results:
+    for rows, errs, meta in results:
         errors += errs
+        if meta is not None:
+            counts["answered"] += 1
+            counts["rows"] += meta["rows"]
+            counts["empty"] += 1 if meta["rows"] == 0 else 0
+            if meta["total_count"] is not None:
+                counts["total_count"] = ((counts["total_count"] or 0)
+                                         + meta["total_count"])
         for row in rows:
             key = row.get("link") or row.get("title")
             if key and key in seen:
@@ -1803,15 +1837,18 @@ def _fetch_keywords(fetch_one, keywords: List[str]
             if key:
                 seen.add(key)
             bills.append(row)
-    return bills, errors, list(keywords)
+    return bills, errors, list(keywords), counts
 
 
 def _govtrack_fetch_bills(keywords: List[str], congress: int,
-                           limit: int = 8) -> Tuple[List[Dict], List[str], List[str]]:
-    """(bills, errors, keywords_queried) from GovTrack, one query per keyword."""
+                           limit: int = 8
+                           ) -> Tuple[List[Dict], List[str], List[str],
+                                      Dict[str, Any]]:
+    """(bills, errors, keywords_queried, provider_counts) from GovTrack, one
+    query per keyword."""
     import requests
 
-    def one(kw: str) -> Tuple[List[Dict], List[str]]:
+    def one(kw: str) -> Tuple[List[Dict], List[str], Optional[Dict[str, Any]]]:
         rows: List[Dict] = []
         try:
             resp = requests.get(
@@ -1853,25 +1890,75 @@ def _govtrack_fetch_bills(keywords: List[str], congress: int,
                 })
         except Exception as exc:  # noqa: BLE001 - recorded, not hidden
             return rows, [f"govtrack {kw!r} (congress {congress}): "
-                          f"{type(exc).__name__}: {str(exc)[:120]}"]
-        return rows, []
+                          f"{type(exc).__name__}: {str(exc)[:120]}"], None
+        # meta.total_count is what GovTrack says matched, which is not what it
+        # sent -- `limit` caps the page. Both travel so a caller can tell "the
+        # provider matched nothing" from "more matched than fitted".
+        return rows, [], {"rows": len(rows),
+                          "total_count": (data.get("meta") or {}).get("total_count")}
 
     return _fetch_keywords(one, keywords)
 
 
+def _congress_credential() -> Secret:
+    """The configured Congress.gov key, wrapped so it cannot be rendered.
+
+    Read here rather than accepted as an argument: a credential that never
+    crosses a function boundary as a string cannot be printed as that
+    function's arguments.
+    """
+    return Secret(os.environ.get("CONGRESS_API_KEY", ""))
+
+
+# Everything from the scheme onward, not just the non-space run. Once a query
+# string is rendered it can carry spaces, and a stricter pattern would leave
+# the tail of the key -- and the tail is the part that matters.
+_PROVIDER_URL_RE = re.compile(r"https?://.*", re.DOTALL)
+
+
+def _scrub_provider_error(exc: Exception, credential: "Secret | None" = None,
+                          limit: int = 200) -> str:
+    """`exc` as one readable line, with the request URL and the credential
+    taken out of it first.
+
+    `requests` builds its messages out of the request URL and the Congress.gov
+    key travels in the query string, so `raise_for_status()` produces a string
+    with the credential in the middle of it. That string was cut to 120
+    characters and handed to the MCP caller in `partial_errors`.
+
+    The cut was never a guard. Measured on the real URL shape, the key starts
+    at character 111 for the keyword "chips" -- inside the cut -- and at 135
+    for a longer one; whether the credential shipped depended on the caller's
+    search term (issue #59). So the URL goes outright, and the length limit is
+    left to do the only job it was ever good at, which is keeping one line
+    readable.
+    """
+    text = _PROVIDER_URL_RE.sub("<url>", str(exc))
+    if credential is not None:
+        text = credential.scrub(text)
+    return f"{type(exc).__name__}: {text[:limit]}"
+
+
 def _congress_api_fetch_bills(keywords: List[str], congress: int,
-                               api_key: str,
-                               limit: int = 10) -> Tuple[List[Dict], List[str], List[str]]:
-    """(bills, errors, keywords_queried) — same contract as _govtrack_fetch_bills."""
+                               credential: Secret,
+                               limit: int = 10
+                               ) -> Tuple[List[Dict], List[str], List[str],
+                                          Dict[str, Any]]:
+    """(bills, errors, keywords_queried, provider_counts) — same contract as
+    _govtrack_fetch_bills."""
     import requests
 
-    def one(kw: str) -> Tuple[List[Dict], List[str]]:
+    def one(kw: str) -> Tuple[List[Dict], List[str], Optional[Dict[str, Any]]]:
         rows: List[Dict] = []
         try:
             resp = requests.get(
                 "https://api.congress.gov/v3/bill",
+                # Revealed inline, at the point of use. The API takes the key
+                # as a query parameter, so requests' own frames necessarily
+                # hold it; ours hold only the Secret, and nothing this
+                # function returns carries either.
                 params={"q": kw, "congress": congress, "format": "json",
-                        "api_key": api_key, "limit": limit},
+                        "api_key": credential.reveal(), "limit": limit},
                 headers={"User-Agent": "Mozilla/5.0"},
                 timeout=12,
             )
@@ -1895,15 +1982,22 @@ def _congress_api_fetch_bills(keywords: List[str], congress: int,
                     "status": status,
                     "introduced_date": latest.get("actionDate", ""),
                     "activity_date": latest.get("actionDate", ""),
-                    "link": "",
+                    # The provider's own canonical URL for the bill, scrubbed
+                    # in case it ever echoes the request. This was hard-coded
+                    # to "", so dedup fell back to the title and a House bill
+                    # and its Senate companion -- which share one -- were
+                    # collapsed into a single row that nothing counted
+                    # (issue #18).
+                    "link": credential.scrub(b.get("url") or ""),
                     "congress": congress,
                     "source": "congress.gov",
                     "matched_keyword": kw,
                 })
         except Exception as exc:  # noqa: BLE001 - recorded, not hidden
             return rows, [f"congress.gov {kw!r} (congress {congress}): "
-                          f"{type(exc).__name__}: {str(exc)[:120]}"]
-        return rows, []
+                          f"{_scrub_provider_error(exc, credential)}"], None
+        return rows, [], {"rows": len(rows),
+                          "total_count": (data.get("pagination") or {}).get("count")}
 
     return _fetch_keywords(one, keywords)
 
@@ -1981,10 +2075,10 @@ def _fetch_policy_signals(ticker: str, sector: str,
     current_congress = (start_year - 1789) // 2 + 1
     prior_congress = current_congress - 1
 
-    api_key = os.environ.get("CONGRESS_API_KEY", "")
-    source = "congress.gov" if api_key else "govtrack.us"
+    credential = _congress_credential()
+    source = "congress.gov" if credential else "govtrack.us"
     degraded: List[str] = []
-    if not api_key:
+    if not credential:
         degraded.append(
             "CONGRESS_API_KEY unset — Congress.gov was not queried; this "
             "answer is from GovTrack alone.")
@@ -1994,25 +2088,55 @@ def _fetch_policy_signals(ticker: str, sector: str,
     # Echoing the mapping there was the lie: it claimed a search for the NDAA
     # that never happened.
     queried: List[str] = []
-    if api_key:
-        bills, errs, kws = _congress_api_fetch_bills(keywords, current_congress, api_key)
+    # What the provider itself handed over, summed across both rounds. Kept
+    # separately from `bills` because dedup and the lookback filter both run
+    # after it, and a zero here means something entirely different from a zero
+    # after them.
+    provider = {"rows": 0, "total_count": None, "answered": 0, "empty": 0}
+
+    def _absorb(counts: Dict[str, Any]) -> None:
+        provider["rows"] += counts["rows"]
+        provider["answered"] += counts["answered"]
+        provider["empty"] += counts["empty"]
+        if counts["total_count"] is not None:
+            provider["total_count"] = ((provider["total_count"] or 0)
+                                       + counts["total_count"])
+
+    if credential:
+        bills, errs, kws, counts = _congress_api_fetch_bills(
+            keywords, current_congress, credential)
         fetch_errors += errs
         queried += kws
+        _absorb(counts)
         if not bills:
-            bills, errs, kws = _congress_api_fetch_bills(keywords, prior_congress, api_key)
+            bills, errs, kws, counts = _congress_api_fetch_bills(
+                keywords, prior_congress, credential)
             fetch_errors += errs
             queried += kws
+            _absorb(counts)
     else:
-        bills, errs, kws = _govtrack_fetch_bills(keywords, current_congress)
+        bills, errs, kws, counts = _govtrack_fetch_bills(keywords, current_congress)
         fetch_errors += errs
         queried += kws
+        _absorb(counts)
         if len(bills) < 3:
-            more, errs, kws = _govtrack_fetch_bills(keywords, prior_congress)
+            more, errs, kws, counts = _govtrack_fetch_bills(keywords, prior_congress)
             bills += more
             fetch_errors += errs
             queried += kws
+            _absorb(counts)
     keywords_searched = list(dict.fromkeys(queried))
     base["sector"] = sector
+
+    # Carried into every response below. `provider_rows_returned` is the count
+    # before dedup, `bills_before_lookback_filter` the count after it and
+    # before the date filter, so a caller (and the regression test that guards
+    # the dedup key) can see which stage emptied the list.
+    provider_counts = {
+        "provider_rows_returned": provider["rows"],
+        "provider_total_count": provider["total_count"],
+        "bills_before_lookback_filter": None,
+    }
 
     if not bills and fetch_errors:
         # Every query the provider was asked errored. An empty bill list here
@@ -2025,20 +2149,36 @@ def _fetch_policy_signals(ticker: str, sector: str,
             "keywords_searched": keywords_searched,
             "keywords_mapped": keywords, "source": source,
             "degraded": degraded,
+            **provider_counts,
         }
 
     # Apply lookback_days: keep bills with recent legislative activity. Bills with
     # an unparseable/missing date are kept (don't over-filter on bad metadata).
+    provider_counts["bills_before_lookback_filter"] = len(bills)
     cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
     def _recent(b: Dict) -> bool:
         d = parse_news_date(b.get("activity_date", "") or b.get("introduced_date", ""))
         return d is None or d >= cutoff
     bills = [b for b in bills if _recent(b)]
 
+    # Every query the provider answered, and every one of them empty. That is
+    # not a reading of the legislative record; it is the absence of one, and
+    # the branch below used to report it as `neutral` -- which a consumer takes
+    # as an affirmative claim that the climate is balanced (issue #18).
+    provider_said_nothing = provider["answered"] > 0 and provider["rows"] == 0
+    if provider_said_nothing:
+        degraded.append(
+            f"{source} returned no bill at all for any of {keywords_searched} "
+            f"— not a bill that failed the {lookback_days}-day filter, none at "
+            f"any date. `signal` is null rather than neutral: the provider said "
+            f"nothing, so there is no legislative climate to report.")
+
     coverage = "partial" if (degraded or fetch_errors) else "full"
 
     if not bills:
-        # The provider answered; nothing it returned matched. A genuine empty.
+        # The provider answered; nothing it returned matched. A genuine empty
+        # -- unless the provider returned nothing to match, which is the case
+        # `provider_said_nothing` separates out.
         return {
             "success": True,
             "coverage": coverage,
@@ -2052,13 +2192,20 @@ def _fetch_policy_signals(ticker: str, sector: str,
             "rows_returned": 0,
             "truncated": False,
             "bills": [],
-            "signal": "neutral",
-            "signal_basis": (f"{source} returned no bill matching "
-                             f"{keywords_searched} with activity in the last "
-                             f"{lookback_days} days"),
+            "signal": None if provider_said_nothing else "neutral",
+            "signal_basis": (
+                (f"no signal: {source} answered every query with zero bills, "
+                 f"so nothing was scored. Reporting that as neutral would "
+                 f"claim the record is balanced; the record was never read.")
+                if provider_said_nothing else
+                (f"{source} returned "
+                 f"{provider_counts['bills_before_lookback_filter']} bill(s) "
+                 f"matching {keywords_searched}, none of them with activity in "
+                 f"the last {lookback_days} days")),
             "source": source,
             "degraded": degraded,
             "partial_errors": fetch_errors,
+            **provider_counts,
         }
 
     # Score each bill
@@ -2108,6 +2255,7 @@ def _fetch_policy_signals(ticker: str, sector: str,
         "source": source,
         "degraded": degraded,
         "partial_errors": fetch_errors,
+        **provider_counts,
     }
 
 
@@ -2557,6 +2705,13 @@ class AltDataServer:
                         "'matched_keyword' and 'signal_basis' states what was summed. "
                         "'bill_count' counts the whole matched set, 'rows_returned' the "
                         "page returned, and 'truncated' says when they differ. "
+                        "'provider_rows_returned' is what the provider actually sent "
+                        "before dedup, 'provider_total_count' what it says matched, and "
+                        "'bills_before_lookback_filter' what survived dedup before the "
+                        "date filter -- so a caller can see which stage emptied the "
+                        "list. A provider that answered every query with zero bills "
+                        "returns signal=null and names itself in 'degraded', never "
+                        "'neutral': nothing was read, so there is no climate to call. "
                         "Most relevant for: semiconductors (CHIPS Act), defense (NDAA), "
                         "pharma (drug pricing), energy (IRA credits), fintech (crypto regs)."
                     ),
@@ -3016,7 +3171,11 @@ if __name__ == "__main__":
         # that spawns it. stdio stays the default for local use.
         from tools.mcp_http import run_http
         print("[altdata] starting over streamable HTTP", file=sys.stderr, flush=True)
-        run_http(AltDataServer().server)
+        # Explicitly none. CONGRESS_API_KEY and FINMIND_TOKEN are real keys
+        # this server reads, but their absence is a documented degradation
+        # the tools report in their own output -- declaring them here would
+        # mark a container that is working as designed unhealthy forever.
+        run_http(AltDataServer().server, required_env=())
     else:
         print("[altdata] starting", file=sys.stderr, flush=True)
         srv = AltDataServer()

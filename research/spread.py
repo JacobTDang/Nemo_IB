@@ -69,9 +69,10 @@ the spread turned out to be.
 """
 from __future__ import annotations
 
+import bisect
 import math
 import statistics
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 import numpy as np
 
@@ -227,23 +228,23 @@ def _moments(open: Sequence[float], high: Sequence[float],
              close: Sequence[float]) -> Optional[Dict[str, float]]:
     o = np.asarray(open, dtype=float)
     h = np.asarray(high, dtype=float)
-    l = np.asarray(low, dtype=float)
+    lo = np.asarray(low, dtype=float)
     c = np.asarray(close, dtype=float)
 
     nobs = len(o)
-    if len(h) != nobs or len(l) != nobs or len(c) != nobs:
+    if len(h) != nobs or len(lo) != nobs or len(c) != nobs:
         raise ValueError(
             f"open/high/low/close must be the same length; got "
-            f"{nobs}/{len(h)}/{len(l)}/{len(c)}")
+            f"{nobs}/{len(h)}/{len(lo)}/{len(c)}")
     if nobs < 3:
         return None
 
     with np.errstate(divide="ignore", invalid="ignore"):
-        o, h, l, c = np.log(o), np.log(h), np.log(l), np.log(c)
-    m = (h + l) / 2.0
+        o, h, lo, c = np.log(o), np.log(h), np.log(lo), np.log(c)
+    m = (h + lo) / 2.0
 
-    h1, l1, c1, m1 = h[:-1], l[:-1], c[:-1], m[:-1]
-    o, h, l, c, m = o[1:], h[1:], l[1:], c[1:], m[1:]
+    h1, l1, c1, m1 = h[:-1], lo[:-1], c[:-1], m[:-1]
+    o, h, lo, c, m = o[1:], h[1:], lo[1:], c[1:], m[1:]
 
     r1 = m - o
     r2 = o - m1
@@ -254,10 +255,10 @@ def _moments(open: Sequence[float], high: Sequence[float],
     # tau marks the bars on which the price moved. A bar whose high, low and
     # previous close are all equal carries no information about a spread, and
     # counting it would drag every probability below toward zero.
-    tau = np.where(np.isnan(h) | np.isnan(l) | np.isnan(c1), np.nan,
-                   (h != l) | (l != c1))
+    tau = np.where(np.isnan(h) | np.isnan(lo) | np.isnan(c1), np.nan,
+                   (h != lo) | (lo != c1))
     po1 = tau * np.where(np.isnan(o) | np.isnan(h), np.nan, o != h)
-    po2 = tau * np.where(np.isnan(o) | np.isnan(l), np.nan, o != l)
+    po2 = tau * np.where(np.isnan(o) | np.isnan(lo), np.nan, o != lo)
     pc1 = tau * np.where(np.isnan(c1) | np.isnan(h1), np.nan, c1 != h1)
     pc2 = tau * np.where(np.isnan(c1) | np.isnan(l1), np.nan, c1 != l1)
 
@@ -315,6 +316,47 @@ def _moments(open: Sequence[float], high: Sequence[float],
 
 # ------------------------------------------------------------------- the window
 
+def _bars_across_a_split(bars: Sequence[Dict[str, Any]],
+                         actions: Sequence[Dict[str, Any]]) -> Set[int]:
+    """Indices of the bars a split's price discontinuity lands on.
+
+    An ex-date is not the same thing as a session. `pit_store.adjusted_bars`
+    keys its adjustment on "every action dated after this bar" rather than on
+    an ex-date matching a bar's date exactly, and its comment gives three ways
+    the exact match misses: the ex-date falls on a holiday, on a session a
+    fetch dropped, or after the last bar recorded. Matching exactly here misses
+    them the same way, and the cost of missing is worse than a lost adjustment
+    -- the raw -90% print stays in the window, EDGE reads it as trading cost,
+    and close-to-close volatility reads it as an eightfold jump in sigma. The
+    name is then rejected every night at several times its real cost, with a
+    number that reads like a verdict on its liquidity.
+
+    A split is one broken transition, not a broken window: the last bar priced
+    before the ex-date to the first bar priced after it. So the bar to drop is
+    the first one dated on or after the ex-date -- the ex-date's own session
+    when it printed, the next session when it did not.
+
+    Both ends of that transition have to be inside the window for there to be
+    anything to drop. A split older than the window's first bar is entirely
+    behind it and every price in the window is on the same side of it; a split
+    effective after the last bar recorded has not printed yet. Dropping a
+    session in either case would spend real evidence correcting a jump that is
+    not in the data, which is the same kind of error in the other direction.
+    """
+    # `bars_as_of` returns sessions in date order, which is what lets the
+    # boundary be found by bisection rather than by scanning.
+    dates = [b["trade_date"] for b in bars]
+    hits: Set[int] = set()
+    for action in actions:
+        if action["action_type"] != "split":
+            continue
+        first_after = bisect.bisect_left(dates, action["ex_date"])
+        if first_after == 0 or first_after == len(dates):
+            continue
+        hits.add(first_after)
+    return hits
+
+
 def _window(ticker: str, as_of: str,
             window: int) -> Dict[str, Any]:
     """The cleaned bars for one name as they stood on `as_of`, or a reason.
@@ -336,8 +378,10 @@ def _window(ticker: str, as_of: str,
     10-for-1 split is a genuine -90% print between two adjacent sessions. EDGE
     only ever compares adjacent bars, so one split breaks exactly the
     transitions that touch it -- and inflates the estimate by an order of
-    magnitude if it is left in. Only splits recorded on or before `as_of` are
-    known, which is why they are read through the point-in-time accessor.
+    magnitude if it is left in. Which bar carries that break, when the ex-date
+    itself never printed, is `_bars_across_a_split`. Only splits recorded on or
+    before `as_of` are known, which is why they are read through the
+    point-in-time accessor.
     """
     if window < MIN_SESSIONS:
         raise ValueError(
@@ -356,14 +400,13 @@ def _window(ticker: str, as_of: str,
             f"{MIN_SESSIONS} required")
         return out
 
-    split_dates = {a["ex_date"] for a
-                   in pit_store.corporate_actions_as_of(ticker, as_of)
-                   if a["action_type"] == "split"}
+    split_bars = _bars_across_a_split(
+        bars, pit_store.corporate_actions_as_of(ticker, as_of))
 
     n = len(bars)
     o = np.full(n, np.nan)
     h = np.full(n, np.nan)
-    l = np.full(n, np.nan)
+    lo = np.full(n, np.nan)
     c = np.full(n, np.nan)
     dollar: List[float] = []
     splits_hit = 0
@@ -378,12 +421,12 @@ def _window(ticker: str, as_of: str,
             if bl > bh or not (bl <= bo <= bh) or not (bl <= bc <= bh):
                 usable = False
 
-        if usable and bar["trade_date"] in split_dates:
+        if usable and i in split_bars:
             usable = False
             splits_hit += 1
 
         if usable:
-            o[i], h[i], l[i], c[i] = bo, bh, bl, bc
+            o[i], h[i], lo[i], c[i] = bo, bh, bl, bc
 
         close, volume = bar.get("close"), bar.get("volume")
         if (close is not None and volume is not None
@@ -412,7 +455,7 @@ def _window(ticker: str, as_of: str,
 
     finite = c[np.isfinite(c)]
     out.update({
-        "open": o, "high": h, "low": l, "close": c,
+        "open": o, "high": h, "low": lo, "close": c,
         "last_price": float(finite[-1]),
         "median_dollar_volume": float(statistics.median(dollar)),
         "sessions_counted": n,
@@ -650,9 +693,11 @@ def spread_basis(ticker: str, as_of: str,
       the tick. Charging EDGE's number here would charge the estimator's bias:
       40bp for SPY, whose market is a cent wide.
 
-      `unknown` -- the reference is not in the store for this window, so there
-      is no yardstick. Picking one of the other two silently is how 40bp
-      becomes a fact.
+      `unknown` -- there is no yardstick, or nothing to hold against it: the
+      reference is not in the store for this window, or the estimator refused
+      this name outright. Picking one of the other two silently is how 40bp
+      becomes a fact, and how a name nobody could measure becomes the cheapest
+      one on the book.
     """
     own = estimate_spread(ticker, as_of, window)
     tick_floor = own.get("tick_floor")
@@ -668,7 +713,21 @@ def spread_basis(ticker: str, as_of: str,
                            f"against: {reference.get('reason') or 'no data'}")}
 
     own_level = own.get("spread")
-    if own_level is not None and own_level > ref_level * RESOLUTION_MULTIPLE:
+    if own_level is None:
+        # A refusal, not a small number. "Below what daily bars can resolve" is
+        # a claim about this name, and it needs an estimate to stand on: with
+        # none, flooring at the tick hands the cheapest cost in the universe to
+        # precisely the names nobody could measure, in a book ranked on edge
+        # net of cost.
+        return {"ticker": ticker, "as_of": as_of, "window": window,
+                "basis": "unknown", "spread": None, "tick_floor": tick_floor,
+                "reference_spread": ref_level,
+                "reason": (f"the estimator returned no spread for {ticker} on "
+                           f"this window, so there is nothing to compare "
+                           f"against the {ref_level * 1e4:.1f}bp the reference "
+                           f"produces: {own.get('reason') or 'no estimate'}")}
+
+    if own_level > ref_level * RESOLUTION_MULTIPLE:
         return {"ticker": ticker, "as_of": as_of, "window": window,
                 "basis": "measured", "spread": own_level,
                 "tick_floor": tick_floor, "reference_spread": ref_level,
@@ -682,14 +741,14 @@ def spread_basis(ticker: str, as_of: str,
                 "reference_spread": ref_level,
                 "reason": "no last price, so there is no tick to floor at"}
 
-    shown = f"{own_level * 1e4:.1f}bp" if own_level is not None else "no estimate"
     return {"ticker": ticker, "as_of": as_of, "window": window,
             "basis": "at_resolution_floor", "spread": tick_floor,
             "tick_floor": tick_floor, "reference_spread": ref_level,
-            "reason": (f"{shown} is not clear of the {ref_level * 1e4:.1f}bp "
-                       f"the reference produces on the same window, so this is "
-                       f"the estimator's floor rather than this name's spread; "
-                       f"charging one tick ({tick_floor * 1e4:.2f}bp) instead")}
+            "reason": (f"{own_level * 1e4:.1f}bp is not clear of the "
+                       f"{ref_level * 1e4:.1f}bp the reference produces on the "
+                       f"same window, so this is the estimator's floor rather "
+                       f"than this name's spread; charging one tick "
+                       f"({tick_floor * 1e4:.2f}bp) instead")}
 
 
 def round_trip_cost(ticker: str, as_of: str, position_dollars: float,
@@ -720,7 +779,9 @@ def round_trip_cost(ticker: str, as_of: str, position_dollars: float,
     `cost` is None with a `reason` whenever the spread could not be measured.
     There is no house average and no last-known value to fall back to, because
     a fallback here is a number nobody can check that gets subtracted from
-    every trade in the study.
+    every trade in the study. `reason` belongs to the cost: when one was
+    charged it is None, and why the point estimate is missing -- which is a
+    different question, and still worth knowing -- is under `estimate_reason`.
     """
     if not (position_dollars > 0):
         raise ValueError(
@@ -733,7 +794,13 @@ def round_trip_cost(ticker: str, as_of: str, position_dollars: float,
 
     base = _window(ticker, as_of, window)
     est = _estimate(base, ticker, as_of, window)
-    result = {**est, "position_dollars": position_dollars,
+    # `est`'s refusal explains why there is no point estimate, and a cost
+    # charged on a different basis is not refused. Carried under `reason` it
+    # sat beside a live `cost` and a `spread` of None, where it reads as this
+    # cost's own provenance -- and every caller tests `cost is None`, so none
+    # of them ever saw it.
+    result = {**est, "estimate_reason": est["reason"],
+              "position_dollars": position_dollars,
               "spread_basis": basis, "resolution": None, "spread_used": None,
               "half_spread": None, "spread_cost": None, "impact_cost": None,
               "cost": None, "participation": None,
@@ -777,6 +844,7 @@ def round_trip_cost(ticker: str, as_of: str, position_dollars: float,
         participation)
 
     result.update({
+        "reason": None,
         "spread_used": charged,
         "half_spread": charged / 2.0,
         "spread_cost": spread_cost,

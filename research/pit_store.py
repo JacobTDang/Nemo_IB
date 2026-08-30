@@ -54,6 +54,19 @@ CREATE TABLE IF NOT EXISTS universe_snapshot (
     PRIMARY KEY (as_of_date, ticker)
 );
 
+-- The same escape valve `bar_revision` is: a rerun's verdict is evidence
+-- that a second answer was computed, and INSERT OR IGNORE alone threw it away.
+-- Text rather than numeric because the two fields it covers are a flag and a
+-- sentence.
+CREATE TABLE IF NOT EXISTS universe_revision (
+    as_of_date TEXT NOT NULL,
+    ticker     TEXT NOT NULL,
+    field      TEXT NOT NULL,
+    old_value  TEXT,
+    new_value  TEXT,
+    noticed_at TEXT NOT NULL
+);
+
 -- Raw only. No adjusted column, by design: see the module docstring.
 CREATE TABLE IF NOT EXISTS daily_bar (
     trade_date  TEXT NOT NULL,
@@ -63,6 +76,15 @@ CREATE TABLE IF NOT EXISTS daily_bar (
     low         REAL,
     close       REAL,
     volume      REAL,
+    -- 'recorded' if the run stood on the session it wrote, 'backfilled' if it
+    -- was replayed for a past date -- the same distinction
+    -- `consensus_snapshot.source` draws, for the same reason. `recorded_at`
+    -- alone does not say it: a replay stamps the session's own evening, which
+    -- is right for prices and silent about how the row was obtained. And a
+    -- backfilled night is worse evidence: the vendor drops delisted tickers,
+    -- so filling 1 August on 26 August is missing precisely the names this
+    -- store exists to keep.
+    source      TEXT NOT NULL DEFAULT 'recorded',
     recorded_at TEXT NOT NULL,
     PRIMARY KEY (trade_date, ticker)
 );
@@ -159,6 +181,23 @@ CREATE TABLE IF NOT EXISTS paper_order (
     side             TEXT,
     fiscal_period    TEXT,
     sue              REAL,
+    -- WHICH surprise that number is. "ts" and "af" are sigmas; "cs" is a rank
+    -- carried as percentile-0.5, so |sue| there is always in (0, 0.5]. One
+    -- column holding both is two incomparable quantities under one name, and a
+    -- coefficient fitted over the mixture describes neither.
+    variant          TEXT,
+    -- The drift coefficient this row's expected edge was priced with, and
+    -- whether it had been measured. Both are module constants at decision
+    -- time and neither is recoverable afterwards -- a book spanning a change
+    -- to either is a book of rows priced differently with nothing saying so.
+    drift_coefficient REAL,
+    drift_calibrated INTEGER,
+    -- How much of the signal rests on quarters `research-seed` reconstructed
+    -- rather than ones the recorder watched. An order built on four
+    -- reconstructions and two observations must not read like one built on
+    -- six observations, in the record that exists to answer exactly that.
+    seeded_quarters  INTEGER,
+    recorded_quarters INTEGER,
     expected_edge_bps REAL,
     cost_bps         REAL,
     net_edge_bps     REAL,
@@ -199,11 +238,21 @@ def _now() -> str:
 
 
 def connect() -> sqlite3.Connection:
+    """A connection to the store, in WAL and willing to wait for a lock.
+
+    Six jobs share this one file on one volume and the schedule overlaps -- the
+    watcher fires at 22:40 while the 22:30 recorder is still fetching. Under
+    SQLite's default rollback journal a writer takes an EXCLUSIVE lock that
+    readers cannot pass, and five seconds later the loser raises "database is
+    locked" in the middle of a nightly write loop. WAL lets the reader through,
+    and thirty seconds is longer than any single write here takes.
+    """
     path = db_path()
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -214,6 +263,15 @@ def connect() -> sqlite3.Connection:
 _MIGRATIONS = (
     ("consensus_snapshot", "eps_actual", "REAL"),
     ("consensus_snapshot", "source", "TEXT NOT NULL DEFAULT 'recorded'"),
+    # Rows already in a deployed store were written by a run standing on the
+    # session it recorded, so the default is the truth about them rather than a
+    # convenience.
+    ("daily_bar", "source", "TEXT NOT NULL DEFAULT 'recorded'"),
+    ("paper_order", "variant", "TEXT"),
+    ("paper_order", "drift_coefficient", "REAL"),
+    ("paper_order", "drift_calibrated", "INTEGER"),
+    ("paper_order", "seeded_quarters", "INTEGER"),
+    ("paper_order", "recorded_quarters", "INTEGER"),
 )
 
 
@@ -231,46 +289,64 @@ def init_schema() -> None:
 # ---------------------------------------------------------------- bars
 
 def record_bars(ticker: str, rows: Iterable[Dict[str, Any]],
-                recorded_at: Optional[str] = None) -> int:
+                recorded_at: Optional[str] = None,
+                conn: Optional[sqlite3.Connection] = None,
+                source: str = "recorded") -> int:
     """Append sessions for one ticker. Returns the count newly written.
 
     A session already present is left exactly as it was. If the incoming values
     differ, the difference is filed in `bar_revision` -- the original is what we
     acted on, and the fact that the vendor now disagrees is separate
     information rather than a reason to lose the original.
+
+    `conn` lets a caller put these writes inside a transaction it already
+    holds, which is how the split and the bars it explains reach the store
+    together or not at all.
+
+    `source` says whether the run stood on the session it is writing. It
+    defaults to the ordinary case for the same reason the column's default
+    does: a caller that says nothing was recording forward.
     """
     stamp = recorded_at or _now()
+    if conn is not None:
+        return _write_bars(conn, ticker, rows, stamp, source)
+    with connect() as own:
+        return _write_bars(own, ticker, rows, stamp, source)
+
+
+def _write_bars(conn: sqlite3.Connection, ticker: str,
+                rows: Iterable[Dict[str, Any]], stamp: str,
+                source: str = "recorded") -> int:
     written = 0
-    with connect() as conn:
-        for row in rows:
-            existing = conn.execute(
-                "SELECT * FROM daily_bar WHERE trade_date = ? AND ticker = ?",
-                (row["trade_date"], ticker)).fetchone()
+    for row in rows:
+        existing = conn.execute(
+            "SELECT * FROM daily_bar WHERE trade_date = ? AND ticker = ?",
+            (row["trade_date"], ticker)).fetchone()
 
-            if existing is None:
-                conn.execute(
-                    """INSERT INTO daily_bar
-                       (trade_date, ticker, open, high, low, close, volume,
-                        recorded_at)
-                       VALUES (?,?,?,?,?,?,?,?)""",
-                    (row["trade_date"], ticker, row.get("open"),
-                     row.get("high"), row.get("low"), row.get("close"),
-                     row.get("volume"), stamp))
-                written += 1
+        if existing is None:
+            conn.execute(
+                """INSERT INTO daily_bar
+                   (trade_date, ticker, open, high, low, close, volume,
+                    source, recorded_at)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (row["trade_date"], ticker, row.get("open"), row.get("high"),
+                 row.get("low"), row.get("close"), row.get("volume"), source,
+                 stamp))
+            written += 1
+            continue
+
+        for field in _BAR_FIELDS:
+            before, after = existing[field], row.get(field)
+            if after is None or before is None:
                 continue
-
-            for field in _BAR_FIELDS:
-                before, after = existing[field], row.get(field)
-                if after is None or before is None:
-                    continue
-                if abs(float(before) - float(after)) > 1e-9:
-                    conn.execute(
-                        """INSERT INTO bar_revision
-                           (trade_date, ticker, field, old_value, new_value,
-                            noticed_at)
-                           VALUES (?,?,?,?,?,?)""",
-                        (row["trade_date"], ticker, field, float(before),
-                         float(after), stamp))
+            if abs(float(before) - float(after)) > 1e-9:
+                conn.execute(
+                    """INSERT INTO bar_revision
+                       (trade_date, ticker, field, old_value, new_value,
+                        noticed_at)
+                       VALUES (?,?,?,?,?,?)""",
+                    (row["trade_date"], ticker, field, float(before),
+                     float(after), stamp))
     return written
 
 
@@ -401,12 +477,17 @@ def revisions(ticker: Optional[str] = None) -> List[Dict[str, Any]]:
 
 def record_corporate_action(ticker: str, ex_date: str, action_type: str,
                             value: float,
-                            recorded_at: Optional[str] = None) -> int:
+                            recorded_at: Optional[str] = None,
+                            conn: Optional[sqlite3.Connection] = None) -> int:
     """A split ratio or a dividend per share, kept apart from the prices.
 
     Storing the action rather than a pre-adjusted price is what lets the
     adjustment in force on any past date be rebuilt. A vendor's adjusted close
     only tells you about today.
+
+    `conn` is for the recorder that writes an action and the bars it explains
+    in one go: passed a connection, this joins that transaction instead of
+    opening and committing one of its own.
     """
     if not (value > 0):
         # A zero split ratio divides by zero at read time and a negative one
@@ -417,13 +498,16 @@ def record_corporate_action(ticker: str, ex_date: str, action_type: str,
             f"{ticker} on {ex_date}. An unapplicable action recorded now is a "
             f"read that fails or silently skips it every time after")
 
-    with connect() as conn:
-        cur = conn.execute(
-            """INSERT OR IGNORE INTO corporate_action
-               (ex_date, ticker, action_type, value, recorded_at)
-               VALUES (?,?,?,?,?)""",
-            (ex_date, ticker, action_type, float(value),
-             recorded_at or _now()))
+    sql = """INSERT OR IGNORE INTO corporate_action
+             (ex_date, ticker, action_type, value, recorded_at)
+             VALUES (?,?,?,?,?)"""
+    params = (ex_date, ticker, action_type, float(value),
+              recorded_at or _now())
+    if conn is not None:
+        cur = conn.execute(sql, params)
+    else:
+        with connect() as own:
+            cur = own.execute(sql, params)
     # Reported like every other recorder here, so a caller can tell a
     # write from a rerun that found the row already present.
     return cur.rowcount or 0
@@ -441,6 +525,12 @@ def corporate_actions_as_of(ticker: str, as_of: str) -> List[Dict[str, Any]]:
 
 # ---------------------------------------------------------------- universe
 
+# The verdict, and only the verdict. The registrant's own details change under
+# us for reasons that are not disagreements -- SEC re-cases a company name
+# often enough that filing those would bury the one row that matters.
+_UNIVERSE_FIELDS = ("eligible", "exclusion_reason")
+
+
 def record_universe(as_of_date: str,
                     entries: Iterable[Dict[str, Any]],
                     recorded_at: Optional[str] = None) -> int:
@@ -450,6 +540,12 @@ def record_universe(as_of_date: str,
     qualify next quarter, and a study that only ever sees the survivors cannot
     tell the difference between a screen that worked and a screen that was
     never applied.
+
+    A rerun's verdict is filed the way a vendor's revised bar is: the first
+    answer is the one the scanner acted on and it stands, but the second one
+    was computed and disagreeing is a fact about the screen. The natural
+    response to a partial night is to run it again, on fuller history, so the
+    disagreement dropped silently here was usually the better answer.
     """
     stamp = recorded_at or _now()
     written = 0
@@ -463,8 +559,49 @@ def record_universe(as_of_date: str,
                 (as_of_date, e["ticker"], e.get("cik"), e.get("name"),
                  1 if e.get("eligible") else 0, e.get("exclusion_reason"),
                  stamp))
-            written += cur.rowcount
+            if cur.rowcount:
+                written += 1
+                continue
+
+            existing = conn.execute(
+                """SELECT eligible, exclusion_reason FROM universe_snapshot
+                   WHERE as_of_date = ? AND ticker = ?""",
+                (as_of_date, e["ticker"])).fetchone()
+            if existing is None:
+                # OR IGNORE swallows a constraint violation as readily as a
+                # duplicate key, and a row that neither inserted nor is
+                # already there was refused, not deduplicated.
+                raise ValueError(
+                    f"universe entry for {e['ticker']!r} on {as_of_date} was "
+                    f"neither written nor already present; the row was "
+                    f"refused: {e!r}")
+            incoming = {"eligible": 1 if e.get("eligible") else 0,
+                        "exclusion_reason": e.get("exclusion_reason")}
+            for field in _UNIVERSE_FIELDS:
+                before, after = existing[field], incoming[field]
+                if before == after:
+                    continue
+                conn.execute(
+                    """INSERT INTO universe_revision
+                       (as_of_date, ticker, field, old_value, new_value,
+                        noticed_at)
+                       VALUES (?,?,?,?,?,?)""",
+                    (as_of_date, e["ticker"], field,
+                     None if before is None else str(before),
+                     None if after is None else str(after), stamp))
     return written
+
+
+def universe_revisions(ticker: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Every time a rerun's screen disagreed with the verdict already filed."""
+    sql = "SELECT * FROM universe_revision"
+    params: tuple = ()
+    if ticker:
+        sql += " WHERE ticker = ?"
+        params = (ticker,)
+    sql += " ORDER BY noticed_at, rowid"
+    with connect() as conn:
+        return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
 
 def universe_as_of(as_of_date: str) -> List[Dict[str, Any]]:
@@ -494,6 +631,11 @@ def universe_as_of(as_of_date: str) -> List[Dict[str, Any]]:
 
 # ------------------------------------------------------------ announcements
 
+# The filing itself, as opposed to a vendor's reading of it. Ranked above
+# everything else when two jobs disagree about the same quarter.
+PRIMARY_SOURCE = "filing"
+
+
 def record_announcement(ticker: str, fiscal_period: str, announced_date: str,
                         timing: str = "unknown",
                         source: Optional[str] = None,
@@ -508,6 +650,13 @@ def record_announcement(ticker: str, fiscal_period: str, announced_date: str,
     so the move is on 14 August, and using the filing date instead measures
     -2.48% against a real -6.57%. It defaults to "unknown" rather than to a
     guess, because a guess here is a wrong number with no warning attached.
+
+    Two jobs write here: the nightly run, from the vendor's calendar, and the
+    backfill, from the Item 2.02 filing. They disagree about the same quarter
+    often enough to matter, and INSERT OR IGNORE alone keeps whichever ran
+    first rather than whichever is right. The filing is the primary source --
+    the vendor is reading that same 8-K and relabelling it -- so a filing row
+    replaces a vendor one, and nothing replaces a filing row.
     """
     with connect() as conn:
         cur = conn.execute(
@@ -517,6 +666,16 @@ def record_announcement(ticker: str, fiscal_period: str, announced_date: str,
                VALUES (?,?,?,?,?,?)""",
             (ticker, fiscal_period, announced_date, timing or "unknown",
              source, recorded_at or _now()))
+        if not cur.rowcount and source == PRIMARY_SOURCE:
+            cur = conn.execute(
+                """UPDATE announcement
+                   SET announced_date = ?, timing = ?, source = ?,
+                       recorded_at = ?
+                   WHERE ticker = ? AND fiscal_period = ?
+                     AND (source IS NULL OR source != ?)""",
+                (announced_date, timing or "unknown", source,
+                 recorded_at or _now(), ticker, fiscal_period,
+                 PRIMARY_SOURCE))
     # Reported like every other recorder here, so a caller can tell a
     # write from a rerun that found the row already present.
     return cur.rowcount or 0
@@ -821,6 +980,11 @@ def has_consensus_history(as_of: str) -> bool:
     return row is not None
 
 
+def _tri_state(value: Any) -> Optional[bool]:
+    """None stays None; anything else is a yes or a no."""
+    return None if value is None else bool(value)
+
+
 def record_paper_orders(as_of_date: str, candidates: Iterable[Dict[str, Any]],
                         rejected: Iterable[Dict[str, Any]] = (),
                         regime: Optional[str] = None,
@@ -841,12 +1005,17 @@ def record_paper_orders(as_of_date: str, candidates: Iterable[Dict[str, Any]],
             cur = conn.execute(
                 """INSERT OR IGNORE INTO paper_order
                    (as_of_date, ticker, accepted, reason, side, fiscal_period,
-                    sue, expected_edge_bps, cost_bps, net_edge_bps,
+                    sue, variant, drift_coefficient, drift_calibrated,
+                    seeded_quarters, recorded_quarters,
+                    expected_edge_bps, cost_bps, net_edge_bps,
                     target_dollars, participation, spread, spread_resolved,
                     rank, regime, gross_target, intended_session, recorded_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (as_of_date, row["ticker"], accepted, row.get("reason"),
                  row.get("side"), row.get("fiscal_period"), row.get("sue"),
+                 row.get("variant"), row.get("drift_coefficient"),
+                 _tri_state(row.get("drift_calibrated")),
+                 row.get("seeded_quarters"), row.get("recorded_quarters"),
                  row.get("expected_edge_bps"), row.get("cost_bps"),
                  row.get("net_edge_bps"), row.get("target_dollars"),
                  row.get("participation"), row.get("spread"),
@@ -872,7 +1041,12 @@ def paper_orders_as_of(as_of: str, accepted_only: bool = False
     with connect() as conn:
         rows = conn.execute(sql, params).fetchall()
     return [{**dict(r), "accepted": bool(r["accepted"]),
-             "spread_resolved": bool(r["spread_resolved"])} for r in rows]
+             "spread_resolved": bool(r["spread_resolved"]),
+             # Three states, not two. A row written before the column existed
+             # never said whether the coefficient was calibrated, and False is
+             # an answer to a question it was not asked.
+             "drift_calibrated": _tri_state(r["drift_calibrated"])}
+            for r in rows]
 
 
 def start_run(job: str, as_of_date: Optional[str] = None) -> int:
@@ -897,6 +1071,44 @@ def finish_run(rows_written: int = 0, status: str = "ok",
                SET finished_at = ?, rows_written = ?, status = ?, error = ?
                WHERE run_id = ?""",
             (_now(), rows_written, status, error, rid))
+
+
+def last_successful_run(job: str, as_of: str) -> Optional[str]:
+    """The most recent date `job` finished successfully for, on or before
+    `as_of`.
+
+    "Has anything been watching lately" is a question this log can answer and
+    that every reader of the store was guessing at. Only a finished run counts,
+    for the same reason `missing_days` says so: a crashed process leaves a
+    started row with no finish, and a failed fetch leaves a finish with no
+    data, and neither is coverage. 'closed' counts alongside 'ok' -- the
+    exchange shuts about ten weekdays a year and a holiday is not a gap.
+    """
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT MAX(as_of_date) AS last FROM run_log
+               WHERE job = ? AND status IN ('ok', 'closed')
+                 AND finished_at IS NOT NULL
+                 AND as_of_date IS NOT NULL AND as_of_date <= ?""",
+            (job, as_of)).fetchone()
+    return row["last"] if row and row["last"] else None
+
+
+def first_run(job: str) -> Optional[str]:
+    """The earliest date `job` ever ran for, or None if it never has.
+
+    What separates a gap from a store that did not exist yet. `missing_days`
+    answers over whatever range it is handed, so a fresh volume asked about the
+    last month reports twenty-two missed nights -- the same saturation that
+    made the gap report worth nothing in the first place. A failed or
+    unfinished run counts here: it is not coverage, but it is proof the
+    recorder was running.
+    """
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT MIN(as_of_date) AS first FROM run_log
+               WHERE job = ? AND as_of_date IS NOT NULL""", (job,)).fetchone()
+    return row["first"] if row and row["first"] else None
 
 
 def missing_days(job: str, start: str, end: str) -> List[str]:

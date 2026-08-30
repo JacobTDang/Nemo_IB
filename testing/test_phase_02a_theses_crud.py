@@ -60,8 +60,8 @@ def test_supersede_only_yields_one_active():
   old = get_thesis(t1)
   assert old['superseded_by'] == t2
   # Latest finds only t2
-  l = latest_thesis("TEST_MSFT")
-  assert l['thesis_id'] == t2
+  found = latest_thesis("TEST_MSFT")
+  assert found['thesis_id'] == t2
   print(f"PASS: supersede chains correctly (t1={t1} -> t2={t2})")
 
 
@@ -96,8 +96,8 @@ def test_info_recommendation_can_be_stored_explicitly():
     analysis_summary="factual lookup", key_assumptions=[], data_gaps=[],
     full_report_md="r"
   )
-  l = latest_thesis("TEST_KO")
-  assert l is not None and l['recommendation'] == 'INFO'
+  found = latest_thesis("TEST_KO")
+  assert found is not None and found['recommendation'] == 'INFO'
   print("PASS: INFO thesis storable when persisted explicitly")
 
 
@@ -108,10 +108,10 @@ def test_ticker_normalization_to_upper():
                      analysis_summary="s", key_assumptions=[], data_gaps=[],
                      full_report_md="r")
   # Latest lookup is case-insensitive
-  l = latest_thesis("test_jpm")
-  l2 = latest_thesis("TEST_JPM")
-  assert l and l2 and l['thesis_id'] == l2['thesis_id']
-  assert l['ticker'] == 'TEST_JPM', f"expected uppercase, got {l['ticker']}"
+  lower = latest_thesis("test_jpm")
+  upper = latest_thesis("TEST_JPM")
+  assert lower and upper and lower['thesis_id'] == upper['thesis_id']
+  assert lower['ticker'] == 'TEST_JPM', f"expected uppercase, got {lower['ticker']}"
   print("PASS: ticker is normalized to uppercase on insert and lookup")
 
 

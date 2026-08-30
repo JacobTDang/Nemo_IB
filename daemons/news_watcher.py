@@ -130,7 +130,9 @@ async def watch_finnhub_company_news(classifier: Materiality_Classifier):
           "symbol": ticker,
           "from": start.strftime("%Y-%m-%d"),
           "to": end.strftime("%Y-%m-%d"),
-          "token": client._api_key,
+          # FinnhubClient holds the key as a Secret so it cannot be rendered;
+          # revealed here at the point of use, never bound to a name.
+          "token": client._api_key.reveal(),
         }
         import aiohttp
         async with aiohttp.ClientSession() as session:
@@ -237,7 +239,7 @@ async def watch_finnhub_general(classifier: Materiality_Classifier):
   while _running:
     try:
       url = "https://finnhub.io/api/v1/news"
-      params = {"category": "general", "token": client._api_key}
+      params = {"category": "general", "token": client._api_key.reveal()}
       import aiohttp
       async with aiohttp.ClientSession() as session:
         async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:

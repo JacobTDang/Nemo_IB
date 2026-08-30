@@ -4,6 +4,11 @@ import httpx
 import os, sys, json, re, time
 from dotenv import load_dotenv
 
+# openrouter_template imports *this* module for CredentialsMissing, which is why
+# Secret was mirrored here rather than imported from there. The shared home
+# imports nothing at all, so there is no cycle to make.
+from common.secret import Secret
+
 # Fix Windows console encoding — always use 'replace' to handle emojis/unicode
 if hasattr(sys.stdout, 'reconfigure'):
   sys.stdout.reconfigure(errors='replace')
@@ -49,12 +54,28 @@ class GroqModel:
     self.model_name = model_name
     self.conversatoin_history = []  # Typo kept for codebase consistency
 
-  def _resolve_api_key(self) -> str:
-    api_key = os.getenv(self._api_key_env)
-    if not api_key:
+  def _resolve_credential(self) -> Secret:
+    """The configured key, wrapped. See Secret for why it is never bare.
+
+    Building the Secret in the same expression that reads the environment is
+    deliberate: an intermediate `api_key = os.getenv(...)` would put the raw
+    value in this frame, and returning a bare `str` would put it in every
+    caller's frame as well.
+    """
+    credential = Secret(os.getenv(self._api_key_env) or "")
+    if not credential:
       raise CredentialsMissing(
         f"{self._api_key_env} not found in environment. Add it to your .env file.")
-    return api_key
+    return credential
+
+  def _scrub(self, text: str) -> str:
+    """Provider text with the configured key taken back out.
+
+    Reads the environment again rather than calling _resolve_credential:
+    every caller is inside an `except` block, and raising CredentialsMissing
+    there would replace the provider's diagnosis with an unrelated one.
+    """
+    return Secret(os.getenv(self._api_key_env) or "").scrub(text)
 
   def validate_credentials(self) -> None:
     """Fail fast at process start. Daemon entrypoints call this on boot so a
@@ -64,13 +85,13 @@ class GroqModel:
     deterministic methods -- prompt builders, guards, scoring maths -- that
     never touch the API, and validating in __init__ held those hostage to a
     credential they never use."""
-    self._resolve_api_key()
+    self._resolve_credential()
 
   @property
   def client(self) -> OpenAI:
     if self._client is None:
       self._client = OpenAI(
-        api_key=self._resolve_api_key(),
+        api_key=self._resolve_credential().reveal(),
         base_url="https://api.groq.com/openai/v1",
         timeout=self.CLIENT_TIMEOUT
       )
@@ -177,7 +198,8 @@ class GroqModel:
         error_type = type(e).__name__
         # 413 = request too large for Groq TPM limit — no Groq model will handle it
         if isinstance(e, APIStatusError) and e.status_code == 413:
-          print(f"\n[Request too large for Groq] {e}. Skipping to Ollama.", file=sys.stderr, flush=True)
+          print(f"\n[Request too large for Groq] {self._scrub(str(e))}. "
+                f"Skipping to Ollama.", file=sys.stderr, flush=True)
           break  # Falls through Groq fallback to Ollama
         # Partial stream: skip retries, go to fallback
         if assistant_response or thinking_started:
@@ -187,8 +209,9 @@ class GroqModel:
         if attempt == self.MAX_RETRIES:
           break
         delay = self.RETRY_BASE_DELAY * (2 ** (attempt - 1))
-        print(f"\n[Retry {attempt}/{self.MAX_RETRIES}] {error_type}: {e}. "
-              f"Retrying in {delay}s...", file=sys.stderr, flush=True)
+        print(f"\n[Retry {attempt}/{self.MAX_RETRIES}] {error_type}: "
+              f"{self._scrub(str(e))}. Retrying in {delay}s...",
+              file=sys.stderr, flush=True)
         time.sleep(delay)
 
     # Primary exhausted — try fallback (same client, different model)
@@ -218,8 +241,9 @@ class GroqModel:
             break
           delay = self.RETRY_BASE_DELAY * (2 ** (attempt - 1))
           error_type = type(e).__name__
-          print(f"\n[Fallback retry {attempt}/{self.MAX_RETRIES}] {error_type}: {e}. "
-                f"Retrying in {delay}s...", file=sys.stderr, flush=True)
+          print(f"\n[Fallback retry {attempt}/{self.MAX_RETRIES}] {error_type}: "
+                f"{self._scrub(str(e))}. Retrying in {delay}s...",
+                file=sys.stderr, flush=True)
           time.sleep(delay)
 
     # Both Groq models exhausted — try Ollama local as last resort

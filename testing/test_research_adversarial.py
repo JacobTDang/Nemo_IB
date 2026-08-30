@@ -839,9 +839,11 @@ def test_the_bootstrap_records_the_index_history_too(store, monkeypatch):
 
     daily_job.bootstrap_history(["AAA"], as_of=days[-1])
 
-    # Like for like against an ordinary name: the bootstrap window is
-    # end-exclusive, so neither gets the as_of session itself -- the nightly
-    # pass records that one.
+    # Like for like against an ordinary name. The assertion is a count
+    # against a count, so it holds whether or not the window reaches the
+    # as_of session -- and it now does: bootstrap_history ends at
+    # max(as_of, today) + 1 because a newcomer's first rotation night is
+    # that call, and stopping a session short left a permanent hole.
     got = pit_store.bars_as_of(scanner.REGIME_TICKER, days[-1])
     peer = pit_store.bars_as_of("AAA", days[-1])
     assert peer, "the fixture recorded nothing at all"

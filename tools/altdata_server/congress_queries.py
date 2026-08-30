@@ -36,7 +36,13 @@ _INCOMPLETE = ("This is not the complete record: {unparsed} of {total} filings "
 
 _BRACKET_NOTE = ("Amounts are the brackets the filer disclosed. Totals are the "
                  "sum of the lower bounds and the sum of the upper bounds; "
-                 "there is no midpoint, because the filings do not contain one.")
+                 "there is no midpoint, because the filings do not contain one. "
+                 "A row disclosed in the top, open-ended band removes the upper "
+                 "bound from the total, because it has none itself. A row whose "
+                 "ceiling could not be read is different: it is counted in "
+                 "ceiling_unknown_count and contributes its floor to the lower "
+                 "bound and nothing to the upper, so the upper bound understates "
+                 "by whatever those rows were worth.")
 
 
 def _rows(conn: sqlite3.Connection, sql: str, params: tuple) -> List[Dict[str, Any]]:
@@ -53,6 +59,35 @@ def _rows(conn: sqlite3.Connection, sql: str, params: tuple) -> List[Dict[str, A
 # those as unbounded let 24 broken rows erase `amount_max_total` for every
 # result set they touched.
 _OPEN_ENDED_FLOORS = frozenset({1_000_000, 50_000_000})
+
+_FLOORS_SQL = ", ".join(str(floor) for floor in sorted(_OPEN_ENDED_FLOORS))
+
+
+def _open_ended_sql(low: str, high: str) -> str:
+    """"No ceiling was disclosed", as a SQL predicate.
+
+    The narrow rule below was written in Python and then never reached: every
+    live aggregate is a SQL aggregate, and each of them spelled the test as
+    "floor not null and ceiling null". That is the broad rule the comment
+    above says was fixed, so one repaired row went on erasing
+    `amount_max_total` for every result set it touched (issue #48). The rule
+    is expressed once here and used by both.
+    """
+    return f"{low} IN ({_FLOORS_SQL}) AND {high} IS NULL"
+
+
+def _ceiling_unknown_sql(low: str, high: str) -> str:
+    """"There was a ceiling and we lost it", as a SQL predicate.
+
+    A mid-bracket floor with no ceiling is a parse failure, not an unbounded
+    disclosure. `_sane_transaction` and `repair_impossible_rows` deliberately
+    produce such rows when a filed ceiling sits below its own floor, and
+    `parse_amount_range` produces one from a stray '+'. They are counted so a
+    reader knows the upper bound is short, rather than spending the whole
+    set's ceiling.
+    """
+    return (f"{low} IS NOT NULL AND {high} IS NULL "
+            f"AND {low} NOT IN ({_FLOORS_SQL})")
 
 
 def _open_ended(rows: List[Dict[str, Any]], low: str, high: str) -> bool:
@@ -85,6 +120,19 @@ def _bracketed_total(low_sum: int, high_sum: Optional[int]) -> Optional[int]:
     return high_sum
 
 
+def _ceiling_unknown(rows: List[Dict[str, Any]], low: str, high: str) -> int:
+    """Rows whose ceiling was lost rather than never disclosed.
+
+    The Python mirror of `_ceiling_unknown_sql`, so the no-match default and
+    the real aggregate carry the same keys. A caller that reads
+    `ceiling_unknown_count` must not find it missing because the query
+    happened to match nobody.
+    """
+    return sum(1 for r in rows
+               if r.get(low) is not None and r.get(high) is None
+               and r.get(low) not in _OPEN_ENDED_FLOORS)
+
+
 def _totals(transactions: List[Dict[str, Any]]) -> Dict[str, Any]:
     """A bracketed total, plus the direction counts that give it meaning."""
     unbounded = _open_ended(transactions, "amount_min", "amount_max")
@@ -95,8 +143,10 @@ def _totals(transactions: List[Dict[str, Any]]) -> Dict[str, Any]:
         "amount_min_total": low_total,
         "amount_max_total": _bracketed_total(low_total, high_total),
         "open_ended_count": sum(1 for t in transactions
-                                if t.get("amount_min") is not None
+                                if t.get("amount_min") in _OPEN_ENDED_FLOORS
                                 and t.get("amount_max") is None),
+        "ceiling_unknown_count": _ceiling_unknown(transactions, "amount_min",
+                                                  "amount_max"),
         "purchase_count": sum(1 for t in transactions
                               if (t.get("transaction_type") or "").startswith("purchase")),
         "sale_count": sum(1 for t in transactions
@@ -138,13 +188,17 @@ def _transaction_aggregate(conn: sqlite3.Connection, where: str,
     So the numbers come from the same WHERE clause as the row list and are
     computed independently of how many rows that list is allowed to carry.
     """
+    open_ended = _open_ended_sql("t.amount_min", "t.amount_max")
+    ceiling_unknown = _ceiling_unknown_sql("t.amount_min", "t.amount_max")
     row = _rows(conn, f"""
         SELECT COUNT(*)                            AS row_count,
                COUNT(DISTINCT m.member_id)         AS member_count,
                SUM(COALESCE(t.amount_min, 0))      AS amount_min_total,
                SUM(COALESCE(t.amount_max, 0))      AS amount_max_total,
-               SUM(CASE WHEN t.amount_min IS NOT NULL AND t.amount_max IS NULL
-                        THEN 1 ELSE 0 END)         AS open_ended_count,
+               SUM(CASE WHEN {open_ended} THEN 1 ELSE 0 END)
+                                                  AS open_ended_count,
+               SUM(CASE WHEN {ceiling_unknown} THEN 1 ELSE 0 END)
+                                                  AS ceiling_unknown_count,
                SUM(CASE WHEN t.transaction_type LIKE 'purchase%'
                         THEN 1 ELSE 0 END)         AS purchase_count,
                SUM(CASE WHEN t.transaction_type LIKE 'sale%'
@@ -155,18 +209,26 @@ def _transaction_aggregate(conn: sqlite3.Connection, where: str,
         JOIN filings f ON f.filing_id = t.filing_id
         LEFT JOIN members m ON m.member_id = t.member_id
         WHERE {where}""", params)[0]
+    low_total = row["amount_min_total"] or 0
     return {
         "row_count": row["row_count"] or 0,
         "member_count": row["member_count"] or 0,
         "totals": {
-            "amount_min_total": row["amount_min_total"] or 0,
+            "amount_min_total": low_total,
             # None, not a smaller number: SUM(COALESCE(max, 0)) closes an
             # open-ended bracket at zero, which is how a maximum once landed
             # below its own minimum. With such a row in the sum the disclosure
             # states no ceiling, so neither does the total.
+            #
+            # A row whose ceiling was merely lost does not do that. It is
+            # counted beside the total instead, because dropping the ceiling
+            # for the whole set on account of one unreadable row throws away
+            # every bound that was read correctly. `_bracketed_total` still
+            # refuses a sum those rows have driven below its own floor.
             "amount_max_total": None if row["open_ended_count"]
-            else (row["amount_max_total"] or 0),
+            else _bracketed_total(low_total, row["amount_max_total"] or 0),
             "open_ended_count": row["open_ended_count"] or 0,
+            "ceiling_unknown_count": row["ceiling_unknown_count"] or 0,
             "purchase_count": row["purchase_count"] or 0,
             "sale_count": row["sale_count"] or 0,
             "exchange_count": row["exchange_count"] or 0,
@@ -182,6 +244,8 @@ def _holding_aggregate(conn: sqlite3.Connection, where: str,
     counted, never summed as zero -- a holding nobody could value and a
     holding worth nothing are different disclosures.
     """
+    open_ended = _open_ended_sql("h.value_min", "h.value_max")
+    ceiling_unknown = _ceiling_unknown_sql("h.value_min", "h.value_max")
     row = _rows(conn, f"""
         SELECT COUNT(*)                            AS row_count,
                COUNT(DISTINCT m.member_id)         AS member_count,
@@ -193,21 +257,25 @@ def _holding_aggregate(conn: sqlite3.Connection, where: str,
                         THEN 1 ELSE 0 END)         AS priced_count,
                SUM(CASE WHEN h.value_min IS NULL
                         THEN 1 ELSE 0 END)         AS unpriced_count,
-               SUM(CASE WHEN h.value_min IS NOT NULL AND h.value_max IS NULL
-                        THEN 1 ELSE 0 END)         AS open_ended_count
+               SUM(CASE WHEN {open_ended} THEN 1 ELSE 0 END)
+                                                   AS open_ended_count,
+               SUM(CASE WHEN {ceiling_unknown} THEN 1 ELSE 0 END)
+                                                   AS ceiling_unknown_count
         FROM holdings h
         LEFT JOIN members m ON m.member_id = h.member_id
         WHERE {where}""", params)[0]
+    low_total = row["value_min_total"] or 0
     return {
         "row_count": row["row_count"] or 0,
         "member_count": row["member_count"] or 0,
         "totals": {
-            "value_min_total": row["value_min_total"] or 0,
+            "value_min_total": low_total,
             "value_max_total": None if row["open_ended_count"]
-            else (row["value_max_total"] or 0),
+            else _bracketed_total(low_total, row["value_max_total"] or 0),
             "priced_count": row["priced_count"] or 0,
             "unpriced_count": row["unpriced_count"] or 0,
             "open_ended_count": row["open_ended_count"] or 0,
+            "ceiling_unknown_count": row["ceiling_unknown_count"] or 0,
         },
     }
 
@@ -226,13 +294,17 @@ def _aggregate_by_member(conn: sqlite3.Connection, table: str,
     if not member_ids:
         return {}
     placeholders = ",".join("?" * len(member_ids))
+    open_ended = _open_ended_sql(f"x.{low}", f"x.{high}")
+    ceiling_unknown = _ceiling_unknown_sql(f"x.{low}", f"x.{high}")
     rows = _rows(conn, f"""
         SELECT x.member_id,
                COUNT(*)                       AS count,
                SUM(COALESCE(x.{low}, 0))      AS low_total,
                SUM(COALESCE(x.{high}, 0))     AS high_total,
-               SUM(CASE WHEN x.{low} IS NOT NULL AND x.{high} IS NULL
-                        THEN 1 ELSE 0 END)    AS open_ended_count,
+               SUM(CASE WHEN {open_ended} THEN 1 ELSE 0 END)
+                                              AS open_ended_count,
+               SUM(CASE WHEN {ceiling_unknown} THEN 1 ELSE 0 END)
+                                              AS ceiling_unknown_count,
                SUM(CASE WHEN x.{low} IS NULL THEN 1 ELSE 0 END) AS unpriced_count
         FROM {table} x
         WHERE x.member_id IN ({placeholders}) {date_clause}
@@ -276,14 +348,17 @@ def _per_member(matched: List[Dict[str, Any]],
     for member in matched:
         agg = aggregate.get(member["member_id"], {})
         unbounded = bool(agg.get("open_ended_count"))
+        low_total = agg.get("low_total", 0) or 0
         out.append({
             "member": member["full_name"], "chamber": member["chamber"],
             "state": member["state"], "district": member["district"],
             "count": agg.get("count", 0),
             "totals": {
-                f"{low_key}_total": agg.get("low_total", 0) or 0,
-                f"{high_key}_total": None if unbounded else (agg.get("high_total", 0) or 0),
+                f"{low_key}_total": low_total,
+                f"{high_key}_total": None if unbounded else _bracketed_total(
+                    low_total, agg.get("high_total", 0) or 0),
                 "open_ended_count": agg.get("open_ended_count", 0) or 0,
+                "ceiling_unknown_count": agg.get("ceiling_unknown_count", 0) or 0,
                 "unpriced_count": agg.get("unpriced_count", 0) or 0,
             }})
     return out
@@ -291,15 +366,22 @@ def _per_member(matched: List[Dict[str, Any]],
 
 # ------------------------------------------------------------------ by ticker
 
-def _uncap_open_ended(rows: List[Dict[str, Any]], key: str) -> List[Dict[str, Any]]:
+def _uncap_open_ended(rows: List[Dict[str, Any]], low_key: str,
+                      high_key: str) -> List[Dict[str, Any]]:
     """SQL SUM cannot express "no ceiling"; COALESCE(max, 0) closes it at zero.
 
     An aggregate containing an open-ended bracket has no upper bound, so the
     ceiling is dropped rather than reported as a figure below its own floor.
+
+    A row whose ceiling was merely lost is not that, and no longer drops the
+    ceiling for the whole leaderboard row -- but it still contributes zero to
+    the sum, so the inversion it can cause is refused here by the same rule
+    that governs every other total.
     """
     for row in rows:
-        if row.get("open_ended_count"):
-            row[key] = None
+        low = row.get(low_key) or 0
+        row[high_key] = None if row.get("open_ended_count") else _bracketed_total(
+            low, row.get(high_key) or 0)
     return rows
 
 
@@ -478,9 +560,10 @@ def most_traded_tickers(since: Optional[str] = None, chamber: Optional[str] = No
                    COUNT(DISTINCT t.member_id)     AS member_count,
                    SUM(COALESCE(t.amount_min, 0))  AS amount_min_total,
                    SUM(COALESCE(t.amount_max, 0))  AS amount_max_total,
-                   SUM(CASE WHEN t.amount_min IS NOT NULL
-                             AND t.amount_max IS NULL
+                   SUM(CASE WHEN {_open_ended_sql("t.amount_min", "t.amount_max")}
                             THEN 1 ELSE 0 END)     AS open_ended_count,
+                   SUM(CASE WHEN {_ceiling_unknown_sql("t.amount_min", "t.amount_max")}
+                            THEN 1 ELSE 0 END)     AS ceiling_unknown_count,
                    SUM(CASE WHEN t.transaction_type LIKE 'purchase%'
                             THEN 1 ELSE 0 END)     AS purchase_count,
                    SUM(CASE WHEN t.transaction_type LIKE 'sale%'
@@ -491,7 +574,7 @@ def most_traded_tickers(since: Optional[str] = None, chamber: Optional[str] = No
             GROUP BY t.ticker
             ORDER BY transaction_count DESC, member_count DESC
             LIMIT ?""", (*params, limit))
-    _uncap_open_ended(tickers, "amount_max_total")
+    _uncap_open_ended(tickers, "amount_min_total", "amount_max_total")
 
     coverage = store.coverage()
     return {
@@ -518,9 +601,10 @@ def most_active_members(since: Optional[str] = None, limit: int = 25
                    COUNT(DISTINCT t.ticker)       AS distinct_tickers,
                    SUM(COALESCE(t.amount_min, 0)) AS amount_min_total,
                    SUM(COALESCE(t.amount_max, 0)) AS amount_max_total,
-                   SUM(CASE WHEN t.amount_min IS NOT NULL
-                             AND t.amount_max IS NULL
-                            THEN 1 ELSE 0 END)    AS open_ended_count
+                   SUM(CASE WHEN {_open_ended_sql("t.amount_min", "t.amount_max")}
+                            THEN 1 ELSE 0 END)    AS open_ended_count,
+                   SUM(CASE WHEN {_ceiling_unknown_sql("t.amount_min", "t.amount_max")}
+                            THEN 1 ELSE 0 END)    AS ceiling_unknown_count
             FROM transactions t
             JOIN filings f ON f.filing_id = t.filing_id
             JOIN members m ON m.member_id = t.member_id
@@ -528,7 +612,7 @@ def most_active_members(since: Optional[str] = None, limit: int = 25
             GROUP BY t.member_id
             ORDER BY transaction_count DESC
             LIMIT ?""", (*params, limit))
-    _uncap_open_ended(members, "amount_max_total")
+    _uncap_open_ended(members, "amount_min_total", "amount_max_total")
 
     coverage = store.coverage()
     return {"success": True, "query": {"since": since, "limit": limit},
@@ -568,7 +652,11 @@ def _holding_totals(holdings: List[Dict[str, Any]]) -> Dict[str, Any]:
         # Never folded into the totals: a holding nobody could price and a
         # holding worth nothing are different disclosures.
         "unpriced_count": len(holdings) - len(priced),
-        "open_ended_count": sum(1 for h in priced if h.get("value_max") is None),
+        "open_ended_count": sum(1 for h in priced
+                                if h.get("value_min") in _OPEN_ENDED_FLOORS
+                                and h.get("value_max") is None),
+        "ceiling_unknown_count": _ceiling_unknown(priced, "value_min",
+                                                  "value_max"),
     }
 
 

@@ -249,7 +249,7 @@ def test_the_t_statistic_is_the_mean_over_the_standard_error():
 
 def test_the_scaled_surprise_is_the_beat_over_the_price(store):
     """A 30 cent beat on a $60 stock is 0.005, which is 50 basis points."""
-    for i in range(10):
+    for i in range(sue_cs.MIN_COHORT):
         store.record_consensus("2026-03-02", f"N{i}", "2026Q1",
                                eps_estimate=1.0, eps_actual=1.0 + i * 0.01,
                                recorded_at="2026-03-02T21:00:00Z")
@@ -268,21 +268,24 @@ def test_the_scaled_surprise_is_the_beat_over_the_price(store):
     assert out["surprise"] == pytest.approx(0.30)
     assert out["scaled_surprise"] == pytest.approx(0.005)
     assert out["scaled_surprise"] * 1e4 == pytest.approx(50.0)
-    assert out["percentile"] == pytest.approx(1.0)
+    # The largest of twenty-one, on a midrank: (20 + 0.5) / 21. A midrank never
+    # reaches 1.0, because the name itself is half of its own rank.
+    assert out["percentile"] == pytest.approx(20.5 / 21)
 
 
 def test_the_median_of_a_symmetric_cohort_sits_at_the_middle(store):
-    for i in range(11):
+    half = sue_cs.MIN_COHORT // 2
+    for i in range(2 * half + 1):
         store.record_consensus("2026-03-02", f"N{i}", "2026Q1",
                                eps_estimate=1.0,
-                               eps_actual=1.0 + (i - 5) * 0.01,
+                               eps_actual=1.0 + (i - half) * 0.01,
                                recorded_at="2026-03-02T21:00:00Z")
         store.record_bars(f"N{i}", [{"trade_date": "2026-03-02", "open": 100.0,
                                      "high": 100.0, "low": 100.0,
                                      "close": 100.0, "volume": 1}],
                           recorded_at="2026-03-02T21:00:00Z")
 
-    middle = sue_cs.surprise_rank("N5", as_of="2026-03-03")
+    middle = sue_cs.surprise_rank(f"N{half}", as_of="2026-03-03")
     assert middle["surprise"] == pytest.approx(0.0)
     assert middle["percentile"] == pytest.approx(0.5)
     assert middle["robust_z"] == pytest.approx(0.0)

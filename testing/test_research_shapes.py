@@ -135,6 +135,8 @@ def test_seeding_twice_writes_nothing_the_second_time(store, monkeypatch):
         {"year": 2026, "quarter": 1, "estimate_eps": 1.0, "actual_eps": 1.2}])
     monkeypatch.setattr(seed_consensus, "_filing_dates", lambda t, as_of=None: {
         "2026Q1": {"period_end": "2026-03-31", "known_at": "2026-04-30"}})
+    monkeypatch.setattr(seed_consensus, "_announcements",
+                        lambda t, as_of=None, **kw: {})
 
     assert seed_consensus.seed(["AAA"])["written"] == 2
     assert seed_consensus.seed(["AAA"])["written"] == 0

@@ -459,7 +459,7 @@ class AlpacaServer:
       local_error = f"{type(e).__name__}: {e}"
 
     broker_tickers = {b["symbol"] for b in broker_positions}
-    local_tickers = {l["ticker"] for l in local_positions}
+    local_tickers = {pos["ticker"] for pos in local_positions}
     missing_locally = sorted(broker_tickers - local_tickers)
     missing_at_broker = sorted(local_tickers - broker_tickers)
     discrepancies = (
