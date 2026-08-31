@@ -232,7 +232,8 @@ def test_the_filed_order_keeps_the_rate_it_was_charged(ready, store,
 def _filed(store, side, sue, entry_day, cost_bps=0.0):
     store.record_paper_orders(
         DAYS[DAYS.index(entry_day) - 1],
-        [{"ticker": "MISS", "side": side, "sue": sue,
+        [{"ticker": "MISS", "side": side, "sue": sue, "variant": "ts",
+          "strength": abs(sue),
           "fiscal_period": "2026Q1", "expected_edge_bps": abs(sue) * 15,
           "cost_bps": cost_bps, "net_edge_bps": abs(sue) * 15 - cost_bps,
           "target_dollars": 5000.0, "intended_session": entry_day, "rank": 1}],
@@ -286,7 +287,8 @@ def test_a_short_and_a_long_that_both_worked_agree_on_the_coefficient(store):
     _filed(store, "short", -2.0, DAYS[1])
     store.record_paper_orders(
         DAYS[0],
-        [{"ticker": "BEAT", "side": "long", "sue": 2.0,
+        [{"ticker": "BEAT", "side": "long", "sue": 2.0, "variant": "ts",
+          "strength": 2.0,
           "fiscal_period": "2026Q1", "expected_edge_bps": 30.0,
           "cost_bps": 0.0, "net_edge_bps": 30.0, "target_dollars": 5000.0,
           "intended_session": DAYS[1], "rank": 2}],

@@ -290,6 +290,10 @@ _MIGRATIONS = (
     ("paper_order", "drift_calibrated", "INTEGER"),
     ("paper_order", "seeded_quarters", "INTEGER"),
     ("paper_order", "recorded_quarters", "INTEGER"),
+    # The quantity the drift coefficient was multiplied by. Not derivable from
+    # `sue` afterwards without knowing the variant, and wrong by 2x if the
+    # variant is guessed.
+    ("paper_order", "strength", "REAL"),
     # What the short leg was charged to stay open, the rate it came from and
     # who quoted it. A book spanning a change of borrow source is a book of
     # rows priced differently with nothing on the row saying so.
@@ -1092,16 +1096,19 @@ def record_paper_orders(as_of_date: str, candidates: Iterable[Dict[str, Any]],
             cur = conn.execute(
                 """INSERT OR IGNORE INTO paper_order
                    (as_of_date, ticker, accepted, reason, side, fiscal_period,
-                    sue, variant, drift_coefficient, drift_calibrated,
+                    sue, variant, strength, drift_coefficient,
+                    drift_calibrated,
                     seeded_quarters, recorded_quarters,
                     expected_edge_bps, cost_bps, borrow_bps, borrow_rate,
                     borrow_source, net_edge_bps,
                     target_dollars, participation, spread, spread_resolved,
                     rank, regime, gross_target, intended_session, recorded_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+                           ?,?,?)""",
                 (as_of_date, row["ticker"], accepted, row.get("reason"),
                  row.get("side"), row.get("fiscal_period"), row.get("sue"),
-                 row.get("variant"), row.get("drift_coefficient"),
+                 row.get("variant"), row.get("strength"),
+                 row.get("drift_coefficient"),
                  _tri_state(row.get("drift_calibrated")),
                  row.get("seeded_quarters"), row.get("recorded_quarters"),
                  row.get("expected_edge_bps"), row.get("cost_bps"),

@@ -957,6 +957,51 @@ def test_a_short_is_refused_when_its_borrow_cannot_be_priced(liquid_universe,
     assert out["borrow_unpriced"] == 1
 
 
+def test_the_candidate_records_the_quantity_it_was_priced_on(liquid_universe,
+                                                             monkeypatch):
+    """`sue` holds percentile-0.5 for this variant and the edge is priced off
+    twice that. Without the multiplier on the row, the scorer had to re-derive
+    it from a column whose meaning depends on the variant -- and got it wrong
+    by a factor of two."""
+    _reported(liquid_universe, "AAA", "2026Q1", "2026-03-02")
+    monkeypatch.setattr(scanner, "SIGNAL_VARIANT", "cs")
+    monkeypatch.setattr(scanner, "_signal_for", lambda t, a: _cs_signal(1.0, t))
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0010))
+
+    c = scanner.scan(as_of="2026-03-03")["candidates"][0]
+
+    assert c["strength"] == pytest.approx(abs(c["sue"]) * 2.0)
+    assert c["expected_edge_bps"] == pytest.approx(
+        c["strength"] * scanner.DRIFT_BPS_PER_TAIL)
+
+
+def test_a_time_series_candidate_is_priced_on_its_own_sigma(liquid_universe,
+                                                            monkeypatch):
+    _reported(liquid_universe, "AAA", "2026Q1", "2026-03-02")
+    monkeypatch.setattr(scanner, "_signal_for", lambda t, a: _signal(t, 2.5))
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0010))
+
+    c = scanner.scan(as_of="2026-03-03")["candidates"][0]
+
+    assert c["strength"] == pytest.approx(2.5)
+    assert c["expected_edge_bps"] == pytest.approx(
+        2.5 * scanner.DRIFT_BPS_PER_SUE)
+
+
+def test_the_filed_order_keeps_the_quantity_it_was_priced_on(liquid_universe,
+                                                             monkeypatch):
+    _reported(liquid_universe, "AAA", "2026Q1", "2026-03-02")
+    monkeypatch.setattr(scanner, "SIGNAL_VARIANT", "cs")
+    monkeypatch.setattr(scanner, "_signal_for", lambda t, a: _cs_signal(1.0, t))
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0010))
+
+    scanner.record_scan(as_of="2026-03-03")
+    filed = [o for o in liquid_universe.paper_orders_as_of("2026-03-03")
+             if o["accepted"]][0]
+
+    assert filed["strength"] == pytest.approx(abs(filed["sue"]) * 2.0)
+
+
 def test_the_edge_comes_from_its_own_coefficient(liquid_universe, monkeypatch):
     """Not from DRIFT_BPS_PER_SUE, which prices a sigma. A rank is a different
     quantity and pricing it with the surprise coefficient would silently make
