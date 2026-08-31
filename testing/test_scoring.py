@@ -81,6 +81,7 @@ def _order(store, ticker="AAA", side="long", sue=3.0, cost_bps=10.0,
     store.record_paper_orders(
         decided,
         [{"ticker": ticker, "side": side, "sue": sue, "fiscal_period": "2026Q1",
+          "variant": "ts", "strength": abs(sue),
           "expected_edge_bps": abs(sue) * 15.0, "cost_bps": cost_bps,
           "borrow_bps": borrow_bps,
           "net_edge_bps": abs(sue) * 15.0 - cost_bps,
@@ -334,7 +335,7 @@ def test_a_horizon_longer_than_the_record_stays_pending(store):
 def _scored(nets, sues=None):
     sues = sues or [2.0] * len(nets)
     return [{"ticker": f"T{i}", "sue": s, "net_bps": n, "gross_bps": n,
-             "cost_bps": 0.0}
+             "cost_bps": 0.0, "variant": "ts", "strength": abs(s)}
             for i, (n, s) in enumerate(zip(nets, sues))]
 
 
@@ -673,6 +674,201 @@ def _mixed(nets, variants):
     return [{"ticker": f"T{i}", "sue": 2.0, "net_bps": n, "gross_bps": n,
              "cost_bps": 0.0, "variant": v}
             for i, (n, v) in enumerate(zip(nets, variants))]
+
+
+def _priced(n, strengths, grosses, variant="ts", nets=None):
+    """Rows as the scanner now files them: `strength` is the quantity it
+    multiplied by the coefficient, kept apart from the `sue` column whose
+    meaning depends on the variant."""
+    nets = nets if nets is not None else grosses
+    return [{"ticker": f"T{i}", "sue": strengths[i % len(strengths)],
+             "strength": strengths[i % len(strengths)],
+             "gross_bps": grosses[i % len(grosses)],
+             "net_bps": nets[i % len(nets)],
+             "cost_bps": 0.0, "variant": variant} for i in range(n)]
+
+
+# --- the coefficient prices what the scanner multiplied ---------------------
+
+def test_the_cross_sectional_coefficient_prices_a_tail_not_the_sue_column():
+    """`sue` holds percentile-0.5 for this variant and the scanner prices
+    twice that. Reporting gross/|sue| offered a coefficient exactly 2x the one
+    that could replace DRIFT_BPS_PER_TAIL."""
+    rows = [{"ticker": f"T{i}", "sue": 0.45, "strength": 0.90,
+             "gross_bps": 100.0, "net_bps": 100.0, "cost_bps": 0.0,
+             "variant": "cs"} for i in range(40)]
+
+    out = scoring._summarise(rows)
+
+    assert out["drift_bps_per_tail"] == pytest.approx(100.0 / 0.90)
+    assert out["drift_bps_per_sue"] is None, (
+        "a tail coefficient was offered under the name of a sigma one")
+    assert out["drift_bps_prices"] == "tail"
+
+
+def test_the_time_series_coefficient_still_prices_a_sigma():
+    out = scoring._summarise(_priced(40, [2.0], [400.0], variant="ts"))
+
+    assert out["drift_bps_per_sue"] == pytest.approx(200.0)
+    assert out["drift_bps_per_tail"] is None
+    assert out["drift_bps_prices"] == "sigma"
+
+
+def test_a_row_filed_before_strength_existed_is_read_from_its_variant():
+    """The column is new; rows already in the book do not have it. The variant
+    says exactly what the scanner multiplied, so it is derived rather than
+    guessed -- and never read off the sue column alone."""
+    old = [{"ticker": f"T{i}", "sue": 0.45, "gross_bps": 100.0,
+            "net_bps": 100.0, "cost_bps": 0.0, "variant": "cs"}
+           for i in range(40)]
+
+    assert scoring._summarise(old)["drift_bps_per_tail"] == pytest.approx(
+        100.0 / 0.90)
+
+
+def test_a_row_with_no_variant_is_left_out_of_the_coefficient():
+    unknown = [{"ticker": f"T{i}", "sue": 2.0, "gross_bps": 400.0,
+                "net_bps": 400.0, "cost_bps": 0.0, "variant": None}
+               for i in range(40)]
+
+    out = scoring._summarise(unknown)
+
+    assert out["drift_bps_per_sue"] is None
+    assert out["drift_bps_per_tail"] is None
+
+
+# --- and it is a slope, with an error bar -----------------------------------
+
+def test_the_coefficient_is_a_slope_through_the_origin_not_a_mean_of_ratios():
+    """Averaging per-trade ratios weights a |SUE| of 1 the same as a |SUE| of
+    5, which puts the most weight on the noisiest observations. Simulated at
+    the declared 15 it is about 48% noisier than the slope at every sample
+    size."""
+    rows = _priced(40, [1.0, 5.0], [100.0, 100.0])
+
+    out = scoring._summarise(rows)
+
+    # mean of ratios would be (100/1 + 100/5)/2 = 60.
+    assert out["drift_bps_per_sue"] == pytest.approx(600.0 / 26.0)
+
+
+def test_the_coefficient_carries_a_standard_error_and_an_interval():
+    out = scoring._summarise(_priced(40, [2.0], [20.0, 30.0, 25.0, 15.0, -5.0]))
+
+    assert out["drift_bps_se"] > 0
+    low, high = out["drift_bps_ci"]
+    assert low < out["drift_bps_per_sue"] < high
+    assert high - low == pytest.approx(2 * 1.96 * out["drift_bps_se"], rel=1e-6)
+
+
+def test_a_coefficient_whose_interval_contains_zero_is_not_quoted():
+    """The gate the whole thing exists for. A replay arm of 74 trades put the
+    coefficient's 95% interval at roughly -50 to +57 around a true 15; nothing
+    in the output said so, and `calibrated` was decided on the net return,
+    which is a different question.
+
+    gross and net are set independently here to isolate that gate from the
+    t-statistic on returns, which these nets pass comfortably."""
+    rows = _priced(40, [2.0], [1000.0, -1000.0], nets=[20.0])
+
+    out = scoring._summarise(rows)
+
+    assert out["t_stat"] is None or out["mean_net_bps"] > 0
+    low, high = out["drift_bps_ci"]
+    assert low < 0 < high
+    assert out["calibrated"] is False
+    assert "interval" in out["calibration_note"]
+
+
+def test_an_interval_clear_of_zero_still_calibrates():
+    out = scoring._summarise(_priced(40, [2.0], [20.0, 30.0, 25.0, 15.0, -5.0]))
+
+    low, high = out["drift_bps_ci"]
+    assert low > 0
+    assert out["calibrated"] is True
+
+
+def test_the_summary_says_how_far_from_a_usable_coefficient_it_is():
+    """`calibrated: False` on its own does not say whether the answer is two
+    more months of recording or twenty years of it. The interval's width
+    relative to the estimate does, and it falls as 1/sqrt(n)."""
+    out = scoring._summarise(_priced(40, [2.0], [20.0, 30.0, 25.0, 15.0, -5.0]))
+
+    half_width = out["drift_bps_ci"][1] - out["drift_bps_per_sue"]
+    assert out["interval_pct_of_estimate"] == pytest.approx(
+        half_width / out["drift_bps_per_sue"])
+    # Four times the sample halves the interval, so the projection scales with
+    # the square of how much narrower it has to get.
+    assert out["trades_for_a_50pct_interval"] == pytest.approx(
+        40 * (out["interval_pct_of_estimate"] / 0.5) ** 2, rel=0.05)
+
+
+def test_a_sample_that_cannot_pin_the_coefficient_says_what_would():
+    """A small positive slope buried in a large dispersion: the sign is real
+    in the point estimate and meaningless in the interval."""
+    rows = _priced(40, [2.0], [1000.0, -900.0], nets=[20.0])
+
+    out = scoring._summarise(rows)
+
+    assert out["calibrated"] is False
+    assert out["trades_for_a_50pct_interval"] > 1000
+    assert "trades" in out["calibration_note"]
+
+
+def test_an_interval_that_clears_zero_is_not_yet_precise_enough_to_price_with():
+    """Two different claims, and only the first is what `calibrated` answers.
+
+    Excluding zero establishes the sign. Replacing a declared coefficient needs
+    the size, and simulated at the declared 15 over 74 trades -- the size of
+    the arms actually replayed -- the slope came back +63.7 with an interval of
+    +1.6 to +125.8: clear of zero, four times the truth, and no basis for
+    replacing anything. `coefficient_usable` is the flag for that stronger
+    claim, kept apart so neither can be read as the other."""
+    rows = _priced(40, [2.0], [1000.0, -380.8], nets=[20.0])
+
+    out = scoring._summarise(rows)
+
+    low, _ = out["drift_bps_ci"]
+    assert low > 0, "this sample is supposed to clear zero"
+    assert out["interval_pct_of_estimate"] > scoring.TARGET_HALF_WIDTH
+    assert out["coefficient_usable"] is False
+    assert "50%" in out["coefficient_note"]
+
+
+def test_a_precise_enough_coefficient_is_marked_usable():
+    out = scoring._summarise(_priced(40, [2.0], [20.0, 30.0, 25.0, 15.0, -5.0]))
+
+    assert out["interval_pct_of_estimate"] < scoring.TARGET_HALF_WIDTH
+    assert out["coefficient_usable"] is True
+
+
+def test_a_sample_that_passes_every_return_gate_can_still_be_too_imprecise():
+    """The one that matters: nothing here is wrong with the book. The sample
+    is large enough, the mean and median agree, and the t-statistic clears its
+    bar -- and the coefficient is still only known to within 89%, which is not
+    a number to price with. `calibrated` says yes and `coefficient_usable`
+    says no, which is the whole reason they are two flags."""
+    out = scoring._summarise(_scored(_at_t(40, 2.20)))
+
+    assert out["calibrated"] is True
+    assert out["interval_pct_of_estimate"] > scoring.TARGET_HALF_WIDTH
+    assert out["coefficient_usable"] is False
+
+
+def test_a_coefficient_nobody_can_quote_is_not_usable_either():
+    out = scoring._summarise(_priced(40, [2.0], [1000.0, -900.0], nets=[20.0]))
+
+    assert out["drift_bps_per_sue"] is not None
+    assert out["calibrated"] is False
+    assert out["coefficient_usable"] is False
+
+
+def test_a_coefficient_of_zero_projects_nothing_rather_than_infinity():
+    out = scoring._summarise(_priced(40, [2.0], [100.0, -100.0]))
+
+    assert out["drift_bps_per_sue"] == pytest.approx(0.0)
+    assert out["interval_pct_of_estimate"] is None
+    assert out["trades_for_a_50pct_interval"] is None
 
 
 def test_a_book_that_mixes_variants_does_not_quote_one_coefficient():

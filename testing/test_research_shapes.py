@@ -191,7 +191,11 @@ def test_a_score_has_its_keys(store):
     out = scoring.score_orders(as_of=DAY)
     assert {"as_of", "horizon_days", "scored", "pending", "unfilled",
             "sample", "hit_rate", "mean_net_bps", "median_net_bps",
-            "t_stat", "drift_bps_per_sue", "calibrated",
+            "t_stat", "drift_bps_per_sue", "drift_bps_per_tail",
+            "drift_bps_prices", "drift_bps_se", "drift_bps_ci",
+            "interval_pct_of_estimate", "trades_for_a_50pct_interval",
+            "coefficient_usable", "coefficient_note",
+            "shorts_without_borrow", "calibrated",
             "calibration_note"} <= set(out)
 
 

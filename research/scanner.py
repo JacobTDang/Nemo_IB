@@ -650,6 +650,11 @@ def scan(as_of: Optional[str] = None,
             # constants or upstream fields at decision time and none of them
             # can be recovered from the row afterwards.
             "variant": signal.get("variant"),
+            # The quantity the coefficient was multiplied by. `sue` is a sigma
+            # for ts and af and percentile-0.5 for cs, which is half what cs
+            # is priced on -- so a scorer deriving the multiplier from that
+            # column offered a coefficient twice the one it would replace.
+            "strength": strength,
             "drift_coefficient": coefficient,
             "drift_calibrated": DRIFT_CALIBRATED,
             "seeded_quarters": signal.get("seeded_quarters"),

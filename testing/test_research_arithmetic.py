@@ -219,16 +219,25 @@ def test_a_ten_percent_move_is_a_thousand_basis_points():
 
 
 def test_the_drift_coefficient_is_gross_over_the_surprise():
-    """Two trades: +60bp on a SUE of 2, +30bp on a SUE of 3. Per unit that is
-    30 and 10, and the mean of those is 20 -- not 90/5."""
+    """Two trades: +60bp on a SUE of 2, +30bp on a SUE of 3.
+
+    Not 90/5 = 18: a total over a total is one trade of size five, and it lets
+    a single large surprise set the coefficient for every small one.
+
+    Not the mean of the per-trade ratios (30 and 10, so 20) either, which is
+    what this asserted before. That weights a SUE of 2 and a SUE of 3 equally
+    in ratio space, so a fixed error in basis points counts one-and-a-half
+    times as heavily on the smaller surprise. The coefficient is a slope, and
+    the slope through the origin is (2*60 + 3*30) / (4 + 9)."""
     scored = [
-        {"ticker": "A", "sue": 2.0, "gross_bps": 60.0, "net_bps": 60.0,
-         "cost_bps": 0.0},
-        {"ticker": "B", "sue": 3.0, "gross_bps": 30.0, "net_bps": 30.0,
-         "cost_bps": 0.0},
+        {"ticker": "A", "sue": 2.0, "variant": "ts", "strength": 2.0,
+         "gross_bps": 60.0, "net_bps": 60.0, "cost_bps": 0.0},
+        {"ticker": "B", "sue": 3.0, "variant": "ts", "strength": 3.0,
+         "gross_bps": 30.0, "net_bps": 30.0, "cost_bps": 0.0},
     ]
     out = scoring._summarise(scored)
-    assert out["drift_bps_per_sue"] == pytest.approx(20.0)
+    assert out["drift_bps_per_sue"] == pytest.approx(210.0 / 13.0)
+    assert out["drift_bps_per_sue"] != pytest.approx(90.0 / 5.0)
     assert out["mean_net_bps"] == pytest.approx(45.0)
     assert out["median_net_bps"] == pytest.approx(45.0)
     assert out["hit_rate"] == pytest.approx(1.0)

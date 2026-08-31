@@ -9,8 +9,28 @@ outcome, and measurement that is never checked is arithmetic.
 It is also the only route to the one number the scanner admits it assumed.
 `DRIFT_BPS_PER_SUE` is declared, reported uncalibrated on every scan, and every
 net edge is proportional to it. The honest replacement is the coefficient this
-book's own outcomes imply, which is what `drift_bps_per_sue` here reports --
-measured from realised returns, never echoed back from the assumption.
+book's own outcomes imply -- measured from realised returns, never echoed back
+from the assumption.
+
+That coefficient is a slope, and it is reported with an interval. A point
+estimate on its own cannot be told from a number the sample happened to
+produce: at the size of the replay arms actually run, 74 trades, a true 15
+comes back with a 95% interval spanning roughly -50 to +57. So the estimate
+carries its standard error, refuses to be quoted when the interval contains
+zero, and says how many trades at the observed dispersion would pin it.
+
+`calibrated` and `coefficient_usable` answer different questions and are kept
+apart for that reason. The first says the book's returns clear their gates and
+the coefficient's sign is not chance. The second says the coefficient is known
+closely enough to price with -- within 50%, which is loose and still a much
+harder bar. A slope of +64 give or take 97% has a sign and no size, and only
+the second flag should ever be read by anything replacing a declared number.
+
+It is also reported per unit of what the scanner multiplied, which is not
+always the `sue` column: `ts` and `af` price a sigma, `cs` prices a rank's
+distance into a tail, and the column holds half of the latter. One key each --
+`drift_bps_per_sue` and `drift_bps_per_tail` -- so a tail coefficient can never
+be read as a sigma one.
 
 The failure modes of a scorer all point the same way, toward flattering the
 strategy:
@@ -319,16 +339,104 @@ def _stub(order: Dict[str, Any]) -> Dict[str, Any]:
             # Which quantity that `sue` is. Without it the summary cannot tell
             # a sigma from a rank, and averages over both.
             "variant": order.get("variant"),
+            # What the coefficient was multiplied by at decision time. Read
+            # rather than re-derived; see `_priced_strength`.
+            "strength": order.get("strength"),
             "fiscal_period": order.get("fiscal_period"),
             "target_dollars": order.get("target_dollars")}
 
 
+# What the coefficient is per unit of, by variant. `ts` and `af` price a
+# standardised surprise -- a sigma. `cs` prices a rank's distance into a tail,
+# which is a different quantity with a different declared coefficient, and one
+# name over both is a coefficient of neither.
+UNIT_OF = {"ts": "sigma", "af": "sigma", "cs": "tail"}
+
+# Two-sided 95%.
+CI_Z = 1.96
+
+# How narrow the coefficient's interval has to be before it is worth calling a
+# measurement, as a fraction of the estimate. Half is generous: a coefficient
+# known to plus or minus 50% still moves every expected edge in the book by
+# that much. Anything looser is not a replacement for a declared number, it is
+# a differently-sourced guess with a confidence interval attached.
+TARGET_HALF_WIDTH = 0.5
+
+
+def _priced_strength(row: Dict[str, Any]) -> Optional[float]:
+    """The quantity the scanner multiplied by the coefficient, for this row.
+
+    Not `|sue|`. That column holds a sigma for `ts` and `af` and
+    `percentile - 0.5` for `cs`, while the scanner prices `cs` with the tail
+    distance -- twice that. Dividing the realised move by the column offered a
+    cross-sectional coefficient exactly 2x the one that could replace
+    `DRIFT_BPS_PER_TAIL`, under a name that read like a sigma.
+
+    The scanner records `strength` now. The derivation below is for rows filed
+    before that column existed: it is exact given the variant, not a guess, and
+    a row whose variant is unknown is left out rather than assumed to be one.
+    """
+    strength = row.get("strength")
+    if strength is not None:
+        return abs(strength) or None
+
+    sue = row.get("sue")
+    if sue in (None, 0):
+        return None
+    variant = row.get("variant")
+    if variant == "cs":
+        return abs(sue) * 2.0
+    if variant in ("ts", "af"):
+        return abs(sue)
+    return None
+
+
+def _slope_through_origin(points: List[tuple]) -> tuple:
+    """Least squares slope with no intercept, and its standard error.
+
+    A coefficient in basis points per unit of surprise IS a slope, and the mean
+    of per-trade ratios is a worse estimator of it: it weights a |SUE| of 1 the
+    same as a |SUE| of 5, so a fixed noise in basis points counts five times as
+    heavily where the signal is weakest. Simulated at the declared 15 over the
+    scanner's own admission band, the ratio average is about 48% noisier at
+    every sample size.
+
+    The standard error is the point of it. Without one there is no way to tell
+    a measured coefficient from a number the sample happened to produce, and
+    the gate below was reading a t-statistic on returns, which answers whether
+    the book made money rather than whether this coefficient is known.
+    """
+    sxx = sum(x * x for x, _ in points)
+    if not sxx:
+        return None, None
+    beta = sum(x * y for x, y in points) / sxx
+    if len(points) < 2:
+        return beta, None
+    residual = sum((y - beta * x) ** 2 for x, y in points)
+    return beta, (residual / (len(points) - 1) / sxx) ** 0.5
+
+
+def _coefficient_note(beta, unit, width, projection) -> str:
+    """What is known about the coefficient, in one line, always said."""
+    if beta is None or unit is None:
+        return "no coefficient could be fitted to this sample"
+    if width is None:
+        return (f"{beta:+.1f} bps per {unit} from a sample too small to carry "
+                f"a standard error")
+    if width <= TARGET_HALF_WIDTH:
+        return (f"{beta:+.1f} bps per {unit}, give or take {width:.0%} -- "
+                f"inside the {TARGET_HALF_WIDTH:.0%} this treats as knowing it")
+    return (f"{beta:+.1f} bps per {unit}, give or take {width:.0%}. That is a "
+            f"sign, not a size: about {projection:,} trades at this dispersion "
+            f"would pin it to within {TARGET_HALF_WIDTH:.0%}")
+
+
 def _summarise(scored: List[Dict[str, Any]],
                comparisons: int = 1) -> Dict[str, Any]:
-    """The realised numbers, and three reasons a coefficient may not be quoted.
+    """The realised numbers, and every reason a coefficient may not be quoted.
 
-    `drift_bps_per_sue` is gross of cost on purpose. Cost is a property of how
-    a position was traded; drift is a property of the surprise, and mixing them
+    The coefficient is gross of cost on purpose. Cost is a property of how a
+    position was traded; drift is a property of the surprise, and mixing them
     gives a coefficient that moves with the size of the book.
 
     Sample size used to be the only gate, and a live replay walked straight
@@ -343,8 +451,14 @@ def _summarise(scored: List[Dict[str, Any]],
       a median on the same side as the mean, because a mean carried by its tail
       describes a lottery rather than an edge;
 
-      and a t-statistic clear of two, because a sign that cannot be told from
-      chance is not a measurement.
+      a t-statistic clear of two, because a sign that cannot be told from
+      chance is not a measurement;
+
+      and an interval on the coefficient itself that does not contain zero. The
+      three above are all about the book's returns, which is a different
+      question from whether this coefficient is known: a sample can make money
+      reliably and still not say what the coefficient is to within a factor of
+      four. That gap is where a declared 15 would have been replaced by noise.
 
     `comparisons` moves that last bar out when the result was chosen from
     several. Three variants were replayed on the same names -- the time-series
@@ -362,14 +476,21 @@ def _summarise(scored: List[Dict[str, Any]],
                 "t_stat": None, "t_threshold": None,
                 "comparisons": comparisons, "variants": [],
                 "shorts_without_borrow": 0,
-                "drift_bps_per_sue": None, "calibrated": False,
+                "drift_bps_per_sue": None, "drift_bps_per_tail": None,
+                "drift_bps_prices": None, "drift_bps_se": None,
+                "drift_bps_ci": None, "interval_pct_of_estimate": None,
+                "trades_for_a_50pct_interval": None,
+                "coefficient_usable": False,
+                "coefficient_note": "no finished trades to measure",
+                "calibrated": False,
                 "calibration_note": "no finished trades to measure"}
 
     nets = [r["net_bps"] for r in scored]
     grosses = [r["gross_bps"] for r in scored]
-    usable = [(r["gross_bps"], abs(r["sue"])) for r in scored
-              if r["sue"] not in (None, 0)]
-    per_sue = [g / s for g, s in usable] if usable else []
+    # Against what the scanner priced with, not against the `sue` column. See
+    # `_priced_strength`.
+    points = [(x, r["gross_bps"]) for r in scored
+              for x in (_priced_strength(r),) if x]
 
     # A sigma and a rank are not the same quantity. The cross-sectional variant
     # stores `percentile - 0.5`, so its |sue| is bounded by 0.5 however large
@@ -377,8 +498,31 @@ def _summarise(scored: List[Dict[str, Any]],
     # 220 basis points per SUE against a declared 15 -- a coefficient of
     # neither signal. The split is reported per variant instead; this refuses.
     variants = sorted({r.get("variant") or "unknown" for r in scored})
-
     sample = len(scored)
+    unit = UNIT_OF.get(variants[0]) if len(variants) == 1 else None
+    beta, beta_se = _slope_through_origin(points) if points else (None, None)
+    # A single trade has a slope and no interval. The sample gate already
+    # refuses it; withholding the number as well would say "not measurable"
+    # where the truth is "measured once", which is a different fact.
+    interval = ((beta - CI_Z * beta_se, beta + CI_Z * beta_se)
+                if beta is not None and beta_se is not None else None)
+    quotable = beta if unit is not None else None
+    # How wide the interval is against the estimate, and how many trades at
+    # this sample's own dispersion would bring it to TARGET_HALF_WIDTH. The
+    # standard error falls as 1/sqrt(n), so the projection is quadratic in how
+    # much narrower it has to get. Without this, `calibrated: False` does not
+    # distinguish two more months of recording from twenty more years.
+    if beta and beta_se is not None:
+        width = CI_Z * beta_se / abs(beta)
+        # What a 50% interval takes, not what is still missing. Below the
+        # current sample it says the interval is already there, which is worth
+        # reading as plainly as the other direction.
+        projection = round(sample * (width / TARGET_HALF_WIDTH) ** 2)
+    else:
+        # A coefficient of zero has no interval that is 50% of it, and a single
+        # trade has no standard error. Neither is a large number.
+        width = projection = None
+
     unpriced = sum(1 for r in scored if r.get("borrow_priced") is False)
     mean_net = statistics.fmean(nets)
     median_net = statistics.median(nets)
@@ -399,6 +543,20 @@ def _summarise(scored: List[Dict[str, Any]],
         failures.append(
             f"sample of {sample} is under the {MIN_CALIBRATION_SAMPLE} this "
             f"will quote a coefficient from")
+    if unit is None and len(variants) == 1:
+        failures.append(
+            f"these rows do not say which signal variant they came from, so "
+            f"it is not known whether sue holds a sigma or a rank -- and the "
+            f"two take different coefficients. No coefficient is quoted")
+    if quotable is not None and interval and interval[0] <= 0 <= interval[1]:
+        failures.append(
+            f"the coefficient's 95% interval is {interval[0]:+.0f} to "
+            f"{interval[1]:+.0f} bps per {unit} and contains zero, so this "
+            f"sample does not measure a coefficient however the returns came "
+            f"out" + (
+                f"; about {projection:,} trades at this dispersion would pin "
+                f"it to within {TARGET_HALF_WIDTH:.0%}"
+                if projection else ""))
     if unpriced:
         failures.append(
             f"{unpriced} of {sample} trades are shorts that never paid a "
@@ -440,8 +598,25 @@ def _summarise(scored: List[Dict[str, Any]],
         "t_threshold": threshold,
         "comparisons": comparisons,
         "variants": variants,
-        "drift_bps_per_sue": (statistics.fmean(per_sue)
-                              if per_sue and len(variants) == 1 else None),
+        # One key per unit, never one key for both. A tail coefficient read
+        # as a sigma coefficient is the 2x error this split exists to stop.
+        "drift_bps_per_sue": quotable if unit == "sigma" else None,
+        "drift_bps_per_tail": quotable if unit == "tail" else None,
+        "drift_bps_prices": unit if quotable is not None else None,
+        "drift_bps_se": beta_se,
+        "drift_bps_ci": interval,
+        "interval_pct_of_estimate": width,
+        "trades_for_a_50pct_interval": projection,
+        # Two claims, kept apart. `calibrated` says the book's returns clear
+        # their gates and the coefficient's sign is not chance. This says the
+        # coefficient is known closely enough to price with -- which is the
+        # only question that matters to anything replacing a declared number,
+        # and a strictly harder one. A slope of +64 give or take 97% has a
+        # sign and no size.
+        "coefficient_usable": bool(
+            not failures and width is not None
+            and width <= TARGET_HALF_WIDTH),
+        "coefficient_note": _coefficient_note(beta, unit, width, projection),
         "calibrated": not failures,
         "calibration_note": (f"{sample} finished trades, median and mean agree, "
                              f"t={t_stat:+.2f} against a bar of "
