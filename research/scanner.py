@@ -31,7 +31,10 @@ cap and every target is clipped to it.
 **A missing input is a refusal.** There is no house-average spread and no
 last-known value. A name whose cost cannot be measured is not a name with an
 average cost, and a fallback here is a number nobody can check being subtracted
-from every trade in the study.
+from every trade in the study. The same applies to the cost of being short: a
+name nobody can price a borrow on is refused rather than charged nothing, and
+charging nothing would put it top of a book ranked net of cost. See
+`research.borrow`.
 
 The one number that is not measured is the drift itself -- how much a unit of
 SUE is worth over the holding period. It is declared as an assumption, reported
@@ -45,7 +48,7 @@ import statistics
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 
-from research import pit_store, spread, sue
+from research import borrow, pit_store, spread, sue
 
 # --- what the book is, before the regime touches it -------------------------
 
@@ -223,6 +226,20 @@ def _cost_for(ticker: str, as_of: str, position_dollars: float) -> Dict[str, Any
     cost["cost_floor"] = (tick_floor + impact) if tick_floor is not None \
         else cost["cost"]
     return cost
+
+
+def _borrow_for(ticker: str, as_of: str, side: str,
+                declared_rate: Optional[float]) -> Dict[str, Any]:
+    """What the position costs to finance over the holding period.
+
+    Zero for a long. For a short it is a rate somebody quoted -- recorded in
+    the store on a date, or declared by the caller -- over the calendar days a
+    twenty-session hold actually covers, and a refusal when there is neither.
+
+    A seam rather than a call so the decision logic can be exercised without a
+    borrow feed, the same way `_cost_for` is.
+    """
+    return borrow.carry_cost(ticker, as_of, side, declared_rate=declared_rate)
 
 
 def _recorder_gap(as_of: str) -> Optional[str]:
@@ -404,7 +421,8 @@ def _signal_problem(signal: Dict[str, Any], as_of: str) -> Optional[str]:
 
 def scan(as_of: Optional[str] = None,
          already_acted: Optional[set] = None,
-         signal_for=None) -> Dict[str, Any]:
+         signal_for=None,
+         borrow_rate: Optional[float] = None) -> Dict[str, Any]:
     """Today's candidates, ranked net of cost, with every rejection kept.
 
     Rejections are half the output. A scanner that quietly stops finding
@@ -418,6 +436,12 @@ def scan(as_of: Optional[str] = None,
     `signal_for` defaults to a live EDGAR lookup. Replay supplies a table it
     built in one pass per name -- as a parameter rather than by rebinding the
     module's seam, which works only until something rebinds it back.
+
+    `borrow_rate` is a flat annualised rate to charge every short the store has
+    no quote for. There is deliberately no default: a short nobody can price is
+    refused, because the alternative -- charging zero -- ranks the least
+    borrowable name in the universe first. Declaring one is an assumption made
+    out loud, and it is recorded on every row it priced.
     """
     as_of = as_of or _today()
     # A new scan must not inherit a cohort assembled for another date.
@@ -479,6 +503,7 @@ def scan(as_of: Optional[str] = None,
     priced = 0
     measured_count = 0
     floored_count = 0
+    borrow_unpriced = 0
 
     for ticker in considered:
         try:
@@ -549,12 +574,32 @@ def scan(as_of: Optional[str] = None,
                              or "cost could not be measured"})
             continue
 
+        # The round trip is a crossing. A short is also a position held open,
+        # and the stock loan bills for every calendar day of it -- 23bp at a 3%
+        # borrow over twenty sessions, against a drift of a few tens of basis
+        # points. Priced separately from `cost` because it is a different
+        # quantity: one is charged twice on the way through, the other accrues.
+        try:
+            carry = _borrow_for(ticker, as_of, side, borrow_rate)
+        except Exception as exc:  # noqa: BLE001 - recorded, not masked
+            rejected.append({"ticker": ticker, "sue": value,
+                             "reason": f"borrow unavailable: "
+                                       f"{type(exc).__name__}: {exc}"})
+            continue
+        if carry.get("cost") is None:
+            borrow_unpriced += 1
+            rejected.append({"ticker": ticker, "sue": value,
+                             "reason": carry.get("reason")
+                             or "borrow could not be priced"})
+            continue
+
         coefficient = (DRIFT_BPS_PER_TAIL if signal.get("variant") == "cs"
                        else DRIFT_BPS_PER_SUE)
         expected_bps = strength * coefficient
         cost_bps = cost["cost"] * 10_000
+        borrow_bps = carry["cost"] * 10_000
         floor_bps = (cost.get("cost_floor") or cost["cost"]) * 10_000
-        net_bps = expected_bps - cost_bps
+        net_bps = expected_bps - cost_bps - borrow_bps
         # Not EDGE's `resolved` flag, which asks only whether the estimate
         # differs from zero -- SPY passes that at 41bp against a market a cent
         # wide. What a reader needs is whether the charge is this name's
@@ -570,20 +615,29 @@ def scan(as_of: Optional[str] = None,
         if net_bps <= 0:
             row = {"ticker": ticker, "sue": value,
                    "cost_bps_high": cost_bps, "cost_bps_low": floor_bps,
+                   "borrow_bps": borrow_bps,
                    "expected_edge_bps": expected_bps}
-            if not resolved and expected_bps > floor_bps:
+            # Borrow is charged whether or not the spread resolved, so the
+            # bound the edge has to clear carries it too. Without that a short
+            # killed outright by its carry would be filed as a name the
+            # estimator could not judge.
+            if not resolved and expected_bps > floor_bps + borrow_bps:
                 # The strategy did not turn this down; the estimator could not
                 # tell. Filing it as a rejection would hide a name that trades
                 # well inside its own bound, and would make a scanner starved
                 # by measurement error look like one facing a quiet tape.
                 row["reason"] = (
                     f"unresolved spread: expected {expected_bps:.1f}bp sits "
-                    f"inside a cost band of {floor_bps:.1f}-{cost_bps:.1f}bp, "
-                    f"so the estimator cannot say whether this clears")
+                    f"inside a cost band of {floor_bps + borrow_bps:.1f}-"
+                    f"{cost_bps + borrow_bps:.1f}bp, so the estimator cannot "
+                    f"say whether this clears")
                 undetermined.append(row)
             else:
+                carried = (f" and {borrow_bps:.1f}bp of borrow"
+                           if borrow_bps else "")
                 row["reason"] = (f"expected {expected_bps:.1f}bp does not clear "
-                                 f"{cost_bps:.1f}bp of round-trip cost")
+                                 f"{cost_bps:.1f}bp of round-trip cost"
+                                 f"{carried}")
                 rejected.append(row)
             continue
 
@@ -602,6 +656,12 @@ def scan(as_of: Optional[str] = None,
             "recorded_quarters": signal.get("recorded_quarters"),
             "expected_edge_bps": expected_bps, "cost_bps": cost_bps,
             "cost_bps_low": floor_bps,
+            # Carry, kept apart from the round trip. `cost_bps` has meant
+            # spread-plus-impact since the first row was filed and folding
+            # borrow into it would change what every historical row says.
+            "borrow_bps": borrow_bps,
+            "borrow_rate": carry.get("annual_rate"),
+            "borrow_source": carry.get("rate_source"),
             "net_edge_bps": net_bps, "target_dollars": target,
             "participation": fit.get("participation"),
             "spread": cost.get("spread"),
@@ -645,6 +705,10 @@ def scan(as_of: Optional[str] = None,
         "costs_total": priced,
         "costs_measured": measured_count,
         "costs_floored": floored_count,
+        # Shorts turned down for want of a borrow rate rather than by the
+        # strategy. Without this a book that has quietly gone long-only reads
+        # like a tape with no bad prints in it.
+        "borrow_unpriced": borrow_unpriced,
         "assumptions": {
             "variant": SIGNAL_VARIANT,
             "drift_bps_per_sue": DRIFT_BPS_PER_SUE,
@@ -654,11 +718,21 @@ def scan(as_of: Optional[str] = None,
                      "is proportional to it. The two coefficients price "
                      "different quantities -- a sigma and a rank -- and are "
                      "deliberately not the same number"),
+            "borrow": {
+                "declared_rate": borrow_rate,
+                "day_count": borrow.DAY_COUNT,
+                "calibrated": False,
+                "note": ("a declared rate is a blanket assumption about every "
+                         "name; a rate recorded in the store for one name "
+                         "beats it. With neither, the short is refused rather "
+                         "than charged nothing"),
+            },
         },
     }
 
 
-def record_scan(as_of: Optional[str] = None) -> Dict[str, Any]:
+def record_scan(as_of: Optional[str] = None,
+                borrow_rate: Optional[float] = None) -> Dict[str, Any]:
     """Run a scan and file it, candidates and rejections alike.
 
     Filed rather than returned so it can be scored against what the market
@@ -672,7 +746,7 @@ def record_scan(as_of: Optional[str] = None) -> Dict[str, Any]:
     book and holding another.
     """
     as_of = as_of or _today()
-    result = scan(as_of)
+    result = scan(as_of, borrow_rate=borrow_rate)
 
     # What this day already decided, if anything. Filing is append-only, so a
     # re-run cannot change it -- and should not, because the filed decision is
@@ -772,10 +846,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         description="Rank today's candidates net of cost and file them.")
     parser.add_argument("--as-of", dest="as_of", default=None,
                         help="date to decide as (default: today)")
+    parser.add_argument("--borrow-rate", dest="borrow_rate", type=float,
+                        default=None,
+                        help="annualised borrow to charge every short the "
+                             "store holds no quote for, e.g. 0.03 for 3%%. "
+                             "Without it a short nobody can price is refused "
+                             "rather than charged nothing; the count is "
+                             "reported as borrow_unpriced")
     args = parser.parse_args(argv)
 
     try:
-        result = record_scan(as_of=args.as_of)
+        result = record_scan(as_of=args.as_of, borrow_rate=args.borrow_rate)
     except Exception as exc:  # noqa: BLE001 - reported, then non-zero
         print(json.dumps({"as_of": args.as_of, "status": "failed",
                           "error": f"{type(exc).__name__}: {exc}"}, indent=2))

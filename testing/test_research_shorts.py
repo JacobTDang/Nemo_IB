@@ -72,37 +72,52 @@ def _cost(bps=10.0):
 
 # --- the decision -----------------------------------------------------------
 
+# A borrow rate the caller declares out loud, so these tests are about the
+# sign flowing through rather than about where a rate comes from. Without one a
+# short is refused; that refusal has its own tests below.
+GC = 0.003
+
+
 def test_a_negative_surprise_becomes_a_short(ready, monkeypatch):
     monkeypatch.setattr(scanner, "_signal_for", _signal(-2.5, ready))
     monkeypatch.setattr(scanner, "_cost_for", _cost())
 
-    c = scanner.scan(as_of=ready)["candidates"][0]
+    c = scanner.scan(as_of=ready, borrow_rate=GC)["candidates"][0]
     assert c["side"] == "short"
     assert c["sue"] == -2.5
 
 
-def test_a_short_is_sized_and_priced_like_a_long(ready, monkeypatch):
+def test_a_short_is_sized_like_a_long_and_charged_borrow_a_long_is_not(
+        ready, monkeypatch):
     """The edge is the magnitude of the surprise, so a -2.5 and a +2.5 buy the
-    same expected move and the same position. Anything else is a directional
-    view smuggled into the sizing."""
+    same expected move and the same position. What differs is the carry: the
+    short pays to stay open and the long does not, and the whole of the
+    difference in net edge is that charge.
+
+    This test used to assert the two net edges were equal, which was the bug --
+    it pinned a cost model that priced no borrow at all."""
     monkeypatch.setattr(scanner, "_cost_for", _cost())
 
     monkeypatch.setattr(scanner, "_signal_for", _signal(-2.5, ready))
-    short = scanner.scan(as_of=ready)["candidates"][0]
+    short = scanner.scan(as_of=ready, borrow_rate=GC)["candidates"][0]
     monkeypatch.setattr(scanner, "_signal_for", _signal(2.5, ready))
-    long = scanner.scan(as_of=ready)["candidates"][0]
+    long = scanner.scan(as_of=ready, borrow_rate=GC)["candidates"][0]
 
     assert short["expected_edge_bps"] == pytest.approx(long["expected_edge_bps"])
-    assert short["net_edge_bps"] == pytest.approx(long["net_edge_bps"])
     assert short["target_dollars"] == pytest.approx(long["target_dollars"])
     assert short["cost_bps"] == pytest.approx(long["cost_bps"])
+
+    assert long["borrow_bps"] == 0.0
+    assert short["borrow_bps"] > 0.0
+    assert short["net_edge_bps"] == pytest.approx(
+        long["net_edge_bps"] - short["borrow_bps"])
 
 
 def test_a_short_below_the_threshold_is_refused_like_a_long(ready, monkeypatch):
     monkeypatch.setattr(scanner, "_signal_for", _signal(-0.4, ready))
     monkeypatch.setattr(scanner, "_cost_for", _cost())
 
-    out = scanner.scan(as_of=ready)
+    out = scanner.scan(as_of=ready, borrow_rate=GC)
     assert out["candidates"] == []
     assert "0.40" in out["rejected"][0]["reason"]
 
@@ -112,7 +127,7 @@ def test_an_implausible_short_is_refused_like_an_implausible_long(ready,
     monkeypatch.setattr(scanner, "_signal_for", _signal(-9.0, ready))
     monkeypatch.setattr(scanner, "_cost_for", _cost())
 
-    out = scanner.scan(as_of=ready)
+    out = scanner.scan(as_of=ready, borrow_rate=GC)
     assert out["candidates"] == []
     assert "9.00" in out["rejected"][0]["reason"]
 
@@ -121,8 +136,95 @@ def test_a_short_that_does_not_clear_its_cost_is_refused(ready, monkeypatch):
     monkeypatch.setattr(scanner, "_signal_for", _signal(-1.2, ready))
     monkeypatch.setattr(scanner, "_cost_for", _cost(bps=40.0))
 
-    out = scanner.scan(as_of=ready)
+    out = scanner.scan(as_of=ready, borrow_rate=GC)
     assert out["candidates"] == []
+
+
+# --- the borrow ------------------------------------------------------------
+
+def test_a_short_nobody_can_price_the_borrow_on_is_not_ranked(ready,
+                                                              monkeypatch):
+    """No rate recorded and none declared. The name is refused rather than
+    charged zero, because a book ranked on edge net of cost gives first place
+    to whichever name was charged least."""
+    monkeypatch.setattr(scanner, "_signal_for", _signal(-2.5, ready))
+    monkeypatch.setattr(scanner, "_cost_for", _cost())
+
+    out = scanner.scan(as_of=ready)
+
+    assert out["candidates"] == []
+    assert "borrow" in out["rejected"][0]["reason"].lower()
+    assert out["borrow_unpriced"] == 1
+
+
+def test_a_long_is_untouched_when_no_borrow_rate_exists(ready, monkeypatch):
+    """The refusal is about the short leg. A missing borrow rate must not
+    quietly empty the whole book."""
+    monkeypatch.setattr(scanner, "_signal_for", _signal(2.5, ready))
+    monkeypatch.setattr(scanner, "_cost_for", _cost())
+
+    out = scanner.scan(as_of=ready)
+
+    assert len(out["candidates"]) == 1
+    assert out["candidates"][0]["borrow_bps"] == 0.0
+    assert out["borrow_unpriced"] == 0
+
+
+def test_a_recorded_rate_prices_a_short_with_no_declaration(ready, store,
+                                                            monkeypatch):
+    store.record_borrow_rates(ready, [{"ticker": "MISS", "annual_rate": 0.005}],
+                              recorded_at=f"{ready}T21:00:00Z")
+    monkeypatch.setattr(scanner, "_signal_for", _signal(-2.5, ready))
+    monkeypatch.setattr(scanner, "_cost_for", _cost())
+
+    c = scanner.scan(as_of=ready)["candidates"][0]
+
+    assert c["borrow_rate"] == 0.005
+    assert c["borrow_source"] == "recorded"
+    assert c["borrow_bps"] > 0
+
+
+def test_borrow_alone_can_sink_a_short_a_long_of_the_same_size_clears(
+        ready, monkeypatch):
+    """30% is hard-to-borrow territory, and over twenty sessions it is 233bp --
+    an order of magnitude past the drift being chased."""
+    monkeypatch.setattr(scanner, "_cost_for", _cost())
+
+    monkeypatch.setattr(scanner, "_signal_for", _signal(2.5, ready))
+    assert scanner.scan(as_of=ready, borrow_rate=0.30)["candidates"] != []
+
+    monkeypatch.setattr(scanner, "_signal_for", _signal(-2.5, ready))
+    out = scanner.scan(as_of=ready, borrow_rate=0.30)
+
+    assert out["candidates"] == []
+    assert "borrow" in out["rejected"][0]["reason"].lower()
+
+
+def test_the_scan_reports_the_borrow_assumption_it_ran_under(ready,
+                                                             monkeypatch):
+    monkeypatch.setattr(scanner, "_signal_for", _signal(-2.5, ready))
+    monkeypatch.setattr(scanner, "_cost_for", _cost())
+
+    out = scanner.scan(as_of=ready, borrow_rate=GC)
+
+    assert out["assumptions"]["borrow"]["declared_rate"] == GC
+    assert out["assumptions"]["borrow"]["calibrated"] is False
+
+
+def test_the_filed_order_keeps_the_rate_it_was_charged(ready, store,
+                                                       monkeypatch):
+    """The rate is a module-or-caller assumption at decision time and is not
+    recoverable from the row afterwards, which is what the column is for."""
+    monkeypatch.setattr(scanner, "_signal_for", _signal(-2.5, ready))
+    monkeypatch.setattr(scanner, "_cost_for", _cost())
+
+    scanner.record_scan(as_of=ready, borrow_rate=GC)
+    filed = [o for o in store.paper_orders_as_of(ready)
+             if o["ticker"] == "MISS" and o["accepted"]][0]
+
+    assert filed["borrow_rate"] == GC
+    assert filed["borrow_source"] == "declared"
+    assert filed["borrow_bps"] == pytest.approx(GC * 28 / 360 * 10_000)
 
 
 # --- the outcome ------------------------------------------------------------

@@ -376,6 +376,12 @@ services:
   #   docker compose --env-file ../.env run --rm research-scan
   #   docker compose --env-file ../.env run --rm research-scan --as-of 2026-08-26
   #
+  # The short leg needs a borrow rate and there is no default. Without one --
+  # a quote recorded in the store, or `--borrow-rate 0.03` declared on the
+  # command line -- every short is refused and counted under `borrow_unpriced`,
+  # because a short charged nothing outranks every name that paid. That refusal
+  # is the deliberate default: the operator picks the assumption, not the code.
+  #
   # It has no cron line of its own. The recorder's line above runs it, chained
   # with `&&`, because "after the recorder" is a dependency and a second clock
   # time cannot express one. Keeping its own flock in that chain still matters:

@@ -58,6 +58,9 @@ def _write_everything_late(store):
         "filer": "Someone LP", "form": "SC 13D",
         "filing_date": "2026-03-02", "detected_at": LATER}],
         recorded_at=LATER)
+    store.record_borrow_rates("2026-03-02",
+                              [{"ticker": "AAA", "annual_rate": 0.03}],
+                              recorded_at=LATER)
 
 
 # --- nothing is visible before it was written -------------------------------
@@ -89,6 +92,10 @@ def test_the_scalar_readers_hide_it_too(store):
     assert pit_store.consensus_as_of("AAA", "2026Q1", PAST) is None
     assert pit_store.actual_as_of("AAA", "2026Q1", PAST) is None
     assert pit_store.has_consensus_history(PAST) is False
+    # Borrow is the number most likely to be loaded in after the fact -- a
+    # broker file for last month arrives next month -- so a leak here would
+    # price every historical short with a rate nobody could have known.
+    assert pit_store.borrow_rate_as_of("AAA", PAST) is None
 
 
 def test_the_same_readers_do_see_it_afterwards(store):
@@ -103,6 +110,7 @@ def test_the_same_readers_do_see_it_afterwards(store):
     assert pit_store.activist_filings_as_of(later)
     assert pit_store.consensus_as_of("AAA", "2026Q1", later)
     assert pit_store.actual_as_of("AAA", "2026Q1", later) == 1.2
+    assert pit_store.borrow_rate_as_of("AAA", later)["annual_rate"] == 0.03
 
 
 def test_every_as_of_reader_in_the_store_is_covered_here():
@@ -112,6 +120,7 @@ def test_every_as_of_reader_in_the_store_is_covered_here():
         "universe_as_of", "announcements_as_of", "paper_orders_as_of",
         "activist_filings_as_of", "consensus_as_of", "actual_as_of",
         "reporters_since", "filed_periods", "has_consensus_history",
+        "borrow_rate_as_of",
         # Reads the run log, which records what the process did rather than
         # what the market did; see the test below for why it is keyed on the
         # date a run was FOR rather than on when it finished.

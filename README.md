@@ -196,12 +196,18 @@ docker compose --env-file ../.env run --rm research-daily               # every 
 | Job | Does | When |
 |---|---|---|
 | `research-daily` | one session of prices per name, screens the universe, snapshots consensus | `30 22 * * 1-5` |
-| `research-scan` | ranks candidates net of trading cost, files the intended orders | `0 23 * * 1-5` |
+| `research-scan` | ranks candidates net of trading cost and borrow, files the intended orders | `0 23 * * 1-5` |
 | `research-watch` | sweeps EDGAR for Schedule 13D stakes taken in a company | `*/20 13-23 * * 1-5` |
 | `research-score` | scores filed orders whose holding period has closed | `0 7 * * 6` |
 | `research-announce` | earnings dates and the hour they landed, from Item 2.02 filings | `0 9 * * 6` |
 | `research-seed` | reconstructs the quarters of consensus the vendor still serves | `0 8 1 * *` |
 | `congress-sync` | ingests congressional disclosures for the `altdata` server | `0 6 * * *` |
+
+The scan has no default borrow rate, so it refuses every short it cannot price
+rather than charging one nothing — a short charged nothing outranks every name
+that paid. Load rates with `python -m research.borrow`, or declare a flat one
+with `research-scan --borrow-rate 0.03`; until then the book is long-only and
+says so. See [`deploy/README.md`](deploy/README.md).
 
 Every job exits non-zero when a stage fails, because the exit code is the only
 way a scheduler finds out — and exits zero when it finds nothing, because most
@@ -228,6 +234,7 @@ universe_snapshot  who was eligible each day, and why the rest were not
 consensus_snapshot what the street expected, and what the vendor reported
 announcement       fiscal identity, the date the market learned, and whether it
                    landed before the open or after the close
+borrow_rate        what it cost to be short, per name, as somebody quoted it
 paper_order        decisions, with the session they were for and no fill price
 activist_filing    13D events with four timestamps, latency derived at read
 run_log            every run, so a day the job did not run is visible

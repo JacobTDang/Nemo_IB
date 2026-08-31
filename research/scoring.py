@@ -283,12 +283,25 @@ def fill(order: Dict[str, Any], entry: Dict[str, Any],
         move = -move
     gross_bps = move * 10_000
     cost_bps = order.get("cost_bps") or 0.0
+    # The carry, which the round trip does not contain. A short that never paid
+    # its borrow shows a realised return nobody could have earned, and that
+    # return is what the calibration gate reads.
+    #
+    # Absent is not zero, and it is not a reason to drop the trade either: a
+    # row filed before the cost model had a borrow term genuinely was decided
+    # without one. Charging it a rate invented today would be worse -- the
+    # record is append-only precisely so a later opinion cannot be applied to
+    # an earlier decision -- so it is scored as it was and counted as unpriced.
+    borrow = order.get("borrow_bps")
+    priced = borrow is not None or order.get("side") != "short"
+    borrow_bps = borrow or 0.0
     return {
         **_stub(order),
         "entry_session": entry["trade_date"], "entry_price": entry_price,
         "exit_session": exit_bar["trade_date"], "exit_price": exit_price,
         "gross_bps": gross_bps, "cost_bps": cost_bps,
-        "net_bps": gross_bps - cost_bps,
+        "borrow_bps": borrow_bps, "borrow_priced": priced,
+        "net_bps": gross_bps - cost_bps - borrow_bps,
     }
 
 
@@ -348,6 +361,7 @@ def _summarise(scored: List[Dict[str, Any]],
                 "median_net_bps": None, "mean_gross_bps": None,
                 "t_stat": None, "t_threshold": None,
                 "comparisons": comparisons, "variants": [],
+                "shorts_without_borrow": 0,
                 "drift_bps_per_sue": None, "calibrated": False,
                 "calibration_note": "no finished trades to measure"}
 
@@ -365,6 +379,7 @@ def _summarise(scored: List[Dict[str, Any]],
     variants = sorted({r.get("variant") or "unknown" for r in scored})
 
     sample = len(scored)
+    unpriced = sum(1 for r in scored if r.get("borrow_priced") is False)
     mean_net = statistics.fmean(nets)
     median_net = statistics.median(nets)
     if sample > 1:
@@ -384,6 +399,12 @@ def _summarise(scored: List[Dict[str, Any]],
         failures.append(
             f"sample of {sample} is under the {MIN_CALIBRATION_SAMPLE} this "
             f"will quote a coefficient from")
+    if unpriced:
+        failures.append(
+            f"{unpriced} of {sample} trades are shorts that never paid a "
+            f"borrow, so their net return is overstated by whatever it would "
+            f"have been -- 23bp at a 3% rate over twenty sessions, against a "
+            f"mean of {mean_net:+.1f}bp")
     if (mean_net > 0) != (median_net > 0):
         failures.append(
             f"the mean ({mean_net:+.1f}bp) and the median ({median_net:+.1f}bp) "
@@ -408,6 +429,10 @@ def _summarise(scored: List[Dict[str, Any]],
     return {
         "sample": sample,
         "hit_rate": sum(1 for n in nets if n > 0) / sample,
+        # Shorts in this sample whose net return never paid a borrow, because
+        # they were decided before the cost model had one. Their net is
+        # overstated by whatever the borrow was, and the gate below reads nets.
+        "shorts_without_borrow": unpriced,
         "mean_net_bps": mean_net,
         "median_net_bps": median_net,
         "mean_gross_bps": statistics.fmean(grosses),

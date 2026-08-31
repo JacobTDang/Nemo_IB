@@ -74,13 +74,15 @@ def _calendar(store, days=None):
 
 
 def _order(store, ticker="AAA", side="long", sue=3.0, cost_bps=10.0,
-           decided=None, session=None, dollars=5000.0):  # noqa: D401
+           decided=None, session=None, dollars=5000.0,
+           borrow_bps=None):  # noqa: D401
     decided = decided or DAYS[0]
     session = session or DAYS[1]
     store.record_paper_orders(
         decided,
         [{"ticker": ticker, "side": side, "sue": sue, "fiscal_period": "2026Q1",
           "expected_edge_bps": abs(sue) * 15.0, "cost_bps": cost_bps,
+          "borrow_bps": borrow_bps,
           "net_edge_bps": abs(sue) * 15.0 - cost_bps,
           "target_dollars": dollars, "participation": 0.001,
           "spread": 0.0005, "spread_resolved": True, "rank": 1,
@@ -166,12 +168,55 @@ def test_the_cost_recorded_at_decision_time_is_subtracted(store):
 
 
 def test_a_short_earns_when_the_price_falls(store):
-    _order(store, side="short", sue=-3.0, session=DAYS[1], cost_bps=0.0)
+    _order(store, side="short", sue=-3.0, session=DAYS[1], cost_bps=0.0,
+           borrow_bps=0.0)
     _calendar(store)
     _bars(store, "AAA", [100.0, 100.0, 100.0, 100.0, 100.0, 90.0, 90.0])
 
     row = scoring.score_orders(as_of=DAYS[10], horizon_days=4)["scored"][0]
     assert row["net_bps"] == pytest.approx(1000.0)
+
+
+def test_the_borrow_charged_at_decision_time_is_subtracted_too(store):
+    """A realised return that never paid its borrow is not a realised return,
+    and it is the number the drift coefficient is calibrated against."""
+    _order(store, side="short", sue=-3.0, session=DAYS[1], cost_bps=40.0,
+           borrow_bps=24.0)
+    _calendar(store)
+    _bars(store, "AAA", [100.0, 100.0, 100.0, 100.0, 100.0, 90.0, 90.0])
+
+    row = scoring.score_orders(as_of=DAYS[10], horizon_days=4)["scored"][0]
+
+    assert row["gross_bps"] == pytest.approx(1000.0)
+    assert row["borrow_bps"] == pytest.approx(24.0)
+    assert row["net_bps"] == pytest.approx(1000.0 - 40.0 - 24.0)
+    assert row["borrow_priced"] is True
+
+
+def test_a_row_filed_before_borrow_was_priced_says_so(store):
+    """Rows written before the cost model had a borrow term genuinely never
+    paid one. The record is append-only, so the honest thing is to count them
+    rather than to invent a charge or to drop them from the sample."""
+    _order(store, side="short", sue=-3.0, session=DAYS[1], cost_bps=0.0)
+    _calendar(store)
+    _bars(store, "AAA", [100.0, 100.0, 100.0, 100.0, 100.0, 90.0, 90.0])
+
+    out = scoring.score_orders(as_of=DAYS[10], horizon_days=4)
+
+    assert out["scored"][0]["borrow_priced"] is False
+    assert out["scored"][0]["net_bps"] == pytest.approx(1000.0)
+    assert out["shorts_without_borrow"] == 1
+
+
+def test_a_long_is_never_counted_as_an_unpriced_short(store):
+    _order(store, session=DAYS[1], cost_bps=0.0)
+    _calendar(store)
+    _bars(store, "AAA", [100.0, 100.0, 100.0, 100.0, 100.0, 110.0, 110.0])
+
+    out = scoring.score_orders(as_of=DAYS[10], horizon_days=4)
+
+    assert out["shorts_without_borrow"] == 0
+    assert out["scored"][0]["borrow_priced"] is True
 
 
 def test_a_split_inside_the_horizon_is_not_a_return(store):

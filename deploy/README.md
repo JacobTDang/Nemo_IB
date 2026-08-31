@@ -334,6 +334,33 @@ CRON_TZ=UTC
  0  4 * * * cd /srv/nemo/deploy && docker container prune -f --filter until=24h --filter label=com.docker.compose.project=deploy
 ```
 
+### The scan is long-only until somebody prices the borrow
+
+`research-scan` refuses every short it cannot price a borrow on, and reports the
+count as `borrow_unpriced`. That is deliberate. Being short is a position held
+open and the stock loan bills for every calendar day of it — 23bp at a 3% rate
+over a twenty-session hold, against a drift of a few tens of basis points — and
+a short charged nothing outranks every name that paid. There is no default rate
+because there is no free source for one.
+
+Two ways to price it, and the first wins where both exist:
+
+```bash
+# a quote per name, from a broker file, dated like everything else in the store
+python -m research.borrow --as-of 2026-08-31 --from-csv rates.csv \
+  --units fraction --source ibkr
+
+# one blanket assumption, made out loud and recorded on every row it priced
+docker compose --env-file ../.env run --rm research-scan --borrow-rate 0.03
+```
+
+`--units` has no default on purpose: `3` and `0.03` are both plausible readings
+of the same column and they differ by a hundred.
+
+The cron line above passes neither, so the nightly book is long-only until you
+decide otherwise. Commission and the long leg's financing are still not modelled
+at all; both are small next to borrow over this horizon, and neither is zero.
+
 ### Why every line carries a `flock`, and why the last line exists
 
 `docker compose run` takes no lock of its own. A pass that overruns its interval

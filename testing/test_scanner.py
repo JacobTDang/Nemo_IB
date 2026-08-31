@@ -936,8 +936,25 @@ def test_the_bottom_of_the_cohort_is_a_short(liquid_universe, monkeypatch):
                         lambda t, a: _cs_signal(0.02, t))
     monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0010))
 
-    c = scanner.scan(as_of="2026-03-03")["candidates"][0]
+    # A short has to be priced to be ranked at all; see `research.borrow`.
+    c = scanner.scan(as_of="2026-03-03", borrow_rate=0.003)["candidates"][0]
     assert c["side"] == "short"
+
+
+def test_a_short_is_refused_when_its_borrow_cannot_be_priced(liquid_universe,
+                                                             monkeypatch):
+    """The same name, with no rate declared and none on record. It is not a
+    cheaper short than one that pays; it is one nobody priced."""
+    _reported(liquid_universe, "AAA", "2026Q1", "2026-03-02")
+    monkeypatch.setattr(scanner, "SIGNAL_VARIANT", "cs")
+    monkeypatch.setattr(scanner, "_signal_for",
+                        lambda t, a: _cs_signal(0.02, t))
+    monkeypatch.setattr(scanner, "_cost_for", _banded_cost(0.0010))
+
+    out = scanner.scan(as_of="2026-03-03")
+
+    assert out["candidates"] == []
+    assert out["borrow_unpriced"] == 1
 
 
 def test_the_edge_comes_from_its_own_coefficient(liquid_universe, monkeypatch):
