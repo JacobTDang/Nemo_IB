@@ -252,7 +252,8 @@ def _refresh_universe_for(tickers: Sequence[str], as_of: str) -> int:
 def run(dates: Sequence[str], horizon_days: int = 20,
         tickers: Optional[Sequence[str]] = None,
         signal_for: Any = _MISSING,
-        comparisons: int = 1) -> Dict[str, Any]:
+        comparisons: int = 1,
+        borrow_rate: Optional[float] = None) -> Dict[str, Any]:
     """Scan on each date, then score what those decisions did.
 
     Uses the scanner unmodified. That is the point of building a store rather
@@ -277,7 +278,7 @@ def run(dates: Sequence[str], horizon_days: int = 20,
         else:
             daily_job.refresh_universe(as_of=as_of)
         result = scanner.scan(as_of=as_of, already_acted=acted,
-                              signal_for=lookup)
+                              signal_for=lookup, borrow_rate=borrow_rate)
         for candidate in result["candidates"]:
             orders.append({**candidate, "as_of_date": as_of})
             period = candidate.get("fiscal_period")
@@ -400,10 +401,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--comparisons", type=int, default=1,
                         help="how many variants have been tried against these "
                              "names; the significance bar moves out with it")
+    parser.add_argument("--borrow-rate", dest="borrow_rate", type=float,
+                        default=None,
+                        help="annualised borrow to charge every short, e.g. "
+                             "0.03 for 3%%. Without it the replay is long-only "
+                             "and says so, because a short nobody can price is "
+                             "refused rather than charged nothing")
     args = parser.parse_args(argv)
 
     result = run(args.dates, horizon_days=args.horizon_days,
-                 tickers=args.tickers, comparisons=args.comparisons)
+                 tickers=args.tickers, comparisons=args.comparisons,
+                 borrow_rate=args.borrow_rate)
     print(json.dumps(result, indent=2, default=str))
     return 0
 

@@ -31,6 +31,7 @@ on 4 March. Only the recording timestamp prevents it.
 """
 from __future__ import annotations
 
+import math
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -170,6 +171,23 @@ CREATE TABLE IF NOT EXISTS activist_filing (
 CREATE INDEX IF NOT EXISTS idx_activist_ticker
     ON activist_filing(subject_ticker, filing_date);
 
+-- What it costs to hold a name short, annualised, as somebody actually quoted
+-- it on a date. There is no default and no house average: the cost model
+-- refuses a short it cannot price rather than charging zero, because zero
+-- makes the least borrowable name in the universe the cheapest short on the
+-- book. `source` names who said so -- a broker file, a vendor, a hand entry --
+-- because a rate is only as good as its origin and none of them agree.
+CREATE TABLE IF NOT EXISTS borrow_rate (
+    as_of_date  TEXT NOT NULL,
+    ticker      TEXT NOT NULL,
+    annual_rate REAL NOT NULL,
+    source      TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY (as_of_date, ticker)
+);
+CREATE INDEX IF NOT EXISTS idx_borrow_ticker
+    ON borrow_rate(ticker, as_of_date);
+
 CREATE TABLE IF NOT EXISTS paper_order (
     as_of_date       TEXT NOT NULL,
     ticker           TEXT NOT NULL,
@@ -272,6 +290,12 @@ _MIGRATIONS = (
     ("paper_order", "drift_calibrated", "INTEGER"),
     ("paper_order", "seeded_quarters", "INTEGER"),
     ("paper_order", "recorded_quarters", "INTEGER"),
+    # What the short leg was charged to stay open, the rate it came from and
+    # who quoted it. A book spanning a change of borrow source is a book of
+    # rows priced differently with nothing on the row saying so.
+    ("paper_order", "borrow_bps", "REAL"),
+    ("paper_order", "borrow_rate", "REAL"),
+    ("paper_order", "borrow_source", "TEXT"),
 )
 
 
@@ -764,6 +788,69 @@ def actual_as_of(ticker: str, fiscal_period: str,
     return float(row["eps_actual"]) if row else None
 
 
+# ---------------------------------------------------------- borrow rates
+
+def record_borrow_rates(as_of_date: str, rows: Iterable[Dict[str, Any]],
+                        source: str = "recorded",
+                        recorded_at: Optional[str] = None) -> int:
+    """One day's cost of being short, per name. Returns the count written.
+
+    Append-only like everything else here: a rate already on record for a date
+    stands, because it is the one a decision that day would have been priced
+    with. A lender revising it afterwards is a different fact about a different
+    day.
+
+    There is no default rate and no partial row. A rate that is absent, not a
+    number, or negative is a caller bug -- and the whole point of this table is
+    that the cost model refuses a short it cannot price, so a bad row admitted
+    here would be worse than no row at all.
+    """
+    stamp = recorded_at or _now()
+    written = 0
+    with connect() as conn:
+        for row in rows:
+            ticker = row.get("ticker")
+            rate = row.get("annual_rate")
+            if not ticker:
+                raise ValueError(f"a borrow rate needs a ticker; got {row!r}")
+            if rate is None or not isinstance(rate, (int, float)) \
+                    or isinstance(rate, bool) or not math.isfinite(float(rate)):
+                raise ValueError(
+                    f"annual_rate for {ticker} on {as_of_date} must be a "
+                    f"finite number; got {rate!r}. A missing rate is a refusal "
+                    f"to price the short, not a cheap one")
+            if float(rate) < 0:
+                raise ValueError(
+                    f"annual_rate for {ticker} on {as_of_date} is {rate!r}. A "
+                    f"negative borrow pays the short to hold it, which is a "
+                    f"sign error somewhere upstream")
+            cur = conn.execute(
+                """INSERT OR IGNORE INTO borrow_rate
+                   (as_of_date, ticker, annual_rate, source, recorded_at)
+                   VALUES (?,?,?,?,?)""",
+                (as_of_date, ticker, float(rate), row.get("source") or source,
+                 stamp))
+            written += cur.rowcount or 0
+    return written
+
+
+def borrow_rate_as_of(ticker: str, as_of: str) -> Optional[Dict[str, Any]]:
+    """The most recent rate on or before `as_of`, or None.
+
+    None, not a house average and not the earliest one on file. Filtered on
+    `recorded_at` as well as the date the row describes: a rate loaded today
+    for a past date is not something that date's decision could have used, and
+    borrow is exactly the number that gets known after the fact.
+    """
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT * FROM borrow_rate
+               WHERE ticker = ? AND as_of_date <= ? AND date(recorded_at) <= ?
+               ORDER BY as_of_date DESC LIMIT 1""",
+            (ticker, as_of, as_of)).fetchone()
+    return dict(row) if row else None
+
+
 # --------------------------------------------------------- 13D events
 
 # Past this, a filing was history when we first looked at it rather than
@@ -1007,16 +1094,19 @@ def record_paper_orders(as_of_date: str, candidates: Iterable[Dict[str, Any]],
                    (as_of_date, ticker, accepted, reason, side, fiscal_period,
                     sue, variant, drift_coefficient, drift_calibrated,
                     seeded_quarters, recorded_quarters,
-                    expected_edge_bps, cost_bps, net_edge_bps,
+                    expected_edge_bps, cost_bps, borrow_bps, borrow_rate,
+                    borrow_source, net_edge_bps,
                     target_dollars, participation, spread, spread_resolved,
                     rank, regime, gross_target, intended_session, recorded_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (as_of_date, row["ticker"], accepted, row.get("reason"),
                  row.get("side"), row.get("fiscal_period"), row.get("sue"),
                  row.get("variant"), row.get("drift_coefficient"),
                  _tri_state(row.get("drift_calibrated")),
                  row.get("seeded_quarters"), row.get("recorded_quarters"),
                  row.get("expected_edge_bps"), row.get("cost_bps"),
+                 row.get("borrow_bps"), row.get("borrow_rate"),
+                 row.get("borrow_source"),
                  row.get("net_edge_bps"), row.get("target_dollars"),
                  row.get("participation"), row.get("spread"),
                  1 if row.get("spread_resolved") else 0, row.get("rank"),
