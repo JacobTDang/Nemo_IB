@@ -334,3 +334,34 @@ def test_nothing_schedules_the_recorder_and_the_scan_at_two_clock_times(
         f"{timed} still schedules the recorder or the scan on its own clock "
         f"time; a recorder that overruns is then a scan on a half-written "
         f"store")
+
+
+# --- the runbook's own SQL has to run -----------------------------------------
+
+def test_every_table_the_deploy_runbook_queries_exists():
+    """The restore section tells an operator to check a backup before trusting
+    it, and that check is a SQL query pasted into a shell. It named
+    `daily_bars`; the table is `daily_bar`, so the one command whose whole job
+    is to prove a backup is good died on a traceback -- after printing "ok"
+    from the integrity check above it, which is the worst possible order to
+    read under pressure during a restore.
+
+    A count kept by hand drifts, and so does a table name.
+    """
+    import re
+
+    from research import pit_store
+
+    doc = pathlib.Path(__file__).resolve().parents[1] / "deploy" / "README.md"
+    tables = set(re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)",
+                            pit_store._SCHEMA))
+    queried = set(re.findall(r"(?:from|FROM)\s+(\w+)", doc.read_text()))
+    # Only names that look like this store's tables; the page is prose as well
+    # as SQL, and "from the recorder" is not a query.
+    candidates = {t for t in queried
+                  if t in tables or f"{t}s" in tables or t.rstrip("s") in tables}
+
+    missing = sorted(t for t in candidates if t not in tables)
+    assert not missing, (
+        f"deploy/README.md queries {missing}, which is not a table in the "
+        f"store; the real names are {sorted(tables)}")

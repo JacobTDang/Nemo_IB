@@ -531,7 +531,7 @@ docker compose --env-file ../.env down          # servers; the jobs are already 
 docker run --rm -v /srv/nemo/backups:/backups --entrypoint python nemo-data:local \
   -c "import sqlite3; db=sqlite3.connect('/backups/pit-2026-08-26.db'); \
 print(db.execute('PRAGMA integrity_check').fetchone()[0]); \
-print(db.execute('select count(*) from daily_bars').fetchone()[0], 'bars')"
+print(db.execute('select count(*) from daily_bar').fetchone()[0], 'bars')"
 
 # Then put it back, at the path NEMO_PIT_DB points at inside the volume.
 docker run --rm -v deploy_research-data:/app/data -v /srv/nemo/backups:/backups \
