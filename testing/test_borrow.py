@@ -303,3 +303,85 @@ def test_the_recorded_range_is_printed_so_a_unit_error_is_visible(
 
     out = capsys.readouterr().out
     assert "0.003" in out and "0.35" in out
+
+
+# --- loading a broker file for the day it describes -------------------------
+
+def test_a_past_dated_load_is_invisible_without_backfill(store, tmp_path):
+    """The default has to stay this way. A rate typed in today is not
+    something last month's decision could have used, and silently backdating
+    every load would reintroduce exactly the lookahead the column stops."""
+    path = _csv(tmp_path, "ticker,annual_rate\nHTB,0.035\n")
+
+    borrow.main(["--as-of", AS_OF, "--from-csv", path, "--units", "fraction"])
+
+    assert store.borrow_rate_as_of("HTB", AS_OF) is None
+
+
+def test_a_past_dated_load_without_backfill_says_it_will_not_be_read(
+        store, tmp_path, capsys):
+    """`3 of 3 rates recorded` on a write nothing will ever return is the
+    confusing pairing: the loader reports success and every short then refuses
+    for want of a rate."""
+    borrow.main(["--as-of", AS_OF, "--units", "fraction",
+                 "--from-csv", _csv(tmp_path, "ticker,annual_rate\nHTB,0.035\n")])
+
+    out = capsys.readouterr().out
+    assert "--backfill" in out
+    assert AS_OF in out
+
+
+def test_backfill_stamps_the_row_at_the_day_it_describes(store, tmp_path,
+                                                         calendar):
+    borrow.main(["--as-of", AS_OF, "--units", "fraction", "--backfill",
+                 "--from-csv", _csv(tmp_path, "ticker,annual_rate\nHTB,0.035\n")])
+
+    row = store.borrow_rate_as_of("HTB", AS_OF)
+
+    assert row is not None, "a backfilled rate was still invisible to its date"
+    assert row["annual_rate"] == pytest.approx(0.035)
+    assert row["recorded_at"].startswith(AS_OF)
+
+
+def test_a_backfilled_rate_prices_a_short_on_that_date(store, tmp_path,
+                                                        calendar):
+    """The point of it: a replay can price shorts from history instead of
+    running long-only or on one blanket assumption."""
+    borrow.main(["--as-of", AS_OF, "--units", "percent", "--backfill",
+                 "--from-csv", _csv(tmp_path, "ticker,annual_rate\nHTB,3.0\n")])
+
+    out = borrow.carry_cost("HTB", AS_OF, side="short")
+
+    assert out["cost"] == pytest.approx(0.03 * 28 / 360)
+    assert out["rate_source"] == "recorded"
+
+
+def test_a_backfilled_rate_says_it_was_filled_in_not_watched(store, tmp_path):
+    """`daily_bar.source` and `consensus_snapshot.source` draw the same line.
+    A rate loaded three weeks later is not evidence of the same kind as one
+    captured on the day, and a study has to be able to tell them apart."""
+    borrow.main(["--as-of", AS_OF, "--units", "fraction", "--backfill",
+                 "--from-csv", _csv(tmp_path, "ticker,annual_rate\nHTB,0.035\n")])
+
+    assert store.borrow_rate_as_of("HTB", AS_OF)["backfilled"] == 1
+
+
+def test_a_live_load_is_not_marked_backfilled(store, tmp_path):
+    borrow.main(["--as-of", TODAY, "--units", "fraction",
+                 "--from-csv", _csv(tmp_path, "ticker,annual_rate\nHTB,0.035\n")])
+
+    assert store.borrow_rate_as_of("HTB", TODAY)["backfilled"] == 0
+
+
+def test_backfilling_a_future_date_is_refused(store, tmp_path):
+    """Stamping a row at the end of a day that has not happened would make it
+    visible to every date after it and to none before, which is not a
+    backfill, it is a forecast."""
+    ahead = (date.today() + timedelta(days=7)).isoformat()
+
+    rc = borrow.main(["--as-of", ahead, "--units", "fraction", "--backfill",
+                      "--from-csv", _csv(tmp_path,
+                                         "ticker,annual_rate\nHTB,0.035\n")])
+
+    assert rc == 1
+    assert store.borrow_rate_as_of("HTB", ahead) is None

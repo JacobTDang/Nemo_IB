@@ -336,6 +336,32 @@ def test_nothing_schedules_the_recorder_and_the_scan_at_two_clock_times(
         f"store")
 
 
+# --- the watcher's cap has to fit its own interval ----------------------------
+
+def test_the_deployed_watcher_caps_its_sweep(compose):
+    """Measured at 0.90s a ticker quiet and about 1.6s under load, a sweep of
+    the 1,565-name eligible universe is 23 to 42 minutes against a 20-minute
+    timer. Uncapped, two firings in three are blocked by flock and exit
+    non-zero, which teaches an operator that a non-zero exit means "still
+    working" -- and the module's own docstring says this shape does not fit.
+    """
+    import yaml
+
+    service = yaml.safe_load(compose)["services"]["research-watch"]
+    argv = list(service.get("entrypoint") or []) + list(
+        service.get("command") or [])
+
+    assert "--max-seconds" in argv, (
+        "research-watch sweeps the whole eligible universe unbounded, and a "
+        "pass takes longer than the interval it runs on. A ticker cap is not "
+        "the bound -- the per-ticker cost moved 0.90s -> 3.0s -> 6.0s across "
+        "one afternoon -- so the budget has to be a clock")
+    budget = float(argv[argv.index("--max-seconds") + 1])
+    assert budget <= 20 * 60 * 0.6, (
+        f"a {budget:.0f}s budget leaves too little of the 1200s interval; a "
+        f"pass that overruns is refused by flock and exits non-zero")
+
+
 # --- the runbook's own SQL has to run -----------------------------------------
 
 def test_every_table_the_deploy_runbook_queries_exists():

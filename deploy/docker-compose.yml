@@ -424,6 +424,24 @@ services:
     profiles: ["sync"]
     restart: "no"
     entrypoint: ["python", "-m", "research.activist_watch"]
+    # A sweep of the eligible universe does not fit the interval it runs on.
+    # Measured: 0.90s a ticker quiet, about 1.6s while the recorder is
+    # competing for the same EDGAR budget, against 1,565 eligible names -- so
+    # 23 minutes at best and over 40 at worst, on a */20 timer. Uncapped, two
+    # firings in three are refused by flock and exit non-zero, which is how an
+    # operator learns to read a failing job as normal.
+    #
+    # A ticker cost 0.90s, then 3.0s, then 6.0s across three measurements on
+    # one machine in one afternoon, so the variable is EDGAR's throttle state
+    # and no fixed ticker count can be sized against it. The bound is a clock:
+    # 600 seconds is half the interval, whatever that buys on the day, and a
+    # cursor means the next pass resumes where this one stopped rather than
+    # restarting at the head. `docker compose run --rm research-watch
+    # --max-seconds N` overrides it for a one-off.
+    #
+    # The real answer is EDGAR's market-wide current-filings feed, one request
+    # for the whole market instead of one per name; see issue #82.
+    command: ["--max-seconds", "600"]
     environment:
       <<: [*filing-cache-env, *clock-env]
       NEMO_PIT_DB: /app/data/pit.db

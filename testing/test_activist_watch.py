@@ -472,6 +472,227 @@ def test_a_capped_pass_is_never_reported_as_full_coverage(store, monkeypatch):
     assert "cap" in str(result["error"]).lower()
 
 
+def test_a_capped_pass_rotates_so_no_name_is_never_watched(store, monkeypatch):
+    """A cap that always takes the head of the list is not a cap, it is a
+    blind spot. Whoever sorts last is never watched, on any pass, forever --
+    and the pass reports `partial` while saying nothing about which names
+    those are.
+
+    Measured at 0.90s per ticker against a 1,565-name universe, a full sweep
+    is 23 minutes quiet and over 40 under load, against a 20-minute timer. So
+    the cap is not optional and the rotation is what makes it honest.
+    """
+    names = [f"T{i:02d}" for i in range(10)]
+    store.record_universe("2026-08-26", [
+        {"ticker": t, "cik": str(i), "eligible": True}
+        for i, t in enumerate(names)], recorded_at="2026-08-26T21:00:00Z")
+
+    asked = []
+    monkeypatch.setattr(activist_watch, "_fetch_company_filings",
+                        lambda ticker: (asked.append(ticker), (INTC_CIK, []))[1])
+
+    seen = set()
+    for _ in range(4):
+        activist_watch.watch_pass(as_of="2026-08-26", max_tickers=3)
+        seen |= set(asked)
+        asked.clear()
+
+    assert seen == set(names), (
+        f"after four passes of three, {sorted(set(names) - seen)} had still "
+        f"never been watched")
+
+
+def test_consecutive_passes_take_different_slices(store, monkeypatch):
+    names = [f"T{i:02d}" for i in range(10)]
+    store.record_universe("2026-08-26", [
+        {"ticker": t, "cik": str(i), "eligible": True}
+        for i, t in enumerate(names)], recorded_at="2026-08-26T21:00:00Z")
+
+    asked = []
+    monkeypatch.setattr(activist_watch, "_fetch_company_filings",
+                        lambda ticker: (asked.append(ticker), (INTC_CIK, []))[1])
+
+    activist_watch.watch_pass(as_of="2026-08-26", max_tickers=3)
+    first = list(asked)
+    asked.clear()
+    activist_watch.watch_pass(as_of="2026-08-26", max_tickers=3)
+    second = list(asked)
+
+    assert first != second, "two passes in a row watched the same three names"
+    assert len(set(first) & set(second)) == 0
+
+
+def test_the_slice_wraps_rather_than_running_off_the_end(store, monkeypatch):
+    """The last slice of a cycle is short unless it wraps, and a short slice
+    means a few names are watched less often than the rest for no reason."""
+    names = [f"T{i:02d}" for i in range(10)]
+    store.record_universe("2026-08-26", [
+        {"ticker": t, "cik": str(i), "eligible": True}
+        for i, t in enumerate(names)], recorded_at="2026-08-26T21:00:00Z")
+
+    asked = []
+    monkeypatch.setattr(activist_watch, "_fetch_company_filings",
+                        lambda ticker: (asked.append(ticker), (INTC_CIK, []))[1])
+
+    sizes = []
+    for _ in range(6):
+        activist_watch.watch_pass(as_of="2026-08-26", max_tickers=4)
+        sizes.append(len(asked))
+        asked.clear()
+
+    assert sizes == [4] * 6, f"a pass watched a short slice: {sizes}"
+
+
+def test_the_note_says_which_slice_was_watched(store, monkeypatch):
+    """`capped at 3 of 10` does not tell an operator whether the coverage is
+    rotating or stuck. The window does."""
+    store.record_universe("2026-08-26", [
+        {"ticker": f"T{i}", "cik": str(i), "eligible": True}
+        for i in range(10)], recorded_at="2026-08-26T21:00:00Z")
+    monkeypatch.setattr(activist_watch, "_fetch_company_filings",
+                        lambda ticker: (INTC_CIK, []))
+
+    result = activist_watch.watch_pass(as_of="2026-08-26", max_tickers=3)
+
+    note = str(result["error"])
+    assert "cap" in note.lower()
+    assert "pass" in note.lower() or "rotat" in note.lower()
+
+
+def test_a_cap_bigger_than_the_universe_watches_all_of_it(store, monkeypatch):
+    store.record_universe("2026-08-26", [
+        {"ticker": f"T{i}", "cik": str(i), "eligible": True}
+        for i in range(3)], recorded_at="2026-08-26T21:00:00Z")
+    asked = []
+    monkeypatch.setattr(activist_watch, "_fetch_company_filings",
+                        lambda ticker: (asked.append(ticker), (INTC_CIK, []))[1])
+
+    result = activist_watch.watch_pass(as_of="2026-08-26", max_tickers=99)
+
+    assert sorted(asked) == ["T0", "T1", "T2"]
+    assert result["status"] == "ok", "a cap nobody hit still reported partial"
+
+
+def test_a_pass_stops_at_its_deadline_however_slow_the_vendor_is(store,
+                                                                 monkeypatch):
+    """The bound that actually holds. A ticker cost 0.90s, then 3.0s, then
+    6.0s across three measurements on the same machine on the same day -- the
+    variable is EDGAR's throttle state, not the ticker count, so no fixed cap
+    can be sized against it. A deadline can."""
+    names = [f"T{i:02d}" for i in range(50)]
+    store.record_universe("2026-08-26", [
+        {"ticker": t, "cik": str(i), "eligible": True}
+        for i, t in enumerate(names)], recorded_at="2026-08-26T21:00:00Z")
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(activist_watch.time, "monotonic", lambda: clock["t"])
+
+    def slow(ticker):
+        clock["t"] += 2.0
+        return INTC_CIK, []
+
+    monkeypatch.setattr(activist_watch, "_fetch_company_filings", slow)
+
+    result = activist_watch.watch_pass(as_of="2026-08-26", max_seconds=10)
+
+    assert result["covered"] == 5, (
+        f"a 10s budget at 2s a ticker covered {result['covered']}")
+    assert result["status"] == "partial"
+
+
+def test_the_next_pass_resumes_where_the_deadline_stopped_the_last(store,
+                                                                   monkeypatch):
+    """Without a cursor a time-bounded pass restarts at the head every time,
+    which is the blind spot again with extra steps."""
+    names = [f"T{i:02d}" for i in range(50)]
+    store.record_universe("2026-08-26", [
+        {"ticker": t, "cik": str(i), "eligible": True}
+        for i, t in enumerate(names)], recorded_at="2026-08-26T21:00:00Z")
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(activist_watch.time, "monotonic", lambda: clock["t"])
+    asked = []
+
+    def slow(ticker):
+        clock["t"] += 2.0
+        asked.append(ticker)
+        return INTC_CIK, []
+
+    monkeypatch.setattr(activist_watch, "_fetch_company_filings", slow)
+
+    activist_watch.watch_pass(as_of="2026-08-26", max_seconds=10)
+    first = list(asked)
+    asked.clear()
+    clock["t"] = 0.0
+    activist_watch.watch_pass(as_of="2026-08-26", max_seconds=10)
+    second = list(asked)
+
+    assert first == names[:5]
+    assert second == names[5:10], f"the second pass repeated {second}"
+
+
+def test_the_cursor_wraps_and_covers_the_whole_watchlist(store, monkeypatch):
+    names = [f"T{i:02d}" for i in range(10)]
+    store.record_universe("2026-08-26", [
+        {"ticker": t, "cik": str(i), "eligible": True}
+        for i, t in enumerate(names)], recorded_at="2026-08-26T21:00:00Z")
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(activist_watch.time, "monotonic", lambda: clock["t"])
+    asked = []
+
+    def slow(ticker):
+        clock["t"] += 2.0
+        asked.append(ticker)
+        return INTC_CIK, []
+
+    monkeypatch.setattr(activist_watch, "_fetch_company_filings", slow)
+
+    seen = set()
+    for _ in range(4):
+        clock["t"] = 0.0
+        activist_watch.watch_pass(as_of="2026-08-26", max_seconds=6)
+        seen |= set(asked)
+        asked.clear()
+
+    assert seen == set(names), f"never watched: {sorted(set(names) - seen)}"
+
+
+def test_a_pass_that_reaches_everyone_is_ok_and_leaves_no_debt(store,
+                                                               monkeypatch):
+    store.record_universe("2026-08-26", [
+        {"ticker": f"T{i}", "cik": str(i), "eligible": True}
+        for i in range(3)], recorded_at="2026-08-26T21:00:00Z")
+    monkeypatch.setattr(activist_watch, "_fetch_company_filings",
+                        lambda t: (INTC_CIK, []))
+
+    result = activist_watch.watch_pass(as_of="2026-08-26", max_seconds=600)
+
+    assert result["status"] == "ok"
+    assert result["covered"] == 3
+
+
+def test_the_note_says_what_stopped_the_pass(store, monkeypatch):
+    names = [f"T{i:02d}" for i in range(50)]
+    store.record_universe("2026-08-26", [
+        {"ticker": t, "cik": str(i), "eligible": True}
+        for i, t in enumerate(names)], recorded_at="2026-08-26T21:00:00Z")
+    clock = {"t": 0.0}
+    monkeypatch.setattr(activist_watch.time, "monotonic", lambda: clock["t"])
+
+    def slow(ticker):
+        clock["t"] += 2.0
+        return INTC_CIK, []
+
+    monkeypatch.setattr(activist_watch, "_fetch_company_filings", slow)
+
+    result = activist_watch.watch_pass(as_of="2026-08-26", max_seconds=10)
+
+    note = str(result["error"]).lower()
+    assert "budget" in note or "second" in note
+    assert "resume" in note or "next pass" in note
+
+
 def test_the_universe_is_read_as_it_stood_on_the_day(store, monkeypatch):
     """A name eligible in March and delisted in June was watched in March. A
     watcher that reads today's universe when replaying a March pass silently

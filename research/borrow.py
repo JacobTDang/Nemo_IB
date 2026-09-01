@@ -36,6 +36,7 @@ implied by silence.
 from __future__ import annotations
 
 import statistics
+from datetime import date
 from typing import Any, Dict, Optional
 
 from research import pit_store, scoring, spread
@@ -169,7 +170,6 @@ def carry_cost(ticker: str, as_of: str, side: str,
 
 
 def _d(day: str):
-    from datetime import date
     return date.fromisoformat(day)
 
 
@@ -237,12 +237,32 @@ def main(argv: Optional[list] = None) -> int:
                         help="whether annual_rate is 0.03 or 3.0 for 3%%")
     parser.add_argument("--source", default="recorded",
                         help="who quoted these, for rows that do not name it")
+    # Off by default, and it has to stay off by default: a rate typed in today
+    # is not something last month's decision could have used, and backdating
+    # every load would reintroduce the lookahead `recorded_at` exists to stop.
+    parser.add_argument("--backfill", action="store_true",
+                        help="stamp the rows at the end of --as-of rather than "
+                             "now, so they are visible to the date they "
+                             "describe. For a broker file collected after the "
+                             "fact; the rows are marked backfilled so a study "
+                             "can tell them from ones captured on the day")
     args = parser.parse_args(argv)
+
+    today = date.today().isoformat()
+    if args.backfill and args.as_of > today:
+        # Stamping a row at the end of a day that has not happened makes it
+        # visible to every date after it and to none before. That is not a
+        # backfill, it is a forecast wearing one's clothes.
+        print(f"--backfill needs a date that has happened; {args.as_of} is "
+              f"after {today}")
+        return 1
 
     try:
         rows = _rows_from_csv(args.from_csv, args.units)
         written = pit_store.record_borrow_rates(
-            args.as_of, rows, source=args.source)
+            args.as_of, rows, source=args.source,
+            recorded_at=f"{args.as_of}T21:00:00Z" if args.backfill else None,
+            backfilled=args.backfill)
     except (OSError, ValueError) as exc:
         print(f"{type(exc).__name__}: {exc}")
         return 1
@@ -253,6 +273,14 @@ def main(argv: Optional[list] = None) -> int:
     print(f"{written} of {len(rows)} rates recorded for {args.as_of}; "
           f"min {rates[0]:g}, median {statistics.median(rates):g}, "
           f"max {rates[-1]:g}")
+    if not args.backfill and args.as_of < today:
+        # The confusing pairing this exists to stop: "recorded" printed over a
+        # write no reader will ever return, followed three minutes later by
+        # every short refusing for want of a rate.
+        print(f"warning: these are stamped now, so a scan dated {args.as_of} "
+              f"will not see them -- `date(recorded_at) <= as_of` hides a rate "
+              f"written after the decision. Pass --backfill to stamp them at "
+              f"{args.as_of} instead")
     return 0
 
 
