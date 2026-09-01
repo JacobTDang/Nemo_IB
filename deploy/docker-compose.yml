@@ -168,9 +168,24 @@ x-server: &server
     start_period: 10s
 
 services:
+  # Memory limits, sized from measured peaks rather than guessed.
+  #
+  # Python frees memory to its own allocator and not to the OS, so a
+  # container's RSS is a high-water mark that never falls. The SEC server sat
+  # at 861MiB after a day of use, went to 934MiB after one round of heavy
+  # extraction, then stayed at 933MiB and 933MiB through two more identical
+  # rounds -- so it plateaus, and this is not a leak. What it is not is
+  # bounded: the peak is whatever the largest thing anyone ever asks for.
+  #
+  # Unlimited, a container that overruns takes the host's memory with it and
+  # the kernel OOM killer picks a victim, which on a shared homelab is as
+  # likely to be something else as the offender. Limited, it dies alone and
+  # `restart: unless-stopped` brings it back. These total 3.2GB, so the whole
+  # stack fits on an 8GB box with room for the batch jobs beside it.
   sec:
     <<: *server
     container_name: nemo-sec
+    mem_limit: 1500m
     command: python -m tools.web_search_server.web_search http
     ports: ["${NEMO_BIND_ADDR:-127.0.0.1}:8810:8080"]
     environment:
@@ -189,6 +204,7 @@ services:
   financial:
     <<: *server
     container_name: nemo-financial
+    mem_limit: 512m
     command: python -m tools.financial_modeling_engine.analysis_tools http
     ports: ["${NEMO_BIND_ADDR:-127.0.0.1}:8811:8080"]
     environment:
@@ -199,6 +215,7 @@ services:
   finnhub:
     <<: *server
     container_name: nemo-finnhub
+    mem_limit: 512m
     command: python -m tools.news_agregator.finnhub_server http
     ports: ["${NEMO_BIND_ADDR:-127.0.0.1}:8812:8080"]
     environment:
@@ -208,6 +225,7 @@ services:
   fred:
     <<: *server
     container_name: nemo-fred
+    mem_limit: 256m
     command: python -m tools.news_agregator.fred_server http
     ports: ["${NEMO_BIND_ADDR:-127.0.0.1}:8813:8080"]
     environment:
@@ -217,6 +235,7 @@ services:
   altdata:
     <<: *server
     container_name: nemo-altdata
+    mem_limit: 512m
     command: python -m tools.altdata_server.server http
     ports: ["${NEMO_BIND_ADDR:-127.0.0.1}:8814:8080"]
     environment:

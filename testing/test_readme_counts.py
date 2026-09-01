@@ -362,6 +362,56 @@ def test_the_deployed_watcher_caps_its_sweep(compose):
         f"pass that overruns is refused by flock and exits non-zero")
 
 
+# --- nothing may take the host down ------------------------------------------
+
+def test_every_long_running_service_has_a_memory_limit(compose):
+    """Python frees memory to its own allocator and not to the OS, so a
+    container's RSS is a high-water mark that never falls. Measured on the SEC
+    server: 861MiB after a day, 934MiB after one round of heavy extraction,
+    then 933MiB and 933MiB after two more identical rounds -- it plateaus, so
+    this is not a leak. But a plateau with no ceiling is still unbounded: the
+    peak is whatever the largest thing anyone ever asks for.
+
+    Without a limit, Docker lets a container take the host's memory and the
+    kernel OOM killer picks a victim, which on a homelab is as likely to be
+    something else as the offender. With one, the container dies alone and
+    `restart: unless-stopped` brings it back.
+    """
+    import yaml
+
+    services = yaml.safe_load(compose)["services"]
+    servers = [n for n, s in services.items()
+               if "profiles" not in s and s.get("restart") == "unless-stopped"]
+    assert servers, "no long-running services found; has the file changed shape?"
+
+    missing = [n for n in servers if not services[n].get("mem_limit")]
+    assert not missing, (
+        f"{missing} can grow until the host runs out; set mem_limit")
+
+
+def test_the_memory_limits_leave_room_above_what_was_measured(compose):
+    """A limit under the observed peak is a crash loop, not a guard."""
+    import yaml
+
+    def megabytes(value):
+        text = str(value).strip().lower()
+        if text.endswith("g"):
+            return float(text[:-1]) * 1024
+        return float(text.rstrip("m"))
+
+    # Peak RSS observed on this deployment, in MiB.
+    measured = {"sec": 934, "financial": 121, "finnhub": 125,
+                "fred": 62, "altdata": 160}
+    services = yaml.safe_load(compose)["services"]
+
+    for name, peak in measured.items():
+        limit = megabytes(services[name]["mem_limit"])
+        assert limit >= peak * 1.4, (
+            f"{name} is limited to {limit:.0f}MiB against a measured peak of "
+            f"{peak}MiB; that is not enough headroom to survive a larger "
+            f"filing than the ones tested")
+
+
 # --- the runbook's own SQL has to run -----------------------------------------
 
 def test_every_table_the_deploy_runbook_queries_exists():
