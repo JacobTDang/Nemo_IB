@@ -11,6 +11,14 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 from dotenv import load_dotenv
 
+# A 429 or a 5xx is worth asking again; a 4xx is not. Three attempts with
+# linear backoff matches what `research.daily_job` gives the bars fetch --
+# deliberately, because the fetch this protects is the one that CANNOT be
+# repeated tomorrow: consensus accrues forward only, so a night lost to a
+# transient 503 is lost for good.
+RETRY_ATTEMPTS = 3
+RETRY_BACKOFF = 2.0
+
 # This key travels as a *query parameter*, so it reaches the URL aiohttp builds,
 # the error text aiohttp renders from that URL, and from there the `error` field
 # this client returns to its MCP caller -- which leaves the process rather than
@@ -72,7 +80,8 @@ class FinnhubClient:
   """Async HTTP client for Finnhub API with rate limiting.
 
   Creates an aiohttp session lazily on first request.
-  Single retry on 429 with 2s backoff.
+  Retries a 429 or any 5xx with linear backoff; a 4xx is returned as it came,
+  because a malformed request does not improve by being repeated.
   """
   BASE_URL = "https://finnhub.io/api/v1"
 
@@ -101,7 +110,7 @@ class FinnhubClient:
 
     session = await self._get_session()
 
-    for attempt in range(2):
+    for attempt in range(RETRY_ATTEMPTS):
       await self._rate_limiter.acquire()
       try:
         # The credential is revealed into the call itself and never bound
@@ -109,11 +118,21 @@ class FinnhubClient:
         # what a rendered traceback prints.
         async with session.get(url, params={**params, "token": self._api_key.reveal()},
                                timeout=aiohttp.ClientTimeout(total=30)) as resp:
-          if resp.status == 429:
-            if attempt == 0:
-              await asyncio.sleep(2)
+          # 429 and 5xx both mean "ask again"; a 4xx means the request is
+          # wrong and will be just as wrong next time, so retrying it only
+          # spends rate limit to receive the same answer.
+          #
+          # 5xx used to fall through to the error return below, and a single
+          # transient 503 from Finnhub's edge then failed a whole night of
+          # consensus -- the one series that cannot be fetched retroactively.
+          if resp.status == 429 or resp.status >= 500:
+            if attempt + 1 < RETRY_ATTEMPTS:
+              await asyncio.sleep(RETRY_BACKOFF * (attempt + 1))
               continue
-            return {"error": f"Rate limited (429) after retry"}
+            text = await resp.text()
+            return {"error": self._api_key.scrub(
+                f"HTTP {resp.status} after {RETRY_ATTEMPTS} attempts: "
+                f"{text[:200]}")}
           if resp.status != 200:
             text = await resp.text()
             return {"error": self._api_key.scrub(f"HTTP {resp.status}: {text[:200]}")}
@@ -126,7 +145,7 @@ class FinnhubClient:
         # back to the caller, which is further than a log line travels.
         return {"error": self._api_key.scrub(f"HTTP client error: {str(e)}")}
 
-    return {"error": "Unexpected: exhausted retries"}
+    return {"error": f"Unexpected: exhausted {RETRY_ATTEMPTS} retries"}
 
   async def close(self):
     """Close the underlying HTTP session."""

@@ -448,13 +448,17 @@ def scan(as_of: Optional[str] = None,
     _COHORT.clear()
     signal_for = signal_for or _signal_for
     if already_acted is None:
-        already_acted = pit_store.filed_periods(as_of)
+        already_acted = pit_store.filed_issuer_periods(as_of)
     scale, regime = _regime_scale(as_of)
     gross = GROSS_TARGET * scale
     per_name = gross / MAX_NAMES
 
-    universe = [m["ticker"] for m in pit_store.universe_as_of(as_of)
-                if m["eligible"]]
+    members = [m for m in pit_store.universe_as_of(as_of) if m["eligible"]]
+    universe = [m["ticker"] for m in members]
+    # Who each line belongs to. One issuer lists more than one -- eight
+    # tickers share Morgan Stanley's CIK, fourteen ProShares funds share one
+    # sponsor's -- and a print belongs to the issuer, not to the line.
+    issuer_of = {m["ticker"]: m["cik"] for m in members if m["cik"]}
     refusal = None
 
     # Narrow before spending a request, not after. Asking EDGAR for a signal on
@@ -524,12 +528,24 @@ def scan(as_of: Optional[str] = None,
             continue
 
         period = signal.get("fiscal_period")
-        if period and (ticker, period) in already_acted:
+        # Two identities, both meaning "already acted", and the set may carry
+        # either. A ticker key says this exact line traded; an issuer key says
+        # this issuer's print did, whichever line carried it. Checking both is
+        # a union of two rules rather than a fallback -- replay keys its own
+        # set on the ticker, and the filed book is keyed on the issuer.
+        #
+        # `issuer_of.get(ticker)` and not `.get(ticker, ticker)`: an
+        # unrecorded issuer must stay None rather than borrow the ticker,
+        # or two names nobody screened would collapse into each other.
+        issuer = issuer_of.get(ticker)
+        if period and ((ticker, period) in already_acted
+                       or (issuer is not None
+                           and (issuer, period) in already_acted)):
             rejected.append({
                 "ticker": ticker, "sue": signal.get("sue"),
-                "reason": (f"already acted on {ticker} {period}; the signal "
-                           f"stays fresh for {MAX_SIGNAL_AGE_DAYS} days and "
-                           f"one print is one trade")})
+                "reason": (f"already acted on this issuer's {period}; the "
+                           f"signal stays fresh for {MAX_SIGNAL_AGE_DAYS} days "
+                           f"and one print is one trade")})
             continue
 
         if signal.get("variant") == "cs":
@@ -650,6 +666,7 @@ def scan(as_of: Optional[str] = None,
             # constants or upstream fields at decision time and none of them
             # can be recovered from the row afterwards.
             "variant": signal.get("variant"),
+            "issuer_cik": issuer,
             # The quantity the coefficient was multiplied by. `sue` is a sigma
             # for ts and af and percentile-0.5 for cs, which is half what cs
             # is priced on -- so a scorer deriving the multiplier from that
@@ -682,6 +699,38 @@ def scan(as_of: Optional[str] = None,
         })
 
     candidates.sort(key=lambda c: c["net_edge_bps"], reverse=True)
+
+    # One print is one trade, and a print belongs to an issuer rather than to
+    # a line it lists under. Collapsed AFTER the ranking, deliberately: taking
+    # whichever sibling the loop reached first would hand the book the worse
+    # execution, and these differ only in what they cost to cross.
+    #
+    # A live scan without this put six Morgan Stanley preferred classes into a
+    # twenty-name book -- same CIK, same quarter, same SUE of 3.95 -- which is
+    # 30% of gross on one bank's earnings in a book sized for twenty
+    # independent bets.
+    best: Dict[Any, Dict[str, Any]] = {}
+    kept: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        # No recorded issuer means no claim that two names are the same one.
+        key = (candidate.get("issuer_cik"), candidate.get("fiscal_period"))
+        if key[0] is None or key[1] is None:
+            kept.append(candidate)
+            continue
+        winner = best.get(key)
+        if winner is None:
+            best[key] = candidate
+            kept.append(candidate)
+            continue
+        rejected.append({
+            "ticker": candidate["ticker"], "sue": candidate["sue"],
+            "reason": (f"{winner['ticker']} is the same issuer "
+                       f"({key[0]}) on the same {key[1]} print and ranks "
+                       f"higher at {winner['net_edge_bps']:.1f}bp net against "
+                       f"{candidate['net_edge_bps']:.1f}bp; one print is one "
+                       f"trade")})
+    candidates = kept
+
     for rank, candidate in enumerate(candidates[:MAX_NAMES], start=1):
         candidate["rank"] = rank
     dropped = candidates[MAX_NAMES:]

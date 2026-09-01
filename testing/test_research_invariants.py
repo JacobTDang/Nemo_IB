@@ -78,6 +78,8 @@ def _write_everything_late(store):
     ("reporters_since",
      lambda: pit_store.reporters_since("2026-01-01", PAST)),
     ("filed_periods", lambda: sorted(pit_store.filed_periods(PAST))),
+    ("filed_issuer_periods",
+     lambda: sorted(pit_store.filed_issuer_periods(PAST))),
     ("cohort", lambda: sue_cs.cohort(as_of=PAST)),
 ])
 def test_no_reader_sees_a_row_written_after_its_date(store, name, call):
@@ -119,8 +121,8 @@ def test_every_as_of_reader_in_the_store_is_covered_here():
         "bars_as_of", "adjusted_bars", "corporate_actions_as_of",
         "universe_as_of", "announcements_as_of", "paper_orders_as_of",
         "activist_filings_as_of", "consensus_as_of", "actual_as_of",
-        "reporters_since", "filed_periods", "has_consensus_history",
-        "borrow_rate_as_of",
+        "reporters_since", "filed_periods", "filed_issuer_periods",
+        "has_consensus_history", "borrow_rate_as_of",
         # Reads the run log, which records what the process did rather than
         # what the market did; see the test below for why it is keyed on the
         # date a run was FOR rather than on when it finished.
