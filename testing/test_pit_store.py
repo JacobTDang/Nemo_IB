@@ -234,8 +234,13 @@ def test_an_unfinished_run_does_not_count_as_coverage(store):
 def test_an_announcement_is_keyed_on_fiscal_identity(store):
     """Not on the vendor's calendar bucket. get_earnings_surprises labels
     AMAT's 13 August print 2026-09-30; joining on that returns nothing."""
+    # `recorded_at` explicitly, not the wall clock. Without it the row is
+    # stamped today and the reader below -- which filters on recorded_at like
+    # every reader here -- correctly hides it from a date in the past. This
+    # test passed until the day the calendar rolled past its own as_of.
     store.record_announcement("AMAT", fiscal_period="2026Q3",
-                              announced_date="2026-08-13", timing="amc")
+                              announced_date="2026-08-13", timing="amc",
+                              recorded_at="2026-08-13T21:00:00Z")
     got = store.announcements_as_of("AMAT", as_of="2026-08-31")
     assert got[0]["fiscal_period"] == "2026Q3"
     assert got[0]["announced_date"] == "2026-08-13"

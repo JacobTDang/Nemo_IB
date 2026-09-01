@@ -334,6 +334,36 @@ CRON_TZ=UTC
  0  4 * * * cd /srv/nemo/deploy && docker container prune -f --filter until=24h --filter label=com.docker.compose.project=deploy
 ```
 
+### What a failed stage costs, and why the chain still uses `&&`
+
+The recorder exits non-zero if **any** stage failed, and the cron line joins it
+to the scan with `&&`, so a bad night costs that night's decisions as well. That
+coupling is deliberate — a scan against a half-written store files a
+permanently wrong book and logs it `ok` — but it means the blast radius of one
+vendor hiccup is larger than it first looks.
+
+The hiccup that matters is consensus, because that series accrues forward only:
+Finnhub serves four quarters however many you ask for, so a night missed is a
+night gone. A cold bootstrap here failed exactly that way on its first run — one
+transient `HTTP 503` from Finnhub's edge, gone within twenty seconds, after
+1.12M bars and 10,391 registrants had already been written successfully.
+
+The fix is in the retry policy, which used to be backwards: `_fetch_bars`
+retried three times with backoff, and the calendar fetch did not retry at all.
+Both now do, and `FinnhubClient` retries any 5xx as well as a 429 — a 4xx is
+still returned as it came, since a malformed request does not improve by being
+repeated.
+
+What is left is a genuine trade rather than a bug: a **sustained** vendor outage
+still costs that night's scan, even though the scan does not need consensus to
+run. It narrows candidates with it and falls back to sweeping the whole eligible
+universe without it, which is slower and works — verified on a real run that
+produced twenty candidates with the consensus stage failed and zero rows in the
+table. Prising the two apart would mean the exit code no longer answering "is
+this record fit to decide on", which is the question `&&` is asking. If you would
+rather have the scan than the alert, run the two as separate cron lines and
+accept that a half-written store gets scanned.
+
 ### The scan is long-only until somebody prices the borrow
 
 `research-scan` refuses every short it cannot price a borrow on, and reports the

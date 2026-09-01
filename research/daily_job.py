@@ -16,6 +16,7 @@ a network, which is the only way the failure modes above get covered at all.
 from __future__ import annotations
 
 import os
+import re
 import statistics
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -378,7 +379,7 @@ def _record_ticker(ticker: str, rows: List[Dict[str, Any]], stamp: str,
                                      conn=conn, source=source)
 
 
-def _fetch_calendar(start: str, end: str) -> List[Dict[str, Any]]:
+def _fetch_calendar_once(start: str, end: str) -> List[Dict[str, Any]]:
     """Who reports in a window, with the estimate as it stands today and the
     actual once it lands.
 
@@ -392,6 +393,10 @@ def _fetch_calendar(start: str, end: str) -> List[Dict[str, Any]]:
     One call for the whole window rather than one per name: at several thousand
     tickers a per-name calendar would exhaust the rate limit long before it
     finished, and the point of this job is that it completes every day.
+
+    One attempt. `_fetch_calendar` below is the retrying wrapper and is what
+    callers use; this is split out so the retry can be tested without a
+    network and so the two concerns stay separate.
     """
     import asyncio
 
@@ -442,6 +447,35 @@ def _fetch_calendar(start: str, end: str) -> List[Dict[str, Any]]:
             "date": row.get("date"),
         })
     return out
+
+
+
+def _fetch_calendar(start: str, end: str) -> List[Dict[str, Any]]:
+    """The calendar, retried the way the bars fetch is retried.
+
+    This one matters more than the bars do, which is exactly backwards from
+    how it was: `_fetch_bars` has retried three times with backoff since it
+    was written, and this called the vendor once. Bars can be re-fetched
+    tomorrow. Consensus cannot -- Finnhub serves four quarters however many
+    you ask for, so a night lost to a transient 503 is a permanent hole in
+    the one series this store exists to accumulate.
+
+    Observed live on a cold bootstrap: a single HTTP 503 from the vendor's
+    edge, gone within twenty seconds, failed the consensus stage, which failed
+    the run, which -- through the `&&` in the cron line -- cost that night's
+    scan as well.
+    """
+    last: Optional[BaseException] = None
+    for attempt in range(FETCH_RETRIES):
+        try:
+            return _fetch_calendar_once(start, end)
+        except Exception as exc:  # noqa: BLE001 - re-raised below with a count
+            last = exc
+            if attempt + 1 < FETCH_RETRIES and FETCH_RETRY_BACKOFF:
+                time.sleep(FETCH_RETRY_BACKOFF * (attempt + 1))
+    raise RuntimeError(
+        f"earnings calendar failed {FETCH_RETRIES} attempts over "
+        f"{start}..{end}: {last}") from last
 
 
 # --------------------------------------------------------- run bookkeeping
@@ -728,12 +762,58 @@ def bootstrap_history(tickers: List[str], lookback_days: int = 730,
 
 # -------------------------------------------------------------- universe
 
+# Suffixes the SEC's own ticker feed uses for instruments that are not common
+# equity, with the counts they carry on a real screen of 10,391 registrants.
+# A preferred pays a fixed dividend and does not participate in earnings
+# growth; a warrant, unit or right is a claim on shares rather than shares.
+# Post-earnings drift is a phenomenon of the common, and none of these have it
+# -- but they share their issuer's CIK, so they inherit its EPS series and its
+# surprise, and they pass every other gate the screen applies.
+_NOT_COMMON = (
+    (r"-P[A-Z]?$", "preferred", 351),
+    (r"-WT[A-Z]?$", "warrant", 63),
+    (r"-RW$", "warrant", 1),
+    (r"-UN$", "unit", 50),
+    (r"-RI$", "right", 18),
+)
+
+# Deliberately NOT excluded: a single-letter class suffix on genuine common.
+# BRK-B, BF-B, HEI-A and PBR-A carry the earnings exactly as the A-class does,
+# and dropping them would take Berkshire out of the universe.
+
+
+def _share_class_problem(ticker: str) -> Optional[str]:
+    """Why this ticker is not common equity, or None.
+
+    Read off the ticker string, which is a heuristic and has to say so: the
+    SEC's company_tickers feed carries no security-type field, so the suffix
+    convention is the only discriminator available without another data source.
+    The reason is recorded in `universe_snapshot.exclusion_reason` like every
+    other exclusion, so the count is auditable and a false positive is visible
+    rather than silent.
+    """
+    for pattern, instrument, seen in _NOT_COMMON:
+        if re.search(pattern, ticker):
+            return (f"{ticker} is a {instrument} rather than common equity, "
+                    f"read from the ticker suffix -- the feed carries no "
+                    f"security type. A {instrument} shares its issuer's CIK "
+                    f"and so inherits its EPS surprise while having no "
+                    f"earnings of its own")
+    return None
+
+
 def _screen(ticker: str, as_of: str) -> Dict[str, Any]:
     """Eligible, or the reason not -- never a bare exclusion.
 
     "No history" and "too thin" are different facts about a name, and a screen
     that returns the same answer for both cannot be audited later.
     """
+    # Before the tape, because it is a property of the instrument rather than
+    # of its trading: a preferred with a decade of history is still a preferred.
+    not_common = _share_class_problem(ticker)
+    if not_common:
+        return {"eligible": False, "exclusion_reason": not_common}
+
     bars = pit_store.bars_as_of(ticker, as_of)
     if len(bars) < MIN_HISTORY_SESSIONS:
         return {"eligible": False,

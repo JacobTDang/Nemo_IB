@@ -1056,6 +1056,36 @@ def filed_periods(as_of: str) -> set:
     return {(r["ticker"], r["fiscal_period"]) for r in rows}
 
 
+def filed_issuer_periods(as_of: str) -> set:
+    """The same question keyed on the issuer, which is what a print belongs to.
+
+    `filed_periods` above answers it per ticker, and that is not the same rule.
+    One issuer lists more than one line: eight tickers share Morgan Stanley's
+    CIK on a real screen, seven share JPMorgan's, and fourteen ProShares funds
+    share one sponsor's. A ticker-keyed check stops the same line trading twice
+    on one print and says nothing about six lines trading once each.
+
+    The CIK comes from `universe_snapshot`, which records it for every name it
+    screens, joined on ticker alone -- a ticker's issuer does not change from
+    one snapshot to the next, and requiring the same date would lose rows for
+    names the screen has since dropped.
+
+    A ticker the universe never recorded contributes nothing here rather than
+    a null key. Absent is not equal, and collapsing every unknown issuer into
+    one would merge unrelated names.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT DISTINCT u.cik, o.fiscal_period
+                 FROM paper_order o
+                 JOIN universe_snapshot u ON u.ticker = o.ticker
+                WHERE o.accepted = 1 AND o.fiscal_period IS NOT NULL
+                  AND u.cik IS NOT NULL
+                  AND o.as_of_date < ? AND date(o.recorded_at) <= ?""",
+            (as_of, as_of)).fetchall()
+    return {(r["cik"], r["fiscal_period"]) for r in rows}
+
+
 def has_consensus_history(as_of: str) -> bool:
     """Whether the consensus recorder had written anything by `as_of`.
 

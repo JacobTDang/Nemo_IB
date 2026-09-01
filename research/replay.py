@@ -284,6 +284,10 @@ def run(dates: Sequence[str], horizon_days: int = 20,
             period = candidate.get("fiscal_period")
             if period:
                 acted.add((candidate["ticker"], period))
+                # And the issuer, so a second share class of the same company
+                # is not replayed as an independent trade on a later date.
+                if candidate.get("issuer_cik"):
+                    acted.add((candidate["issuer_cik"], period))
 
     # How many variants have been tried against these names. A t-statistic
     # from the best of several is not a t-statistic from one, and the caller
