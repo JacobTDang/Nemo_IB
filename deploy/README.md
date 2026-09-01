@@ -387,6 +387,49 @@ docker compose --env-file ../.env run --rm research-scan --borrow-rate 0.03
 `--units` has no default on purpose: `3` and `0.03` are both plausible readings
 of the same column and they differ by a hundred.
 
+A broker publishes its short list for a date and you collect it the next
+morning, so `--as-of` is usually yesterday. Add `--backfill` for that: it stamps
+the rows at the end of the day they describe instead of now, and marks them
+`backfilled` so a study can tell them from rates captured live. Without it the
+rows are stamped now and a scan dated yesterday will not see them —
+`date(recorded_at) <= as_of` is doing its job, and the loader warns rather than
+reporting a silent success.
+
+```bash
+python -m research.borrow --as-of 2026-08-31 --from-csv rates.csv \
+  --units percent --source ibkr --backfill
+```
+
+### The watcher sweeps a slice, not the universe
+
+`research-watch` runs `--max-seconds 600` (set in the compose file, override it
+on the command line for a one-off). A full sweep does not fit the interval it
+runs on: 1,565 eligible names took over 40 minutes uncapped, against a `*/20`
+timer, so two firings in three were refused by `flock` and exited non-zero —
+which is how an operator learns to read a failing job as normal.
+
+**The bound is a clock, not a ticker count.** Three measurements on one machine
+in one afternoon put a ticker at **0.90s, then 3.0s, then 6.0s** — the rate got
+worse as the sample got *smaller*, so the variable is EDGAR's throttle state and
+not the work. Any fixed ticker cap sized against one of those numbers is wrong
+on the other two.
+
+A cursor (`job_cursor` in the store) records where each pass stopped, so the
+next one resumes there instead of restarting at the head — otherwise a bounded
+pass is the same blind spot with extra steps, permanently never reaching
+whoever sorts last. A pass that does not finish reports `partial`, says what
+stopped it and where the next one resumes, so rotating coverage is
+distinguishable from stuck coverage in the run log.
+
+On a slow day the cycle is simply longer, against a 13D that must be filed
+within five days. That is the trade: coverage *rate* degrades, coverage
+*completeness* does not.
+
+Bounding is management, not a cure. The real answer is EDGAR's market-wide
+current-filings feed — one request for the whole market rather than one per name
+— which `research/activist_watch.py` names in its own docstring and does not
+implement. The feed is live and returns Atom; see issue #82.
+
 The cron line above passes neither, so the nightly book is long-only until you
 decide otherwise. Commission and the long leg's financing are still not modelled
 at all; both are small next to borrow over this horizon, and neither is zero.

@@ -182,6 +182,13 @@ CREATE TABLE IF NOT EXISTS borrow_rate (
     ticker      TEXT NOT NULL,
     annual_rate REAL NOT NULL,
     source      TEXT NOT NULL,
+    -- Whether the rate was captured on the day it describes or loaded in
+    -- afterwards. `source` names who quoted it, which is a different
+    -- question. The same line `daily_bar.source` and
+    -- `consensus_snapshot.source` draw: a broker file loaded three weeks
+    -- late is not evidence of the same kind as one taken on the day, and a
+    -- study has to be able to tell them apart.
+    backfilled  INTEGER NOT NULL DEFAULT 0,
     recorded_at TEXT NOT NULL,
     PRIMARY KEY (as_of_date, ticker)
 );
@@ -231,6 +238,16 @@ CREATE TABLE IF NOT EXISTS paper_order (
     intended_session TEXT,
     recorded_at      TEXT NOT NULL,
     PRIMARY KEY (as_of_date, ticker)
+);
+
+-- Where a job that cannot finish in one pass should start the next one.
+-- Not point-in-time and deliberately not append-only: this is the process
+-- talking to its own next run about scheduling, not a record of what the
+-- market did, and every other table here is the second thing.
+CREATE TABLE IF NOT EXISTS job_cursor (
+    job        TEXT PRIMARY KEY,
+    position   INTEGER NOT NULL,
+    updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS run_log (
@@ -300,6 +317,7 @@ _MIGRATIONS = (
     ("paper_order", "borrow_bps", "REAL"),
     ("paper_order", "borrow_rate", "REAL"),
     ("paper_order", "borrow_source", "TEXT"),
+    ("borrow_rate", "backfilled", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -796,7 +814,8 @@ def actual_as_of(ticker: str, fiscal_period: str,
 
 def record_borrow_rates(as_of_date: str, rows: Iterable[Dict[str, Any]],
                         source: str = "recorded",
-                        recorded_at: Optional[str] = None) -> int:
+                        recorded_at: Optional[str] = None,
+                        backfilled: bool = False) -> int:
     """One day's cost of being short, per name. Returns the count written.
 
     Append-only like everything else here: a rate already on record for a date
@@ -830,10 +849,11 @@ def record_borrow_rates(as_of_date: str, rows: Iterable[Dict[str, Any]],
                     f"sign error somewhere upstream")
             cur = conn.execute(
                 """INSERT OR IGNORE INTO borrow_rate
-                   (as_of_date, ticker, annual_rate, source, recorded_at)
-                   VALUES (?,?,?,?,?)""",
+                   (as_of_date, ticker, annual_rate, source, backfilled,
+                    recorded_at)
+                   VALUES (?,?,?,?,?,?)""",
                 (as_of_date, ticker, float(rate), row.get("source") or source,
-                 stamp))
+                 1 if backfilled else 0, stamp))
             written += cur.rowcount or 0
     return written
 
@@ -1174,6 +1194,34 @@ def paper_orders_as_of(as_of: str, accepted_only: bool = False
              # an answer to a question it was not asked.
              "drift_calibrated": _tri_state(r["drift_calibrated"])}
             for r in rows]
+
+
+def cursor_for(job: str) -> int:
+    """Where `job` should resume, or 0 if it has never run.
+
+    Zero rather than None: a job with no cursor starts at the beginning, which
+    is what "never run" means here. There is no third answer to distinguish.
+    """
+    with connect() as conn:
+        row = conn.execute("SELECT position FROM job_cursor WHERE job = ?",
+                           (job,)).fetchone()
+    return int(row["position"]) if row else 0
+
+
+def set_cursor(job: str, position: int) -> None:
+    """Where the next pass starts. Overwritten, not appended.
+
+    The one place in this store that overwrites. A cursor is scheduling state
+    -- the process telling its own next run where it got to -- and keeping a
+    history of it would be keeping a log of a variable.
+    """
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO job_cursor (job, position, updated_at)
+               VALUES (?,?,?)
+               ON CONFLICT(job) DO UPDATE SET position = excluded.position,
+                                              updated_at = excluded.updated_at""",
+            (job, int(position), _now()))
 
 
 def start_run(job: str, as_of_date: Optional[str] = None) -> int:

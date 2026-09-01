@@ -37,8 +37,12 @@ Scale, honestly: one SEC request per ticker per pass, paced. That fits a
 watchlist of tens polled every few minutes. It does not fit sweeping thousands
 of names every minute -- for that the mechanism is EDGAR's market-wide
 current-filings feed, one request for the whole market, which this module does
-not implement. `max_tickers` exists so a universe-wide pass degrades into an
-honestly-labelled partial rather than a fan-out into a rate limit.
+not implement. `max_seconds` exists so a universe-wide pass degrades into an
+honestly-labelled partial rather than a fan-out into a rate limit -- and a
+cursor means the next pass resumes where it stopped, so a slow day costs
+coverage rate rather than leaving the tail of the list permanently unwatched.
+The budget rather than `max_tickers` is the bound that holds: the same pass
+cost 0.90s, 3.0s and 6.0s a ticker in three measurements on one afternoon.
 """
 from __future__ import annotations
 
@@ -173,7 +177,8 @@ def _watchlist(as_of: str) -> List[str]:
 def watch_pass(tickers: Optional[Sequence[str]] = None,
                as_of: Optional[str] = None,
                detected_at: Optional[str] = None,
-               max_tickers: Optional[int] = None) -> Dict[str, Any]:
+               max_tickers: Optional[int] = None,
+               max_seconds: Optional[float] = None) -> Dict[str, Any]:
     """One sweep. Records new subject-side 13D filings and how late we were.
 
     `tickers` defaults to the eligible universe as of the date. The pass is
@@ -224,13 +229,24 @@ def watch_pass(tickers: Optional[Sequence[str]] = None,
 
     total_requested = len(requested)
     notes: List[str] = []
-    if max_tickers is not None and total_requested > max_tickers:
-        # Truncated, and therefore never `ok`. The names past the cap were not
-        # watched, so their silence carries no information and a pass that
-        # called itself complete would be inviting someone to read it as one.
+
+    # Where the last pass stopped. A bounded pass that always starts at the
+    # head is the blind spot with extra steps: whoever sorts last is never
+    # watched on any pass, forever, while the status says `partial` and names
+    # nobody.
+    start = pit_store.cursor_for(JOB) % total_requested if total_requested \
+        else 0
+    if start:
+        requested = requested[start:] + requested[:start]
+
+    # A ticker cost 0.90s, then 3.0s, then 6.0s across three measurements on
+    # one machine in one afternoon -- the variable is EDGAR's throttle state,
+    # not the ticker count, so no fixed ticker cap can be sized against it. A
+    # deadline holds whatever the vendor is doing, and the cursor turns "ran
+    # out of time" into "got this far" rather than into a hole.
+    deadline = (time.monotonic() + max_seconds) if max_seconds else None
+    if max_tickers is not None and len(requested) > max_tickers:
         requested = requested[:max_tickers]
-        notes.append(f"watchlist capped at {max_tickers} of {total_requested} "
-                     f"names; the rest were not watched")
 
     covered = 0
     failures: List[str] = []
@@ -238,7 +254,13 @@ def watch_pass(tickers: Optional[Sequence[str]] = None,
     filed_by_this_company = 0
     disagreements: List[str] = []
 
+    watched = 0
+    stopped_by = None
     for ticker in requested:
+        if deadline is not None and time.monotonic() >= deadline:
+            stopped_by = "budget"
+            break
+        watched += 1
         # The submissions index and every header fetched below are cached under
         # /root/.edgar and nothing removes one. The eviction that keeps the
         # servers alive is an asyncio task in the HTTP app's lifespan, and this
@@ -321,10 +343,24 @@ def watch_pass(tickers: Optional[Sequence[str]] = None,
         filed_by_this_company += local_filer_side
         disagreements.extend(local_disagreements)
 
+    # Advance by what was actually watched, not by a nominal window: a pass
+    # cut short by the budget must not skip the names it never reached.
+    if total_requested:
+        pit_store.set_cursor(JOB, (start + watched) % total_requested)
+
     status = daily_job.coverage_status(covered, total_requested)
     if failures:
         notes.append(f"{len(failures)} of {total_requested} lookups failed: "
                      + "; ".join(failures[:5]))
+    if watched < total_requested:
+        resume = (start + watched) % total_requested
+        reason = ("its time budget" if stopped_by == "budget"
+                  else f"the {max_tickers}-name cap")
+        notes.append(
+            f"watched {watched} of {total_requested} names, from offset "
+            f"{start}; stopped by {reason} and the next pass resumes at "
+            f"{resume}. The names not reached were not watched, so their "
+            f"silence carries no information")
     error = " | ".join(notes) if notes else None
     pit_store.finish_run(rows_written=len(events), status=status, error=error,
                          run_id=run_id)
@@ -413,12 +449,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--as-of", dest="as_of", default=None,
                         help="date whose eligible universe to sweep "
                              "(default: today)")
+    parser.add_argument("--max-seconds", dest="max_seconds", type=float,
+                        default=None,
+                        help="stop requesting new names after this many "
+                             "seconds and resume there next pass. The bound "
+                             "that holds: a ticker cost 0.90s, 3.0s and 6.0s "
+                             "in three measurements on one afternoon, so the "
+                             "variable is EDGAR's throttle state rather than "
+                             "the ticker count")
     parser.add_argument("--max-tickers", dest="max_tickers", type=int,
                         default=None,
                         help="cap the sweep, for a first pass on a cold store")
     args = parser.parse_args(argv)
 
-    result = watch_pass(as_of=args.as_of, max_tickers=args.max_tickers)
+    result = watch_pass(as_of=args.as_of, max_tickers=args.max_tickers,
+                        max_seconds=args.max_seconds)
 
     # What it recorded is half the answer. The other half is how late it was,
     # which is the only figure that says whether a twenty-minute timer is
