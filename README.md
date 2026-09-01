@@ -1,8 +1,8 @@
 # Nemo_IB
 
-MCP servers that read company, market, macro and alternative financial data
-from primary sources, plus the scheduled jobs that record what was known on
-each date.
+This project has two parts. Five MCP servers read company, market, macro, and
+alternative financial data from primary sources. Scheduled jobs record what was
+known on each date.
 
 ## Homelab setup
 
@@ -16,38 +16,44 @@ cd deploy
 NEMO_MCP_TOKEN=$(openssl rand -hex 32) docker compose --env-file ../.env up -d
 ```
 
-`SEC_EMAIL` is required — SEC fair access wants a real contact address in the
-User-Agent, and the servers refuse to call EDGAR without one rather than send a
-placeholder.
+`SEC_EMAIL` is necessary. SEC fair access rules require a real contact address
+in the User-Agent header. The servers refuse to call EDGAR without one. They do
+not send a placeholder.
 
-`--env-file ../.env` is not optional. Each service declares only the keys its
-own code reads, and compose interpolates those from a `.env` beside the compose
-file — which is `deploy/.env`, not the one at the repo root. Without the flag
-every credential resolves empty. That fails loud rather than quietly: the
-servers refuse to start without a token, `/ready` answers 503, and `finnhub`
-and `fred` crash-loop on a missing key.
+`--env-file ../.env` is also necessary. Each service declares only the keys that
+its own code reads. Compose reads those values from a `.env` file beside the
+compose file. That file is `deploy/.env`, and it is not the file at the top of
+the repository. Without the flag, every credential becomes empty.
 
-Ports publish on `127.0.0.1` unless `NEMO_BIND_ADDR` says otherwise, so a
-missing variable fails closed instead of exposing five servers to the LAN. On a
-homelab, set it to the machine's Tailscale address:
+That failure is loud. The servers refuse to start without a token. The `/ready`
+endpoint answers `503`. The `finnhub` and `fred` servers restart continuously
+when their key is absent.
+
+Ports publish on `127.0.0.1` unless `NEMO_BIND_ADDR` gives a different address.
+A missing variable therefore fails closed. It does not expose five servers to
+the local network. On a homelab, set the variable to the Tailscale address of
+the machine:
 
 ```bash
 NEMO_BIND_ADDR=100.x.y.z NEMO_MCP_TOKEN=... docker compose --env-file ../.env up -d
 ```
 
-For a different architecture than the build host:
+To build for a different architecture than the build host:
 
 ```bash
 docker buildx build --platform linux/amd64 -t nemo-data:amd64 --load .
 NEMO_IMAGE=nemo-data:amd64 NEMO_TARGET_ARCH=amd64 docker compose --env-file ../.env up -d
 ```
 
-Deployment detail — what persists, log retention, auth, and the blockers a
-green test suite does not catch: [`deploy/README.md`](deploy/README.md).
+Each server carries a memory limit. The limits total 3.2GB for the five
+servers. [`deploy/README.md`](deploy/README.md) gives the measurements behind
+those numbers. It also covers what persists, log retention, authentication, and
+the problems that a passing test suite does not find.
 
 ### Registering with an MCP client
 
-Streamable HTTP with a bearer token, one entry per server:
+The servers use streamable HTTP with a bearer token. Register one entry for
+each server:
 
 ```json
 {
@@ -59,20 +65,22 @@ Streamable HTTP with a bearer token, one entry per server:
 }
 ```
 
-Each needs `Authorization: Bearer $NEMO_MCP_TOKEN`. The trailing slash on
-`/mcp/` matters: without it the server answers `307`, and some clients drop the
-`Authorization` header across the redirect.
+Each entry needs `Authorization: Bearer $NEMO_MCP_TOKEN`. The trailing slash on
+`/mcp/` is necessary. Without the slash, the server answers `307`. Some clients
+then drop the `Authorization` header across the redirect.
 
-`stdio` still works locally — `python -m tools.web_search_server.web_search`
-with no argument — but HTTP is what the image serves.
+The `stdio` transport also works locally. Run
+`python -m tools.web_search_server.web_search` with no argument. The image
+serves HTTP.
 
 ## MCP servers
 
-Five ship in the image and serve **96 tools** between them. They declare 99:
-`search`, `rag_search` and `rag_ingest` are capability-gated and hidden,
-because SearXNG and the RAG stack are not in this image. Every count here is
-checked against the servers' own registries by `testing/test_readme_counts.py`,
-so it fails rather than drifts.
+Five servers ship in the image. Together they serve **96 tools**.
+They declare 99: the image hides `search`, `rag_search`, and `rag_ingest`. It
+contains neither SearXNG nor the RAG stack.
+
+`testing/test_readme_counts.py` checks every count on this page against the
+registry of each server. A count that drifts fails the test suite.
 
 | Server | Tools | Reads from | Needs |
 |---|---:|---|---|
@@ -82,14 +90,16 @@ so it fails rather than drifts.
 | `fred` | 5 | FRED | `FRED_API_KEY` |
 | `altdata` | 9 | House Clerk, Senate eFD, USAspending, GovTrack, ATS boards, FinMind | `SEC_EMAIL` |
 
-`alpaca` (6 tools, places orders), `excel` (3) and `sentry` (19, reads book
-state) exist in the repo and are deliberately excluded from the image. A
-data-source host holds no positions and should not be able to trade.
+Three more servers exist in the repository and stay out of the image. They are
+`alpaca` with 6 tools that place orders, `excel` with 3 tools, and `sentry` with
+19 tools that read book state. A data-source host holds no positions. It must
+not be able to trade.
 
-The rule throughout is that a tool never states something about a company it
-did not read. A failed fetch says so rather than reporting an outage as "this
-filer does not disclose it"; a concept the filer does not tag produces a
-refusal naming what was looked for, not a substitute.
+One rule applies to every tool. A tool never states something about a company
+that it did not read. A failed fetch reports the failure. It does not report an
+outage as "this filer does not disclose it". When a filer tags no value for a
+concept, the tool refuses and names the concept it looked for. It supplies no
+substitute.
 
 ### `sec` — 48 tools
 
@@ -114,16 +124,16 @@ refusal naming what was looked for, not a substitute.
 `get_sic_code` `find_peers_by_sic` `get_foreign_filer_profile`
 `get_supply_chain` `get_patent_filings` `get_urls_content`
 
-Foreign private issuers are handled explicitly: asking for a 10-K on a 20-F
-filer returns which form it actually files. Values carry their reporting
-currency — TSM reports in TWD, and a P/E built on a USD price and TWD earnings
-is wrong by ~30x.
+This server handles foreign private issuers explicitly. A request for a 10-K
+against a 20-F filer returns the form that the company files. Values carry their
+reporting currency. TSM reports in TWD. A P/E ratio built on a USD price and TWD
+earnings is wrong by approximately 30 times.
 
-This server declares 51 and serves 48. `search` needs SearXNG; `rag_search` and
-`rag_ingest` need the RAG stack. `search` is the one worth gating on principle:
-it answers a missing SearXNG with an empty result list and no error, so
-advertising it would make an absent container look like a query that matched
-nothing.
+This server declares 51 tools and serves 48. The `search` tool needs SearXNG.
+The `rag_search` and `rag_ingest` tools need the RAG stack. The `search` tool is
+the important one to hide. It answers a missing SearXNG with an empty result
+list and no error. To advertise it would make an absent container look like a
+query that matched nothing.
 
 ### `financial` — 20 tools
 
@@ -135,9 +145,9 @@ nothing.
 `backtest_signal` `analyze_exposures` `record_thesis_evolution`
 `get_thesis_evolution`
 
-The calculators refuse structures they cannot model rather than returning a
-number: an LBO whose debt exceeds the purchase price is unfinanceable, and
-saying so beats reporting the 40x MOIC that sizing produces.
+The calculators refuse a structure that they cannot model. They return no
+number. An LBO with more debt than purchase price cannot be financed. To say so
+is better than to report the 40x MOIC that this structure produces.
 
 ### `finnhub` — 14 tools
 
@@ -152,8 +162,8 @@ saying so beats reporting the 40x MOIC that sizing produces.
 `get_macro_snapshot` `get_treasury_yields` `get_credit_spreads` `get_fred_series`
 `search_fred`
 
-Spreads reported alongside a curve are struck from that same curve, so the two
-always reconcile.
+A spread reported beside a curve comes from that same curve. The two values
+therefore always agree.
 
 ### `altdata` — 9 tools
 
@@ -161,9 +171,10 @@ always reconcile.
 `get_policy_signals` `get_capex_announcements` `get_congress_trades`
 `get_congress_holdings` `get_congress_leaderboard` `get_congress_coverage`
 
-Congressional disclosures are ingested rather than fetched per call — House
-Clerk PTRs (PDF) and Senate eFD filings are parsed once into SQLite, because a
-round trip plus a PDF parse per filing made every answer partial:
+This server reads congressional disclosures from a local store. It does not
+fetch them for each call. A separate job parses House Clerk PTR documents and
+Senate eFD filings into SQLite once. One network round trip and one PDF parse
+for each filing made every answer partial.
 
 ```bash
 docker compose --env-file ../.env run --rm congress-sync \
@@ -171,21 +182,25 @@ docker compose --env-file ../.env run --rm congress-sync \
 docker compose --env-file ../.env run --rm congress-sync --status
 ```
 
-Safe to re-run and safe to cron; nothing already parsed is fetched twice.
+The sync job is safe to run again and safe to schedule. It fetches nothing that
+it has already parsed.
 
-These are transactions and year-covering snapshots, **not live positions**.
-Members file up to 45 days after trading, annual reports arrive months after
-the year they cover, and roughly a third of holding rows are Excepted
-Investment Funds whose contents are legally not itemised. Filings that arrive
-as scans are counted in `coverage` rather than dropped. Amounts stay as the
-ranges the filings publish — `amount_min` and `amount_max`, no midpoint.
-Holdings are Senate-only.
+These rows are transactions and year-covering snapshots. They are **not live
+positions**. A member can file up to 45 days after a trade. An annual report
+arrives months after the year that it covers. Approximately one third of the
+holding rows are Excepted Investment Funds, and the law does not require a filer
+to itemize their contents.
+
+The store counts a filing that arrives as a scan in `coverage`. It drops no such
+filing. Amounts stay as the ranges that the filings publish, under `amount_min`
+and `amount_max`. The store computes no midpoint. Only the Senate reports
+holdings.
 
 ## Automation
 
-The same image on a schedule. All are batch jobs under the `sync` profile, so
-`docker compose up` never starts them — a `restart: unless-stopped` batch job
-is a loop.
+The jobs run the same image on a schedule. Every job is a batch job under the
+`sync` profile. Therefore `docker compose up` starts none of them. A batch job
+with `restart: unless-stopped` becomes a loop.
 
 ```bash
 cd deploy
@@ -203,27 +218,29 @@ docker compose --env-file ../.env run --rm research-daily               # every 
 | `research-seed` | reconstructs the quarters of consensus the vendor still serves | `0 8 1 * *` |
 | `congress-sync` | ingests congressional disclosures for the `altdata` server | `0 6 * * *` |
 
-The scan has no default borrow rate, so it refuses every short it cannot price
-rather than charging one nothing — a short charged nothing outranks every name
-that paid. Load rates with `python -m research.borrow`, or declare a flat one
-with `research-scan --borrow-rate 0.03`; until then the book is long-only and
-says so. See [`deploy/README.md`](deploy/README.md).
+The scan has no default borrow rate. It refuses every short position that it
+cannot price. It charges no short position nothing, because a short charged
+nothing outranks every name that paid. Load rates with
+`python -m research.borrow`, or declare one flat rate with
+`research-scan --borrow-rate 0.03`. Until then the book holds long positions
+only, and the scan reports that. [`deploy/README.md`](deploy/README.md) gives
+the arithmetic.
 
-Every job exits non-zero when a stage fails, because the exit code is the only
-way a scheduler finds out — and exits zero when it finds nothing, because most
-nights it will, and paging on that is how the one night that matters gets
-ignored.
+Every job exits non-zero when a stage fails. The exit code is the only way that
+a scheduler learns about the failure. Every job exits zero when it finds
+nothing. Most nights it will find nothing. An alert on an empty night teaches
+the operator to ignore the alert that matters.
 
-Cron lines live in [`deploy/README.md`](deploy/README.md) and are checked
-against the compose file by `testing/test_readme_counts.py`.
+The cron lines are in [`deploy/README.md`](deploy/README.md).
+`testing/test_readme_counts.py` checks them against the compose file.
 
 ### The record
 
-`research-daily` writes one SQLite file on the `research-data` volume. Some of
-what is in it cannot be fetched later at any price: what analysts expected last
-Tuesday is unrecoverable by Thursday, a company delisted in March is gone from
-the vendor by June, and the vendor serves four quarters of consensus however
-many you ask for. Back it up like a database that matters.
+`research-daily` writes one SQLite file on the `research-data` volume. Money
+cannot buy back some of what that file holds. What analysts expected last
+Tuesday is unrecoverable by Thursday. A company that delisted in March is gone
+from the vendor by June. The vendor serves four quarters of consensus however
+many quarters you request. Back up this file like a database that matters.
 
 ```
 daily_bar          as-traded OHLCV, never overwritten
@@ -240,16 +257,19 @@ activist_filing    13D events with four timestamps, latency derived at read
 run_log            every run, so a day the job did not run is visible
 ```
 
-The record is append-only and every row carries when it was written as well as
-what date it describes. Every reader filters on both, which is what stops a
-value learned today from being visible to a question asked about last month.
+The record is append-only. Every row carries the date that it describes and the
+time when the recorder wrote it. Every reader filters on both fields. That
+filter is what stops a value learned today from becoming visible to a question
+about last month.
 
-Prices are stored as the stock printed them. `auto_adjust=False` does not mean
-unadjusted — it returns split-adjusted prices, so NVDA's 2024-06-07 close
-arrives as 120.89 against a real print of 1208.88. The conversion back happens
-on the way in; the adjustment is rebuilt at read time from actions the reader
-could have known, so a split announced in June cannot change what a May reader
-computed.
+The store keeps prices as the stock printed them. `auto_adjust=False` does not
+mean unadjusted. It returns split-adjusted prices. The NVDA close for
+2024-06-07 arrives as 120.89 against a real print of 1208.88. The recorder
+converts the price back on the way in.
+
+A reader rebuilds the adjustment from the corporate actions that the reader
+could have known. Therefore a split announced in June cannot change what a May
+reader computed.
 
 ## Tests
 
@@ -258,9 +278,11 @@ SKIP_NETWORK_TESTS=1 pytest testing/          # offline: no credentials, no netw
 STRICT_GATES=1 pytest testing/                # everything gated must actually run
 ```
 
-The offline run needs nothing and should never fail. The strict run turns a
-skipped gate into a failure, because a gate that cannot fail is not a gate.
+The offline run needs no credentials and no network. It must never fail. The
+strict run turns a skipped gate into a failure, because a gate that cannot fail
+is not a gate.
 
-The deploy gate is `testing/test_http_transport.py`, which completes a real MCP
-handshake and one live tool call against each server. A health check only proves
-the port is bound; a server whose MCP layer failed still answers it.
+The deploy gate is `testing/test_http_transport.py`. It completes a real MCP
+handshake and one live tool call against each server. A health check proves only
+that the port is bound. A server whose MCP layer failed to start still answers
+one.
