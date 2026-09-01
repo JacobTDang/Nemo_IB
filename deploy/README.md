@@ -400,6 +400,41 @@ python -m research.borrow --as-of 2026-08-31 --from-csv rates.csv \
   --units percent --source ibkr --backfill
 ```
 
+### Memory, and why it never goes down
+
+Python frees memory to its own allocator, not to the operating system. So a
+container's RSS is a high-water mark: it rises to the largest thing the process
+has ever done and stays there, even while idle.
+
+Measured on the SEC server over a day of real use:
+
+| | RSS |
+|---|---:|
+| after a day of mixed load | 861 MiB |
+| after one round of heavy extraction | 934 MiB |
+| after a second identical round | 933 MiB |
+| after a third | 933 MiB |
+| after a restart | 124 MiB |
+
+The first round of a new workload raises the mark; repeating it does not. Memory
+is reused rather than accumulated, so **this is not a leak and it does not need
+watching**. A restart reclaims it, and nothing here requires one.
+
+What it is not is *bounded*. The peak is whatever the largest thing anyone ever
+asks for, and unlimited, a container that overruns takes the host's memory with
+it — at which point the kernel OOM killer picks a victim, which on a shared
+homelab is as likely to be something else as the offender. So each server now
+carries a `mem_limit`, sized from these measurements with headroom:
+
+```
+sec 1500m · financial 512m · finnhub 512m · fred 256m · altdata 512m
+```
+
+That is 3.2GB for the whole stack, and a container that runs away now dies alone
+and comes back under `restart: unless-stopped`. The batch jobs are unlimited by
+design: they are transient, `research-daily --bootstrap` is the heaviest of them,
+and capping a job that exits anyway buys nothing.
+
 ### The watcher sweeps a slice, not the universe
 
 `research-watch` runs `--max-seconds 600` (set in the compose file, override it
