@@ -602,3 +602,20 @@ def test_a_replay_built_store_says_its_bars_were_backfilled(tmp_path, monkeypatc
     assert got[0] == "backfilled", (
         f"a replayed session claims source={got[0]!r}; it was not recorded "
         f"on the evening it describes")
+
+
+def test_a_replayed_signal_says_it_is_the_time_series_variant():
+    """The scanner records `variant` on every order and the scorer quotes a
+    coefficient only when a sample's variant is known. Replay's precomputed
+    table is the time-series surprise by construction, and its lookup returned
+    rows with no `variant` at all -- so a full replay produced trades and then
+    `drift_bps_per_sue: None`, with the note that the rows did not say which
+    quantity `sue` was."""
+    replay.load_signals({"AAA": [{"sue": 2.0, "known_at": "2026-03-02",
+                                  "fiscal_period": "2026Q1",
+                                  "sigma_quarters": 8, "basis_changes": []}]})
+
+    signal = replay._signal_for("AAA", "2026-03-03")
+
+    assert signal["success"] is True
+    assert signal["variant"] == "ts"
