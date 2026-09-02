@@ -22,7 +22,6 @@ and the cron lines are already held to.
 from __future__ import annotations
 
 import pathlib
-import re
 
 import pytest
 
