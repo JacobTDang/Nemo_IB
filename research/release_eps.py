@@ -93,7 +93,17 @@ _NON_GAAP = re.compile(
 # skipped: some headlines say "included" too.
 _COMPONENT = re.compile(
     r"\b(?:included|includes|including|impact\s+of|benefit\s+of|charges?\s+of"
-    r"|gains?\s+of|losses\s+of|expense\s+of|related\s+to)\b", re.I)
+    r"|gains?\s+of|losses\s+of|expense\s+of|related\s+to"
+    # AGNC: "a net loss of $(433) million in other gain (loss), net, or
+    # $(0.39) per common share" -- the amount is a line item.
+    r"|\bin\s+other\b|\bin\s+[a-z\s()]{3,40},\s*net\b)", re.I)
+
+# A sentence that exists to compare. Advanced Energy's "This compares with
+# $1.94 per diluted share in the fourth quarter of 2025" names a quarter --
+# the prior one -- and beat the headline that named none.
+_COMPARATIVE = re.compile(
+    r"^\s*(?:this|that|which)\s+compares|^\s*compared\s+(?:with|to)"
+    r"|^\s*(?:versus|vs\.?)\s", re.I)
 
 # XBRL's diluted EPS is the total. Continuing operations is a different basis
 # when there were discontinued ones -- demoted, and accepted when it is all
@@ -187,6 +197,17 @@ def _value_of(match) -> float:
     return float(dollars) if dollars else float(cents) / 100.0
 
 
+def _figure_position(sentence: str, match: "re.Match") -> int:
+    """Where the figure adjacent to the phrase starts, or the phrase start."""
+    before = sentence[:match.start()]
+    tail = _MONEY_BEFORE.search(before)
+    if tail:
+        return tail.start()
+    after = sentence[match.end():match.end() + 60]
+    lead = _MONEY_AFTER.search(after)
+    return match.end() + lead.start() if lead else match.start()
+
+
 def _figure_beside(sentence: str, match: "re.Match"):
     """The first figure adjacent to a phrase: immediately before it ("$0.49
     per diluted share", "32 cents per share") or within a few words after it
@@ -238,7 +259,12 @@ def _from_prose(text: str) -> Dict[str, Any]:
         value = _figure_beside(sentence, match)
         if value is None:
             continue
-        rank = 0 if _QUARTER.search(sentence) else (
+        # A quarter word counts only before the figure. After it, it names
+        # the period being compared against: "... $1.94 per diluted share in
+        # the fourth quarter of 2025".
+        figure_at = _figure_position(sentence, match)
+        head = sentence[:figure_at]
+        rank = 0 if _QUARTER.search(head) else (
             2 if _ANNUAL.search(sentence) else 1)
         # The wrong number beats the wrong period. A component of earnings
         # ("included ... losses of $322 million, or $0.42 per diluted share")
@@ -248,7 +274,8 @@ def _from_prose(text: str) -> Dict[str, Any]:
         # excluding the one-time charge" comes after the figure, so it is not
         # a reason to skip, only to lose to a clean sentence -- then a
         # diluted phrase over an unqualified one, then document order.
-        key = (bool(_COMPONENT.search(sentence[:match.start()])),
+        key = (bool(_COMPONENT.search(sentence[:match.start()]))
+               or bool(_COMPARATIVE.search(sentence)),
                bool(_CONTINUING.search(sentence)),
                rank,
                bool(_NON_GAAP.search(sentence)),
