@@ -852,3 +852,60 @@ def test_a_line_item_dressed_as_a_headline_is_a_component():
             "share.")
 
     assert release_eps.extract_diluted_eps(text)["eps"] == pytest.approx(-0.17)
+
+
+# --- guidance, sub-bullets, and the figure before the noun ------------------
+
+def test_a_guidance_sentence_is_never_the_reported_figure():
+    """Photronics: "For the fourth quarter of fiscal 2025, Photronics expects
+    ... $0.48 per diluted share" names the quarter before its figure and
+    outranked the reported $0.39. Forward-looking is skipped, not ranked."""
+    text = ("GAAP Net income attributable to Photronics, Inc. shareholders was "
+            "$22.9 million, or $0.39 per diluted share, compared with $0.30 in "
+            "the third quarter of 2024. Fourth Quarter Fiscal 2025 Guidance For "
+            "the fourth quarter of fiscal 2025, Photronics expects revenue to be "
+            "between $215 million and $225 million and GAAP net income per "
+            "diluted share to be between $0.44 and $0.52, and non-GAAP net "
+            "income of $0.48 per diluted share.")
+
+    assert release_eps.extract_diluted_eps(text)["eps"] == pytest.approx(0.39)
+
+
+def test_sub_bullets_split_and_the_figure_may_precede_the_noun():
+    """AGNC's highlights block: "$0.52 comprehensive income per common share,
+    comprised of: ◦ $0.52 net income per common share ◦ $0.00 other
+    comprehensive income ... • $0.36 dividends declared per common share".
+    One sentence to a splitter without "◦", rejected wholesale for the
+    dividend; and the figure sits before the noun, not beside the phrase."""
+    text = ("SECOND QUARTER 2026 FINANCIAL HIGHLIGHTS • $0.52 comprehensive "
+            "income per common share, comprised of: ◦ $0.52 net income per "
+            "common share ◦ $0.00 other comprehensive income per common share "
+            "• $0.36 dividends declared per common share • $8.41 tangible net "
+            "book value per common share as of June 30, 2026")
+
+    out = release_eps.extract_diluted_eps(text)
+
+    assert out["eps"] == pytest.approx(0.52)
+    assert "net income per common share" in out["evidence"]
+
+
+def test_comprehensive_income_per_share_is_not_net_income():
+    text = ("• $0.71 comprehensive income per common share, comprised of: ◦ "
+            "$0.52 net income per common share ◦ $0.19 other comprehensive "
+            "income per common share")
+
+    assert release_eps.extract_diluted_eps(text)["eps"] == pytest.approx(0.52)
+
+
+def test_two_cents_on_a_derived_fourth_quarter_still_agrees():
+    """XBRL has no Q4 filing; the quarter is the year less nine months, four
+    roundings deep. Photronics' $1.07 against a derived 1.0499 is the same
+    number."""
+    series = _series()
+    signal = release_eps.signal_from_release(
+        series, "2026Q4", release_eps=1.57, announced_date="2026-11-30")
+
+    assert signal["agrees_with_xbrl"] is True
+    off = release_eps.signal_from_release(
+        series, "2026Q4", release_eps=1.60, announced_date="2026-11-30")
+    assert off["agrees_with_xbrl"] is False

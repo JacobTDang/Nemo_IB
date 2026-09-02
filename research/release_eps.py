@@ -51,7 +51,11 @@ VARIANT = "ts_release"
 # How far a release figure may sit from the later XBRL figure and still be the
 # same number. A cent covers rounding; anything more is a different basis, a
 # restatement, or the wrong figure.
-AGREEMENT_TOLERANCE = 0.015
+# Two and a half cents, not one. XBRL has no fourth-quarter filing, so Q4 is
+# the year less nine months -- four roundings deep -- and Photronics' $1.07
+# against a derived 1.0499 is the same number. A wrong figure is not two
+# cents off; it is thirty percent off.
+AGREEMENT_TOLERANCE = 0.025
 
 # One retry on a read timeout. EDGAR drops long SGML pulls under load and the
 # second attempt usually lands; a third rarely does, and hammering a vendor
@@ -161,7 +165,23 @@ _MONEY_AFTER = re.compile(
 # ...but only where a new item starts. Photronics also wraps lines with a
 # bullet mid-sentence ("$28.9 • million"), and splitting there strands the
 # non-GAAP sentence's figure in a fragment carrying no qualifier.
-_SENTENCE = re.compile(r"(?<=[.!?])\s+(?=[A-Z“\"(])|\s*[•·▪■]\s*(?=[A-Z“\"])")
+# A sub-bullet is a boundary too, and it may open with a figure: AGNC's
+# highlights are "◦ $0.52 net income per common share ◦ $0.00 other ...".
+_SENTENCE = re.compile(
+    r"(?<=[.!?])\s+(?=[A-Z“\"(])|\s*[•·▪■]\s*(?=[A-Z“\"])|\s*[◦○●‣]\s*(?=[A-Z“\"$(])")
+
+# Forward-looking. A guidance sentence names the next quarter before its
+# figure and would outrank the reported one; it is never the reported one.
+_GUIDANCE = re.compile(
+    r"\b(?:guidance|outlook|expects?|anticipates?|forecasts?|projects?|"
+    r"to\s+be\s+(?:between|in\s+the\s+range|approximately))\b", re.I)
+
+# The figure before the noun before the phrase: "$0.52 net income per common
+# share". Neither adjacent form sees it.
+_MONEY_THEN_NOUN = re.compile(
+    r"(?:(?:-\s?\$|\(\s?\$|\$\s?\(|\$)\s?-?(\d*\.\d{2})\)?|(\d{1,3})\s+cents)"
+    r"\s+(?:of\s+)?(?:GAAP\s+)?(?:net\s+)?(?:income|earnings|loss)"
+    r"(?:\s+\((?:loss|income)\))?\s*$", re.I)
 
 _MONTHS = {m: i for i, m in enumerate(
     ("january", "february", "march", "april", "may", "june", "july",
@@ -213,7 +233,7 @@ def _figure_beside(sentence: str, match: "re.Match"):
     per diluted share", "32 cents per share") or within a few words after it
     ("was $2.02")."""
     before = sentence[:match.start()]
-    tail = _MONEY_BEFORE.search(before)
+    tail = _MONEY_BEFORE.search(before) or _MONEY_THEN_NOUN.search(before)
     if tail:
         g = 1 if tail.group(1) else 2
         loss = _clause_is_loss(sentence, tail.start(g)) or \
@@ -241,7 +261,7 @@ def _from_prose(text: str) -> Dict[str, Any]:
     candidates: List[tuple] = []
     saw_phrase = saw_gaap = False
     for index, sentence in enumerate(_SENTENCE.split(text)):
-        if _STATEMENT.search(sentence):
+        if _STATEMENT.search(sentence) or _GUIDANCE.search(sentence):
             continue
         match = _DILUTED.search(sentence)
         basis = "gaap"
