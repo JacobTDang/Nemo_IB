@@ -230,7 +230,13 @@ def _signal_for(ticker: str, as_of: str) -> Dict[str, Any]:
     if not rows:
         return {"ticker": ticker, "success": False, "sue": None,
                 "error": f"no filed signal for {ticker} on or before {as_of}"}
-    return {**rows[-1], "ticker": ticker, "success": True, "error": None}
+    # Tagged here rather than in the table, and tagged at all: the scanner
+    # records `variant` on every order and the scorer quotes a coefficient
+    # only when a sample's variant is known. This table is the time-series
+    # surprise by construction, and rows without the tag replayed 230 dates
+    # into trades that could not be turned into a number.
+    return {**rows[-1], "ticker": ticker, "success": True, "error": None,
+            "variant": "ts"}
 
 
 def _refresh_universe_for(tickers: Sequence[str], as_of: str) -> int:
