@@ -679,3 +679,128 @@ def test_comparable_is_non_gaap():
     text = "Comparable EPS (non-GAAP) grew 18% to $0.86."
 
     assert release_eps.extract_diluted_eps(text)["eps"] is None
+
+
+# --- the shapes a hundred-name audit added -----------------------------------
+#
+# 2,337 releases, 69% agreement on reads. The unqualified "per share" fallback
+# was 57% right; the diluted phrase 78%. Each shape below cost tens of reads.
+
+def test_a_component_of_earnings_is_not_the_earnings():
+    """Aflac: the sentence naming the quarter described a component --
+    "included pretax net realized investment losses of $322 million, or
+    $0.42 per diluted share" -- and outranked the headline "$0.69 per diluted
+    share" that did not name the quarter. 25 of 30 releases wrong."""
+    text = ("Net earnings were $525 million, or $0.69 per diluted share, "
+            "compared with $2.6 billion, or $3.27 per diluted share a year ago. "
+            "Net earnings in the fourth quarter of 2018 included pretax net "
+            "realized investment losses of $322 million, or $0.42 per diluted "
+            "share, compared with pretax net gains of $58 million, or $0.07 "
+            "per diluted share a year ago.")
+
+    assert release_eps.extract_diluted_eps(text)["eps"] == pytest.approx(0.69)
+
+
+def test_continuing_operations_loses_to_a_total_figure():
+    """XBRL's diluted EPS is the total. "From continuing operations" is a
+    different basis when the company had discontinued ones."""
+    text = ("GAAP net income from continuing operations was $23.4 million or "
+            "$0.61 per diluted share. GAAP net income was $31.5 million, or "
+            "$0.82 per diluted share.")
+
+    assert release_eps.extract_diluted_eps(text)["eps"] == pytest.approx(0.82)
+
+
+def test_continuing_operations_is_accepted_when_it_is_all_there_is():
+    text = ("GAAP net income from continuing operations was $23.4 million or "
+            "$0.61 per diluted share, compared with $0.40 in the prior quarter.")
+
+    assert release_eps.extract_diluted_eps(text)["eps"] == pytest.approx(0.61)
+
+
+def test_a_net_loss_sentence_makes_an_unqualified_figure_negative():
+    """Alcoa: "Net loss attributable to Alcoa Corporation was $746 million,
+    or $4.17 per share" read as +4.17, because the sign came only from the
+    phrase and the phrase was "per share". 63 sign flips in a hundred names."""
+    text = ("Net loss attributable to Alcoa Corporation was $746 million, or "
+            "$4.17 per share, primarily due to the decline in aluminum prices.")
+
+    assert release_eps.extract_diluted_eps(text)["eps"] == pytest.approx(-4.17)
+
+
+def test_a_parenthetical_loss_label_does_not_force_a_negative():
+    """"Net income (loss) per diluted share of $0.30" is a row label with
+    both words in it. The figure is positive unless the digits say so."""
+    text = "Net income (loss) per diluted share was $0.30, up from $0.12."
+
+    assert release_eps.extract_diluted_eps(text)["eps"] == pytest.approx(0.30)
+
+
+def test_cents_are_read():
+    """Agilent writes every figure in cents. 214 "phrase found, no figure
+    beside it" refusals in a hundred names."""
+    for text, want in (
+        ("GAAP net income of $101 million, or 32 cents per share.", 0.32),
+        ("Diluted earnings per share of 85 cents, up from 70 cents.", 0.85),
+        ("GAAP net loss of $12 million, or 5 cents per diluted share.", -0.05),
+        ("Diluted earnings per share were $.85, compared with $.70.", 0.85),
+    ):
+        assert release_eps.extract_diluted_eps(text)["eps"] == pytest.approx(want), text
+
+
+def test_a_reit_or_insurer_metric_per_share_is_not_earnings():
+    """AGNC: "net spread and dollar roll income per common share" is the
+    headline, and it is non-GAAP by another name. Five preferred tickers of
+    the same issuer read it 125 times."""
+    for text in (
+        "Net spread and dollar roll income of $0.44 per common share.",
+        "Comprehensive income of $0.12 per common share for the quarter.",
+        "Distributable earnings of $1.10 per share.",
+        "Funds from operations (FFO) of $2.05 per diluted share.",
+        "Core earnings of $0.95 per share.",
+        "Operating earnings per share were $1.20.",
+    ):
+        assert release_eps.extract_diluted_eps(text)["eps"] is None, text
+
+
+def test_the_unqualified_fallback_needs_net_income_wording():
+    """"Earnings" alone let too much through: 57% right against 78% for the
+    diluted phrase. The fallback reads "per share" only beside net income,
+    net earnings or net loss."""
+    assert release_eps.extract_diluted_eps(
+        "Earnings of $1.20 per share reflect strong demand.")["eps"] is None
+    assert release_eps.extract_diluted_eps(
+        "Net income of $1.2 billion, or $1.20 per share.")["eps"] == pytest.approx(1.20)
+
+
+def test_a_filing_missing_from_the_list_says_so(monkeypatch):
+    """113 refusals said "no EX-99 exhibit attached" for filings that plainly
+    carry one. The filing was not in the list the lookup searched, and the
+    reason blamed the exhibit."""
+    class _Company:
+        def get_filings(self, form=None):
+            return [_Filing("other", [_Attachment("ex99-1.htm", "EX-99.1", APPLE)])]
+
+    monkeypatch.setattr(release_eps, "_company", lambda ticker: _Company())
+    monkeypatch.setattr(release_eps, "_filing_by_accession", lambda acc: None)
+
+    out = release_eps.read_release("AAPL", "acc-not-listed")
+
+    assert out["eps"] is None
+    assert "not in" in out["reason"] or "not found" in out["reason"]
+
+
+def test_a_filing_missing_from_the_list_is_resolved_the_slow_way(monkeypatch):
+    """The list is the fast path. A filing it does not hold -- an old one past
+    the page, a list that came back short -- is resolved through the
+    quarterly index before the release is given up on."""
+    class _Company:
+        def get_filings(self, form=None):
+            return [_Filing("other", [])]
+
+    monkeypatch.setattr(release_eps, "_company", lambda ticker: _Company())
+    monkeypatch.setattr(
+        release_eps, "_filing_by_accession",
+        lambda acc: _Filing(acc, [_Attachment("ex99-1.htm", "EX-99.1", APPLE)]))
+
+    assert release_eps.read_release("AAPL", "old-acc")["eps"] == pytest.approx(2.02)
