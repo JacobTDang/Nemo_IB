@@ -804,3 +804,39 @@ def test_a_filing_missing_from_the_list_is_resolved_the_slow_way(monkeypatch):
         lambda acc: _Filing(acc, [_Attachment("ex99-1.htm", "EX-99.1", APPLE)]))
 
     assert release_eps.read_release("AAPL", "old-acc")["eps"] == pytest.approx(2.02)
+
+
+# --- the quarter word belongs to the comparison ------------------------------
+
+def test_a_comparative_sentence_does_not_outrank_the_headline():
+    """Advanced Energy, 32 of 33 wrong: "This compares with $1.94 per diluted
+    share in the fourth quarter of 2025" names a quarter -- the prior one --
+    and beat the headline that named none. A quarter word after the figure
+    describes the comparison; only one before it describes the figure."""
+    text = ("GAAP net income was $62 million or $1.58 per diluted share. This "
+            "compares with $75 million or $1.94 per diluted share in the "
+            "fourth quarter of 2025, and $47 million or $1.23 per diluted "
+            "share in the first quarter of 2025.")
+
+    assert release_eps.extract_diluted_eps(text)["eps"] == pytest.approx(1.58)
+
+
+def test_a_quarter_word_before_the_figure_still_counts():
+    text = ("For the fiscal year, diluted earnings per share were $6.10. "
+            "Fourth quarter diluted earnings per share were $1.58, compared "
+            "with $1.94 in the prior quarter.")
+
+    assert release_eps.extract_diluted_eps(text)["eps"] == pytest.approx(1.58)
+
+
+def test_a_line_item_dressed_as_a_headline_is_a_component():
+    """AGNC, 23 of 31 wrong: "recorded a net loss of $(433) million in other
+    gain (loss), net, or $(0.39) per common share" -- the amount is a line
+    item. The headline is the one about net income available to common."""
+    text = ("For the first quarter, net loss available to common stockholders "
+            "was $(155) million, or $(0.17) per common share. OTHER GAIN "
+            "(LOSS), NET For the first quarter, the Company recorded a net "
+            "loss of $(433) million in other gain (loss), net, or $(0.39) per "
+            "common share, compared to a net gain of $789 million.")
+
+    assert release_eps.extract_diluted_eps(text)["eps"] == pytest.approx(-0.17)
