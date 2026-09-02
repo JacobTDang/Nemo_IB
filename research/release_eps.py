@@ -102,7 +102,7 @@ _COMPONENT = re.compile(
 # $1.94 per diluted share in the fourth quarter of 2025" names a quarter --
 # the prior one -- and beat the headline that named none.
 _COMPARATIVE = re.compile(
-    r"^\s*(?:this|that|which)\s+compares|^\s*compared\s+(?:with|to)"
+    r"\b(?:this|that|which)\s+compares\b|^\s*compared\s+(?:with|to)"
     r"|^\s*(?:versus|vs\.?)\s", re.I)
 
 # XBRL's diluted EPS is the total. Continuing operations is a different basis

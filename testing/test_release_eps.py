@@ -807,16 +807,28 @@ def test_a_filing_missing_from_the_list_is_resolved_the_slow_way(monkeypatch):
 
 
 # --- the quarter word belongs to the comparison ------------------------------
+#
+# Each test below is arranged so that only its own rule can save it: the
+# sibling rules are kept out of reach by sentence order and wording. A first
+# version of these passed with every rule removed.
 
-def test_a_comparative_sentence_does_not_outrank_the_headline():
-    """Advanced Energy, 32 of 33 wrong: "This compares with $1.94 per diluted
-    share in the fourth quarter of 2025" names a quarter -- the prior one --
-    and beat the headline that named none. A quarter word after the figure
-    describes the comparison; only one before it describes the figure."""
-    text = ("GAAP net income was $62 million or $1.58 per diluted share. This "
-            "compares with $75 million or $1.94 per diluted share in the "
-            "fourth quarter of 2025, and $47 million or $1.23 per diluted "
-            "share in the first quarter of 2025.")
+def test_a_comparison_opener_demotes_even_with_the_quarter_word_first():
+    """Advanced Energy, 32 of 33 wrong. "In the fourth quarter of 2025, this
+    compares with ... $1.94" has the quarter word before the figure, so the
+    position rule cannot help; only recognising a comparison can."""
+    text = ("GAAP net income was $62 million or $1.58 per diluted share. In the "
+            "fourth quarter of 2025, this compares with $75 million or $1.94 per "
+            "diluted share.")
+
+    assert release_eps.extract_diluted_eps(text)["eps"] == pytest.approx(1.58)
+
+
+def test_a_quarter_word_after_the_figure_names_the_comparison():
+    """No comparison opener to catch here; the quarter word simply follows
+    the figure, and that is where a prior-period figure puts it."""
+    text = ("GAAP net income was $62 million or $1.58 per diluted share. Net "
+            "income was $75 million or $1.94 per diluted share in the fourth "
+            "quarter of 2025.")
 
     assert release_eps.extract_diluted_eps(text)["eps"] == pytest.approx(1.58)
 
@@ -830,13 +842,13 @@ def test_a_quarter_word_before_the_figure_still_counts():
 
 
 def test_a_line_item_dressed_as_a_headline_is_a_component():
-    """AGNC, 23 of 31 wrong: "recorded a net loss of $(433) million in other
-    gain (loss), net, or $(0.39) per common share" -- the amount is a line
-    item. The headline is the one about net income available to common."""
-    text = ("For the first quarter, net loss available to common stockholders "
-            "was $(155) million, or $(0.17) per common share. OTHER GAIN "
-            "(LOSS), NET For the first quarter, the Company recorded a net "
-            "loss of $(433) million in other gain (loss), net, or $(0.39) per "
-            "common share, compared to a net gain of $789 million.")
+    """AGNC, 23 of 31 wrong. The line-item sentence comes FIRST here and
+    names the quarter before its figure, so neither order nor position can
+    save it; only recognising "in other ..., net" as a component can."""
+    text = ("OTHER GAIN (LOSS), NET For the first quarter, the Company recorded "
+            "a net loss of $(433) million in other gain (loss), net, or $(0.39) "
+            "per common share. For the first quarter, net loss available to "
+            "common stockholders was $(155) million, or $(0.17) per common "
+            "share.")
 
     assert release_eps.extract_diluted_eps(text)["eps"] == pytest.approx(-0.17)
