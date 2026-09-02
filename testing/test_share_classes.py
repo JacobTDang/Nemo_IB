@@ -252,3 +252,90 @@ def test_different_quarters_of_one_issuer_are_different_prints(two_classes,
     out = scanner.scan(as_of=two_classes)
 
     assert "BANK" in [c["ticker"] for c in out["candidates"]]
+
+
+# --- one line per issuer, at the screen ------------------------------------
+#
+# The suffix rule cannot see everything. AGNC Investment's five preferred
+# series list as AGNCL, AGNCM, AGNCN, AGNCO and AGNCP -- no hyphen, a trailing
+# letter -- and all five passed the screen, each wearing the common's EPS
+# surprise. The scanner's collapse protected the book; nothing protected the
+# bar fetch, the signal build or the watcher's sweep, which paid a request per
+# line. So the universe itself keeps one line per CIK, the most liquid, and
+# the scanner's collapse becomes a second line of defence. See issue #91.
+
+def _bars(store, ticker, volume):
+    store.record_bars(ticker, [
+        {"trade_date": d, "open": 100.0, "high": 101.0, "low": 99.0,
+         "close": 100.0, "volume": volume} for d in DAYS[:300]],
+        recorded_at=f"{AS_OF}T21:00:00Z")
+
+
+def _registrants(monkeypatch, rows):
+    monkeypatch.setattr(daily_job, "_fetch_sec_tickers", lambda: [
+        {"ticker": t, "cik": cik, "name": t} for t, cik in rows])
+
+
+def test_the_universe_keeps_one_line_per_issuer_the_most_liquid(store,
+                                                               monkeypatch):
+    """BRK-A is listed first and is the shorter-looking symbol; BRK-B is the
+    line that trades. Whichever came first, or whichever is shortest, would
+    both keep the wrong one."""
+    _bars(store, "BRK-A", volume=40_000)     # $4M a day: clears the floor
+    _bars(store, "BRK-B", volume=4_000_000)
+    _bars(store, "OTHER", volume=4_000_000)
+    _registrants(monkeypatch, [("BRK-A", "1067983"), ("BRK-B", "1067983"),
+                               ("OTHER", "111111")])
+
+    out = daily_job.refresh_universe(as_of=AS_OF)
+    members = {m["ticker"]: m for m in pit_store.universe_as_of(AS_OF)}
+
+    assert out["collapsed"] == 1
+    assert out["eligible"] == 2
+    assert members["BRK-B"]["eligible"] is True
+    assert members["OTHER"]["eligible"] is True
+    assert members["BRK-A"]["eligible"] is False
+    assert "BRK-B" in members["BRK-A"]["exclusion_reason"]
+    assert "1067983" in members["BRK-A"]["exclusion_reason"]
+
+
+def test_five_hyphenless_preferreds_fall_to_the_common():
+    lines = [{"ticker": t, "cik": "1423689", "eligible": True,
+              "exclusion_reason": None, "median_dollar_volume": mdv}
+             for t, mdv in (("AGNCL", 2e6), ("AGNC", 3e8), ("AGNCM", 2e6),
+                            ("AGNCN", 3e6), ("AGNCO", 2e6), ("AGNCP", 1e6))]
+
+    dropped = daily_job._one_line_per_issuer(lines)
+    kept = [e["ticker"] for e in lines if e["eligible"]]
+
+    assert dropped == 5
+    assert kept == ["AGNC"]
+    for e in lines:
+        if e["ticker"] != "AGNC":
+            assert "AGNC" in e["exclusion_reason"]
+
+
+def test_lines_with_no_cik_are_not_collapsed_at_the_screen():
+    """Absent is not equal, here as in the scanner."""
+    lines = [{"ticker": t, "cik": cik, "eligible": True,
+              "exclusion_reason": None, "median_dollar_volume": 1e7}
+             for t, cik in (("AAA", ""), ("BBB", ""), ("CCC", None),
+                            ("DDD", None))]
+
+    assert daily_job._one_line_per_issuer(lines) == 0
+    assert all(e["eligible"] for e in lines)
+
+
+def test_a_sibling_the_screen_already_rejected_is_left_with_its_own_reason():
+    """Only eligible lines compete. A thin sibling keeps the reason the
+    liquidity screen gave it, and does not knock the common out either."""
+    lines = [
+        {"ticker": "BANK", "cik": "895421", "eligible": True,
+         "exclusion_reason": None, "median_dollar_volume": 5e8},
+        {"ticker": "BANKL", "cik": "895421", "eligible": False,
+         "exclusion_reason": "median dollar volume 40,000 below the floor"},
+    ]
+
+    assert daily_job._one_line_per_issuer(lines) == 0
+    assert lines[0]["eligible"] is True
+    assert lines[1]["exclusion_reason"].startswith("median dollar volume")

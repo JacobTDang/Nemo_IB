@@ -779,7 +779,11 @@ _NOT_COMMON = (
 
 # Deliberately NOT excluded: a single-letter class suffix on genuine common.
 # BRK-B, BF-B, HEI-A and PBR-A carry the earnings exactly as the A-class does,
-# and dropping them would take Berkshire out of the universe.
+# and dropping them would take Berkshire out of the universe. Two classes of
+# one issuer are then reduced to the more liquid one by `_one_line_per_issuer`,
+# which keys on the CIK and so also catches what no suffix rule can: AGNC's
+# preferred series list as AGNCL..AGNCP, hyphenless, and passed this screen
+# five times over (issue #91).
 
 
 def _share_class_problem(ticker: str) -> Optional[str]:
@@ -846,6 +850,39 @@ def _screen(ticker: str, as_of: str) -> Dict[str, Any]:
             "median_dollar_volume": median_dollar}
 
 
+def _one_line_per_issuer(entries: List[Dict[str, Any]]) -> int:
+    """Among eligible lines sharing a CIK, keep the most liquid; reject the
+    rest, each naming the sibling kept. Returns how many were dropped.
+
+    The scanner already collapses candidates by issuer, which protects the
+    book. It does not protect anything upstream: the bar fetch, the signal
+    build and the watcher's sweep each spend a request per ticker, and a
+    preferred or a second class that shares its issuer's CIK inherits the
+    common's EPS surprise while having no earnings of its own. Only eligible
+    lines compete -- a sibling the liquidity screen rejected keeps that
+    reason -- and a missing CIK is not a shared one.
+    """
+    by_cik: Dict[str, List[Dict[str, Any]]] = {}
+    for e in entries:
+        if e["eligible"] and e.get("cik"):
+            by_cik.setdefault(e["cik"], []).append(e)
+    dropped = 0
+    for cik, lines in by_cik.items():
+        if len(lines) < 2:
+            continue
+        kept = max(lines, key=lambda e: e["median_dollar_volume"])
+        for e in lines:
+            if e is kept:
+                continue
+            e["eligible"] = False
+            e["exclusion_reason"] = (
+                f"{e['ticker']} shares CIK {cik} with {kept['ticker']}, the "
+                f"more liquid line. One issuer's print is one trade; a second "
+                f"listing carries the same EPS surprise under another symbol")
+            dropped += 1
+    return dropped
+
+
 def refresh_universe(as_of: Optional[str] = None) -> Dict[str, Any]:
     """Today's membership, eligible and rejected alike.
 
@@ -863,12 +900,9 @@ def refresh_universe(as_of: Optional[str] = None) -> Dict[str, Any]:
                              error=f"{type(exc).__name__}: {exc}")
         return {"status": "failed", "error": str(exc)}
 
-    entries = []
-    eligible = 0
-    for reg in registrants:
-        verdict = _screen(reg["ticker"], as_of)
-        eligible += 1 if verdict["eligible"] else 0
-        entries.append({**reg, **verdict})
+    entries = [{**reg, **_screen(reg["ticker"], as_of)} for reg in registrants]
+    collapsed = _one_line_per_issuer(entries)
+    eligible = sum(1 for e in entries if e["eligible"])
 
     # End of the day it screened, like every other recorder here. Stamped
     # `now`, a screen run for a past date is visible to that date -- and the
@@ -879,7 +913,7 @@ def refresh_universe(as_of: Optional[str] = None) -> Dict[str, Any]:
     pit_store.finish_run(rows_written=written, status=status,
                          error=None if status == "ok" else "no registrants")
     return {"status": status, "written": written, "eligible": eligible,
-            "screened": len(entries)}
+            "screened": len(entries), "collapsed": collapsed}
 
 
 def eligible_tickers(as_of: Optional[str] = None) -> List[str]:
