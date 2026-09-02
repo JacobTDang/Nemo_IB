@@ -367,7 +367,7 @@ def _stub(order: Dict[str, Any]) -> Dict[str, Any]:
 # standardised surprise -- a sigma. `cs` prices a rank's distance into a tail,
 # which is a different quantity with a different declared coefficient, and one
 # name over both is a coefficient of neither.
-UNIT_OF = {"ts": "sigma", "af": "sigma", "cs": "tail"}
+UNIT_OF = {"ts": "sigma", "af": "sigma", "ts_release": "sigma", "cs": "tail"}
 
 # Two-sided 95%.
 CI_Z = 1.96

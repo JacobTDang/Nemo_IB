@@ -58,10 +58,10 @@ FIRST_PARTY = {"tools", "research", "agent", "state", "knowledge"}
 # through by a pattern.
 DECLARED_AHEAD_OF_THE_CODE = {
     "NEMO_FILING_CACHE_CAP_MB": {
-        "congress-sync", "research-daily", "research-scan",
+        "congress-sync", "research-daily",
     },
     "NEMO_FILING_CACHE_INTERVAL_S": {
-        "congress-sync", "research-daily", "research-scan",
+        "congress-sync", "research-daily",
     },
 }
 
