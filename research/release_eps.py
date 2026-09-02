@@ -70,8 +70,9 @@ _DILUTED = re.compile(
 # The unqualified form banks use: "$7.70 per share", "EPS of $7.70". Accepted
 # only in a sentence that is about earnings and not about a distribution.
 _PER_SHARE = re.compile(r"(?:per\s+(?:common\s+)?share|\bEPS\b)", re.I)
-_EARNINGS_WORDS = re.compile(r"net\s+(?:income|loss|earnings)|earnings|\bEPS\b",
-                             re.I)
+# Net income, net earnings or net loss -- "earnings" alone let too much
+# through: 57% right against 78% for the diluted phrase on a hundred names.
+_EARNINGS_WORDS = re.compile(r"net\s+(?:income|loss|earnings)|\bEPS\b", re.I)
 _NOT_EARNINGS = re.compile(
     r"dividend|book\s+value|repurchas|buy\s*back|offering|price\s+of|"
     r"average\s+(?:price|cost)|exercise|conversion", re.I)
@@ -79,7 +80,32 @@ _NOT_EARNINGS = re.compile(
 # Qualifiers that make a figure something other than the GAAP one.
 _NON_GAAP = re.compile(
     r"non[-\s]?gaap|adjusted|pro\s*forma|normali[sz]ed|core\s+(?:eps|earnings)"
-    r"|excluding|ex[-\s]items|significant\s+items|\bcomparable\b", re.I)
+    r"|excluding|ex[-\s]items|significant\s+items|\bcomparable\b"
+    # A REIT's or an insurer's headline metric, which is non-GAAP by another
+    # name: AGNC's "net spread and dollar roll income per common share".
+    r"|net\s+spread|dollar\s+roll|distributable|funds\s+from\s+operations"
+    r"|\bA?FFO\b|comprehensive\s+income|operating\s+earnings|economic\s+return",
+    re.I)
+
+# A component of earnings is not the earnings. Aflac's quarter-naming sentence
+# was "included pretax net realized investment losses of $322 million, or
+# $0.42 per diluted share", and it outranked the headline. Demoted, not
+# skipped: some headlines say "included" too.
+_COMPONENT = re.compile(
+    r"\b(?:included|includes|including|impact\s+of|benefit\s+of|charges?\s+of"
+    r"|gains?\s+of|losses\s+of|expense\s+of|related\s+to)\b", re.I)
+
+# XBRL's diluted EPS is the total. Continuing operations is a different basis
+# when there were discontinued ones -- demoted, and accepted when it is all
+# there is.
+_CONTINUING = re.compile(r"continuing\s+operations", re.I)
+
+# Whether the clause is about a loss, whatever the phrase says. Alcoa: "Net
+# loss attributable to Alcoa Corporation was $746 million, or $4.17 per share"
+# read as +4.17 because the phrase was "per share". A parenthetical "(loss)"
+# in a row label -- "Net income (loss) per share" -- is not a loss.
+_NET_LOSS = re.compile(r"\bnet\s+loss\b|\bloss\s+per\b|\bloss\s+of\b", re.I)
+_NET_INCOME = re.compile(r"\bnet\s+(?:income|earnings)\b", re.I)
 
 # Whether a sentence is about the quarter or the year. Q4 releases carry both,
 # and the year comes first.
@@ -106,7 +132,8 @@ _STATEMENT = re.compile(
 # A dollar figure, with the three ways a loss is written: $(0.12), ($0.12),
 # -$0.12, and a table's bare "$ -0.33".
 _MONEY_BEFORE = re.compile(
-    r"(?:-\s?\$|\(\s?\$|\$\s?\(|\$)\s?-?(\d+\.\d{2})\)?\s*(?:,|or)?\s*$")
+    r"(?:(?:-\s?\$|\(\s?\$|\$\s?\(|\$)\s?-?(\d*\.\d{2})\)?"
+    r"|(\d{1,3})\s+cents)\s*(?:,|or)?\s*$", re.I)
 # ...or through a growth verb and a percentage: "EPS grew 18% to $0.91",
 # "increased 12% to $2.02", "rose to $1.10". Coca-Cola writes every headline
 # that way, and an adjacency rule without it refused all 23 of its releases.
@@ -115,7 +142,8 @@ _MONEY_AFTER = re.compile(
     r"(?:was|were|of|totaled|totalled|came\s+in\s+at|reached|at|:|,|\(|"
     r"(?:grew|increased|rose|climbed|improved|expanded|declined|decreased|fell|"
     r"dropped|was\s+up|was\s+down)(?:\s+\d+(?:\.\d+)?\s*%)?\s+(?:to|at))?"
-    r"\s*(?:-\s?\$|\(\s?\$|\$\s?\(|\$)\s?-?(\d+\.\d{2})\)?", re.I)
+    r"\s*(?:(?:-\s?\$|\(\s?\$|\$\s?\(|\$)\s?-?(\d*\.\d{2})\)?"
+    r"|(\d{1,3})\s+cents)", re.I)
 
 # A bullet is a sentence boundary too: older releases are flattened bullet
 # lists with no full stops, and to a splitter on punctuation alone the whole
@@ -130,31 +158,53 @@ _MONTHS = {m: i for i, m in enumerate(
      "august", "september", "october", "november", "december"), start=1)}
 
 
-def _sign(sentence: str, start: int, end: int, phrase_has_loss: bool) -> int:
+def _sign(sentence: str, start: int, end: int, clause_is_loss: bool) -> int:
     """Negative for a loss, written three ways: "-$0.12", "$(0.12)", "($0.12)".
 
     The paren forms close on the digits. "( $7.70 PER SHARE)" is a parenthetical
     around a whole phrase and closes after the words, so an opening paren alone
     is not a loss -- JPMorgan's headline came back as -7.70 while it was.
     """
-    if phrase_has_loss or sentence[end:end + 1] == ")":
+    if clause_is_loss or sentence[end:end + 1] == ")":
         return -1
     return -1 if "-" in sentence[max(0, start - 3):start] else 1
 
 
-def _figure_beside(sentence: str, match: "re.Match", loss: bool):
+def _clause_is_loss(sentence: str, upto: int) -> bool:
+    """Whether the words before the figure describe a loss.
+
+    "Net loss ... was $746 million, or $4.17 per share" is a loss whatever
+    the phrase says. "Net income (loss) per share" is a row label carrying
+    both words and is not."""
+    clause = sentence[:upto]
+    if _NET_INCOME.search(clause) and not re.search(r"\bnet\s+loss\b", clause, re.I):
+        return False
+    return bool(_NET_LOSS.search(clause))
+
+
+def _value_of(match) -> float:
+    dollars, cents = match.group(1), match.group(2)
+    return float(dollars) if dollars else float(cents) / 100.0
+
+
+def _figure_beside(sentence: str, match: "re.Match"):
     """The first figure adjacent to a phrase: immediately before it ("$0.49
-    per diluted share") or within a few words after it ("was $2.02")."""
+    per diluted share", "32 cents per share") or within a few words after it
+    ("was $2.02")."""
     before = sentence[:match.start()]
     tail = _MONEY_BEFORE.search(before)
     if tail:
-        return _sign(sentence, tail.start(1), tail.end(1), loss) \
-            * float(tail.group(1))
+        g = 1 if tail.group(1) else 2
+        loss = _clause_is_loss(sentence, tail.start(g)) or \
+            "loss" in match.group(0).lower()
+        return _sign(sentence, tail.start(g), tail.end(g), loss) * _value_of(tail)
     after = sentence[match.end():match.end() + 60]
     lead = _MONEY_AFTER.search(after)
     if lead:
-        start, end = match.end() + lead.start(1), match.end() + lead.end(1)
-        return _sign(sentence, start, end, loss) * float(lead.group(1))
+        g = 1 if lead.group(1) else 2
+        start, end = match.end() + lead.start(g), match.end() + lead.end(g)
+        loss = _clause_is_loss(sentence, start) or "loss" in match.group(0).lower()
+        return _sign(sentence, start, end, loss) * _value_of(lead)
     return None
 
 
@@ -185,21 +235,29 @@ def _from_prose(text: str) -> Dict[str, Any]:
         if _NON_GAAP.search(sentence[:match.start()]):
             continue
         saw_gaap = True
-        value = _figure_beside(sentence, match, "loss" in match.group(0).lower())
+        value = _figure_beside(sentence, match)
         if value is None:
             continue
         rank = 0 if _QUARTER.search(sentence) else (
             2 if _ANNUAL.search(sentence) else 1)
-        # "$1.64 ... when excluding the one-time charge": the qualifier comes
-        # after the figure, so it is not a reason to skip -- the sentence may
-        # be the only one -- but a sentence carrying no qualifier at all
-        # outranks it, and a diluted phrase outranks an unqualified one.
-        qualified = bool(_NON_GAAP.search(sentence))
-        candidates.append((rank, qualified, basis != "gaap", index, value,
-                           basis, sentence.strip()))
+        # The wrong number beats the wrong period. A component of earnings
+        # ("included ... losses of $322 million, or $0.42 per diluted share")
+        # and a continuing-operations basis are wrong figures whatever quarter
+        # they name, so those demerits come before the period rank. Then the
+        # rank, then a non-GAAP qualifier anywhere -- "$1.64 ... when
+        # excluding the one-time charge" comes after the figure, so it is not
+        # a reason to skip, only to lose to a clean sentence -- then a
+        # diluted phrase over an unqualified one, then document order.
+        key = (bool(_COMPONENT.search(sentence[:match.start()])),
+               bool(_CONTINUING.search(sentence)),
+               rank,
+               bool(_NON_GAAP.search(sentence)),
+               basis != "gaap",
+               index)
+        candidates.append((key, value, basis, sentence.strip()))
 
     if candidates:
-        _, _, _, _, value, basis, evidence = min(candidates)
+        _, value, basis, evidence = min(candidates)
         return {"eps": value, "basis": basis, "evidence": evidence,
                 "reason": None}
     if not saw_phrase:
@@ -398,6 +456,13 @@ def _exhibit_rank(attachment) -> Optional[int]:
     return 1
 
 
+def _filing_by_accession(accession: str):
+    """The slow path: resolve one accession through the quarterly index."""
+    import edgar
+
+    return edgar.get_by_accession_number(accession)
+
+
 def _exhibits(ticker: str, accession: str, filings=None) -> List[Any]:
     """The EX-99 attachments of one 8-K, EX-99.1 first.
 
@@ -411,12 +476,24 @@ def _exhibits(ticker: str, accession: str, filings=None) -> List[Any]:
     filing = next((f for f in filings
                    if getattr(f, "accession_no", None) == accession), None)
     if filing is None:
-        return []
+        filing = _filing_by_accession(accession)
+    if filing is None:
+        raise LookupError(f"{accession} is not in {ticker}'s 8-K list and "
+                          f"could not be resolved from the index")
     # The filing's index page, not `filing.attachments`: the latter parses
     # the whole SGML submission to list the exhibits -- for Rivian, 28
     # embedded images -- at 17 seconds a release, and the read timeouts came
     # from there. The index is a small page listing the same documents.
-    documents = filing.homepage.documents
+    #
+    # An empty index is a transient, not a fact: 113 releases in a hundred
+    # names came back "no EX-99 exhibit" from filings that plainly carry one.
+    # Asked again, then read the slow way before believing it.
+    documents = list(filing.homepage.documents or [])
+    if not documents:
+        time.sleep(FETCH_RETRY_BACKOFF)
+        documents = list(filing.homepage.documents or [])
+    if not documents:
+        documents = list(filing.attachments or [])
     ranked = [(rank, i, a) for i, a in enumerate(documents)
               for rank in (_exhibit_rank(a),) if rank is not None]
     return [a for _, _, a in sorted(ranked, key=lambda t: (t[0], t[1]))]
@@ -452,10 +529,14 @@ def read_release(ticker: str, accession: str,
     narrative has no figure and whose supplement has an unreadable table
     still says which of those it was.
     """
-    exhibits = _exhibits(ticker, accession, filings=filings)
+    try:
+        exhibits = _exhibits(ticker, accession, filings=filings)
+    except LookupError as exc:
+        return {"eps": None, "basis": None, "evidence": None,
+                "reason": f"filing not found: {exc}"}
     if not exhibits:
         return {"eps": None, "basis": None, "evidence": None,
-                "reason": "no EX-99 exhibit attached to the 8-K"}
+                "reason": "the 8-K lists documents and none is an EX-99 exhibit"}
     first_refusal = None
     for attachment in exhibits:
         read = extract_diluted_eps(_text_of(attachment), period_end=period_end)
