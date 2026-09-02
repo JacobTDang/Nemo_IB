@@ -186,13 +186,20 @@ def _signal_for(ticker: str, as_of: str) -> Dict[str, Any]:
         if analyst.get("success"):
             return {**analyst, "variant": "af"}
         return {**sue.sue_ts(ticker, as_of=as_of), "variant": "ts"}
+    if SIGNAL_VARIANT == "ts_release":
+        # The same surprise, dated from the 8-K rather than the 10-Q. See
+        # `research.release_eps` for why the eight days matter.
+        from research import release_eps
+        return {**release_eps.sue_ts_release(ticker, as_of=as_of),
+                "variant": "ts_release"}
     if SIGNAL_VARIANT == "cs":
         from research import sue_cs
         return {**sue_cs.surprise_rank(ticker, as_of=as_of,
                                        peers=_peers_for(as_of)),
                 "variant": "cs"}
     raise ValueError(
-        f"SIGNAL_VARIANT must be 'ts', 'af', 'af_or_ts' or 'cs'; got "
+        f"SIGNAL_VARIANT must be 'ts', 'af', 'af_or_ts', 'ts_release' or "
+        f"'cs'; got "
         f"{SIGNAL_VARIANT!r}")
 
 
