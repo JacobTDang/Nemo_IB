@@ -11,7 +11,7 @@ and the failure that matters is not an inaccurate charge: it is a zero charge
 that makes the least borrowable name in the universe look like the cheapest
 short on the book.
 """
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -236,7 +236,7 @@ def test_a_bad_side_is_a_caller_bug_not_a_free_short(calendar):
 # typed in today is not something last month's decision could have used. So
 # these load for today and read as of today; the point-in-time behaviour when
 # the two dates differ is pinned above.
-TODAY = date.today().isoformat()
+TODAY = datetime.now(timezone.utc).date().isoformat()
 
 
 def _csv(tmp_path, text):
@@ -371,6 +371,61 @@ def test_a_live_load_is_not_marked_backfilled(store, tmp_path):
                  "--from-csv", _csv(tmp_path, "ticker,annual_rate\nHTB,0.035\n")])
 
     assert store.borrow_rate_as_of("HTB", TODAY)["backfilled"] == 0
+
+
+def test_todays_date_comes_from_the_same_clock_the_store_stamps_with():
+    """The two tests below monkeypatch `_today`, so they pin that the loader
+    asks it rather than what it answers. This pins the answer.
+
+    `pit_store._now()` is UTC. Anything comparing a date against it must be
+    UTC too, or the two disagree for the hours between local midnight and UTC
+    midnight -- which is when this was found, at 23:10 CDT on 2026-09-01, with
+    the UTC date already 2026-09-02.
+    """
+    from datetime import datetime, timezone
+
+    assert borrow._today() == datetime.now(timezone.utc).date().isoformat()
+    assert pit_store._now().startswith(borrow._today()), (
+        "the loader's date and the store's stamp come from different clocks")
+
+
+def test_the_loader_reads_the_clock_in_utc_like_the_store_does(store,
+                                                               tmp_path,
+                                                               capsys,
+                                                               monkeypatch):
+    """`pit_store._now()` stamps in UTC. A loader on the local date splits from
+    it for the hours between local midnight and UTC midnight, and both branches
+    that read the clock then get the wrong answer. Issue #28 in a second place.
+
+    Caught for real at 23:10 CDT, when the local date was 2026-09-01 and the
+    UTC date was already 2026-09-02. The store is UTC, so the loader must be.
+    """
+    monkeypatch.setattr(borrow, "_today", lambda: "2026-09-02")
+    path = _csv(tmp_path, "ticker,annual_rate\nHTB,0.035\n")
+
+    # The operator's local date is still 2026-09-01. Loading for it writes a
+    # row stamped 2026-09-02Z, which the reader hides -- so the warning has to
+    # fire. Judged against the local date it would not.
+    borrow.main(["--as-of", "2026-09-01", "--units", "fraction",
+                 "--from-csv", path])
+
+    assert "--backfill" in capsys.readouterr().out, (
+        "no warning for a load the reader will not return")
+
+
+def test_a_date_that_is_today_in_utc_is_not_refused_as_the_future(store,
+                                                                  tmp_path,
+                                                                  monkeypatch):
+    """The other half of the same split. Judged against a local date that has
+    not caught up yet, today in UTC looks like tomorrow and gets refused."""
+    monkeypatch.setattr(borrow, "_today", lambda: "2026-09-02")
+
+    rc = borrow.main(["--as-of", "2026-09-02", "--units", "fraction",
+                      "--backfill", "--from-csv",
+                      _csv(tmp_path, "ticker,annual_rate\nHTB,0.035\n")])
+
+    assert rc == 0, "today in UTC was refused as a future date"
+    assert store.borrow_rate_as_of("HTB", "2026-09-02") is not None
 
 
 def test_backfilling_a_future_date_is_refused(store, tmp_path):

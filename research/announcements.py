@@ -32,7 +32,7 @@ from datetime import date, time, timedelta
 from typing import Any, Dict, List, Optional, Sequence
 from zoneinfo import ZoneInfo
 
-from research import pit_store
+from research import daily_job, pit_store
 from tools import filing_cache
 
 EXCHANGE_TZ = ZoneInfo("America/New_York")
@@ -221,6 +221,7 @@ def backfill(tickers: Sequence[str],
     exists to answer.
     """
     as_of = as_of or _today()
+    run_id = pit_store.start_run("announce", as_of_date=as_of)
     written = 0
     covered = 0
     failed: List[str] = []
@@ -247,6 +248,15 @@ def backfill(tickers: Sequence[str],
                 ticker.upper(), period, row["announced_date"],
                 timing=row["timing"], source=pit_store.PRIMARY_SOURCE,
                 recorded_at=f"{row['announced_date']}T21:00:00Z")
+
+    # The same three-state vocabulary the recorder uses, so `missing_days` and
+    # `coverage_status` read this job exactly like the others.
+    pit_store.finish_run(
+        rows_written=written,
+        status=daily_job.coverage_status(covered, len(tickers)),
+        error=(f"{len(failed)} of {len(tickers)} lookups failed: "
+               + "; ".join(failed[:5])) if failed else None,
+        run_id=run_id)
 
     return {"tickers": len(tickers), "covered": covered, "written": written,
             "failed": failed}

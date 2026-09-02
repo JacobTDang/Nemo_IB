@@ -332,6 +332,7 @@ CRON_TZ=UTC
  0  6 * * * cd /srv/nemo/deploy && flock -n /var/lock/nemo-congress-sync.lock docker compose --env-file ../.env run --rm congress-sync
 15  3 * * * cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-backup.lock docker compose --env-file ../.env run --rm research-backup
  0  4 * * * cd /srv/nemo/deploy && docker container prune -f --filter until=24h --filter label=com.docker.compose.project=deploy
+0 12 * * 1-5 cd /srv/nemo/deploy && docker compose --env-file ../.env run --rm research-status
 ```
 
 ### What a failed stage costs, and why the chain still uses `&&`
@@ -399,6 +400,42 @@ reporting a silent success.
 python -m research.borrow --as-of 2026-08-31 --from-csv rates.csv \
   --units percent --source ibkr --backfill
 ```
+
+### Seeing what happened, from a terminal
+
+`research-status` reads the store and prints one screen. It writes nothing, so
+it is safe to run at any time and safe beside a running job.
+
+```bash
+cd /srv/nemo/deploy
+docker compose --env-file ../.env run --rm research-status
+docker compose --env-file ../.env run --rm research-status --json   # for scripts
+```
+
+It answers the question the row counts cannot: **a job that ran and found
+nothing writes no rows, and so does a job that did not run.** Only `run_log`
+separates them, so the report reads the log. Four states matter:
+
+| state | means |
+|---|---|
+| `never` | no finished run at all. Normal on a fresh volume, an outage three weeks in |
+| `crashed` | a run started and never finished, so the process died |
+| `stale` | the last success is older than that job's own tolerance |
+| `failed` | the run finished and reported failure, with the reason |
+
+`activist_watch` is expected to report `partial` every pass, because it watches
+a time-bounded slice of the watchlist by design. The report knows that and does
+not raise it. Every other job reporting `partial` is worth a look.
+
+The command exits `1` when anything needs attention, so it also works as a cron
+healthcheck rather than only by eye. The cron block above carries the line, at
+midday on a weekday, so a night that failed is seen the same day rather than
+the next time somebody looks.
+
+For logs rather than state, `docker compose --env-file ../.env logs -f sec`
+follows one server, and `docker compose --env-file ../.env ps` shows which
+containers are up and healthy. Each server keeps 30MB of logs, three files of
+ten.
 
 ### Memory, and why it never goes down
 
