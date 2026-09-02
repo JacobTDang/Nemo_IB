@@ -88,6 +88,11 @@ def score_orders(as_of: Optional[str] = None,
     job called this, and this scored everything at one comparison.
     """
     as_of = as_of or _today()
+    # On the record before any work, so a crash leaves a started row with no
+    # finish -- which `missing_days` correctly refuses to count as coverage.
+    # This job is the one that checks the others, so a week it silently did
+    # not run is the most expensive gap in the log.
+    run_id = pit_store.start_run("score", as_of_date=as_of)
     orders = [o for o in pit_store.paper_orders_as_of(as_of, accepted_only=True)]
 
     scored: List[Dict[str, Any]] = []
@@ -151,6 +156,18 @@ def score_orders(as_of: Optional[str] = None,
         scored.append({**row,
                        "expected_edge_bps": order["expected_edge_bps"],
                        "timing": _timing_of(order, as_of)})
+
+    # Scored, not written: this job writes no rows. `rows_written` is what a
+    # reader compares against zero, and for a scorer the count that means "it
+    # did something" is how many trades it could close.
+    # `ok` with zero rows, not `closed`. In this store `closed` means the
+    # exchange was shut, and `missing_days` counts it as coverage for that
+    # reason -- borrowing the word for "nothing had finished yet" would make
+    # a scorer's quiet week indistinguishable from a market holiday.
+    pit_store.finish_run(
+        rows_written=len(scored), status="ok",
+        error=None if scored else "no finished horizons to score",
+        run_id=run_id)
 
     return {"as_of": as_of, "horizon_days": horizon_days,
             "scored": scored, "pending": pending, "unfilled": unfilled,

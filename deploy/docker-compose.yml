@@ -277,6 +277,11 @@ services:
   # which is where compose gets the project name from -- hence the cd.
   #   0 4 * * * cd /srv/nemo/deploy && docker container prune -f --filter until=24h --filter label=com.docker.compose.project=deploy
   #
+  # And the healthcheck, which exits non-zero when a job has stopped
+  # running. Midday on a weekday, so a night that failed is seen the
+  # same day rather than the next time somebody looks:
+  #   0 12 * * 1-5 cd /srv/nemo/deploy && docker compose --env-file ../.env run --rm research-status
+  #
   # A reboot mid-job does NOT block the next run, and that part is well built:
   # start_run (research/pit_store.py) only INSERTs, and missing_days counts a
   # started-but-unfinished row as a gap. There is no lock file or run marker to
@@ -382,6 +387,36 @@ services:
     tmpfs:
       - /root/.edgar:rw,size=512m
       - /app/db_cache:rw,size=128m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # What the automation did, in one screen. Reads the store and writes
+  # nothing, so it is safe to run at any time and safe beside a running job.
+  #
+  #   docker compose --env-file ../.env run --rm research-status
+  #   docker compose --env-file ../.env run --rm research-status --json
+  #
+  # Exits 1 when something needs attention, so it also works as a cron
+  # healthcheck rather than only by eye.
+  research-status:
+    image: ${NEMO_IMAGE:-nemo-data:local}
+    profiles: ["sync"]
+    restart: "no"
+    entrypoint: ["python", "-m", "research.status"]
+    environment:
+      <<: *clock-env
+      NEMO_PIT_DB: /app/data/pit.db
+    volumes:
+      - research-data:/app/data
+    # It writes nothing to either, and gets them anyway: the rule that every
+    # batch service caps its writes is worth keeping absolute, so a service
+    # that later grows a cache does not quietly land on the host disk.
+    tmpfs:
+      - /root/.edgar:rw,size=16m
+      - /app/db_cache:rw,size=16m
     logging:
       driver: json-file
       options:

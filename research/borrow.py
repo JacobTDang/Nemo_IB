@@ -36,7 +36,7 @@ implied by silence.
 from __future__ import annotations
 
 import statistics
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any, Dict, Optional
 
 from research import pit_store, scoring, spread
@@ -175,6 +175,18 @@ def _d(day: str):
 
 # ------------------------------------------------------------- entry point
 
+def _today() -> str:
+    """Today in UTC, because the store stamps `recorded_at` in UTC.
+
+    A local date splits from the store's for the hours between local midnight
+    and UTC midnight. In those hours a loader on the local date writes rows the
+    reader will hide and prints no warning, and refuses a legitimate UTC date
+    as if it were in the future. That is issue #28's failure in a second place,
+    and the whole package reads the clock in UTC for the same reason.
+    """
+    return datetime.now(timezone.utc).date().isoformat()
+
+
 def _rows_from_csv(path: str, units: str) -> list:
     """Every row, or an exception. Never some of them.
 
@@ -248,7 +260,7 @@ def main(argv: Optional[list] = None) -> int:
                              "can tell them from ones captured on the day")
     args = parser.parse_args(argv)
 
-    today = date.today().isoformat()
+    today = _today()
     if args.backfill and args.as_of > today:
         # Stamping a row at the end of a day that has not happened makes it
         # visible to every date after it and to none before. That is not a

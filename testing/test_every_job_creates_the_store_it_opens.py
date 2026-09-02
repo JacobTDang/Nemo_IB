@@ -17,6 +17,13 @@ added without the call, instead of the day someone runs it on a fresh volume.
 A job module is one that defines `main()` and touches `pit_store`. That is the
 definition the bug has: a module with no `main()` is never the first command,
 and one that never opens the store cannot find its tables missing.
+
+`status` is the one exception, and it is exempt for the opposite reason rather
+than by oversight. It reads and changes nothing, so building a schema would
+mean creating an empty store as a side effect of looking at one -- and then
+reporting nine jobs as "never run" against a database this command had just
+invented. It answers a missing store by saying so, which
+`testing/test_status.py` pins.
 """
 from __future__ import annotations
 
@@ -67,11 +74,16 @@ def _calls_init_schema(node: ast.AST) -> bool:
     return False
 
 
+# Readers, not jobs. See the module docstring.
+EXEMPT = {"status"}
+
+
 def _job_modules() -> list[str]:
     found = []
     for path in sorted(RESEARCH.glob("*.py")):
         tree = _tree(path)
-        if _main_of(tree) is not None and _touches_pit_store(tree):
+        if (_main_of(tree) is not None and _touches_pit_store(tree)
+                and path.stem not in EXEMPT):
             found.append(path.stem)
     return found
 

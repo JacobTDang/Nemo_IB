@@ -87,6 +87,12 @@ def _fetch_surprises(ticker: str) -> List[Dict[str, Any]]:
     return (payload.get("data") or {}).get("quarters") or []
 
 
+def _today() -> str:
+    """UTC, like every other date this package derives from the clock."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).date().isoformat()
+
+
 def _stamp(day: str) -> str:
     return f"{day}T21:00:00Z"
 
@@ -130,6 +136,7 @@ def seed(tickers: Sequence[str],
     Never overwrites: a quarter already in the record was watched, and a real
     observation outranks a reconstruction of it.
     """
+    run_id = pit_store.start_run("seed", as_of_date=as_of or _today())
     written = 0
     incomplete = 0
     undated = 0
@@ -230,6 +237,17 @@ def seed(tickers: Sequence[str],
                 learned, ticker, fiscal, eps_estimate=estimate,
                 eps_actual=actual, recorded_at=_stamp(learned),
                 source=SOURCE) or 0
+
+    # A seed run that reconstructs nothing is a real outcome: the vendor
+    # serves four quarters, and a book already holding them has nothing left
+    # to rebuild. That is `ok` with zero rows, like every other job that finds
+    # nothing. It is `failed` only when every name errored.
+    pit_store.finish_run(
+        rows_written=written,
+        status="failed" if failed and not written else "ok",
+        error=(f"{len(failed)} of {len(tickers)} names failed: "
+               + "; ".join(str(f) for f in failed[:5])) if failed else None,
+        run_id=run_id)
 
     return {"tickers": len(tickers), "quarters_seen": seen,
             "written": written, "incomplete": incomplete, "undated": undated,

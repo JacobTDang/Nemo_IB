@@ -693,6 +693,62 @@ def test_the_note_says_what_stopped_the_pass(store, monkeypatch):
     assert "resume" in note or "next pass" in note
 
 
+def test_a_budgeted_pass_is_judged_on_what_it_tried_to_watch(store,
+                                                              monkeypatch):
+    """A time-bounded pass deliberately watches a slice. Measured against the
+    whole watchlist it reports `partial` every twenty minutes, or `failed`
+    when the budget expires before any name completes -- and then the status
+    report cries wolf on a job that is working exactly as designed.
+
+    `daily_job._bars_status` exists for this same reason: `requested` there is
+    the nightly ask, which deliberately contains names expected to be empty.
+    """
+    names = [f"T{i:02d}" for i in range(50)]
+    store.record_universe("2026-08-26", [
+        {"ticker": t, "cik": str(i), "eligible": True}
+        for i, t in enumerate(names)], recorded_at="2026-08-26T21:00:00Z")
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(activist_watch.time, "monotonic", lambda: clock["t"])
+
+    def slow(ticker):
+        clock["t"] += 2.0
+        return INTC_CIK, []
+
+    monkeypatch.setattr(activist_watch, "_fetch_company_filings", slow)
+
+    result = activist_watch.watch_pass(as_of="2026-08-26", max_seconds=10)
+
+    assert result["covered"] == 5
+    # `partial` is the truth: a fifth of a sweep is not a covered day, and
+    # `missing_days` must not count it as one.
+    assert result["status"] == "partial"
+    assert "5 of 50" in str(result["error"])
+    # Knowing that `partial` is this job's steady state rather than a fault
+    # belongs to the reader. See `research.status.JOBS`.
+    from research import status as status_report
+    spec = [j for j in status_report.JOBS if j["job"] == "activist_watch"][0]
+    assert spec["partial_is_normal"] is True
+
+
+def test_a_pass_that_reaches_nobody_it_tried_is_still_failed(store,
+                                                             monkeypatch):
+    """The other direction. Budgeting must not turn a broken pass into a
+    healthy one."""
+    store.record_universe("2026-08-26", [
+        {"ticker": f"T{i}", "cik": str(i), "eligible": True}
+        for i in range(5)], recorded_at="2026-08-26T21:00:00Z")
+
+    def dead(ticker):
+        raise RuntimeError("EDGAR refused")
+
+    monkeypatch.setattr(activist_watch, "_fetch_company_filings", dead)
+
+    result = activist_watch.watch_pass(as_of="2026-08-26")
+
+    assert result["status"] == "failed"
+
+
 def test_the_universe_is_read_as_it_stood_on_the_day(store, monkeypatch):
     """A name eligible in March and delisted in June was watched in March. A
     watcher that reads today's universe when replaying a March pass silently

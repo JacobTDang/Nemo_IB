@@ -348,6 +348,13 @@ def watch_pass(tickers: Optional[Sequence[str]] = None,
     if total_requested:
         pit_store.set_cursor(JOB, (start + watched) % total_requested)
 
+    # Against the whole watchlist, not against the slice this pass attempted.
+    # A bounded pass genuinely has not covered the watchlist, and reporting it
+    # as `ok` would let `missing_days` count a twentieth of a sweep as a
+    # covered day. The status is the truth about coverage.
+    #
+    # That `partial` is the steady state for this job rather than a fault is a
+    # question for whoever reads it, and `research.status` knows it.
     status = daily_job.coverage_status(covered, total_requested)
     if failures:
         notes.append(f"{len(failures)} of {total_requested} lookups failed: "
