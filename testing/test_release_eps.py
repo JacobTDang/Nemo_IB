@@ -860,13 +860,15 @@ def test_a_guidance_sentence_is_never_the_reported_figure():
     """Photronics: "For the fourth quarter of fiscal 2025, Photronics expects
     ... $0.48 per diluted share" names the quarter before its figure and
     outranked the reported $0.39. Forward-looking is skipped, not ranked."""
+    # The guidance sentence must be a candidate the ranking would otherwise
+    # crown -- quarter word before a figure beside the phrase -- so that only
+    # the skip can save the headline. A first fixture produced no candidate
+    # at all and passed with the rule removed.
     text = ("GAAP Net income attributable to Photronics, Inc. shareholders was "
             "$22.9 million, or $0.39 per diluted share, compared with $0.30 in "
-            "the third quarter of 2024. Fourth Quarter Fiscal 2025 Guidance For "
-            "the fourth quarter of fiscal 2025, Photronics expects revenue to be "
-            "between $215 million and $225 million and GAAP net income per "
-            "diluted share to be between $0.44 and $0.52, and non-GAAP net "
-            "income of $0.48 per diluted share.")
+            "the third quarter of 2024. For the fourth quarter of fiscal 2025, "
+            "Photronics expects GAAP net income of $0.48 per diluted share on "
+            "revenue of $220 million.")
 
     assert release_eps.extract_diluted_eps(text)["eps"] == pytest.approx(0.39)
 
