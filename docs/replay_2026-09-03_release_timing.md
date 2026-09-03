@@ -153,9 +153,10 @@ now bounds itself by what the filesystem charges (#98), and the whole
 roster's cache measured 166MB, so a warm cache fits under the production
 cap.
 
-Switching is one setting, `SIGNAL_VARIANT=ts_release`, and the paper book
-records the variant on every order so a book spanning the change stays
-auditable. Forward paper trading is the out-of-sample test this replay
+Switching is one line, `SIGNAL_VARIANT = "ts_release"` in
+`research/scanner.py`, and a rebuild of the image; the constant is not read
+from the environment. The paper book records the variant on every order, so
+a book spanning the change stays auditable. Forward paper trading is the out-of-sample test this replay
 cannot provide.
 
 ## Raw output
