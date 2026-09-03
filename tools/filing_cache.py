@@ -7,6 +7,9 @@ no eviction does not limit a cache, it schedules an outage -- the mount reached
 100% in the running deployment and every SEC read began failing with
 `[Errno 28] No space left on device`.
 
+Sizes are what the filesystem allocates (`st_blocks`), because that is what
+fills a tmpfs: tens of thousands of tiny metadata files each cost a page.
+
 Pruning is by access time, so a filing being read repeatedly survives while one
 fetched once months ago does not. It trims to a fraction of the cap rather than
 to the cap itself, because a single filing can be 89MB and trimming to exactly
@@ -75,7 +78,12 @@ def prune(root: Any, cap_bytes: int | None = None,
         except OSError as exc:            # vanished mid-walk, or unreadable
             report["failed"].append(f"{path}: {type(exc).__name__}: {exc}")
             continue
-        entries.append((stat.st_atime, stat.st_size, path))
+        # What the filesystem charges, not the apparent length. tmpfs bills
+        # whole pages, and edgartools' hishel cache writes three files per
+        # object -- body, a sub-kilobyte .meta, an empty .lock -- so on a
+        # live cache the page charge ran 1.39x the st_size sum and the 512m
+        # mount filled under a 400MB cap without a single prune (issue #98).
+        entries.append((stat.st_atime, stat.st_blocks * 512, path))
 
     total = sum(size for _, size, _ in entries)
     report["bytes_before"] = total

@@ -53,13 +53,16 @@
 # edgartools into the same /root/.edgar, and a full-universe sweep with no
 # --max-tickers is how that mount reaches [Errno 28] again.
 #
-# Stated plainly: on the batch jobs these two are still inert. The interval
-# pruner (_prune_filing_cache_forever) starts in the HTTP app's lifespan and
-# nowhere else, and the jobs never import tools.mcp_http, so nothing in them
-# reads these values yet. The tmpfs cap is the only bound they have today. The
-# missing half is a prune call from the jobs themselves; until it lands,
-# testing/test_compose_env_minimality.py lists them by name as declared ahead
-# of the code rather than letting them pass unnoticed.
+# The servers prune from a task in the HTTP app's lifespan
+# (_prune_filing_cache_forever); the jobs that drive edgartools -- the watcher,
+# announcements, seed -- ask filing_cache.prune_if_due between names. The two
+# jobs that do not fetch filings (congress-sync, research-daily) carry the
+# values without reading them, and testing/test_compose_env_minimality.py
+# lists those two by name rather than letting them pass unnoticed.
+#
+# The cap is compared against what the filesystem allocates, not the apparent
+# byte count: tmpfs charges whole pages and the cache is mostly tiny files,
+# so an apparent-size cap of 400MB let the mount fill (issue #98).
 x-filing-cache-env: &filing-cache-env
   NEMO_FILING_CACHE_CAP_MB: ${NEMO_FILING_CACHE_CAP_MB:-360}
   NEMO_FILING_CACHE_INTERVAL_S: ${NEMO_FILING_CACHE_INTERVAL_S:-300}

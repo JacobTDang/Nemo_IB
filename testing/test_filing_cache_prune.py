@@ -29,6 +29,12 @@ def _write(path, size, atime=None):
     return path
 
 
+def _allocated(path):
+    """What the filesystem charges for the file, which is what the pruner
+    measures: whole blocks, not the byte count written."""
+    return path.stat().st_blocks * 512
+
+
 def test_a_cache_under_its_cap_is_left_alone(tmp_path):
     _write(tmp_path / "a.txt", 100)
     report = filing_cache.prune(tmp_path, cap_bytes=10_000)
@@ -90,10 +96,12 @@ def test_nested_files_are_counted_and_evictable(tmp_path):
     nested = tmp_path / "0001045810" / "10-K"
     nested.mkdir(parents=True)
     now = time.time()
-    _write(nested / "big.txt", 9_000, atime=now - 5_000)
+    big = _write(nested / "big.txt", 9_000, atime=now - 5_000)
     _write(tmp_path / "small.txt", 500, atime=now)
 
-    report = filing_cache.prune(tmp_path, cap_bytes=2_000, target_fraction=0.5)
+    # Over the cap by the small file alone; evicting the big one settles it.
+    report = filing_cache.prune(tmp_path, cap_bytes=_allocated(big),
+                                target_fraction=0.5)
 
     assert report["removed_files"] == 1
     assert not (nested / "big.txt").exists()
@@ -102,11 +110,12 @@ def test_nested_files_are_counted_and_evictable(tmp_path):
 
 def test_the_report_says_how_much_it_freed(tmp_path):
     now = time.time()
-    _write(tmp_path / "a.txt", 6_000, atime=now - 1_000)
+    a = _write(tmp_path / "a.txt", 6_000, atime=now - 1_000)
+    charged = _allocated(a)
     report = filing_cache.prune(tmp_path, cap_bytes=1_000, target_fraction=0.5)
 
-    assert report["bytes_removed"] == 6_000
-    assert report["bytes_before"] == 6_000
+    assert report["bytes_removed"] == charged
+    assert report["bytes_before"] == charged
     assert report["bytes_after"] == 0
 
 
@@ -259,3 +268,27 @@ def test_a_due_prune_evicts_for_real(monkeypatch, tmp_path):
     report = filing_cache.prune_if_due(tmp_path, cap=8_000)
     assert report["removed_files"] > 0
     assert report["bytes_after"] <= 8_000 * filing_cache.DEFAULT_TARGET_FRACTION
+
+
+def test_the_pruner_measures_what_the_filesystem_charges_not_apparent_size(
+        tmp_path):
+    """tmpfs charges whole pages and hishel writes three files per object,
+    two of them tiny. On a live cache the page charge ran 1.39x the apparent
+    sum, so the 512m mount filled at ~370MB apparent, under a 400MB cap, and
+    the pruner never fired. Issue #98.
+
+    Two hundred one-byte files: 200 bytes apparent, 200 pages allocated. A
+    cap between the two must prune."""
+    root = tmp_path / "edgar"
+    root.mkdir()
+    for i in range(200):
+        (root / f"obj{i}.meta").write_bytes(b"x")
+    allocated = sum(p.stat().st_blocks * 512 for p in root.iterdir())
+    assert allocated > 200 * 64, "filesystem did not round up; test is moot here"
+
+    report = filing_cache.prune(root, cap_bytes=allocated // 2)
+
+    assert report["bytes_before"] == allocated
+    assert report["removed_files"] > 0, (
+        "200 bytes apparent looked under the cap; the mount would be full")
+    assert report["bytes_after"] <= allocated // 2 * filing_cache.DEFAULT_TARGET_FRACTION
