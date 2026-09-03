@@ -216,6 +216,7 @@ docker compose --env-file ../.env run --rm research-daily               # every 
 | `research-score` | scores filed orders whose holding period has closed | `0 7 * * 6` |
 | `research-announce` | earnings dates and the hour they landed, from Item 2.02 filings | `0 9 * * 6` |
 | `research-seed` | reconstructs the quarters of consensus the vendor still serves | `0 8 1 * *` |
+| `research-status` | reads the run log and the book, prints one screen, exits 1 when a job needs attention | `0 12 * * 1-5` |
 | `congress-sync` | ingests congressional disclosures for the `altdata` server | `0 6 * * *` |
 
 The scan has no default borrow rate. It refuses every short position that it
@@ -233,6 +234,34 @@ the operator to ignore the alert that matters.
 
 The cron lines are in [`deploy/README.md`](deploy/README.md).
 `testing/test_readme_counts.py` checks them against the compose file.
+
+`research-status` shows the last run of every job, its state, and the open
+book. It reads the store and writes nothing. It exits 1 when a job crashed,
+failed, or is stale. Therefore cron can run it as a check. The `--json` flag
+prints the same report for scripts.
+
+```bash
+docker compose --env-file ../.env run --rm research-status
+```
+
+The scan ranks on one earnings surprise. The constant SIGNAL_VARIANT in
+`research/scanner.py` names it, and the scan ships with `ts`. The environment
+does not set it. The `ts` variant
+computes the surprise from the XBRL financials. The `ts_release` variant reads
+diluted EPS from the 8-K earnings release on the day that it is filed. The `cs`
+variant uses the recorded consensus. Every paper order records the variant that
+produced it.
+
+A replay over one year compared `ts` and `ts_release` on the same prints. The
+release-timed entry earned 61 bps more per trade. The gain comes from prints
+where the XBRL filing arrived a week or more after the release.
+[`docs/replay_2026-09-03_release_timing.md`](docs/replay_2026-09-03_release_timing.md)
+gives the numbers and the caveats.
+
+The universe screen keeps one line per issuer. When two tickers share a CIK,
+the more liquid line stays. The other line is excluded, and the record names
+the line that stayed. A preferred, warrant, unit, or right is excluded by its
+ticker suffix.
 
 ### The record
 
