@@ -608,21 +608,22 @@ on those is one nobody reads by the time it matters.
 
 ### The filing cache the jobs share with the servers
 
-`research-watch` and `research-announce` drive edgartools, which caches every
-document it fetches under `/root/.edgar` — the same 512MB tmpfs that reached
-100% on the servers and made every SEC read fail with `[Errno 28] No space left
-on device`. A `research-watch` pass over the whole eligible universe, thousands
-of names with no default `--max-tickers`, is the shape of run that gets there.
+`research-watch`, `research-announce` and `research-seed` drive edgartools,
+which caches every document it fetches under `/root/.edgar` — the same 512MB
+tmpfs that reached 100% on the servers and made every SEC read fail with
+`[Errno 28] No space left on device`. A pass over the whole eligible universe
+is the shape of run that gets there.
 
-`NEMO_FILING_CACHE_CAP_MB` and `NEMO_FILING_CACHE_INTERVAL_S` are now set on
-these jobs as well as on the servers. **They do not take effect yet**, and that
-is worth saying rather than leaving to be discovered: the interval pruner starts
-in the HTTP app's lifespan (`tools/mcp_http.py`) and nowhere else, and the batch
-jobs never import that module. Their only bound today is the tmpfs cap itself,
-which fails the write rather than evicting — the job exits non-zero, which cron
-reports, so it is loud, not silent. The half still missing is a prune call from
-the jobs. How large a real pass actually gets is unmeasured; these jobs have
-never run on the audit host.
+Each of those jobs calls `filing_cache.prune_if_due` between names, on the same
+`NEMO_FILING_CACHE_CAP_MB` and `NEMO_FILING_CACHE_INTERVAL_S` the servers read.
+The pruner measures what the filesystem allocates, not the byte count written.
+tmpfs charges whole pages, and edgartools writes three files per fetched object
+— the body, a sub-kilobyte `.meta`, an empty `.lock` — so on a live cache the
+page charge ran 1.39× the apparent size. Measured by `st_size`, a 400MB cap let
+the mount reach 512MB without a single prune (issue #98). The one real pass
+measured so far, the 8-K histories of 1,022 issuers, wrote 166MB in 23,000
+files: a full sweep fits under the cap, and a burst that does not is evicted
+rather than failed.
 
 ### Backing up `research-data`
 
