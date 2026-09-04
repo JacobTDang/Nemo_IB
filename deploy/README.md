@@ -437,6 +437,42 @@ follows one server, and `docker compose --env-file ../.env ps` shows which
 containers are up and healthy. Each server keeps 30MB of logs, three files of
 ten.
 
+#### `nemo`, so none of that has to be remembered
+
+Every command above has to be typed from `/srv/nemo/deploy`, with the right
+`--env-file`, in the right order, at 2am. `nemo` is the same commands behind
+one name. It finds the compose file from its own location, so it works from
+any directory on the host. Install it once, into a virtualenv of its own:
+
+```bash
+python3 -m venv /srv/nemo/.venv
+/srv/nemo/.venv/bin/pip install -e /srv/nemo
+ln -s /srv/nemo/.venv/bin/nemo /usr/local/bin/nemo    # or put the bin on PATH
+```
+
+```bash
+nemo status        # the screen above, exit 1 when a job needs attention
+nemo services      # every container, the exited batch jobs included
+nemo logs sec -f   # follow one server, `-n 500` for more scrollback
+nemo --monitor     # both screens, repainted every 30 seconds, ctrl-c to stop
+```
+
+**On this host `nemo status` runs in a container, and says so on stderr before
+it prints.** That is not a fallback, it is the only thing that can work: the
+store is in the `research-data` volume, and the host user cannot open a volume.
+So `nemo status` here is `docker compose --env-file ../.env run --rm
+research-status` with the flags passed through, which is why it takes a couple
+of seconds rather than being instant. On a laptop with a checkout and a
+`db_cache/pit.db` on disk the same command reads the file in process instead.
+`--via local` and `--via docker` force the choice when you want to be sure
+which store you are looking at.
+
+`nemo services` is the one worth knowing. It asks compose for every container
+rather than the running ones, so a batch job that exited is on the table with
+its exit status, and a server whose container is gone entirely gets a row
+saying `missing` instead of quietly not being there. It exits non-zero unless
+all five servers are running and healthy, so it doubles as a check.
+
 ### Memory, and why it never goes down
 
 Python frees memory to its own allocator, not to the operating system. So a

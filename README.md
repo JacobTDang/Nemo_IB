@@ -244,6 +244,41 @@ prints the same report for scripts.
 docker compose --env-file ../.env run --rm research-status
 ```
 
+### The `nemo` command
+
+`nemo` answers "is this thing working" from a terminal. Install it into the
+virtual environment once, from the repository root.
+
+```bash
+pip install -e .
+```
+
+| Command | Does |
+|---|---|
+| `nemo status` | prints the same screen as `research-status`, and exits 1 when a job needs attention |
+| `nemo services` | prints every container, and exits 1 when a server is not running and healthy |
+| `nemo logs <service>` | prints the last 200 lines of one service, and follows the log with `-f` |
+| `nemo monitor` | prints the status screen and the services table on a loop |
+
+`nemo --monitor` is the same command as `nemo monitor`. It refreshes every 30
+seconds until Ctrl-C. The `--every` flag sets a different interval. A refresh
+that fails prints the reason in place, and the next refresh runs.
+
+`nemo status` reads the store in this process when `NEMO_PIT_DB` names a
+readable file. Otherwise it runs `research-status` in a container, and it says
+so on the error stream before it prints. The homelab keeps the store in a
+volume that the host user cannot open, so the container is the only reader
+there. The `--via local` and `--via docker` flags force one source.
+
+`nemo services` asks compose for every container, and not only for the running
+ones. A batch job that exited is on the table. A server with no container at
+all is on the table as well, because a missing container is the fact that the
+operator needs.
+
+`nemo` finds the compose file from its own location, and not from the working
+directory. Therefore it works from any subdirectory.
+`python -m research.cli` runs the same command without the install.
+
 The scan ranks on one earnings surprise. The constant SIGNAL_VARIANT in
 `research/scanner.py` names it, and the scan ships with `ts`. The environment
 does not set it. The `ts` variant
