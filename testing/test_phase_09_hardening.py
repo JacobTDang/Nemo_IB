@@ -19,7 +19,12 @@ from state.schema import init_schema, get_connection
 from state.theses import insert_thesis
 from state.positions import record_order
 from state.events_store import store_event
-from fastapi.testclient import TestClient
+from testing._gates import require_importable_for_module  # noqa: E402
+
+require_importable_for_module(
+    "fastapi", "it is not a declared dependency of this project (issue #111); "
+    "pip install it into the venv to run the dashboard tests")
+from fastapi.testclient import TestClient  # noqa: E402
 from dashboard.app import app
 
 

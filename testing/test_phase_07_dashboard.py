@@ -6,7 +6,12 @@ Tests read-only invariant by inspecting code, then exercises each route.
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from fastapi.testclient import TestClient
+from testing._gates import require_importable_for_module  # noqa: E402
+
+require_importable_for_module(
+    "fastapi", "it is not a declared dependency of this project (issue #111); "
+    "pip install it into the venv to run the dashboard tests")
+from fastapi.testclient import TestClient  # noqa: E402
 from state.schema import init_schema, get_connection, add_to_watchlist
 from state.theses import insert_thesis
 from state.events_store import store_event

@@ -23,6 +23,7 @@ SearXNG query is a network call whether or not a credential happens to be
 present. Before this module existed nothing marked those tests, so an offline
 run still spent real time and real money on live completions.
 """
+import importlib
 import os
 
 import pytest
@@ -155,6 +156,34 @@ def _gate(name: str):
         # phase. Failing in setup instead would report an error, not a failure.
         return pytest.mark.fail_missing_service(name=name, reason=reason)
     return pytest.mark.skipif(True, reason=reason)
+
+
+def require_for_module(name: str) -> None:
+    """The module-level form of `_gate`, for a file whose import needs the
+    service: a roster built at collection by constructing every server, say.
+    A marker cannot help there because collection has already failed. Same
+    two rules: the skip names what is missing, and under NEMO_REQUIRE_SERVICES=1
+    it fails instead -- a collection error, which is as loud as a module can be.
+    """
+    reason = service_missing(name)
+    if reason is None:
+        return None
+    if STRICT:
+        pytest.fail(reason, pytrace=False)
+    pytest.skip(reason, allow_module_level=True)
+
+
+def require_importable_for_module(module: str, install: str) -> None:
+    """Module-level gate on an optional package. `install` says how to get it,
+    because "No module named 'sqlite_vec'" from a collection error does not."""
+    try:
+        importlib.import_module(module)
+    except ImportError as exc:
+        reason = f"{module} is not importable ({exc}); {install}"
+        if STRICT:
+            pytest.fail(reason, pytrace=False)
+        pytest.skip(reason, allow_module_level=True)
+    return None
 
 
 requires_searxng = _gate("searxng")

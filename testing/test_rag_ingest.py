@@ -36,6 +36,11 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+from testing._gates import require_importable_for_module  # noqa: E402
+
+require_importable_for_module(
+    "sqlite_vec", "it is the optional `rag` extra: uv sync --extra rag, or "
+    "pip install -e '.[rag]'")
 from agent.rag import ingest, store  # noqa: E402
 from state.schema import get_connection, init_schema  # noqa: E402
 

@@ -26,8 +26,9 @@ compose file. That file is `deploy/.env`, and it is not the file at the top of
 the repository. Without the flag, every credential becomes empty.
 
 That failure is loud. The servers refuse to start without a token. The `/ready`
-endpoint answers `503`. The `finnhub` and `fred` servers restart continuously
-when their key is absent.
+endpoint answers `503`. The `finnhub` and `fred` servers start without their
+key, but `/ready` reports the missing key, the container stays unhealthy, and
+every request fails with the name of the key.
 
 Ports publish on `127.0.0.1` unless `NEMO_BIND_ADDR` gives a different address.
 A missing variable therefore fails closed. It does not expose five servers to
@@ -339,7 +340,7 @@ reader computed.
 
 ```bash
 SKIP_NETWORK_TESTS=1 pytest testing/          # offline: no credentials, no network
-STRICT_GATES=1 pytest testing/                # everything gated must actually run
+NEMO_REQUIRE_SERVICES=1 pytest testing/       # everything gated must actually run
 ```
 
 The offline run needs no credentials and no network. It must never fail. The

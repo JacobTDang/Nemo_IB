@@ -46,7 +46,12 @@ from typing import Any, Dict, List, Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from state.schema import init_schema, get_connection
-from agent.rag.chunker import chunk_text
+from testing._gates import require_importable_for_module  # noqa: E402
+
+require_importable_for_module(
+    "sqlite_vec", "it is the optional `rag` extra: uv sync --extra rag, or "
+    "pip install -e '.[rag]'")
+from agent.rag.chunker import chunk_text  # noqa: E402
 from agent.rag.embedder import embed
 from agent.rag.store import insert_chunk, delete_by_doc_id, count_chunks
 from agent.rag.search import rag_search
