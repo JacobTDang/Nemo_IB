@@ -262,3 +262,86 @@ def test_every_gate_guards_at_least_one_test():
         f"these gates guard no test, so they cannot fail and stand for "
         f"coverage that no longer exists: {unused}. Remove the gate and its "
         f"env var, or apply it.")
+
+
+# --- module-level gates ------------------------------------------------------
+#
+# Seven test files need their service at import: a roster built at collection
+# by constructing every server, or an optional package imported at the top of
+# the file. A per-test marker cannot help there -- collection has already
+# failed -- and the first CI run erred on all seven. The two helpers below are
+# the module-level form of the same two rules: name what is missing, and turn
+# the skip into a failure under NEMO_REQUIRE_SERVICES=1.
+
+def _outcome_of(call):
+    try:
+        call()
+    except BaseException as exc:  # noqa: BLE001 - Skipped and Failed both derive from BaseException
+        return exc
+    return None
+
+
+def test_a_module_gate_skips_and_names_what_is_missing(monkeypatch):
+    from testing import _gates
+    monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
+    monkeypatch.setenv("SKIP_NETWORK_TESTS", "0")
+    monkeypatch.setattr(_gates, "_env_key", lambda name: False)
+    monkeypatch.setattr(_gates, "STRICT", False)
+
+    with pytest.raises(pytest.skip.Exception) as info:
+        _gates.require_for_module("finnhub")
+
+    assert "FINNHUB_API_KEY" in str(info.value)
+
+
+def test_a_module_gate_is_silent_when_the_service_is_there(monkeypatch):
+    from testing import _gates
+    monkeypatch.setenv("SKIP_NETWORK_TESTS", "0")
+    monkeypatch.setattr(_gates, "_env_key", lambda name: True)
+
+    assert _gates.require_for_module("finnhub") is None
+
+
+def test_a_module_gate_fails_rather_than_skips_under_strict(monkeypatch):
+    from testing import _gates
+    monkeypatch.setenv("SKIP_NETWORK_TESTS", "0")
+    monkeypatch.setattr(_gates, "_env_key", lambda name: False)
+    monkeypatch.setattr(_gates, "STRICT", True)
+
+    # Caught broadly on purpose: a skip raised here would pass straight
+    # through `pytest.raises(Failed)` and report this test as skipped, which
+    # is the one outcome a strict-mode test must never be able to produce.
+    outcome = _outcome_of(lambda: _gates.require_for_module("finnhub"))
+
+    assert isinstance(outcome, pytest.fail.Exception), (
+        f"strict mode did not fail: {type(outcome).__name__}")
+    assert "FINNHUB_API_KEY" in str(outcome)
+
+
+def test_an_import_gate_names_the_package_and_how_to_get_it(monkeypatch):
+    from testing import _gates
+    monkeypatch.setattr(_gates, "STRICT", False)
+
+    with pytest.raises(pytest.skip.Exception) as info:
+        _gates.require_importable_for_module(
+            "no_such_package_for_this_test", "install the rag extra")
+
+    assert "no_such_package_for_this_test" in str(info.value)
+    assert "install the rag extra" in str(info.value)
+
+
+def test_an_import_gate_is_silent_for_a_package_that_imports():
+    from testing import _gates
+
+    assert _gates.require_importable_for_module("json", "unused") is None
+
+
+def test_an_import_gate_fails_rather_than_skips_under_strict(monkeypatch):
+    from testing import _gates
+    monkeypatch.setattr(_gates, "STRICT", True)
+
+    outcome = _outcome_of(lambda: _gates.require_importable_for_module(
+        "no_such_package_for_this_test", "install the rag extra"))
+
+    assert isinstance(outcome, pytest.fail.Exception), (
+        f"strict mode did not fail: {type(outcome).__name__}")

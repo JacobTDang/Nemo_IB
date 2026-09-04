@@ -339,7 +339,7 @@ reader computed.
 
 ```bash
 SKIP_NETWORK_TESTS=1 pytest testing/          # offline: no credentials, no network
-STRICT_GATES=1 pytest testing/                # everything gated must actually run
+NEMO_REQUIRE_SERVICES=1 pytest testing/       # everything gated must actually run
 ```
 
 The offline run needs no credentials and no network. It must never fail. The

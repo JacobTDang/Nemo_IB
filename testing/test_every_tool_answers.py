@@ -27,7 +27,13 @@ import json
 import mcp.types as types
 import pytest
 
-from testing._gates import requires_sec
+from testing._gates import require_for_module, requires_sec
+
+# The roster below is built at collection by constructing every server, and
+# the finnhub and fred servers refuse to construct without their key. Every
+# test in this file talks to a live server, so the file is gated as a whole.
+require_for_module("finnhub")
+require_for_module("fred")
 
 SERVERS = {
     "sec": ("tools.web_search_server.web_search", "WebSearchServer"),

@@ -31,7 +31,12 @@ if PROJECT_ROOT not in sys.path:
 
 import numpy as np
 
-from agent.rag import chunker, embedder, store
+from testing._gates import require_importable_for_module  # noqa: E402
+
+require_importable_for_module(
+    "sqlite_vec", "it is the optional `rag` extra: uv sync --extra rag, or "
+    "pip install -e '.[rag]'")
+from agent.rag import chunker, embedder, store  # noqa: E402
 from state.schema import get_connection, init_schema
 
 
