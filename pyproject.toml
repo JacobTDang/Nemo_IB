@@ -182,6 +182,25 @@ dependencies = [
   "zstandard==0.25.0",
 ]
 
+# The one command an operator types. `pip install -e .` puts `nemo` on PATH,
+# and from there `nemo status`, `nemo services`, `nemo logs` and
+# `nemo --monitor` answer "is this thing working" without anybody having to
+# remember a compose incantation. See `research/cli.py`.
+[project.scripts]
+nemo = "research.cli:main"
+
+# Only the package the console script imports. This is a flat layout with
+# fifteen top-level directories, and setuptools' automatic discovery refuses
+# to guess among them -- rightly, since `docs`, `deploy` and `db_cache` are
+# not packages. Naming one is also the smaller install: nothing else needs to
+# be importable for `nemo` to work.
+[tool.setuptools]
+packages = ["research"]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -189,6 +208,15 @@ markers = [
     "slow: long-running tests excluded from quick runs via -m 'not slow'",
     "network: live-network tests skippable via SKIP_NETWORK_TESTS=1",
 ]
+
+[tool.uv]
+# uv already treats this project as virtual -- uv.lock records
+# `source = { virtual = "." }` -- and the environment it manages is the
+# dependencies, not the project. The build backend declared above would
+# otherwise flip that, and every lock and sync would start building the
+# project itself. `nemo` is installed on purpose, with `pip install -e .`,
+# rather than as a side effect of a sync.
+package = false
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
