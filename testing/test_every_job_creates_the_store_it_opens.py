@@ -18,12 +18,12 @@ A job module is one that defines `main()` and touches `pit_store`. That is the
 definition the bug has: a module with no `main()` is never the first command,
 and one that never opens the store cannot find its tables missing.
 
-`status` is the one exception, and it is exempt for the opposite reason rather
-than by oversight. It reads and changes nothing, so building a schema would
-mean creating an empty store as a side effect of looking at one -- and then
-reporting nine jobs as "never run" against a database this command had just
-invented. It answers a missing store by saying so, which
-`testing/test_status.py` pins.
+`status` and `cli` are the exceptions, and they are exempt for the opposite
+reason rather than by oversight. They read and change nothing, so building a
+schema would mean creating an empty store as a side effect of looking at one
+-- and then reporting nine jobs as "never run" against a database the command
+had just invented. Both answer a missing store by saying so, which
+`testing/test_status.py` and `testing/test_cli.py` pin.
 """
 from __future__ import annotations
 
@@ -75,7 +75,14 @@ def _calls_init_schema(node: ast.AST) -> bool:
 
 
 # Readers, not jobs. See the module docstring.
-EXEMPT = {"status"}
+#
+# `cli` is exempt for exactly the reason `status` is, and the reason matters
+# more there: `nemo status` is the first thing anybody types on a fresh
+# volume, and a front door that builds a schema in order to report on it would
+# answer "nine jobs have never run" against a database it had just invented.
+# It reads `pit_store` only for the default path of the store it is looking
+# for, and opens nothing.
+EXEMPT = {"status", "cli"}
 
 
 def _job_modules() -> list[str]:
