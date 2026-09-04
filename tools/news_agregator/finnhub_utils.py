@@ -86,9 +86,20 @@ class FinnhubClient:
   BASE_URL = "https://finnhub.io/api/v1"
 
   def __init__(self):
-    self._api_key = get_api_key()
+    # Read on first request, not here, so a server can be built and its
+    # registry read on a machine with no credential: the offline suite
+    # counts tools and checks labels without a key. Failing loud moves
+    # to the first request, which raises the same error naming the key,
+    # and /ready reports the missing FINNHUB_API_KEY on its own.
+    self._api_key: Optional[Secret] = None
     self._session: Optional[aiohttp.ClientSession] = None
     self._rate_limiter = RateLimiter()
+
+  @property
+  def api_key(self) -> Secret:
+    if self._api_key is None:
+      self._api_key = get_api_key()
+    return self._api_key
 
   async def _get_session(self) -> aiohttp.ClientSession:
     if self._session is None or self._session.closed:
@@ -110,13 +121,14 @@ class FinnhubClient:
 
     session = await self._get_session()
 
+    key = self.api_key
     for attempt in range(RETRY_ATTEMPTS):
       await self._rate_limiter.acquire()
       try:
         # The credential is revealed into the call itself and never bound
         # to a name: a `params` dict holding it is a local, and a local is
         # what a rendered traceback prints.
-        async with session.get(url, params={**params, "token": self._api_key.reveal()},
+        async with session.get(url, params={**params, "token": key.reveal()},
                                timeout=aiohttp.ClientTimeout(total=30)) as resp:
           # 429 and 5xx both mean "ask again"; a 4xx means the request is
           # wrong and will be just as wrong next time, so retrying it only
@@ -130,12 +142,12 @@ class FinnhubClient:
               await asyncio.sleep(RETRY_BACKOFF * (attempt + 1))
               continue
             text = await resp.text()
-            return {"error": self._api_key.scrub(
+            return {"error": key.scrub(
                 f"HTTP {resp.status} after {RETRY_ATTEMPTS} attempts: "
                 f"{text[:200]}")}
           if resp.status != 200:
             text = await resp.text()
-            return {"error": self._api_key.scrub(f"HTTP {resp.status}: {text[:200]}")}
+            return {"error": key.scrub(f"HTTP {resp.status}: {text[:200]}")}
           return await resp.json()
       except asyncio.TimeoutError:
         return {"error": "Request timed out (15s)"}
@@ -143,7 +155,7 @@ class FinnhubClient:
         # aiohttp renders the request URL into several of its errors, and the
         # credential is a query parameter of that URL. Scrubbed before it goes
         # back to the caller, which is further than a log line travels.
-        return {"error": self._api_key.scrub(f"HTTP client error: {str(e)}")}
+        return {"error": key.scrub(f"HTTP client error: {str(e)}")}
 
     return {"error": f"Unexpected: exhausted {RETRY_ATTEMPTS} retries"}
 

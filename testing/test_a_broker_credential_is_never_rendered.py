@@ -379,8 +379,11 @@ def test_get_api_key_returns_a_secret(data_client):
   assert isinstance(credential, mod.Secret)
   assert credential.reveal() == sentinel
   assert _BODY not in f"{credential!r}"
-  assert isinstance(client._api_key, mod.Secret), \
+  # Resolved through the property: the key is read on first use, and what
+  # the instance then holds must be the wrapper, never the string.
+  assert isinstance(client.api_key, mod.Secret), \
     "the client still holds a renderable credential on the instance"
+  assert isinstance(client._api_key, mod.Secret)
 
 
 def test_get_api_key_still_refuses_when_unset(data_client, monkeypatch):

@@ -34,6 +34,10 @@ def test_the_filing_walk_excludes_amendments(monkeypatch):
         return _Filings()
 
     import tools.web_search_server.sec_utils as su
+    # The stub never reaches EDGAR, but the identity check runs before the
+    # walk, so this unit test needs an address to get past it on a machine
+    # with no .env (CI).
+    monkeypatch.setenv("SEC_EMAIL", "unit-test@example.invalid")
     # get_latest_filing caches failures as well as successes, and monkeypatch
     # cannot un-poison a cache. Without a fresh one, the None this stub
     # produces for MO is what the live Altria test below reads back -- the
