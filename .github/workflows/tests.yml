@@ -1,0 +1,39 @@
+# The offline suite on every pull request and every push to main. The same
+# command the README documents: no credentials, no network, and it must never
+# fail. Docker is absent on the runner on purpose, which is one of the two
+# environments `nemo` is tested against.
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  offline-suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # --frozen installs exactly what uv.lock records and refuses to re-lock,
+      # so a PR that changes a dependency without updating the lock fails here
+      # rather than on the homelab.
+      - name: Install
+        run: uv sync --frozen
+
+      - name: Lint
+        run: uvx ruff@0.15.14 check .   # pinned to the version the venv carries; not a project dependency
+
+      - name: Offline suite
+        env:
+          SKIP_NETWORK_TESTS: "1"
+        run: uv run python -m pytest testing/ -q --ignore=testing/output -p no:randomly
