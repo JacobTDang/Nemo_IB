@@ -347,6 +347,9 @@ The offline run needs no credentials and no network. It must never fail. The
 strict run turns a skipped gate into a failure, because a gate that cannot fail
 is not a gate.
 
+GitHub Actions runs the offline run on every pull request and on every push to
+`main`. The `main` branch accepts a merge only after that run passes.
+
 The deploy gate is `testing/test_http_transport.py`. It completes a real MCP
 handshake and one live tool call against each server. A health check proves only
 that the port is bound. A server whose MCP layer failed to start still answers
