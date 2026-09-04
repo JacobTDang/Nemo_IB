@@ -647,20 +647,6 @@ wheels = [
 ]
 
 [[package]]
-name = "html5"
-version = "0.0.9"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "setuptools" },
-    { name = "six" },
-    { name = "webencodings" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/d2/b1/4835c1b9e9b2e20e87758439ddb4e8b7cbe07235b5eea60858816e3021df/html5-0.0.9.tar.gz", hash = "sha256:c4ea3de7615dc8dc373b386db4f0e839e16f56c66afe68933313d76fb469240a", size = 118914, upload-time = "2016-08-05T09:20:25.251Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/e6/51/431cc45b61c668e26f406405878a86f7c537864426368210249bf9bed515/html5-0.0.9-py2.py3-none-any.whl", hash = "sha256:0dcc8ab9a80924817c52c6fdcb7f2d3d22ae0977604f361731f11bc01c015a37", size = 112419, upload-time = "2016-08-05T09:20:28.245Z" },
-]
-
-[[package]]
 name = "html5lib"
 version = "1.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1174,7 +1160,6 @@ dependencies = [
     { name = "h2" },
     { name = "hishel" },
     { name = "hpack" },
-    { name = "html5" },
     { name = "html5lib" },
     { name = "htmldate" },
     { name = "httpcore" },
@@ -1379,7 +1364,6 @@ requires-dist = [
     { name = "h2", specifier = "==4.3.0" },
     { name = "hishel", specifier = "==0.1.3" },
     { name = "hpack", specifier = "==4.1.0" },
-    { name = "html5", specifier = "==0.0.9" },
     { name = "html5lib", specifier = "==1.1" },
     { name = "htmldate", specifier = "==1.9.4" },
     { name = "httpcore", specifier = "==1.0.9" },
