@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -615,3 +616,47 @@ def test_the_module_runs_as_a_module():
     assert done.returncode == 0, done.stderr
     for command in ("status", "services", "logs", "monitor"):
         assert command in done.stdout
+
+
+# --- what the host install needs (issue #122) --------------------------------
+#
+# The host runs `nemo` from a venv of its own. The project's dependency list is
+# every server's, torch included, so `pip install -e` pulled gigabytes onto the
+# host to run a status screen. The documented install is python-dotenv plus
+# `--no-deps`, and that is sufficient only while these modules import nothing
+# else from outside the standard library.
+
+def test_the_command_imports_nothing_but_the_stdlib_and_dotenv():
+    code = ("import sys; before = set(sys.modules); "
+            "import research.cli, research.status, research.pit_store; "
+            "print(' '.join(sorted({m.split('.')[0] "
+            "for m in set(sys.modules) - before})))")
+    loaded = subprocess.run([sys.executable, "-c", code], cwd=ROOT, check=True,
+                            capture_output=True, text=True).stdout.split()
+    third_party = {m for m in loaded
+                   if m not in sys.stdlib_module_names and m != "research"
+                   and not m.startswith("_")}
+
+    assert third_party == {"dotenv"}, (
+        f"nemo now imports {sorted(third_party)}; the documented host install "
+        f"(python-dotenv plus --no-deps) no longer runs it")
+
+
+@pytest.mark.parametrize("doc", ["README.md", "deploy/README.md"])
+def test_every_documented_install_skips_the_server_dependencies(doc):
+    installs = re.findall(r"pip install[^\n]*\s-e\s", (ROOT / doc).read_text())
+
+    assert installs, f"{doc} no longer says how to install nemo"
+    for line in installs:
+        assert "--no-deps" in line, (
+            f"{doc}: {line.strip()!r} installs every server dependency, "
+            f"torch included, to run a status screen")
+
+
+@pytest.mark.parametrize("doc", ["README.md", "deploy/README.md"])
+def test_the_documented_dotenv_pin_is_the_project_pin(doc):
+    pin = re.search(r'"python-dotenv==([^"]+)"',
+                    (ROOT / "pyproject.toml").read_text()).group(1)
+
+    assert set(re.findall(r"python-dotenv==([\w.]+)",
+                          (ROOT / doc).read_text())) == {pin}

@@ -446,9 +446,17 @@ any directory on the host. Install it once, into a virtualenv of its own:
 
 ```bash
 python3 -m venv /srv/nemo/.venv
-/srv/nemo/.venv/bin/pip install -e /srv/nemo
-ln -s /srv/nemo/.venv/bin/nemo /usr/local/bin/nemo    # or put the bin on PATH
+/srv/nemo/.venv/bin/pip install python-dotenv==1.2.1
+/srv/nemo/.venv/bin/pip install --no-deps -e /srv/nemo
+sudo ln -s /srv/nemo/.venv/bin/nemo /usr/local/bin/nemo    # or put the bin on PATH
 ```
+
+`--no-deps` is the part that matters. The project's dependency list is every
+server's, torch included, and without the flag pip downloads several gigabytes
+onto the host to run a status screen. The command imports only the standard
+library and python-dotenv, which `research` uses to load `.env`.
+`testing/test_cli.py` pins that import list, so the two install lines stay
+sufficient (issue #122).
 
 ```bash
 nemo status        # the screen above, exit 1 when a job needs attention
