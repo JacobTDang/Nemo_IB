@@ -132,3 +132,55 @@ def test_the_runtime_stage_carries_everything_the_build_stage_copied():
     assert not missing, (
         f"{missing} reach the build stage and not the runtime stage, so they "
         f"are absent from the image that actually runs")
+
+
+# --- parsers pandas loads for us --------------------------------------------
+#
+# `pd.read_html` imports its parser itself: lxml for the default flavor, and
+# bs4 plus html5lib for `flavor="bs4"`. Our code imports neither, so the import
+# walk above cannot see them. The governance extractor falls back to the bs4
+# flavor when lxml refuses a filing, and the image had no html5lib, so the
+# fallback raised ImportError inside its own `except` (issue #112). lxml was
+# present only because trafilatura depends on it -- one upgrade from gone.
+
+READ_HTML_NEEDS = {
+    None: {"lxml"},
+    "lxml": {"lxml"},
+    "bs4": {"beautifulsoup4", "html5lib"},
+    "html5lib": {"beautifulsoup4", "html5lib"},
+}
+
+
+def _read_html_flavors(path: pathlib.Path) -> list:
+    """The `flavor` of every `read_html(...)` call in a file; None if unset."""
+    tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    flavors = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "read_html"):
+            flavor = None
+            for kw in node.keywords:
+                if kw.arg == "flavor":
+                    assert isinstance(kw.value, ast.Constant), (
+                        f"{path.relative_to(ROOT)}: a computed read_html flavor "
+                        f"cannot be checked; pass a literal")
+                    flavor = kw.value.value
+            flavors.append(flavor)
+    return flavors
+
+
+def test_every_parser_read_html_needs_is_installed_in_the_image():
+    declared = _server_group()
+    calls, missing = 0, []
+    for path in _source_files():
+        for flavor in _read_html_flavors(path):
+            calls += 1
+            for distribution in sorted(READ_HTML_NEEDS[flavor]):
+                if distribution not in declared:
+                    missing.append(f"{path.relative_to(ROOT)} read_html"
+                                   f"(flavor={flavor!r}) needs {distribution}")
+
+    assert calls, "no read_html call found; the check would pass vacuously"
+    assert not missing, (
+        "the `server` group lacks what pandas imports for these calls, so "
+        "they fail in the image: " + "; ".join(sorted(set(missing))))
