@@ -543,6 +543,116 @@ def test_a_failed_series_carries_the_new_fields_too(monkeypatch):
     assert result["raw_change_pct"] is None
 
 
+# ------------------------------------------- a spin-off is not a split
+#
+# The split calendar also carries spin-off price adjustments. HON's lists
+# 1.061 on 2025-10-30 (the Solstice spin) and 0.9535 on 2026-06-29, and neither
+# changed Honeywell's share count. Applying both rebased the history by 6% and
+# 5%, which moved a clean 2:1 drop off the round ratio the safety net looks
+# for, so the drop was published as a 52% buyback (issue #103). An event is
+# applied only when the cover pages either side of it confirm it.
+
+def _hon_series():
+    """HON's eight 10-Q covers as filed, read from EDGAR 2026-09-23."""
+    return [
+        _point("2026-07-23", "2026-06-30", 316_940_010),
+        _point("2026-04-23", "2026-03-31", 633_653_119),
+        _point("2025-10-23", "2025-09-30", 634_887_208),
+        _point("2025-07-24", "2025-06-30", 634_896_562),
+        _point("2025-04-29", "2025-03-31", 642_682_909),
+        _point("2024-10-24", "2024-09-30", 650_247_380),
+        _point("2024-07-25", "2024-06-30", 649_671_200),
+        _point("2024-04-25", "2024-03-31", 651_185_513),
+    ]
+
+
+HON_CALENDAR = [("2025-10-30", 1.061), ("2026-06-29", 0.9535)]
+
+
+def test_a_halving_is_not_published_as_a_buyback(series, splits):
+    series(_hon_series())
+    splits(HON_CALENDAR)
+
+    result = dilution.get_share_count_series("HON")
+
+    assert result["direction"] != "buyback", (
+        f"a one-quarter halving was called a buyback of "
+        f"{result['change_pct']}%")
+    assert result["direction"] == dilution.UNDETERMINED
+    assert result["change_pct"] is None
+
+
+def test_calendar_events_the_filings_do_not_show_are_not_applied(series, splits):
+    series(_hon_series())
+    splits(HON_CALENDAR)
+
+    result = dilution.get_share_count_series("HON")
+    adjustment = result["split_adjustment"]
+
+    assert adjustment["splits_applied"] == []
+    assert result["split_adjusted"] is False
+    assert [e["date"] for e in adjustment["calendar_events_not_applied"]] == [
+        "2025-10-30", "2026-06-29"]
+
+
+def test_a_rejected_calendar_event_is_named_in_a_warning(series, splits):
+    series(_hon_series())
+    splits(HON_CALENDAR)
+
+    result = dilution.get_share_count_series("HON")
+    warning = next((w for w in result["warnings"]
+                    if w["code"] == "split_calendar_event_not_applied"), None)
+
+    assert warning is not None, [w["code"] for w in result["warnings"]]
+    assert "2025-10-30" in warning["message"]
+    assert "spin-off" in warning["message"]
+
+
+def test_a_spin_off_factor_alone_leaves_a_quiet_series_alone(series, splits):
+    """No halving to hide behind. The spin-off factor falls in a quarter whose
+    count did not move; an earlier 25% issuance is what makes the window ask
+    the calendar at all. Counts cannot tell a small factor from a stock
+    dividend when both land in a quarter that also issued shares, so the
+    factor sits where the covers are flat."""
+    series([_point("2026-05-01", "2026-04-25", 500_000_000),
+            _point("2025-11-01", "2025-10-25", 500_000_000),
+            _point("2025-05-01", "2025-04-25", 499_000_000),
+            _point("2024-11-01", "2024-10-25", 400_000_000)])
+    splits([("2025-09-15", 1.061)])
+
+    result = dilution.get_share_count_series("SPUN")
+
+    assert result["split_adjustment"]["splits_applied"] == []
+    assert result["change_pct"] == pytest.approx(25.0)
+    assert result["direction"] == "dilution"
+
+
+def test_a_stock_dividend_the_filings_show_is_still_applied(series, splits):
+    """A 21-for-20 stock dividend is a real share-count change. The covers
+    either side moved by it, less a little buyback, so it is kept."""
+    series([_point("2026-05-01", "2026-04-25", 1_042_000_000),
+            _point("2025-11-01", "2025-10-25", 1_045_000_000),
+            _point("2025-05-01", "2025-04-25", 1_000_000_000),
+            _point("2024-11-01", "2024-10-25", 800_000_000)])
+    splits([("2025-09-15", 1.05)])
+
+    result = dilution.get_share_count_series("STOCKDIV")
+
+    assert result["split_adjustment"]["splits_applied"] == [
+        {"date": "2025-09-15", "ratio": 1.05}]
+
+
+def test_a_failed_series_carries_the_rejected_events_field(monkeypatch):
+    def raise_not_covered(*a, **k):
+        from tools.web_search_server.sec_series import NotCovered
+        raise NotCovered("no such concept")
+    monkeypatch.setattr(dilution, "fetch_concept_series", raise_not_covered)
+
+    result = dilution.get_share_count_series("NOTAGS")
+
+    assert result["split_adjustment"]["calendar_events_not_applied"] == []
+
+
 # ---------------------------------------------------------------- the detector
 
 def test_the_detector_knows_a_round_ratio_from_a_capital_raise():

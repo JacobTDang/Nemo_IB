@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import re
 from datetime import date, timedelta
-from math import gcd
+from math import gcd, log, prod
 from typing import Any, Dict, List, Optional, Tuple
 
 from edgar import Company
@@ -119,6 +119,20 @@ _MIN_CONVERSION_RATIO = 2.0
 _DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 UNDETERMINED = "split_suspected_undetermined"
+
+# A split calendar is not only a split calendar. Yahoo records a spin-off's
+# price adjustment beside real splits: HON's lists 1.061 on 2025-10-30, the
+# Solstice spin, and 0.9535 on 2026-06-29, and neither changed Honeywell's
+# share count. Applied as splits, they rebased HON's history by 6% and 5%,
+# which moved a clean 2:1 drop off the round ratio the safety net looks for,
+# and the drop was published as a 52% buyback (issue #103).
+#
+# So an event is applied only when the cover pages either side of it confirm
+# it: they must sit closer to its ratio than to no change at all, and what is
+# left over must be smaller than a split. A leftover of 1.5x or more is itself
+# split-shaped, and the unexplained-jump check below deals with it better than
+# a ratio the filings do not bear out.
+_SPLIT_CONFIRMATION_RESIDUAL = _SPLIT_MIN_RATIO
 
 
 def _class_label(member: Optional[str]) -> str:
@@ -351,6 +365,62 @@ def _consult_split_calendar(
         return None, f"{type(exc).__name__}: {exc}"
 
 
+def _straddle(totals: List[Tuple[Optional[str], float]],
+              date: str) -> Optional[Tuple[str, str, float]]:
+    """(older_as_of, newer_as_of, newer / older) for the covers around `date`.
+
+    A cover dated on the split date already counts the new shares, the same
+    boundary `_factor_for` draws, so it is the newer side.
+    """
+    dated = sorted((d, t) for d, t in totals if d is not None and t)
+    older = [(d, t) for d, t in dated if d < date]
+    newer = [(d, t) for d, t in dated if d >= date]
+    if not older or not newer:
+        return None
+    (older_date, older_total), (newer_date, newer_total) = older[-1], newer[0]
+    return older_date, newer_date, newer_total / older_total
+
+
+def _confirmed_by_the_filings(
+        events: List[Dict[str, Any]],
+        totals: List[Tuple[Optional[str], float]]
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """(applied, rejected) calendar events, judged against the cover pages.
+
+    Events between the same two covers are judged together, as their product:
+    the covers see only the combined move.
+    """
+    groups: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for event in events:
+        straddle = _straddle(totals, event["date"])
+        key = straddle[:2] if straddle else ("", event["date"])
+        groups.setdefault(key, {"straddle": straddle, "events": []})
+        groups[key]["events"].append(event)
+
+    applied: List[Dict[str, Any]] = []
+    rejected: List[Dict[str, Any]] = []
+    for group in groups.values():
+        straddle, members = group["straddle"], group["events"]
+        if straddle is None:
+            moved = None
+            reason = "no cover page either side of it to confirm it against"
+        else:
+            moved = straddle[2]
+            ratio = prod(e["ratio"] for e in members)
+            residual = abs(log(moved / ratio))
+            if (residual < abs(log(moved))
+                    and residual < log(_SPLIT_CONFIRMATION_RESIDUAL)):
+                applied.extend(members)
+                continue
+            reason = (f"the cover pages of {straddle[0]} and {straddle[1]} "
+                      f"moved by {moved:.4g}x")
+        rejected.extend({**e, "filings_moved": moved, "reason": reason}
+                        for e in members)
+    applied.sort(key=lambda e: e["date"])
+    rejected.sort(key=lambda e: e["date"])
+    return applied, rejected
+
+
 def _factor_for(as_of: Optional[str],
                 applied: List[Dict[str, Any]]) -> float:
     """Multiple that puts a count stated on `as_of` onto the newest basis.
@@ -563,6 +633,7 @@ def _empty_adjustment() -> Dict[str, Any]:
         "adjusted_oldest_total": None,
         "raw_change_pct": None,
         "unexplained_jumps": [],
+        "calendar_events_not_applied": [],
     }
 
 
@@ -651,11 +722,14 @@ def get_share_count_series(ticker: str, limit: int = 8,
     # leaves the series unadjusted, and the check below then refuses a
     # direction rather than guessing which side of the split a filing sits on.
     applied: List[Dict[str, Any]] = []
+    rejected: List[Dict[str, Any]] = []
     if events and dated_totals:
         oldest_as_of, latest_as_of = dated_totals[0][0], dated_totals[-1][0]
         if oldest_as_of is not None and latest_as_of is not None:
-            applied = [e for e in events
-                       if oldest_as_of < e["date"] <= latest_as_of]
+            in_window = [e for e in events
+                         if oldest_as_of < e["date"] <= latest_as_of]
+            applied, rejected = _confirmed_by_the_filings(in_window,
+                                                          dated_totals)
 
     for observation in observations:
         observation["factor"] = _factor_for(observation["as_of"], applied)
@@ -742,6 +816,7 @@ def get_share_count_series(ticker: str, limit: int = 8,
         "adjusted_oldest_total": oldest_adjusted,
         "raw_change_pct": raw_change_pct,
         "unexplained_jumps": unexplained,
+        "calendar_events_not_applied": rejected,
     })
 
     return {
@@ -819,6 +894,19 @@ def _split_warnings(ticker: str, adjustment: Dict[str, Any],
                 f"raw_change_pct ({adjustment['raw_change_pct']:.2f}%) is the "
                 f"unadjusted difference between cover pages."),
             "splits_applied": adjustment["splits_applied"],
+        })
+    if adjustment["calendar_events_not_applied"]:
+        described = "; ".join(f"{_shape(e)} ({e['reason']})"
+                              for e in adjustment["calendar_events_not_applied"])
+        warnings.append({
+            "code": "split_calendar_event_not_applied",
+            "message": (
+                f"{ticker}: the split calendar lists {described}, and the "
+                f"share counts do not show it, so it was not applied. Split "
+                f"calendars also record spin-off price adjustments, which "
+                f"change the price history and not the share count."),
+            "calendar_events_not_applied":
+                adjustment["calendar_events_not_applied"],
         })
     if source_error is not None:
         warnings.append({

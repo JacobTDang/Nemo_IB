@@ -767,7 +767,7 @@ percentage on consolidated revenue and says which filer pattern it is. Pinned by
 `test_an_aggregation_member_is_flagged_rather_than_silently_summed` and three
 neighbours in `testing/test_segment_fact_selection.py`.
 
-#### 6. `get_share_count_series` calls a corporate separation a buyback (P2)
+#### 6. FIXED — `get_share_count_series` calls a corporate separation a buyback (P2)
 
 HON's share count halves from 633,653,119 (2026-04-23 10-Q) to 316,940,010
 (2026-07-23 10-Q). Both figures are correct — Honeywell separated — but the tool
@@ -778,6 +778,17 @@ This also broke the first draft of identity 7: comparing the post-separation
 10-Q share count against the 10-K's public float read as a 180% violation of an
 identity that was not violated. The check now reads the share count off the same
 cover page as the float, so both describe the same capital structure.
+
+**Fixed** under issue #103 (2026-09-23). The cause was the split calendar, not
+the direction logic. Yahoo lists HON's spin-off price adjustments as splits,
+1.061 on 2025-10-30 and 0.9535 on 2026-06-29, and the tool applied both. That
+rebased the history by 6% and 5% and moved the 2:1 drop off the round ratio the
+unexplained-jump check looks for. A calendar event is now applied only when the
+cover pages either side of it confirm it, and a rejected event is named in a
+`split_calendar_event_not_applied` warning. HON now reads
+`split_suspected_undetermined` with no percentage, and the live NVDA, CMG, LRCX
+and AVGO splits are still applied. Pinned by the spin-off tests in
+`testing/test_split_adjusted_shares.py`.
 
 #### 7. FIXED — `forward_metrics` reports a credential failure as "not disclosed" (P2)
 
