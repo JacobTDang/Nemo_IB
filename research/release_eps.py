@@ -40,6 +40,7 @@ from __future__ import annotations
 import copy
 import os
 import re
+import statistics
 import time
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
@@ -722,3 +723,82 @@ def sue_ts_release(ticker: str, as_of: Optional[str] = None) -> Dict[str, Any]:
     return signal_from_release(series, period, read["eps"],
                                latest["announced_date"], as_of=as_of,
                                accession=latest.get("accession"))
+
+
+# --------------------------------------------------------- the filing lag
+#
+# The release-timed gain over XBRL timing sat in prints whose 10-Q arrived a
+# week or more after the release (issue #115). The current quarter's lag is
+# unknown when its release lands; the issuer's lag in earlier quarters is not,
+# so it can be a point-in-time screen. Only the measurement lives here. The
+# screen and its threshold are fixed in the issue before held-out data is read.
+
+# Four quarters is a year: enough that one late filing does not decide it, and
+# short enough that a filer who changed its close process is judged on its
+# current habits.
+LAG_QUARTERS = 4
+
+
+def filing_lags(release_dates: Dict[str, str],
+                filing_dates: Dict[str, str]) -> List[Dict[str, Any]]:
+    """Calendar days from each quarter's release to the filing that carried
+    its XBRL, oldest filing first.
+
+    A quarter with only one of the two dates is left out. A missing release is
+    not a zero-day lag, and counting it as one would pull every median down.
+    """
+    rows = []
+    for period, filed in filing_dates.items():
+        released = release_dates.get(period)
+        if not released or not filed:
+            continue
+        rows.append({
+            "fiscal_period": period, "released": released[:10],
+            "filed": filed[:10],
+            "lag_days": (date.fromisoformat(filed[:10])
+                         - date.fromisoformat(released[:10])).days,
+        })
+    return sorted(rows, key=lambda r: r["filed"])
+
+
+def usual_filing_lag(release_dates: Dict[str, str],
+                     filing_dates: Dict[str, str], as_of: str,
+                     quarters: int = LAG_QUARTERS) -> Dict[str, Any]:
+    """Median lag over the last `quarters` quarters filed on or before `as_of`.
+
+    Filtered on the filing date, not the release date: a quarter whose release
+    is public and whose 10-Q is not has no lag yet. Fewer than `quarters`
+    known is a refusal with the count, not a median of whatever there is.
+    """
+    known = [r for r in filing_lags(release_dates, filing_dates)
+             if r["filed"] <= as_of[:10]]
+    recent = known[-quarters:]
+    if len(recent) < quarters:
+        return {"lag_days": None, "quarters": recent,
+                "reason": (f"{len(recent)} quarter(s) have both a release and "
+                           f"a filing on or before {as_of[:10]}; {quarters} "
+                           f"are needed")}
+    return {"lag_days": statistics.median(r["lag_days"] for r in recent),
+            "quarters": recent, "reason": None}
+
+
+def usual_filing_lag_for(ticker: str, as_of: Optional[str] = None,
+                         quarters: int = LAG_QUARTERS) -> Dict[str, Any]:
+    """`usual_filing_lag` for one issuer, read from EDGAR as of `as_of`."""
+    from research import announcements
+
+    as_of = as_of or sue._today()
+    series = sue.eps_series(ticker, as_of=as_of)
+    if not series["success"]:
+        return {"ticker": ticker, "as_of": as_of, "lag_days": None,
+                "quarters": [], "reason": series["error"]}
+    by_period = {q["fiscal_period"]: {"period_end": q.get("period_end"),
+                                      "known_at": q["known_at"]}
+                 for q in series["quarters"]}
+    releases = announcements.for_quarters(ticker, as_of=as_of,
+                                          quarters=by_period)
+    lag = usual_filing_lag(
+        {period: r["announced_date"] for period, r in releases.items()},
+        {period: d["known_at"] for period, d in by_period.items()},
+        as_of, quarters)
+    return {"ticker": ticker, "as_of": as_of, **lag}
