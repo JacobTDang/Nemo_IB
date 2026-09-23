@@ -225,6 +225,39 @@ def test_missing_float_is_explicit(monkeypatch):
     assert result["public_float"] is None
 
 
+# ------------------------------------------- a failure is not a disclosure
+#
+# Each concept attempt used to sit in `except Exception: continue`. With
+# SEC_EMAIL unset, get_geographic_revenue answered "NVDA does not disaggregate
+# revenue by geography in its 10-K" -- a claim about NVIDIA, caused by an
+# environment variable. Only NotCovered may move the chain to the next concept;
+# anything else is the tool failing and must say so (known-issues entry 7).
+
+@pytest.mark.parametrize("tool", [fm.get_contracted_revenue,
+                                  fm.get_geographic_revenue,
+                                  fm.get_public_float],
+                         ids=lambda f: f.__name__)
+@pytest.mark.parametrize("failure", [
+    ValueError("SEC_EMAIL is not set"),
+    ConnectionError("EDGAR read timed out"),
+], ids=["no-identity", "network"])
+def test_a_fetch_failure_is_reported_as_a_failure_not_a_disclosure(
+        monkeypatch, tool, failure):
+    def fake(ticker, concept, **kwargs):
+        raise failure
+    monkeypatch.setattr(fm, "fetch_concept_series", fake)
+
+    result = tool("NVDA")
+
+    assert result["success"] is False
+    assert str(failure) in result["error"], (
+        f"the cause was dropped: {result['error']!r}")
+    for claim in ("does not disaggregate", "does not disclose", "not covered"):
+        assert claim not in result["error"].lower(), (
+            f"an outage was reported as a fact about the filer: "
+            f"{result['error']!r}")
+
+
 # ------------------------------------------------------------- live golden set
 
 @pytest.fixture(scope="module", autouse=True)

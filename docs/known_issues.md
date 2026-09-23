@@ -741,7 +741,7 @@ Regression: `testing/test_segment_fact_selection.py`, offline for the mechanism
 against GE's, CAT's, AMT's, AAPL's and XOM's real context shapes, and
 network-gated for the filings.
 
-#### 5. `get_segment_financials` has no overlap detection (P1)
+#### 5. FIXED — `get_segment_financials` has no overlap detection (P1)
 
 `get_geographic_revenue` detects nested members and sets `members_overlap`. The
 segment tool has no equivalent, so aggregation and parent members are summed
@@ -760,6 +760,13 @@ alongside the members they aggregate:
 revenue and flag the overlap rather than trying to recognise parent members from
 tag names, which cannot be done.
 
+**Fixed** in f017914 (2026-08-24). The tool sums the members' latest revenue and
+compares it with consolidated revenue. When the sum exceeds it beyond
+`_SEGMENT_OVERLAP_TOLERANCE`, it sets `members_overlap`, re-bases every
+percentage on consolidated revenue and says which filer pattern it is. Pinned by
+`test_an_aggregation_member_is_flagged_rather_than_silently_summed` and three
+neighbours in `testing/test_segment_fact_selection.py`.
+
 #### 6. `get_share_count_series` calls a corporate separation a buyback (P2)
 
 HON's share count halves from 633,653,119 (2026-04-23 10-Q) to 316,940,010
@@ -772,7 +779,7 @@ This also broke the first draft of identity 7: comparing the post-separation
 identity that was not violated. The check now reads the share count off the same
 cover page as the float, so both describe the same capital structure.
 
-#### 7. `forward_metrics` reports a credential failure as "not disclosed" (P2)
+#### 7. FIXED — `forward_metrics` reports a credential failure as "not disclosed" (P2)
 
 `get_geographic_revenue` and `_series_for` wrap each concept attempt in
 `except Exception: continue`. With `SEC_EMAIL` unset, `get_geographic_revenue`
@@ -780,6 +787,12 @@ returns *"NVDA does not disaggregate revenue by geography in its 10-K"* —
 a statement about NVIDIA, caused by a missing environment variable. NVDA
 discloses four geographies. `earnings_quality._series` swallows only
 `NotCovered` and documents why; `forward_metrics` should match it.
+
+**Fixed** in 347889d (2026-08-24). Both concept chains catch only `NotCovered`,
+and any other failure returns `success: False` with the cause. No test pinned it
+until issue #104: `test_a_fetch_failure_is_reported_as_a_failure_not_a_disclosure`
+in `testing/test_forward_metrics.py` now covers all three tools with a missing
+identity and a network error, and restoring the catch-all fails it.
 
 ### Legitimate violations, encoded narrowly
 
