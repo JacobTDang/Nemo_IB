@@ -113,6 +113,14 @@ x-server-env: &server-env
   # rather than silently publishing every tool. That is tested, and it fails
   # at container start instead of at compose parse.
   MCP_AUTH_TOKEN: ${NEMO_MCP_TOKEN:-}
+  # A named token per agent, beside the operator's own (issue #108), as
+  # "name:token,name:token" in ../.env. Removing one name withdraws that agent
+  # and no other; `docker compose up -d` applies it. Empty means no agents.
+  MCP_AGENT_TOKENS: ${NEMO_MCP_AGENT_TOKENS:-}
+  # Requests per minute each agent may make; the operator is not limited.
+  # Empty means no limit. Every agent shares one SEC identity, so one in a loop
+  # can spend the rate limit the others depend on.
+  MCP_RATE_LIMIT_PER_MINUTE: ${NEMO_MCP_RATE_LIMIT_PER_MINUTE:-}
 
 x-server: &server
   # Overridable so the homelab can deploy the amd64 build the notes above

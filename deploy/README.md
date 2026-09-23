@@ -886,6 +886,45 @@ none because it looks like security.
 `/health` is exempt so the container healthcheck works without credentials. It
 reports liveness only and never returns data.
 
+### One token per agent, and a budget each
+
+For a fleet of agents rather than one operator (issue #108), give each agent
+its own named token. Withdrawing one then withdraws that agent alone; with a
+single shared token it meant rotating every agent's. On the host:
+
+```bash
+echo "NEMO_MCP_AGENT_TOKENS=grok-1:$(openssl rand -hex 32),grok-2:$(openssl rand -hex 32)" >> /srv/nemo/.env
+echo "NEMO_MCP_RATE_LIMIT_PER_MINUTE=60" >> /srv/nemo/.env
+```
+
+The shell generates the tokens as it writes the line; `.env` itself runs no
+commands. Then `docker compose --env-file ../.env up -d` to apply, and again
+after deleting a name from that line to withdraw the agent. The operator's `NEMO_MCP_TOKEN` keeps
+working beside them and is never limited.
+
+Each agent sends its own token as `Authorization: Bearer <token>`. Every agent
+request is logged with its name (`[mcp_http] grok-2 POST /mcp/`), which the
+access log alone cannot say for a fleet. An agent over its budget gets `429`
+with a `Retry-After` in seconds, and the refusal is logged by name. The budget
+exists because every agent shares one `SEC_EMAIL` identity and one set of
+vendor keys: an agent stuck in a loop would otherwise spend the SEC's rate
+limit for all of them.
+
+A malformed list stops the servers at start, naming the entry by position and
+never printing a token: a missing `name:`, a token under 24 characters, a name
+used twice, a token shared by two agents, or an agent holding the operator's
+token.
+
+Where the agents run decides how they reach the host. Agents on machines you
+control join the tailnet, and the address above works unchanged; Tailscale's
+ephemeral auth keys suit containers that come and go. Agents on a hosted
+platform you do not control need a public HTTPS address in front of the ports,
+such as a Cloudflare Tunnel or a reverse proxy with its own TLS certificate.
+Never publish the raw ports: the servers speak plain HTTP, and the token would
+cross the internet readable. The memory limits above were measured with one
+client; re-measure them under the fleet's real concurrency before trusting
+them.
+
 ### Why not OAuth
 
 The MCP specification defines an OAuth 2.1 flow, and it is right for a
