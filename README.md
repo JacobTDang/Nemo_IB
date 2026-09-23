@@ -247,12 +247,17 @@ docker compose --env-file ../.env run --rm research-status
 
 ### The `nemo` command
 
-`nemo` answers "is this thing working" from a terminal. Install it into the
-virtual environment once, from the repository root.
+`nemo` answers "is this thing working" from a terminal. It needs one package,
+python-dotenv, and nothing else outside the standard library. Install it into
+the virtual environment once, from the repository root.
 
 ```bash
-pip install -e .
+pip install python-dotenv==1.2.1
+pip install --no-deps -e .
 ```
+
+The `--no-deps` flag is necessary. Without it, pip installs every dependency of
+the servers, torch included, which is several gigabytes.
 
 | Command | Does |
 |---|---|
