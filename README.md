@@ -304,6 +304,26 @@ the more liquid line stays. The other line is excluded, and the record names
 the line that stayed. A preferred, warrant, unit, or right is excluded by its
 ticker suffix.
 
+The paper book has two limits. No position is larger than 5% of the gross
+target. Each night, before it decides, the scan records what the book is
+worth. Closed trades count at their net, and open trades count at the last
+close. When the book is 10% of the gross target below its peak, a switch trips.
+A tripped switch stops the scan from filing orders until a person resets it
+with a reason:
+
+```bash
+docker compose --env-file ../.env run --rm --entrypoint python research-scan \
+  -m research.risk --reset --reason "why it is safe to trade again"
+```
+
+The switch does not reset itself when the book recovers. `nemo status` shows
+the switch and the gate on every screen.
+
+The gate is the test before real money. It needs 200 forward trades with fills
+that a broker measured, a mean net above zero, and a t-statistic above the
+threshold for six variants. The weekly score records the gate. The gate cannot
+pass on modeled costs, so it reports "not passed" until measured fills exist.
+
 ### The record
 
 `research-daily` writes one SQLite file on the `research-data` volume. Money
@@ -324,6 +344,9 @@ announcement       fiscal identity, the date the market learned, and whether it
 borrow_rate        what it cost to be short, per name, as somebody quoted it
 paper_order        decisions, with the session they were for and no fill price
 activist_filing    13D events with four timestamps, latency derived at read
+book_equity        what the paper book was worth each night, and the limit
+risk_event         each time the drawdown switch tripped or a person reset it
+gate_check         the go/no-go gate as each weekly score found it
 run_log            every run, so a day the job did not run is visible
 ```
 

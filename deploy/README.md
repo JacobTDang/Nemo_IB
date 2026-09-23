@@ -401,6 +401,43 @@ python -m research.borrow --as-of 2026-08-31 --from-csv rates.csv \
   --units percent --source ibkr --backfill
 ```
 
+### The book's limits, and the switch that stops it
+
+Two limits, set by the owner before any forward result was read (issue #117).
+No position is larger than 5% of the gross target: the scan spreads the gross
+over twenty names, which is 5% each, but only by arithmetic, and the cap now
+says so in code. And a drawdown switch: every night, before deciding, the scan
+records what the paper book is worth in `book_equity`, closed trades at the net
+scoring gives them and open ones marked at the last close with their whole
+round trip already charged. When the book sits 10% of the gross target below
+its peak, the switch trips.
+
+A tripped switch makes `research-scan` file nothing and exit 1, which cron
+reports; `research-status` at noon exits 1 and names it under ATTENTION. It
+does not re-arm when equity recovers, because a switch that re-arms on a bounce
+trades straight through the drawdown it exists to stop. Re-arming is a
+decision, and the record keeps who made it and why:
+
+```bash
+cd /srv/nemo/deploy
+docker compose --env-file ../.env run --rm --entrypoint python research-scan \
+  -m research.risk                                        # the switch, as JSON
+docker compose --env-file ../.env run --rm --entrypoint python research-scan \
+  -m research.risk --reset --reason "one name gapped; the rest are intact"
+```
+
+A reset measures the peak from the equity it was made at. Measured from the old
+peak, a book still under water would trip again the next night. A reset is
+refused while the switch is armed, because the only use for lowering an armed
+peak is to stop it tripping when it should.
+
+The go/no-go gate is recorded by the weekly score in `gate_check`: 200 forward
+trades with measured fills, a mean net above zero, and a t-statistic above the
+Bonferroni bar for the six variants tried. Measured means a broker filled it
+(issue #116); until then the gate reads "not passed" with that reason, because
+a gate that passed on modeled costs would be passing on the assumption it
+exists to test.
+
 ### Seeing what happened, from a terminal
 
 `research-status` reads the store and prints one screen. It writes nothing, so

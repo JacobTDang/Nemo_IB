@@ -61,6 +61,19 @@ def _write_everything_late(store):
     store.record_borrow_rates("2026-03-02",
                               [{"ticker": "AAA", "annual_rate": 0.03}],
                               recorded_at=LATER)
+    store.record_book_equity(
+        "2026-03-02", {"equity_dollars": -20_000.0,
+                       "realized_dollars": -20_000.0, "open_dollars": 0.0,
+                       "closed_trades": 1, "open_trades": 0,
+                       "unmarked_trades": 0},
+        limit_dollars=10_000.0, recorded_at=LATER)
+    store.record_risk_event("2026-03-02", "tripped", "a trip written later",
+                            drawdown_dollars=20_000.0, recorded_at=LATER)
+    store.record_gate_check("2026-03-02", {
+        "trades": 1, "measured_trades": 1, "min_trades": 200,
+        "mean_net_bps": 5.0, "t_stat": None, "t_threshold": 2.87,
+        "comparisons": 6, "passed": False, "reason": "written later"},
+        recorded_at=LATER)
 
 
 # --- nothing is visible before it was written -------------------------------
@@ -81,6 +94,7 @@ def _write_everything_late(store):
     ("filed_issuer_periods",
      lambda: sorted(pit_store.filed_issuer_periods(PAST))),
     ("cohort", lambda: sue_cs.cohort(as_of=PAST)),
+    ("book_equity_as_of", lambda: pit_store.book_equity_as_of(PAST)),
 ])
 def test_no_reader_sees_a_row_written_after_its_date(store, name, call):
     _write_everything_late(store)
@@ -98,6 +112,11 @@ def test_the_scalar_readers_hide_it_too(store):
     # broker file for last month arrives next month -- so a leak here would
     # price every historical short with a rate nobody could have known.
     assert pit_store.borrow_rate_as_of("AAA", PAST) is None
+    # A drawdown switch that read tomorrow's loss would trip a replayed night
+    # on a loss nobody had yet taken.
+    state = pit_store.risk_state(PAST)
+    assert state["halted"] is False and state["latest"] is None
+    assert pit_store.latest_gate_check(PAST) is None
 
 
 def test_the_same_readers_do_see_it_afterwards(store):
@@ -113,6 +132,9 @@ def test_the_same_readers_do_see_it_afterwards(store):
     assert pit_store.consensus_as_of("AAA", "2026Q1", later)
     assert pit_store.actual_as_of("AAA", "2026Q1", later) == 1.2
     assert pit_store.borrow_rate_as_of("AAA", later)["annual_rate"] == 0.03
+    assert pit_store.book_equity_as_of(later)
+    assert pit_store.risk_state(later)["halted"] is True
+    assert pit_store.latest_gate_check(later)["reason"] == "written later"
 
 
 def test_every_as_of_reader_in_the_store_is_covered_here():
@@ -122,7 +144,7 @@ def test_every_as_of_reader_in_the_store_is_covered_here():
         "universe_as_of", "announcements_as_of", "paper_orders_as_of",
         "activist_filings_as_of", "consensus_as_of", "actual_as_of",
         "reporters_since", "filed_periods", "filed_issuer_periods",
-        "has_consensus_history", "borrow_rate_as_of",
+        "has_consensus_history", "borrow_rate_as_of", "book_equity_as_of",
         # Reads the run log, which records what the process did rather than
         # what the market did; see the test below for why it is keyed on the
         # date a run was FOR rather than on when it finished.

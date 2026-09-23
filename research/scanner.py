@@ -48,7 +48,7 @@ import statistics
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 
-from research import borrow, pit_store, spread, sue
+from research import borrow, pit_store, risk, spread, sue
 
 # --- what the book is, before the regime touches it -------------------------
 
@@ -578,7 +578,9 @@ def scan(as_of: Optional[str] = None,
             rejected.append({"ticker": ticker, "reason": fit["reason"],
                              "sue": value})
             continue
-        target = min(per_name, fit["max_position_dollars"])
+        # The cap is stated, not implied by the name count (issue #117).
+        target = min(per_name, fit["max_position_dollars"],
+                     risk.MAX_POSITION_FRACTION * GROSS_TARGET)
         if target <= 0:
             rejected.append({"ticker": ticker, "sue": value,
                              "reason": "no tradeable size at this liquidity"})
@@ -807,6 +809,17 @@ def record_scan(as_of: Optional[str] = None,
     book and holding another.
     """
     as_of = as_of or _today()
+
+    # Before deciding anything: what the book is worth tonight, and whether
+    # the drawdown switch is tripped. A tripped switch files nothing and says
+    # so in the run log, the same way a scan that cannot see the tape does.
+    halt = risk.check_and_record(as_of, GROSS_TARGET)
+    if halt["halted"]:
+        pit_store.start_run("scan", as_of_date=as_of)
+        pit_store.finish_run(rows_written=0, status="failed",
+                             error=halt["reason"])
+        raise risk.RiskHalted(halt["reason"])
+
     result = scan(as_of, borrow_rate=borrow_rate)
 
     # What this day already decided, if anything. Filing is append-only, so a
