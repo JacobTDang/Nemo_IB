@@ -205,6 +205,19 @@ class AsyncBroker:
       "filled_at": o.get("filled_at"),
     }
 
+  async def get_calendar(self, start: str, end: str) -> List[str]:
+    """Trading dates from `start` to `end` inclusive, as YYYY-MM-DD.
+
+    A weekday the exchange is shut is absent from the answer, which is how the
+    paper-fill job knows not to send anything that morning. An error raises
+    rather than returning an empty list, because an empty calendar reads as
+    "the market is shut".
+    """
+    resp = await self._client.get("/v2/calendar",
+                                  params={"start": start, "end": end})
+    self._raise_for_status(resp)
+    return [str(day["date"]) for day in resp.json()]
+
   async def get_order_by_id(self, order_id: str) -> Dict[str, Any]:
     resp = await self._client.get(f"/v2/orders/{order_id}")
     self._raise_for_status(resp)

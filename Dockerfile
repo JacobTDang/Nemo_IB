@@ -95,6 +95,34 @@ CMD ["python", "-m", "tools.news_agregator.fred_server", "server"]
 
 
 # --------------------------------------------------------------------------
+# The paper-fill job (issue #116), a separate target:
+#
+#   docker build --target fills -t nemo-fills:local .
+#
+# It is the one thing in this repo that can place an order, so it is its own
+# image: the data image's layers plus the broker client and the job, and the
+# Alpaca keys only in its compose service. It sits above `runtime` on purpose.
+# A plain `docker build` builds the last stage, and the last stage must stay
+# the data image, which cannot trade (testing/test_paper_fills.py pins it).
+# --------------------------------------------------------------------------
+FROM base AS fills-src
+COPY tools/alpaca/__init__.py tools/alpaca/async_broker.py tools/alpaca/fills.py ./tools/alpaca/
+RUN python -c "import tools.alpaca.fills; print('the paper-fill job imports')"
+
+FROM python:3.12-slim AS fills
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app \
+    PATH="/app/.venv/bin:$PATH"
+WORKDIR /app
+COPY --from=fills-src /app/.venv /app/.venv
+COPY --from=fills-src /app/tools /app/tools
+COPY --from=fills-src /app/research /app/research
+COPY --from=fills-src /app/common /app/common
+ENTRYPOINT ["python", "-m", "tools.alpaca.fills"]
+
+
+# --------------------------------------------------------------------------
 # Runtime stage: carries the venv and the source, not uv or curl or the
 # apt lists used to install them.
 # --------------------------------------------------------------------------

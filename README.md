@@ -324,6 +324,13 @@ that a broker measured, a mean net above zero, and a t-statistic above the
 threshold for six variants. The weekly score records the gate. The gate cannot
 pass on modeled costs, so it reports "not passed" until measured fills exist.
 
+The `research-fills` job measures those fills with an Alpaca paper account. It
+sends each filed order to the opening auction of its session and records what
+filled. Its report compares each fill with the open that the scoring assumes.
+The job runs from its own image, because it can place orders. The data image
+cannot place orders. Paper fills show the quoted spread at the open. They do
+not show the price impact of the order.
+
 ### The record
 
 `research-daily` writes one SQLite file on the `research-data` volume. Money
@@ -347,6 +354,7 @@ activist_filing    13D events with four timestamps, latency derived at read
 book_equity        what the paper book was worth each night, and the limit
 risk_event         each time the drawdown switch tripped or a person reset it
 gate_check         the go/no-go gate as each weekly score found it
+paper_fill         each order sent to the paper broker, and what it filled
 run_log            every run, so a day the job did not run is visible
 ```
 

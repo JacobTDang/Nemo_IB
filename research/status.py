@@ -75,6 +75,15 @@ JOBS = (
     {"job": "seed", "module": "research.seed_consensus",
      "every": "monthly", "stale_after_days": 40,
      "partial_is_normal": False},
+    # Paper fills (issue #116). Optional: they run only once Alpaca paper keys
+    # are in .env, so a job that has never run is shown, not raised. Once it
+    # has run, a failure or a stall is raised like any other.
+    {"job": "fill_submit", "module": "tools.alpaca.fills",
+     "every": "weekday", "stale_after_days": 5,
+     "partial_is_normal": False, "optional": True},
+    {"job": "fill_collect", "module": "tools.alpaca.fills",
+     "every": "weekday", "stale_after_days": 5,
+     "partial_is_normal": False, "optional": True},
 )
 
 # Reported in full. Anything else in the schema still shows up under `tables`.
@@ -116,6 +125,7 @@ def _job_state(spec: Dict[str, Any], as_of: str) -> Dict[str, Any]:
     job = spec["job"]
     out = {"job": job, "module": spec["module"], "every": spec["every"],
            "partial_is_normal": spec["partial_is_normal"],
+           "optional": spec.get("optional", False),
            "last_run": None, "last_success": None, "state": "never",
            "status": None, "rows_written": None, "error": None,
            "age_days": None, "gaps": None}
@@ -214,6 +224,8 @@ def collect(as_of: Optional[str] = None) -> Dict[str, Any]:
 
     attention: List[str] = []
     for job in jobs:
+        if job["state"] == "never" and job["optional"]:
+            continue
         if job["state"] == "never":
             attention.append(
                 f"{job['job']} has never completed a run (runs {job['every']})")

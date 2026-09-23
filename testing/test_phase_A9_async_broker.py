@@ -172,3 +172,42 @@ if __name__ == "__main__":
   test_close_position_calls_delete()
   test_broker_error_on_4xx_5xx()
   print("\nAll Phase A9 async broker tests passed.")
+
+
+def test_get_calendar_returns_the_trading_dates_and_leaves_out_holidays():
+  """The paper-fill job asks this before sending anything (issue #116): a
+  weekday the exchange is shut is simply absent from the answer."""
+  seen = {}
+
+  def handler(request):
+    seen["path"] = request.url.path
+    seen["params"] = dict(request.url.params)
+    return httpx.Response(200, json=[
+      {"date": "2026-07-02", "open": "09:30", "close": "16:00"},
+      {"date": "2026-07-06", "open": "09:30", "close": "16:00"},
+    ])
+
+  async def run(broker):
+    return await broker.get_calendar("2026-07-02", "2026-07-06")
+
+  dates = asyncio.run(_with_mock_broker(handler, run))
+
+  assert dates == ["2026-07-02", "2026-07-06"]
+  assert seen["path"] == "/v2/calendar"
+  assert seen["params"] == {"start": "2026-07-02", "end": "2026-07-06"}
+
+
+def test_get_calendar_raises_on_an_error_rather_than_answering_empty():
+  """An empty calendar reads as "the market is shut", so an error must not
+  arrive looking like one."""
+  def handler(request):
+    return httpx.Response(500, json={"message": "internal error"})
+
+  async def run(broker):
+    return await broker.get_calendar("2026-07-02", "2026-07-06")
+
+  try:
+    asyncio.run(_with_mock_broker(handler, run))
+    raise AssertionError("an error came back as a calendar")
+  except AsyncBrokerError as exc:
+    assert "500" in str(exc)

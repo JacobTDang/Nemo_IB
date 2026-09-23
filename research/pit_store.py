@@ -298,6 +298,31 @@ CREATE TABLE IF NOT EXISTS gate_check (
     recorded_at     TEXT NOT NULL
 );
 
+-- What a paper broker filled for each leg of a filed order (issue #116). The
+-- one table here a later write may change, and only once: a row's status moves
+-- from submitted to a terminal answer, and a terminal answer stands.
+CREATE TABLE IF NOT EXISTS paper_fill (
+    order_as_of       TEXT NOT NULL,
+    ticker            TEXT NOT NULL,
+    leg               TEXT NOT NULL CHECK (leg IN ('entry', 'exit')),
+    -- The session the book's scoring uses for this leg, and the one the order
+    -- was actually sent for. They differ only for an exit sent late, which is
+    -- a different trade and is not measured.
+    scheduled_session TEXT NOT NULL,
+    session           TEXT NOT NULL,
+    side              TEXT NOT NULL,
+    qty               INTEGER NOT NULL,
+    client_order_id   TEXT NOT NULL UNIQUE,
+    broker_order_id   TEXT,
+    status            TEXT NOT NULL,
+    reason            TEXT,
+    filled_qty        REAL,
+    filled_price      REAL,
+    filled_at         TEXT,
+    submitted_at      TEXT NOT NULL,
+    PRIMARY KEY (order_as_of, ticker, leg)
+);
+
 CREATE TABLE IF NOT EXISTS run_log (
     run_id       INTEGER PRIMARY KEY AUTOINCREMENT,
     job          TEXT NOT NULL,
@@ -1467,3 +1492,95 @@ def latest_gate_check(as_of_date: str) -> Optional[Dict[str, Any]]:
                 ORDER BY as_of_date DESC LIMIT 1""",
             (as_of_date, as_of_date)).fetchone()
     return dict(row) if row else None
+
+
+# ------------------------------------------------------------- paper fills
+#
+# Issue #116. Standard library only, like the rest of this module: the gate in
+# `scoring` reads measured round trips from here.
+
+FILL_TERMINAL = ("filled", "canceled", "expired", "rejected", "skipped")
+
+
+def record_fill_submission(row: Dict[str, Any]) -> int:
+    """One leg sent, skipped or refused. The first record of a leg stands."""
+    with connect() as conn:
+        cur = conn.execute(
+            """INSERT OR IGNORE INTO paper_fill
+               (order_as_of, ticker, leg, scheduled_session, session, side, qty,
+                client_order_id, broker_order_id, status, reason, submitted_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (row["order_as_of"], row["ticker"], row["leg"],
+             row["scheduled_session"], row["session"], row["side"], row["qty"],
+             row["client_order_id"], row.get("broker_order_id"), row["status"],
+             row.get("reason"), row["submitted_at"]))
+        return cur.rowcount
+
+
+def update_paper_fill(client_order_id: str, status: str,
+                      filled_qty: Optional[float],
+                      filled_price: Optional[float],
+                      filled_at: Optional[str]) -> int:
+    """What the broker says now. A leg already at a terminal answer is left
+    alone: a fill price is a fact, and a later look must not restate it."""
+    placeholders = ",".join("?" * len(FILL_TERMINAL))
+    with connect() as conn:
+        cur = conn.execute(
+            f"""UPDATE paper_fill
+                   SET status = ?, filled_qty = ?, filled_price = ?,
+                       filled_at = ?
+                 WHERE client_order_id = ?
+                   AND status NOT IN ({placeholders})""",
+            (status, filled_qty, filled_price, filled_at, client_order_id,
+             *FILL_TERMINAL))
+        return cur.rowcount
+
+
+def paper_fills_as_of(as_of_date: str) -> List[Dict[str, Any]]:
+    """Every leg submitted on or before `as_of_date`, as it stood then.
+
+    A fill that came after the date is shown as still pending: on that day
+    nobody knew the price.
+    """
+    with connect() as conn:
+        rows = [dict(r) for r in conn.execute(
+            """SELECT * FROM paper_fill WHERE date(submitted_at) <= ?
+                ORDER BY submitted_at, ticker, leg""", (as_of_date,))]
+    for row in rows:
+        if row["filled_at"] and row["filled_at"][:10] > as_of_date:
+            row.update({"status": "pending", "filled_qty": None,
+                        "filled_price": None, "filled_at": None})
+    return rows
+
+
+def measured_round_trips(as_of_date: str) -> List[Dict[str, Any]]:
+    """Orders whose entry and exit both filled on schedule by `as_of_date`.
+
+    The measured counterpart of a scored trade: same order, same sessions,
+    the broker's prices instead of the opens.
+    """
+    orders = {(o["as_of_date"], o["ticker"]): o
+              for o in paper_orders_as_of(as_of_date, accepted_only=True)}
+    legs: Dict[tuple, Dict[str, Any]] = {}
+    for row in paper_fills_as_of(as_of_date):
+        legs.setdefault((row["order_as_of"], row["ticker"]), {})[row["leg"]] = row
+    trips = []
+    for key, pair in sorted(legs.items()):
+        entry, exit_ = pair.get("entry"), pair.get("exit")
+        order = orders.get(key)
+        if not (entry and exit_ and order):
+            continue
+        if not all(leg["status"] == "filled" and leg["filled_price"]
+                   and leg["session"] == leg["scheduled_session"]
+                   for leg in (entry, exit_)):
+            continue
+        trips.append({
+            "order_as_of": key[0], "ticker": key[1],
+            "side": order.get("side") or "long",
+            "entry_session": entry["session"], "exit_session": exit_["session"],
+            "entry_price": entry["filled_price"],
+            "exit_price": exit_["filled_price"],
+            "qty": exit_["filled_qty"], "cost_bps": order.get("cost_bps"),
+            "borrow_bps": order.get("borrow_bps"),
+            "participation": order.get("participation")})
+    return trips
