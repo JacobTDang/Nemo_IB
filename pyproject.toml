@@ -250,7 +250,12 @@ server = [
   "ddgs==9.10.0",
   "python-dotenv==1.2.1",
   "edgartools==5.8.0",
+  # pandas.read_html imports its own parsers, so no import in our code names
+  # them: lxml for the default flavor, html5lib for the bs4 fallback the
+  # governance extractor uses when lxml refuses a filing (issue #112).
+  "html5lib==1.1",
   "httpx==0.28.1",
+  "lxml==6.0.2",
   "mcp==1.25.0",
   "numpy==2.3.5",
   "pandas==2.3.3",
