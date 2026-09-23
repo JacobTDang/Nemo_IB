@@ -231,8 +231,16 @@ def collect(as_of: Optional[str] = None) -> Dict[str, Any]:
                 f"{(job['error'] or '')[:80]}")
 
 
+    risk = pit_store.risk_state(as_of)
+    if risk["halted"]:
+        attention.append(
+            f"risk switch tripped on {risk['tripped']['as_of_date']}; the scan "
+            f"files no orders until it is reset with a reason")
+
     return {"as_of": as_of, "jobs": jobs, "store": _store_summary(),
-            "book": _book_summary(as_of), "attention": attention}
+            "book": _book_summary(as_of), "risk": risk,
+            "gate": pit_store.latest_gate_check(as_of),
+            "attention": attention}
 
 
 def _render(report: Dict[str, Any]) -> str:
@@ -272,12 +280,43 @@ def _render(report: Dict[str, Any]) -> str:
                   f"{book['issuers']} issuers, {book['shorts']} short, "
                   f"{book['borrow_rates']} borrow rates on file"]
 
+    lines += _risk_lines(report.get("risk"), report.get("gate"))
+
     if report["attention"]:
         lines += ["", "  ATTENTION"]
         lines += [f"    ! {a}" for a in report["attention"]]
     else:
         lines += ["", "  nothing needs attention"]
     return "\n".join(lines)
+
+
+def _risk_lines(risk: Optional[Dict[str, Any]],
+                gate: Optional[Dict[str, Any]]) -> List[str]:
+    """The drawdown switch and the go/no-go gate, one line each (#117)."""
+    lines = [""]
+    latest = (risk or {}).get("latest")
+    if not latest:
+        lines.append("  RISK   no equity recorded yet; the scan records it "
+                     "each night before deciding")
+    else:
+        switch = (f"switch TRIPPED on {risk['tripped']['as_of_date']}; reset "
+                  f"with python -m research.risk --reset --reason"
+                  if risk["halted"] else "switch armed")
+        unmarked = (f", {latest['unmarked_trades']} unmarked"
+                    if latest["unmarked_trades"] else "")
+        lines.append(
+            f"  RISK   equity {latest['equity_dollars']:+,.0f} "
+            f"({latest['closed_trades']} closed, {latest['open_trades']} open"
+            f"{unmarked}); drawdown {risk['drawdown_dollars']:,.0f} of a "
+            f"{latest['limit_dollars']:,.0f} limit; {switch}")
+    if not gate:
+        lines.append("  GATE   not checked yet; the weekly score records it")
+    else:
+        verdict = "PASSED" if gate["passed"] else "not passed"
+        lines.append(
+            f"  GATE   {gate['measured_trades']} of {gate['min_trades']} trades "
+            f"with measured fills; {verdict}: {gate['reason'][:110]}")
+    return lines
 
 
 def main(argv: Optional[List[str]] = None) -> int:

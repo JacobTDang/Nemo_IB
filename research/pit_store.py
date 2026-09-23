@@ -250,6 +250,54 @@ CREATE TABLE IF NOT EXISTS job_cursor (
     updated_at TEXT NOT NULL
 );
 
+-- The book's worth on each date it decided, as the scan measured it before
+-- deciding: closed trades at their net, open ones marked at the last close.
+-- The drawdown switch reads its peak from here, and the limit in force is kept
+-- on the row so a later change to it cannot restate an earlier night.
+CREATE TABLE IF NOT EXISTS book_equity (
+    as_of_date       TEXT PRIMARY KEY,
+    equity_dollars   REAL NOT NULL,
+    realized_dollars REAL NOT NULL,
+    open_dollars     REAL NOT NULL,
+    closed_trades    INTEGER NOT NULL,
+    open_trades      INTEGER NOT NULL,
+    -- Open positions with no price to mark them at. Unknown, not zero.
+    unmarked_trades  INTEGER NOT NULL,
+    limit_dollars    REAL NOT NULL,
+    recorded_at      TEXT NOT NULL
+);
+
+-- The drawdown switch, as events: it trips, and a person resets it with a
+-- reason. Kept as a sequence rather than a flag so the record says when it
+-- tripped, why, and who decided it could run again and on what grounds.
+CREATE TABLE IF NOT EXISTS risk_event (
+    event_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    as_of_date       TEXT NOT NULL,
+    event            TEXT NOT NULL CHECK (event IN ('tripped', 'reset')),
+    reason           TEXT NOT NULL,
+    drawdown_dollars REAL,
+    -- On a reset: the equity the peak is measured from afterwards.
+    baseline_dollars REAL,
+    recorded_at      TEXT NOT NULL
+);
+
+-- The go/no-go gate as the weekly score found it. The bar is kept on the row
+-- beside the result, because a gate re-read against today's bar is a gate
+-- that can move after the fact.
+CREATE TABLE IF NOT EXISTS gate_check (
+    as_of_date      TEXT PRIMARY KEY,
+    trades          INTEGER NOT NULL,
+    measured_trades INTEGER NOT NULL,
+    min_trades      INTEGER NOT NULL,
+    mean_net_bps    REAL,
+    t_stat          REAL,
+    t_threshold     REAL NOT NULL,
+    comparisons     INTEGER NOT NULL,
+    passed          INTEGER NOT NULL,
+    reason          TEXT NOT NULL,
+    recorded_at     TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS run_log (
     run_id       INTEGER PRIMARY KEY AUTOINCREMENT,
     job          TEXT NOT NULL,
@@ -1318,3 +1366,104 @@ def missing_days(job: str, start: str, end: str) -> List[str]:
             gaps.append(day.isoformat())
         day += timedelta(days=1)
     return gaps
+
+
+# ------------------------------------------------------------ risk and gate
+#
+# Issue #117. Read here, with the standard library only, because the status
+# screen reads them and `nemo` must install without the servers' dependencies.
+
+def record_book_equity(as_of_date: str, equity: Dict[str, Any],
+                       limit_dollars: float,
+                       recorded_at: Optional[str] = None) -> int:
+    """The book's worth on `as_of_date`. The first answer for a date stands."""
+    with connect() as conn:
+        cur = conn.execute(
+            """INSERT OR IGNORE INTO book_equity
+               (as_of_date, equity_dollars, realized_dollars, open_dollars,
+                closed_trades, open_trades, unmarked_trades, limit_dollars,
+                recorded_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (as_of_date, equity["equity_dollars"], equity["realized_dollars"],
+             equity["open_dollars"], equity["closed_trades"],
+             equity["open_trades"], equity["unmarked_trades"], limit_dollars,
+             recorded_at or _now()))
+        return cur.rowcount
+
+
+def book_equity_as_of(as_of_date: str) -> List[Dict[str, Any]]:
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT * FROM book_equity
+                WHERE as_of_date <= ? AND date(recorded_at) <= ?
+                ORDER BY as_of_date""", (as_of_date, as_of_date)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def record_risk_event(as_of_date: str, event: str, reason: str,
+                      drawdown_dollars: Optional[float] = None,
+                      baseline_dollars: Optional[float] = None,
+                      recorded_at: Optional[str] = None) -> int:
+    with connect() as conn:
+        cur = conn.execute(
+            """INSERT INTO risk_event
+               (as_of_date, event, reason, drawdown_dollars, baseline_dollars,
+                recorded_at) VALUES (?,?,?,?,?,?)""",
+            (as_of_date, event, reason, drawdown_dollars, baseline_dollars,
+             recorded_at or _now()))
+        return cur.rowcount
+
+
+def risk_state(as_of_date: str) -> Dict[str, Any]:
+    """Whether the switch is tripped, and the book's drawdown from its peak.
+
+    The peak starts at zero, the book's value before it traded, and a reset
+    moves it to the equity the reset was made at: measured from the old peak,
+    a book still under water would trip again the next night.
+    """
+    with connect() as conn:
+        events = [dict(r) for r in conn.execute(
+            """SELECT * FROM risk_event
+                WHERE as_of_date <= ? AND date(recorded_at) <= ?
+                ORDER BY event_id""", (as_of_date, as_of_date))]
+    resets = [e for e in events if e["event"] == "reset"]
+    last_reset = resets[-1] if resets else None
+    halted = bool(events) and events[-1]["event"] == "tripped"
+    tripped = next((e for e in reversed(events) if e["event"] == "tripped"),
+                   None) if halted else None
+
+    equities = book_equity_as_of(as_of_date)
+    latest = equities[-1] if equities else None
+    since = last_reset["as_of_date"] if last_reset else None
+    baseline = (last_reset["baseline_dollars"] or 0.0) if last_reset else 0.0
+    peak = max([baseline] + [e["equity_dollars"] for e in equities
+                             if since is None or e["as_of_date"] >= since])
+    return {"halted": halted, "tripped": tripped, "last_reset": last_reset,
+            "latest": latest, "peak_dollars": peak,
+            "drawdown_dollars": (peak - latest["equity_dollars"]
+                                 if latest else None)}
+
+
+def record_gate_check(as_of_date: str, gate: Dict[str, Any],
+                      recorded_at: Optional[str] = None) -> int:
+    with connect() as conn:
+        cur = conn.execute(
+            """INSERT OR IGNORE INTO gate_check
+               (as_of_date, trades, measured_trades, min_trades, mean_net_bps,
+                t_stat, t_threshold, comparisons, passed, reason, recorded_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (as_of_date, gate["trades"], gate["measured_trades"],
+             gate["min_trades"], gate["mean_net_bps"], gate["t_stat"],
+             gate["t_threshold"], gate["comparisons"], int(gate["passed"]),
+             gate["reason"], recorded_at or _now()))
+        return cur.rowcount
+
+
+def latest_gate_check(as_of_date: str) -> Optional[Dict[str, Any]]:
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT * FROM gate_check
+                WHERE as_of_date <= ? AND date(recorded_at) <= ?
+                ORDER BY as_of_date DESC LIMIT 1""",
+            (as_of_date, as_of_date)).fetchone()
+    return dict(row) if row else None

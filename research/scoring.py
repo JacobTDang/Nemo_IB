@@ -54,6 +54,7 @@ strategy:
 """
 from __future__ import annotations
 
+import math
 import statistics
 from typing import Any, Dict, List, Optional
 
@@ -93,6 +94,43 @@ def score_orders(as_of: Optional[str] = None,
     # This job is the one that checks the others, so a week it silently did
     # not run is the most expensive gap in the log.
     run_id = pit_store.start_run("score", as_of_date=as_of)
+    book = evaluate_book(as_of, horizon_days)
+    scored, pending, unfilled = book["scored"], book["pending"], book["unfilled"]
+
+    # The gate is judged on measured fills only, and none are measured until
+    # the paper-fill job (#116) runs; `gate_check` says so rather than judging
+    # modeled costs as if they were real ones.
+    gate = gate_check([], trades=len(scored))
+    pit_store.record_gate_check(as_of, gate, recorded_at=f"{as_of}T21:00:00Z")
+
+    # Scored, not written: this job writes no rows. `rows_written` is what a
+    # reader compares against zero, and for a scorer the count that means "it
+    # did something" is how many trades it could close.
+    # `ok` with zero rows, not `closed`. In this store `closed` means the
+    # exchange was shut, and `missing_days` counts it as coverage for that
+    # reason -- borrowing the word for "nothing had finished yet" would make
+    # a scorer's quiet week indistinguishable from a market holiday.
+    pit_store.finish_run(
+        rows_written=len(scored), status="ok",
+        error=None if scored else "no finished horizons to score",
+        run_id=run_id)
+
+    return {"as_of": as_of, "horizon_days": horizon_days,
+            "scored": scored, "pending": pending, "unfilled": unfilled,
+            "gate": gate,
+            "by_timing": split_by_timing(scored, comparisons),
+            "by_variant": split_by_variant(scored, comparisons),
+            **_summarise(scored, comparisons=comparisons)}
+
+
+def evaluate_book(as_of: str,
+                  horizon_days: int = DEFAULT_HORIZON_DAYS) -> Dict[str, Any]:
+    """Every filed order, sorted into scored, pending and unfilled.
+
+    The arithmetic of `score_orders` without its run-log entry, so the
+    nightly drawdown check can read the same numbers the weekly score does
+    without recording a scoring run it did not make.
+    """
     orders = [o for o in pit_store.paper_orders_as_of(as_of, accepted_only=True)]
 
     scored: List[Dict[str, Any]] = []
@@ -157,23 +195,70 @@ def score_orders(as_of: Optional[str] = None,
                        "expected_edge_bps": order["expected_edge_bps"],
                        "timing": _timing_of(order, as_of)})
 
-    # Scored, not written: this job writes no rows. `rows_written` is what a
-    # reader compares against zero, and for a scorer the count that means "it
-    # did something" is how many trades it could close.
-    # `ok` with zero rows, not `closed`. In this store `closed` means the
-    # exchange was shut, and `missing_days` counts it as coverage for that
-    # reason -- borrowing the word for "nothing had finished yet" would make
-    # a scorer's quiet week indistinguishable from a market holiday.
-    pit_store.finish_run(
-        rows_written=len(scored), status="ok",
-        error=None if scored else "no finished horizons to score",
-        run_id=run_id)
+    return {"scored": scored, "pending": pending, "unfilled": unfilled}
 
-    return {"as_of": as_of, "horizon_days": horizon_days,
-            "scored": scored, "pending": pending, "unfilled": unfilled,
-            "by_timing": split_by_timing(scored, comparisons),
-            "by_variant": split_by_variant(scored, comparisons),
-            **_summarise(scored, comparisons=comparisons)}
+
+def t_threshold(comparisons: int = 1) -> float:
+    """The t a result must clear when it was chosen from `comparisons` tries.
+
+    Bonferroni on the two-sided normal quantile: one comparison keeps the
+    familiar 2.0, and each additional one moves the bar out.
+    """
+    if comparisons > 1:
+        return statistics.NormalDist().inv_cdf(1 - 0.05 / (2 * comparisons))
+    return 2.0
+
+
+# --- the go/no-go gate (issue #117) -----------------------------------------
+#
+# Set by the owner on 2026-09-23, before any forward result was examined.
+# Six comparisons: the five arms of the release-timing replay
+# (docs/replay_2026-09-03_release_timing.md) and the lag screen of #115.
+GATE_MIN_TRADES = 200
+GATE_COMPARISONS = 6
+
+
+def gate_check(measured_net_bps: List[float], trades: Optional[int] = None,
+               comparisons: int = GATE_COMPARISONS,
+               min_trades: int = GATE_MIN_TRADES) -> Dict[str, Any]:
+    """Whether the book has earned real money, on measured fills only.
+
+    Modeled costs are what every result so far is net of, and a gate that
+    passed on them would be passing on the assumption it exists to test. So
+    an empty `measured_net_bps` is a refusal that says why, not a zero.
+    """
+    n = len(measured_net_bps)
+    threshold = t_threshold(comparisons)
+    out = {"trades": n if trades is None else trades, "measured_trades": n,
+           "min_trades": min_trades, "comparisons": comparisons,
+           "t_threshold": threshold, "mean_net_bps": None, "t_stat": None,
+           "passed": False}
+    if n == 0:
+        out["reason"] = (
+            f"no fills measured yet: {out['trades']} forward trades are "
+            f"scored on modeled costs only, and the gate cannot pass on "
+            f"those (issue #116)")
+        return out
+
+    mean = statistics.fmean(measured_net_bps)
+    sd = statistics.stdev(measured_net_bps) if n > 1 else 0.0
+    t = mean / (sd / math.sqrt(n)) if sd > 0 else None
+    out.update({"mean_net_bps": mean, "t_stat": t})
+    failures = []
+    if n < min_trades:
+        failures.append(f"{n} of {min_trades} trades have measured fills")
+    if mean <= 0:
+        failures.append(f"the mean net of measured fills is {mean:+.1f}bp, "
+                        f"not above zero")
+    if t is None or t <= threshold:
+        shown = "undefined" if t is None else f"{t:+.2f}"
+        failures.append(f"t is {shown}, not above {threshold:.2f}, the bar "
+                        f"for {comparisons} variants tried")
+    out["passed"] = not failures
+    out["reason"] = ("; ".join(failures) if failures else
+                     f"passed: {n} measured trades, mean {mean:+.1f}bp net, "
+                     f"t {t:+.2f} against {threshold:.2f}")
+    return out
 
 
 def split_by_variant(scored: List[Dict[str, Any]],
@@ -585,13 +670,7 @@ def _summarise(scored: List[Dict[str, Any]],
             f"the mean ({mean_net:+.1f}bp) and the median ({median_net:+.1f}bp) "
             f"fall on opposite sides of zero, so the average is carried by its "
             f"tail rather than by the typical trade")
-    # Bonferroni on the two-sided normal quantile: one comparison keeps the
-    # familiar 2.0, and each additional one moves the bar out.
-    if comparisons > 1:
-        from statistics import NormalDist
-        threshold = NormalDist().inv_cdf(1 - 0.05 / (2 * comparisons))
-    else:
-        threshold = 2.0
+    threshold = t_threshold(comparisons)
 
     if t_stat is None or abs(t_stat) < threshold:
         shown = "undefined" if t_stat is None else f"{t_stat:+.2f}"
