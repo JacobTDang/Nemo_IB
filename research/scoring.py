@@ -97,10 +97,10 @@ def score_orders(as_of: Optional[str] = None,
     book = evaluate_book(as_of, horizon_days)
     scored, pending, unfilled = book["scored"], book["pending"], book["unfilled"]
 
-    # The gate is judged on measured fills only, and none are measured until
-    # the paper-fill job (#116) runs; `gate_check` says so rather than judging
-    # modeled costs as if they were real ones.
-    gate = gate_check([], trades=len(scored))
+    # The gate is judged on measured fills only: round trips the paper-fill
+    # job (#116) sent and the broker filled on schedule. With none it says so
+    # rather than judging modeled costs as if they were real ones.
+    gate = gate_check(measured_net_bps(as_of), trades=len(scored))
     pit_store.record_gate_check(as_of, gate, recorded_at=f"{as_of}T21:00:00Z")
 
     # Scored, not written: this job writes no rows. `rows_written` is what a
@@ -216,6 +216,22 @@ def t_threshold(comparisons: int = 1) -> float:
 # (docs/replay_2026-09-03_release_timing.md) and the lag screen of #115.
 GATE_MIN_TRADES = 200
 GATE_COMPARISONS = 6
+
+
+def measured_net_bps(as_of: str) -> List[float]:
+    """Net return of every round trip a broker filled on schedule, in bp.
+
+    The fills replace the opens, so the spread and any slippage are in the
+    prices themselves. Borrow is the one cost a paper broker does not charge,
+    so the order's own borrow is still taken off a short.
+    """
+    out = []
+    for trip in pit_store.measured_round_trips(as_of):
+        move = trip["exit_price"] / trip["entry_price"] - 1.0
+        if trip["side"] == "short":
+            move = -move
+        out.append(move * 10_000 - (trip.get("borrow_bps") or 0.0))
+    return out
 
 
 def gate_check(measured_net_bps: List[float], trades: Optional[int] = None,

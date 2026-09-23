@@ -552,6 +552,48 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # Paper fills (issue #116). Sends each filed order to an Alpaca PAPER account
+  # for the opening auction of its session, collects what filled after the
+  # open, and reports each fill against the open the scoring assumes, so the
+  # cost model is measured instead of assumed. Its own image, because it is the
+  # one thing here that can place an order and the data image must not be able
+  # to:
+  #
+  #   docker build --target fills -t nemo-fills:local .
+  #
+  # Paper only; it never constructs a live broker. It needs ALPACA_PAPER_KEY and
+  # ALPACA_PAPER_SECRET in .env and exits 1 naming both without them, so its
+  # two cron lines go in only once the keys are there.
+  #
+  #   docker compose --env-file ../.env run --rm research-fills submit
+  #   docker compose --env-file ../.env run --rm research-fills collect
+  #   docker compose --env-file ../.env run --rm research-fills report
+  #
+  # Submitted before the opening auction's 09:28 ET cutoff in both EDT and EST,
+  # collected after the 09:30 open in both:
+  #   15 13 * * 1-5 cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-fills.lock docker compose --env-file ../.env run --rm research-fills submit
+  #   45 14 * * 1-5 cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-fills.lock docker compose --env-file ../.env run --rm research-fills collect
+  research-fills:
+    image: ${NEMO_FILLS_IMAGE:-nemo-fills:local}
+    profiles: ["sync"]
+    restart: "no"
+    entrypoint: ["python", "-m", "tools.alpaca.fills"]
+    environment:
+      <<: *clock-env
+      NEMO_PIT_DB: /app/data/pit.db
+      ALPACA_PAPER_KEY: ${ALPACA_PAPER_KEY:-}
+      ALPACA_PAPER_SECRET: ${ALPACA_PAPER_SECRET:-}
+    volumes:
+      - research-data:/app/data
+    tmpfs:
+      - /root/.edgar:rw,size=16m
+      - /app/db_cache:rw,size=16m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   # Consensus seeding. The analyst surprise needs eight quarters of what the
   # street expected before each print; Finnhub serves four and no more, so the
   # recorder fills the rest one day at a time. Seeding those four takes the

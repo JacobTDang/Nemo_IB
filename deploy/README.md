@@ -438,6 +438,56 @@ Bonferroni bar for the six variants tried. Measured means a broker filled it
 a gate that passed on modeled costs would be passing on the assumption it
 exists to test.
 
+### Measuring fills with a paper account
+
+Every result the study has produced is net of a modeled cost: a spread
+estimated from daily bars plus an impact term. The names that carry the
+release-timed edge are the thin ones, where that estimate is least reliable,
+and the release arm's median trade is about zero, so a cost error of a few tens
+of basis points changes its sign. `research-fills` measures it (issue #116).
+
+Each weekday before the opening auction closes to new orders it sends the legs
+due that session to an Alpaca **paper** account as opening-auction market
+orders in whole shares: entries for orders the scan filed for today, exits for
+entries whose twenty sessions are up. After the open it collects what filled.
+`report` sets each fill against the open the scoring assumes, and the weekly
+score feeds round trips filled on schedule into the go/no-go gate above, which
+cannot pass without them.
+
+It is its own image, because it is the one thing here that can place an order
+and the data image must not be able to:
+
+```bash
+cd /srv/nemo
+docker build --target fills -t nemo-fills:local .
+```
+
+Create a free Alpaca paper account, generate its keys, and add them to `.env`
+as `ALPACA_PAPER_KEY` and `ALPACA_PAPER_SECRET`. Only `research-fills` is handed
+them. The job never builds a live broker. Then add two lines to the same
+crontab, under its `CRON_TZ=UTC` line:
+
+```cron
+15 13 * * 1-5 cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-fills.lock docker compose --env-file ../.env run --rm research-fills submit
+45 14 * * 1-5 cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-fills.lock docker compose --env-file ../.env run --rm research-fills collect
+```
+
+13:15 UTC is before the auction's 09:28 ET cutoff in summer and winter time,
+and 14:45 is after the 09:30 open in both. An entry the job missed is not sent a
+day late, since that is a different trade from the one the book scores; an exit
+sent late still goes, to flatten the position, and is left out of the
+measurement. `nemo status` lists both jobs, and neither is raised until it has
+run once.
+
+```bash
+docker compose --env-file ../.env run --rm research-fills report
+```
+
+Know what it cannot tell you. Paper fills are simulated from quotes: they
+measure the quoted spread at the open, not the price impact of the order itself.
+Only small live orders measure impact, and that is a decision for the owner, not
+for this job.
+
 ### Seeing what happened, from a terminal
 
 `research-status` reads the store and prints one screen. It writes nothing, so

@@ -69,6 +69,20 @@ def _write_everything_late(store):
         limit_dollars=10_000.0, recorded_at=LATER)
     store.record_risk_event("2026-03-02", "tripped", "a trip written later",
                             drawdown_dollars=20_000.0, recorded_at=LATER)
+    store.record_paper_orders(
+        "2026-02-20",
+        [{"ticker": "FFF", "fiscal_period": "2026Q1", "side": "long",
+          "sue": 2.0, "target_dollars": 100.0,
+          "intended_session": "2026-02-23"}], recorded_at=LATER)
+    for leg, session, price in (("entry", "2026-02-23", 10.0),
+                                ("exit", "2026-03-02", 11.0)):
+        cid = f"nemo-2026-02-20-FFF-{leg}"
+        store.record_fill_submission({
+            "order_as_of": "2026-02-20", "ticker": "FFF", "leg": leg,
+            "scheduled_session": session, "session": session, "side": "buy",
+            "qty": 10, "client_order_id": cid, "broker_order_id": f"b-{cid}",
+            "status": "accepted", "submitted_at": LATER})
+        store.update_paper_fill(cid, "filled", 10, price, LATER)
     store.record_gate_check("2026-03-02", {
         "trades": 1, "measured_trades": 1, "min_trades": 200,
         "mean_net_bps": 5.0, "t_stat": None, "t_threshold": 2.87,
@@ -95,6 +109,8 @@ def _write_everything_late(store):
      lambda: sorted(pit_store.filed_issuer_periods(PAST))),
     ("cohort", lambda: sue_cs.cohort(as_of=PAST)),
     ("book_equity_as_of", lambda: pit_store.book_equity_as_of(PAST)),
+    ("paper_fills_as_of", lambda: pit_store.paper_fills_as_of(PAST)),
+    ("measured_round_trips", lambda: pit_store.measured_round_trips(PAST)),
 ])
 def test_no_reader_sees_a_row_written_after_its_date(store, name, call):
     _write_everything_late(store)
@@ -135,6 +151,8 @@ def test_the_same_readers_do_see_it_afterwards(store):
     assert pit_store.book_equity_as_of(later)
     assert pit_store.risk_state(later)["halted"] is True
     assert pit_store.latest_gate_check(later)["reason"] == "written later"
+    assert pit_store.paper_fills_as_of(later)
+    assert pit_store.measured_round_trips(later)
 
 
 def test_every_as_of_reader_in_the_store_is_covered_here():
@@ -145,6 +163,7 @@ def test_every_as_of_reader_in_the_store_is_covered_here():
         "activist_filings_as_of", "consensus_as_of", "actual_as_of",
         "reporters_since", "filed_periods", "filed_issuer_periods",
         "has_consensus_history", "borrow_rate_as_of", "book_equity_as_of",
+        "paper_fills_as_of", "measured_round_trips",
         # Reads the run log, which records what the process did rather than
         # what the market did; see the test below for why it is keyed on the
         # date a run was FOR rather than on when it finished.
