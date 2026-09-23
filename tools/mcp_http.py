@@ -16,12 +16,16 @@ container accumulates nothing across requests.
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import datetime as dt
 import hmac
+import math
 import os
 import pathlib
+import re
 import sys
+import time
 from collections.abc import Sequence
 from typing import Any
 
@@ -122,7 +126,9 @@ def build_app(mcp_server: Any, *, stateless: bool = True,
 
     token = resolve_auth_token() if auth_token is _UNSET else auth_token
     if token:
-        app.add_middleware(BearerAuthMiddleware, token=token)
+        app.add_middleware(BearerAuthMiddleware, token=token,
+                           agents=resolve_agent_tokens(token),
+                           rate_limit=resolve_rate_limit())
 
     log_responses, log_chars = resolve_response_logging()
     if log_responses:
@@ -395,6 +401,76 @@ def resolve_auth_token() -> str | None:
         "through a tunnel you control.")
 
 
+# One named token per agent (issue #108). A single shared token meant that
+# withdrawing one agent rotated every agent's token; a list lets one name be
+# removed and the rest keep working. Read from MCP_AGENT_TOKENS as
+# "name:token,name:token", beside the operator's own MCP_AUTH_TOKEN.
+_AGENT_NAME = re.compile(r"[A-Za-z0-9_.-]{1,40}")
+
+
+def resolve_agent_tokens(operator_token: str | None) -> dict:
+    """{agent name: token} from MCP_AGENT_TOKENS, or {} when it is unset.
+
+    A malformed list refuses to start, naming the entry by position and never
+    echoing a token: the message lands in a container log.
+    """
+    raw = os.environ.get("MCP_AGENT_TOKENS", "").strip()
+    if not raw:
+        return {}
+    tokens: dict = {}
+    for position, entry in enumerate(raw.split(","), start=1):
+        entry = entry.strip()
+        if not entry:
+            continue
+        name, sep, token = entry.partition(":")
+        name, token = name.strip(), token.strip()
+        where = f"MCP_AGENT_TOKENS entry {position}"
+        if not sep or not name or not token:
+            raise RuntimeError(f"{where} is not in the form name:token")
+        if not _AGENT_NAME.fullmatch(name):
+            raise RuntimeError(
+                f"{where}: the agent name must be 1-40 letters, digits, '_', "
+                f"'.' or '-', because it is written into every log line")
+        if len(token) < MIN_TOKEN_LENGTH:
+            raise RuntimeError(
+                f"{where} ({name}): the token is {len(token)} chars, minimum "
+                f"{MIN_TOKEN_LENGTH}. Generate one with: openssl rand -hex 32")
+        if name in tokens:
+            raise RuntimeError(f"{where}: the name {name!r} appears twice")
+        if token in tokens.values():
+            raise RuntimeError(
+                f"{where} ({name}) reuses another agent's token, so the two "
+                f"could not be told apart or withdrawn separately")
+        if operator_token and hmac.compare_digest(token, operator_token):
+            raise RuntimeError(
+                f"{where} ({name}) holds the operator token; give the agent "
+                f"its own so withdrawing it does not lock the operator out")
+        tokens[name] = token
+    return tokens
+
+
+def resolve_rate_limit() -> int | None:
+    """Requests per minute each agent may make, or None for no limit.
+
+    Every agent shares one SEC identity and one set of vendor keys, so one
+    agent in a loop could spend the rate limit the others depend on.
+    """
+    raw = os.environ.get("MCP_RATE_LIMIT_PER_MINUTE", "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        raise RuntimeError(
+            f"MCP_RATE_LIMIT_PER_MINUTE must be a whole number of requests, "
+            f"not {raw!r}") from None
+    if value < 1:
+        raise RuntimeError(
+            f"MCP_RATE_LIMIT_PER_MINUTE must be at least 1; unset it for no "
+            f"limit rather than setting {value}")
+    return value
+
+
 class BearerAuthMiddleware:
     """Reject requests without a matching bearer token.
 
@@ -403,13 +479,23 @@ class BearerAuthMiddleware:
     has no way to hold a token -- and both report the server's own state, never
     data. A readiness endpoint behind the token could not be used by the thing
     it exists for.
+
+    Besides the operator's token it accepts one named token per agent, records
+    the name on the request, and holds each agent (not the operator) to
+    `rate_limit` requests in any sixty seconds.
     """
 
     def __init__(self, app, token: str,
-                 exempt_paths: tuple = ("/health", "/ready")):
+                 exempt_paths: tuple = ("/health", "/ready"),
+                 agents: dict | None = None, rate_limit: int | None = None,
+                 clock=time.monotonic):
         self.app = app
         self._token = token
         self._exempt = tuple(exempt_paths)
+        self._credentials = [("operator", token)] + list((agents or {}).items())
+        self._rate_limit = rate_limit
+        self._clock = clock
+        self._windows: dict = {}
 
     async def __call__(self, scope, receive, send):
         if scope.get("type") != "http" or scope.get("path", "") in self._exempt:
@@ -426,8 +512,14 @@ class BearerAuthMiddleware:
                 break
 
         # compare_digest so a wrong token cannot be discovered a character at a
-        # time from response timing.
-        if not supplied or not hmac.compare_digest(supplied, self._token):
+        # time from response timing, and against every credential rather than
+        # stopping at the first match, so the timing does not say which one.
+        client = None
+        if supplied:
+            for name, token in self._credentials:
+                if hmac.compare_digest(supplied, token):
+                    client = name
+        if client is None:
             response = JSONResponse(
                 {"error": "unauthorized",
                  "detail": "A valid bearer token is required."},
@@ -436,7 +528,39 @@ class BearerAuthMiddleware:
             await response(scope, receive, send)
             return
 
+        if client != "operator" and self._rate_limit:
+            wait = self._spend(client)
+            if wait is not None:
+                print(f"[mcp_http] {client} refused: {self._rate_limit}/min "
+                      f"budget spent, retry in {wait}s", file=sys.stderr,
+                      flush=True)
+                response = JSONResponse(
+                    {"error": "rate_limited",
+                     "detail": (f"{client} has made {self._rate_limit} "
+                                f"requests in the last minute; retry in "
+                                f"{wait}s")},
+                    status_code=429, headers={"Retry-After": str(wait)})
+                await response(scope, receive, send)
+                return
+
+        scope.setdefault("state", {})["mcp_client"] = client
+        if client != "operator":
+            # The access log already has every request; this adds whose it
+            # was, which is the one thing it cannot say for a fleet.
+            print(f"[mcp_http] {client} {scope.get('method')} "
+                  f"{scope.get('path')}", file=sys.stderr, flush=True)
         await self.app(scope, receive, send)
+
+    def _spend(self, client: str) -> int | None:
+        """Record one request, or the seconds until the budget has room."""
+        now = self._clock()
+        window = self._windows.setdefault(client, collections.deque())
+        while window and now - window[0] >= 60.0:
+            window.popleft()
+        if len(window) >= self._rate_limit:
+            return max(1, math.ceil(60.0 - (now - window[0])))
+        window.append(now)
+        return None
 
 
 # ---------------------------------------------------------------------------
