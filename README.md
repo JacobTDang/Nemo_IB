@@ -1,6 +1,6 @@
 # Nemo_IB
 
-![Nemo IB in 22 seconds: the five servers, the point-in-time record, the replay result, and the status screen](docs/media/nemo-ib.gif)
+![Nemo IB in 23 seconds: an agent reads NVIDIA's revenue and share count from its filings, then one weekday of the jobs that run on their own](docs/media/nemo-ib.gif)
 
 This project has two parts. Five MCP servers read company, market, macro, and
 alternative financial data from primary sources. Scheduled jobs record what was
