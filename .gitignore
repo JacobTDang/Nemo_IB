@@ -44,3 +44,11 @@ testing/test_zz_rag_gate_probe.py
 
 # Left behind by `pip install -e .`, which is how `nemo` gets onto PATH.
 *.egg-info/
+
+# /brag launch-video runs: the plan, renders and scratch frames stay local.
+# The README GIF lives in docs/media/ instead, where GitHub can show it.
+brag-output*/
+
+# linkC, a local multi-agent tool, writes its inbox and handoff notes here
+# and has staged them on its own before. They are session chatter, not code.
+.linkc/
