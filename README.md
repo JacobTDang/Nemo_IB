@@ -1,6 +1,6 @@
 # Nemo_IB
 
-![Nemo IB in 23 seconds: an agent reads NVIDIA's revenue and share count from its filings, then one weekday of the jobs that run on their own](docs/media/nemo-ib.gif)
+![Nemo IB in 31 seconds, as a trading terminal: an agent reads NVIDIA's 10-K, 10-Q and 8-Ks, its industry, suppliers, insiders, Congress trades and Treasury yields, then one weekday of the scheduled jobs runs on its own](docs/media/nemo-ib.gif)
 
 This project has two parts. Five MCP servers read company, market, macro, and
 alternative financial data from primary sources. Scheduled jobs record what was
