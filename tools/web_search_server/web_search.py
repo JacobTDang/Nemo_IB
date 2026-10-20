@@ -1581,7 +1581,17 @@ warnings_per_tool={
 
   async def get_latest_filing(self, ticker: str, form_type: str = '10-K') -> List[TextContent]:
     # Note: This returns filing metadata, not the full filing object (which isn't JSON serializable)
-    result = await asyncio.to_thread(get_latest_filing, ticker, form_type)
+    try:
+      result = await asyncio.to_thread(get_latest_filing, ticker, form_type)
+    except Exception as e:  # noqa: BLE001 - reported, not swallowed
+      # A ticker SEC does not map is refused here, with its reason. Folded
+      # into "No filing found" it read as a fact about the filer (#136).
+      return [TextContent(type="text", text=safe_json_dumps({
+        'ticker': ticker,
+        'form_type': form_type,
+        'error': f'{type(e).__name__}: {e}',
+        'success': False
+      }))]
     if result:
       # Convert to JSON-serializable format
       json_result = {

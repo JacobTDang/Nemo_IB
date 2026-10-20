@@ -53,8 +53,7 @@ from datetime import date, timedelta
 from math import gcd, log, prod
 from typing import Any, Dict, List, Optional, Tuple
 
-from edgar import Company
-
+from . import registrant
 from .foreign_issuer import form_mismatch_note, not_covered_reason
 from .sec_series import NotCovered, _require_identity, fetch_concept_series
 
@@ -943,7 +942,7 @@ def get_shelf_activity(ticker: str, lookback_days: int = 730) -> Dict[str, Any]:
     """
     try:
         _require_identity()
-        company = Company(ticker)
+        company = registrant.company(ticker)
         cutoff = date.today() - timedelta(days=lookback_days)
 
         def _recent(form_name: str) -> List[Dict[str, Any]]:

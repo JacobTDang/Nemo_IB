@@ -363,7 +363,7 @@ def _fake_edgar(monkeypatch, frame, contexts=None):
 
     monkeypatch.setattr(ss, "_require_identity", lambda: "test")
     filings = [_FakeFiling(frame, contexts or {})]
-    monkeypatch.setattr(ss, "Company", lambda ticker: type("C", (), {
+    monkeypatch.setattr(ss.registrant, "company", lambda ticker: type("C", (), {
         "get_filings": lambda self, form, amendments=True: type("F", (), {
             "head": lambda self, limit: filings})()})())
 
@@ -460,7 +460,7 @@ def test_amendments_are_excluded_from_the_filing_walk(monkeypatch):
         return type("F", (), {"head": lambda self, limit: filings})()
 
     monkeypatch.setattr(ss, "_require_identity", lambda: "test")
-    monkeypatch.setattr(ss, "Company", lambda ticker: type(
+    monkeypatch.setattr(ss.registrant, "company", lambda ticker: type(
         "C", (), {"get_filings": get_filings})())
 
     fetch_concept_series("TSLA", "us-gaap:Assets", form="10-K", limit=1)

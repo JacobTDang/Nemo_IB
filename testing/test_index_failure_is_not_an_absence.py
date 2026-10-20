@@ -43,8 +43,7 @@ class _Throttled:
 
 
 def _install(monkeypatch, company):
-    import edgar
-    monkeypatch.setattr(edgar, "Company", company)
+    monkeypatch.setattr(fi.registrant, "company", lambda ticker: company())
 
 
 def test_a_throttled_index_is_not_reported_as_no_filings(monkeypatch):

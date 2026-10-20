@@ -40,7 +40,7 @@ from tools.web_search_server import debt_maturity as dm
 from tools.web_search_server import foreign_issuer as fi
 from tools.web_search_server import forward_metrics as fm
 from tools.web_search_server import sbc
-from tools.web_search_server import sec_series
+from tools.web_search_server import registrant, sec_series
 from tools.web_search_server import shared_filings
 from tools.web_search_server.sec_series import ConceptFact, FilingPoint
 
@@ -97,7 +97,7 @@ def edgar(monkeypatch):
             counters["amendments"] = amendments
             return filings
 
-    monkeypatch.setattr(sec_series, "Company", _FakeCompany)
+    monkeypatch.setattr(registrant, "company", _FakeCompany)
     monkeypatch.setattr(sec_series, "_require_identity",
                         lambda: "test@example.invalid")
     monkeypatch.setattr(sec_series, "_throttle", lambda: None)
@@ -325,7 +325,7 @@ def test_a_replaced_seam_stands_the_shared_walk_down(module, tool, monkeypatch):
     def explode(*args, **kwargs):  # pragma: no cover - must never run
         raise AssertionError("the shared walk ran despite a replaced seam")
 
-    monkeypatch.setattr(sec_series, "Company", explode)
+    monkeypatch.setattr(registrant, "company", explode)
 
     result = getattr(module, tool)("FAKE")
 

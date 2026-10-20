@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
+from . import registrant
 from .sec_series import _require_identity, _throttle
 
 _TICKER_MAP_URL = "https://www.sec.gov/files/company_tickers.json"
@@ -65,10 +66,8 @@ def _ticker_map() -> Dict[int, Tuple[str, str]]:
 
 
 def _company_sic(ticker: str) -> Tuple[Optional[str], Optional[str], Optional[int]]:
-    from edgar import Company
-
     _require_identity()
-    company = Company(ticker)
+    company = registrant.company(ticker)
     return (getattr(company, "sic", None),
             getattr(company, "industry", None),
             getattr(company, "cik", None))

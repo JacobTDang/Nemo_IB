@@ -107,7 +107,7 @@ def test_a_throttled_form_query_is_not_reported_as_zero_activists(monkeypatch):
             return []
 
     monkeypatch.setattr(su, "_require_identity", lambda: "test@example.com")
-    monkeypatch.setattr(su, "Company", lambda t: _Throttled())
+    monkeypatch.setattr(su.registrant, "company", lambda t: _Throttled())
 
     result = su.get_schedule_13d_filings("INTC")
 

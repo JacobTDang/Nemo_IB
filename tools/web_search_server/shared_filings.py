@@ -41,7 +41,7 @@ import time
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, Iterator, List, Tuple
 
-from . import sec_series
+from . import registrant, sec_series
 from .sec_series import NotCovered
 
 
@@ -147,7 +147,7 @@ class SharedFilings:
             return cached
 
         sec_series._require_identity()
-        company = sec_series.Company(self._ticker)
+        company = registrant.company(self._ticker)
         # amendments=False for the reason fetch_concept_series gives: a 10-K/A
         # carrying only Part III takes a slot in the walk and hides the real
         # 10-K behind it.
