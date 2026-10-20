@@ -135,7 +135,7 @@ x-server: &server
   # Rotating on size rather than on a timer is deliberate: a daily reset does
   # not bound the worst case, because a runaway loop fills the disk long before
   # midnight. This caps each service at 30MB total, whatever happens.
-  logging:
+  logging: &server-logging
     driver: json-file
     options:
       max-size: "10m"
@@ -158,7 +158,7 @@ x-server: &server
   # service; losing it on every restart would make the pipeline unusable.
   volumes:
     - congress-data:/app/data
-  healthcheck:
+  healthcheck: &server-healthcheck
     # No curl in the runtime stage; python is what the image has.
     #
     # /ready, not /health. /health only proves the port is bound and the app
@@ -263,6 +263,36 @@ services:
       # healthcheck red.
       CONGRESS_API_KEY: ${CONGRESS_API_KEY:-}
       FINMIND_TOKEN: ${FINMIND_TOKEN:-}
+
+  # The five servers behind one URL (tools/gateway.py), so a client registers
+  # one entry rather than five. It forwards each call to the server that serves
+  # the tool, over this file's network, with the operator token.
+  #
+  # Not `<<: *server`. The gateway reads no filing and no congressional
+  # store, so it takes neither tmpfs nor the volume, and it is handed no
+  # data-source key: each server keeps only the keys its own code reads.
+  nemo:
+    image: ${NEMO_IMAGE:-nemo-data:local}
+    container_name: nemo-gateway
+    restart: unless-stopped
+    logging: *server-logging
+    healthcheck: *server-healthcheck
+    # The size of the smallest server's limit. It holds a tool list and the
+    # calls in flight, and reads no filing.
+    mem_limit: 256m
+    command: python -m tools.gateway http
+    ports: ["${NEMO_BIND_ADDR:-127.0.0.1}:8815:8080"]
+    environment:
+      <<: *server-env
+      # Every data server, by its service name. testing/test_gateway.py fails
+      # when a server in the image is missing from this list.
+      MCP_GATEWAY_BACKENDS: sec=http://sec:8080/mcp/,financial=http://financial:8080/mcp/,finnhub=http://finnhub:8080/mcp/,fred=http://fred:8080/mcp/,altdata=http://altdata:8080/mcp/
+    depends_on:
+      sec: {condition: service_healthy}
+      financial: {condition: service_healthy}
+      finnhub: {condition: service_healthy}
+      fred: {condition: service_healthy}
+      altdata: {condition: service_healthy}
 
   # -------------------------------------------------------------------------
   # The scheduled jobs. Everything below binds no port, serves nothing and

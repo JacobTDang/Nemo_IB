@@ -56,8 +56,23 @@ flag those names resolve to empty and the servers come up with no credentials
 and no token. They say so — `/ready` answers 503 and `resolve_auth_token`
 refuses to start — but the flag is what stops it happening.
 
-Then point the client at each one, with `Authorization: Bearer $NEMO_MCP_TOKEN`
-on every request:
+Then point the client at the gateway, with `Authorization: Bearer $NEMO_MCP_TOKEN`
+on every request. One entry serves all 96 tools:
+
+```
+nemo            http://<host>:8815/mcp/
+```
+
+The gateway (`tools.gateway`, the `nemo` service) forwards each call to the
+server that serves the tool, over the compose network, with the operator token.
+It holds no data-source key, so each server still holds only the keys its own
+code reads. A server that does not answer makes the gateway's tool list fail
+with that server's name, not shrink: a list four servers long would read to a
+client as a smaller product rather than an outage. `testing/test_gateway.py`
+fails when a server in the image is missing from the gateway's list.
+
+Each server also answers on its own port, for a client that wants one server
+only:
 
 ```
 nemo-sec        http://<host>:8810/mcp/
@@ -976,8 +991,8 @@ export NEMO_MCP_TOKEN=$(openssl rand -hex 32)
 docker compose --env-file ../.env up -d
 ```
 
-Then register `http://<host>:8810/mcp/` in the client, with the header
-`Authorization: Bearer $NEMO_MCP_TOKEN`.
+Then register the gateway, `http://<host>:8815/mcp/`, in the client, with the
+header `Authorization: Bearer $NEMO_MCP_TOKEN`.
 
 **A server with no token refuses to start.** Defaulting to open means one
 forgotten variable silently publishes every tool while the running server looks
@@ -1009,7 +1024,9 @@ working beside them and is never limited.
 
 Each agent sends its own token as `Authorization: Bearer <token>`. Every agent
 request is logged with its name (`[mcp_http] grok-2 POST /mcp/`), which the
-access log alone cannot say for a fleet. An agent over its budget gets `429`
+access log alone cannot say for a fleet. Through the gateway, the name is in the
+gateway's log (`docker logs nemo-gateway`), and the server behind it logs the
+call as the operator's. An agent over its budget gets `429`
 with a `Retry-After` in seconds, and the refusal is logged by name. The budget
 exists because every agent shares one `SEC_EMAIL` identity and one set of
 vendor keys: an agent stuck in a loop would otherwise spend the SEC's rate

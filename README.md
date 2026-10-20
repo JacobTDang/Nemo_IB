@@ -55,18 +55,21 @@ the problems that a passing test suite does not find.
 
 ### Registering with an MCP client
 
-The servers use streamable HTTP with a bearer token. Register one entry for
-each server:
+The servers use streamable HTTP with a bearer token. Register one entry, for the
+gateway:
 
 ```json
 {
-  "nemo-sec":       { "transport": "http", "url": "http://127.0.0.1:8810/mcp/" },
-  "nemo-financial": { "transport": "http", "url": "http://127.0.0.1:8811/mcp/" },
-  "nemo-finnhub":   { "transport": "http", "url": "http://127.0.0.1:8812/mcp/" },
-  "nemo-fred":      { "transport": "http", "url": "http://127.0.0.1:8813/mcp/" },
-  "nemo-altdata":   { "transport": "http", "url": "http://127.0.0.1:8814/mcp/" }
+  "nemo": { "transport": "http", "url": "http://127.0.0.1:8815/mcp/" }
 }
 ```
+
+The gateway serves the tools of all five servers at one URL. It sends each call
+to the server that serves the tool. It holds no data-source key. If a server
+does not answer, the tool list fails and names that server.
+
+Each server also answers on its own port, 8810 to 8814, for a client that needs
+one server only. [`deploy/README.md`](deploy/README.md) lists the ports.
 
 Each entry needs `Authorization: Bearer $NEMO_MCP_TOKEN`. The trailing slash on
 `/mcp/` is necessary. Without the slash, the server answers `307`. Some clients
