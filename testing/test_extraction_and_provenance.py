@@ -277,6 +277,31 @@ def test_the_same_sentence_is_not_counted_twice():
   assert len(keys) == len(set(keys)), keys
 
 
+# The same disclosure as NVDA's notes to the financial statements print it.
+# There the percentages are inline XBRL facts, and edgartools 5.62 renders each
+# fact and its "%" as two words. 5.8.0 dropped the facts altogether ("Three
+# direct customers accounted for 25 18 13 17 16"), so this third copy never
+# reached the scanner before the upgrade (#138).
+NVDA_NOTES_TEXT = (
+  "Direct Customers - For fiscal year 2026, sales to one direct customer "
+  "represented 22 % of total revenue and sales to another direct customer "
+  "represented 14 % of total revenue, all of which were primarily attributable "
+  "to the Compute & Networking segment."
+)
+
+
+def test_a_percentage_rendered_with_a_space_is_the_same_disclosure():
+  """Read as "22" and "%", the notes' copy added a word the other two lack,
+  so it was kept as a new customer: FY2026 totalled 72% of revenue from two
+  customers of 22% and 14%."""
+  found = sec_utils._scan_customer_concentration(
+    NVDA_TEXT + "\n\n" + NVDA_NOTES_TEXT)
+  rows = [r for r in found['customer_disclosures'] if r['fiscal_year'] == 2026]
+  assert sorted(r['pct_of_revenue'] for r in rows) == [14.0, 22.0], rows
+  periods = {p['fiscal_year']: p for p in found['periods']}
+  assert periods[2026]['total_pct'] == 36.0
+
+
 def test_each_disclosure_carries_the_fiscal_year_it_describes():
   """Three fiscal years were interleaved in one flat list with no year field,
   so 12% (FY2025) read as a second FY2026 customer. Without the year the rows
@@ -353,7 +378,12 @@ def test_nvda_live_concentration_has_no_duplicates_and_no_impossible_period():
   result = sec_utils.extract_customer_concentration('NVDA', '10-K')
   assert result['success'] is True, result.get('error')
   rows = result['customer_disclosures']
-  keys = [(r['pct_of_revenue'], r['fiscal_year']) for r in rows]
+  # Keyed on the basis and both shares. Since edgartools 5.62 renders the
+  # notes, NVDA's two accounts-receivable disclosures arrive too, and each has
+  # no revenue share and no fiscal year: two receivables rows are not one
+  # revenue row printed twice.
+  keys = [(r['basis'], r['pct_of_revenue'], r['pct_of_receivables'],
+           r['fiscal_year']) for r in rows]
   assert len(keys) == len(set(keys)), keys
   for period in result['periods']:
     assert period['total_pct'] <= 100, period
