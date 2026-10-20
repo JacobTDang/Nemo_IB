@@ -73,6 +73,12 @@ PS_LINES = [
      "Publishers": [{"URL": "127.0.0.1", "TargetPort": 8080,
                      "PublishedPort": 8810, "Protocol": "tcp"}],
      "Name": "nemo-sec"},
+    # The gateway, added in the same shape when it joined the stack.
+    {"Service": "nemo", "State": "running", "Health": "healthy",
+     "Status": "Up 2 days (healthy)", "ExitCode": 0,
+     "Publishers": [{"URL": "127.0.0.1", "TargetPort": 8080,
+                     "PublishedPort": 8815, "Protocol": "tcp"}],
+     "Name": "nemo-gateway"},
 ]
 
 
@@ -286,7 +292,7 @@ def test_the_published_port_is_on_the_table(docker, capsys):
     assert "8810" in capsys.readouterr().out
 
 
-def test_five_healthy_servers_exit_zero(docker):
+def test_a_healthy_stack_exits_zero(docker):
     assert cli.main(["services"], run=FakeRun(_done(0, _ps(PS_LINES)))) == 0
 
 
@@ -311,8 +317,8 @@ def test_a_server_that_is_up_but_not_healthy_exits_non_zero(docker):
 
 
 def test_an_exited_batch_job_is_not_a_reason_to_fail(docker):
-    """Every job under the `sync` profile is meant to exit. Only the five
-    long-running servers are held to running-and-healthy."""
+    """Every job under the `sync` profile is meant to exit. Only the
+    long-running services are held to running-and-healthy."""
     assert cli.main(["services"], run=FakeRun(_done(0, _ps(PS_LINES)))) == 0
 
 
@@ -397,7 +403,8 @@ def test_the_servers_are_the_services_that_are_not_batch_jobs():
         (ROOT / "deploy" / "docker-compose.yml").read_text())["services"]
     expected = {n for n, s in services.items() if "profiles" not in s}
     assert set(cli.servers()) == expected
-    assert expected == {"sec", "financial", "finnhub", "fred", "altdata"}
+    assert expected == {"sec", "financial", "finnhub", "fred", "altdata",
+                        "nemo"}
 
 
 def test_the_default_store_is_anchored_to_the_repository(monkeypatch):

@@ -169,8 +169,9 @@ def servers() -> List[str]:
     """The long-running services, in the order the compose file declares them.
 
     A service under a profile is a batch job: `docker compose up` starts none
-    of them and every one is meant to exit. Only these five are held to
-    running-and-healthy, because only these five are supposed to be up.
+    of them and every one is meant to exit. Only the five servers and the
+    gateway in front of them are held to running-and-healthy, because only
+    they are supposed to be up.
     """
     return [name for name, block in _service_blocks().items()
             if not any(_PROFILES_RE.match(line) for line in block)]
@@ -300,7 +301,8 @@ def _table(rows: List[Tuple[str, ...]]) -> str:
 
 def services_report(run: Callable[..., subprocess.CompletedProcess]
                     ) -> Tuple[str, int]:
-    """The table, and 0 only when all five servers are running and healthy.
+    """The table, and 0 only when every server and the gateway are running and
+    healthy.
 
     `-a` is the whole point. Without it a batch job that has already exited is
     absent, and so is a server whose container died -- and a table missing the
