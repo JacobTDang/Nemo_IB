@@ -20,8 +20,10 @@ as this host happens to.
 import asyncio
 import importlib
 import inspect
+import os
 import pathlib
 import re
+import subprocess
 
 import mcp.types as types
 import pytest
@@ -242,6 +244,11 @@ CRON = re.compile(
 RUNS = re.compile(r"docker compose\b[^\n]*?run --rm ([a-z][a-z0-9-]*)")
 
 
+def _uncommented(text):
+    """The compose file carries its cron lines as comments."""
+    return re.sub(r"^\s*#", "", text, flags=re.M)
+
+
 @pytest.fixture(scope="module")
 def deploy_doc():
     return DEPLOY.read_text()
@@ -273,8 +280,14 @@ def test_every_service_the_page_names_exists(deploy_doc, compose):
 
 def test_every_scheduled_service_is_on_the_page(compose, deploy_doc):
     """The other direction. A job added to the stack and left undocumented is
-    one nobody schedules, and a recorder nobody schedules records nothing."""
-    scheduled = set(re.findall(RUNS.pattern + r"\s*$", compose, re.M))
+    one nobody schedules, and a recorder nobody schedules records nothing.
+
+    Read off the compose file's cron lines, every service on each. It was a
+    service name at the end of a line, and a cron line no longer ends in one:
+    it ends in the log it keeps (issue #132)."""
+    scheduled = {service for _, command in _cron_lines(_uncommented(compose))
+                 for service in RUNS.findall(command)}
+    assert scheduled, "the compose file carries no cron lines"
     documented = set(RUNS.findall(deploy_doc))
     missing = scheduled - documented
     assert not missing, f"scheduled but not documented: {sorted(missing)}"
@@ -334,6 +347,191 @@ def test_nothing_schedules_the_recorder_and_the_scan_at_two_clock_times(
         f"{timed} still schedules the recorder or the scan on its own clock "
         f"time; a recorder that overruns is then a scan on a half-written "
         f"store")
+
+
+# --- a failed cron line has to reach somebody (issue #132) --------------------
+#
+# Cron reports a failure one way: it mails what the line printed. A stock
+# Ubuntu cloud image has no mail transfer agent, and on the homelab every line
+# ended in "(CRON) info (No MTA installed, discarding output)". The jobs run
+# with `--rm`, so the container log went with them, and `run_log` has no row
+# for a job that died before `start_run` -- nor for congress-sync or the backup
+# at all.
+#
+# So each line appends all it prints to a file under /srv/nemo/logs, which a
+# host with no mail still keeps, and prints the end of that file only when it
+# fails, which is the one time cron should mail. A line that logs and prints
+# nothing keeps the output and tells nobody.
+#
+# Run, not read: each line goes through `/bin/sh -c` as cron runs it, with
+# `docker` and `flock` stubbed, so a redirect that misses half the command or a
+# chain that lost its meaning inside the braces fails here.
+
+LOGS = "/srv/nemo/logs"
+LOG_REDIRECT = re.compile(r">> (/srv/nemo/logs/[\w.-]+\.log) 2>&1")
+
+# The only absolute paths a line may name. The test moves these three into a
+# temporary directory; anything else would be touched on the machine running
+# the tests.
+_HOST_PATHS = ("/srv/nemo/deploy", LOGS, "/var/lock")
+
+# `docker` prints on both streams, and fails when told to: for every call, or
+# for a call naming one service. `flock` runs its command, or does what
+# util-linux `flock -n` does on a held lock: exit 1 and print nothing.
+_DOCKER_STUB = """#!/bin/sh
+echo "stdout of docker $*"
+echo "stderr of docker $*" >&2
+[ "$FAIL" = every ] && exit 1
+case " $* " in *" $FAIL "*) [ -n "$FAIL" ] && exit 1 ;; esac
+exit 0
+"""
+_FLOCK_STUB = """#!/bin/sh
+[ -n "$LOCK_HELD" ] && exit 1
+shift 2
+exec "$@"
+"""
+
+
+def _every_cron_line(deploy_doc, compose):
+    """Both files carry the lines, and an operator can copy either."""
+    lines = sorted(set(_cron_lines(deploy_doc))
+                   | set(_cron_lines(_uncommented(compose))))
+    assert lines, "no cron lines on the page or in the compose file"
+    return lines
+
+
+def _log_of(command):
+    kept = LOG_REDIRECT.search(command)
+    assert kept, (
+        f"'{command}' keeps no log under {LOGS}; on a host with no mail its "
+        f"output is gone")
+    return kept.group(1)
+
+
+def _run_as_cron(command, root, **env):
+    """One line through `/bin/sh -c`, nothing on a terminal, as cron runs it.
+    Returns what cron would mail, and the log the line kept."""
+    for path in re.findall(r"(?<![\w.])/[\w./-]+", command):
+        assert path.startswith(_HOST_PATHS), (
+            f"'{command}' names {path}; running it would touch this machine")
+    log = _log_of(command)
+    stubs = root / "bin"
+    stubs.mkdir(parents=True)
+    for name, body in (("docker", _DOCKER_STUB), ("flock", _FLOCK_STUB)):
+        (stubs / name).write_text(body)
+        (stubs / name).chmod(0o755)
+    for directory in ("deploy", "logs", "lock"):
+        (root / directory).mkdir()
+    local = (command.replace("/srv/nemo/deploy", str(root / "deploy"))
+             .replace(LOGS, str(root / "logs"))
+             .replace("/var/lock", str(root / "lock")))
+    ran = subprocess.run(
+        ["/bin/sh", "-c", local], capture_output=True, text=True, timeout=30,
+        env={"PATH": f"{stubs}{os.pathsep}{os.environ['PATH']}", **env})
+    kept = root / "logs" / log[len(LOGS) + 1:]
+    return ran.stdout + ran.stderr, kept.read_text() if kept.exists() else ""
+
+
+def test_every_cron_line_keeps_its_output_and_mails_nothing_when_it_succeeds(
+        deploy_doc, compose, tmp_path):
+    """Both streams into the log, appended, for the whole command. A redirect
+    on the last command alone leaves the rest to cron's mail on every run, and
+    a mail on every run is one nobody reads."""
+    for n, (schedule, command) in enumerate(
+            _every_cron_line(deploy_doc, compose)):
+        assert "%" not in command, (
+            f"'{command}': cron turns `%` into a newline and cuts the line")
+        mailed, log = _run_as_cron(command, tmp_path / f"line{n}")
+        assert mailed == "", (
+            f"'{schedule} {command}' prints {mailed!r} on success, which cron "
+            f"mails every time it runs")
+        assert "stdout of docker" in log and "stderr of docker" in log, (
+            f"'{command}' does not keep both streams in its log: {log!r}")
+
+
+def test_every_cron_line_prints_its_output_when_it_fails(deploy_doc, compose,
+                                                         tmp_path):
+    """The one thing cron mails. A line that logs a failure and prints nothing
+    keeps the evidence on a host nobody is reading."""
+    for n, (schedule, command) in enumerate(
+            _every_cron_line(deploy_doc, compose)):
+        mailed, log = _run_as_cron(command, tmp_path / f"line{n}",
+                                   FAIL="every")
+        assert "stderr of docker" in mailed, (
+            f"'{schedule} {command}' failed and printed {mailed!r}; cron has "
+            f"nothing to mail")
+        assert "stderr of docker" in log, (
+            f"'{command}' failed and kept no output in its log")
+
+
+def test_a_run_refused_by_its_lock_still_prints_something(deploy_doc, compose,
+                                                          tmp_path):
+    """`flock -n` on a held lock exits 1 and prints nothing. The end of a
+    fresh log is then empty, and a failure with no output is no mail at all.
+    The line writes the date first, so the failed run always has a line."""
+    locked = [(schedule, command) for schedule, command in
+              _every_cron_line(deploy_doc, compose) if "flock -n" in command]
+    assert locked, "no cron line takes a lock"
+    for n, (schedule, command) in enumerate(locked):
+        mailed, _ = _run_as_cron(command, tmp_path / f"line{n}",
+                                 LOCK_HELD="1")
+        assert mailed.strip(), (
+            f"'{schedule} {command}' was refused by its lock and printed "
+            f"nothing; cron mails nothing and the skipped run is silent")
+
+
+def test_a_failed_recorder_still_stops_the_scan_inside_the_logged_line(
+        deploy_doc, compose, tmp_path):
+    """The braces that send the chain to one log must not change what `&&`
+    means: no scan after a recorder that failed."""
+    chained = [command for _, command in _every_cron_line(deploy_doc, compose)
+               if "research-scan" in command]
+    assert chained, "nothing schedules research-scan"
+    for n, command in enumerate(chained):
+        mailed, log = _run_as_cron(command, tmp_path / f"line{n}",
+                                   FAIL="research-daily")
+        assert "run --rm research-daily" in log, log
+        assert "run --rm research-scan" not in log, (
+            f"'{command}' ran the scan after the recorder failed")
+        assert "run --rm research-daily" in mailed, (
+            f"'{command}': the recorder failed and nothing was printed")
+
+
+def test_the_cron_block_names_where_a_failure_is_mailed(deploy_doc):
+    """Cron mails the crontab's owner when `MAILTO` is unset, which on a
+    server is a local mailbox nobody opens. The block sets it above the first
+    job, so every job line below it uses it."""
+    blocks = [b for b in re.findall(r"```cron\n(.*?)```", deploy_doc, re.S)
+              if "research-daily" in b]
+    assert blocks, "no cron block on the page schedules research-daily"
+    for block in blocks:
+        mailto = re.search(r"^MAILTO=\S+@\S+$", block, re.M)
+        first_job = re.search(r"^.*cd /srv/nemo/deploy && ", block, re.M)
+        assert mailto and mailto.start() < first_job.start(), (
+            f"the cron block does not set MAILTO above its first job:\n{block}")
+
+
+def test_every_log_the_cron_lines_keep_is_rotated(deploy_doc, compose):
+    """The logs are on host disk, which nothing else here bounds.
+
+    `copytruncate`, because the shell holds a line's log open for the whole
+    run. Rotated by rename instead, a run that spans the rotation writes into
+    the old file, and its `tail` on failure reads the new, empty one: a failed
+    run that mails nothing."""
+    import fnmatch
+
+    stanza = re.search(r"^\s*(/srv/nemo/logs/\S+) \{\n(.*?)^\s*\}",
+                       deploy_doc, re.M | re.S)
+    assert stanza, "the page has no logrotate stanza for /srv/nemo/logs"
+    pattern, body = stanza.groups()
+    for _, command in _every_cron_line(deploy_doc, compose):
+        assert fnmatch.fnmatch(_log_of(command), pattern), (
+            f"'{command}' keeps a log that {pattern} does not rotate")
+    directives = {line.split()[0] for line in body.splitlines()
+                  if line.strip()}
+    for needed in ("rotate", "maxsize", "copytruncate"):
+        assert needed in directives, (
+            f"the logrotate stanza has no `{needed}`:\n{body}")
 
 
 # --- the watcher's cap has to fit its own interval ----------------------------

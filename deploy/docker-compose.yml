@@ -275,6 +275,12 @@ services:
   # second one exit non-zero immediately rather than wait, because a skipped
   # pass that says nothing is indistinguishable from one that never fired.
   #
+  # Every line also appends its output to a log under /srv/nemo/logs, and
+  # prints the end of that log only when it fails. Cron mails only what a line
+  # prints, so it mails only a failure, and a host with no mail transfer agent
+  # still keeps the output. deploy/README.md has the host setup (MAILTO, an MTA,
+  # logrotate); issue #132 is what a host without it lost.
+  #
   # And `--rm` is not a guarantee. Removal happens in the compose CLI after the
   # container exits, so a host reboot mid-job kills the CLI and leaves the
   # container in Exited forever. These services set no container_name, so each
@@ -286,12 +292,12 @@ services:
   # So: sweep them. The label is what keeps this off every other project's
   # exited containers on the same host, and its value is this directory's name,
   # which is where compose gets the project name from -- hence the cd.
-  #   0 4 * * * cd /srv/nemo/deploy && docker container prune -f --filter until=24h --filter label=com.docker.compose.project=deploy
+  #   0 4 * * * cd /srv/nemo/deploy && { date -u; docker container prune -f --filter until=24h --filter label=com.docker.compose.project=deploy; } >> /srv/nemo/logs/docker-prune.log 2>&1 || tail -n 100 /srv/nemo/logs/docker-prune.log
   #
   # And the healthcheck, which exits non-zero when a job has stopped
   # running. Midday on a weekday, so a night that failed is seen the
   # same day rather than the next time somebody looks:
-  #   0 12 * * 1-5 cd /srv/nemo/deploy && docker compose --env-file ../.env run --rm research-status
+  #   0 12 * * 1-5 cd /srv/nemo/deploy && { date -u; docker compose --env-file ../.env run --rm research-status; } >> /srv/nemo/logs/research-status.log 2>&1 || tail -n 100 /srv/nemo/logs/research-status.log
   #
   # A reboot mid-job does NOT block the next run, and that part is well built:
   # start_run (research/pit_store.py) only INSERTs, and missing_days counts a
@@ -309,7 +315,7 @@ services:
   #
   # Safe to re-run and safe to cron: filings already parsed are never
   # refetched, so a nightly run costs one index fetch plus whatever is new.
-  #   0 6 * * * cd /srv/nemo/deploy && flock -n /var/lock/nemo-congress-sync.lock docker compose --env-file ../.env run --rm congress-sync
+  #   0 6 * * * cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-congress-sync.lock docker compose --env-file ../.env run --rm congress-sync; } >> /srv/nemo/logs/congress-sync.log 2>&1 || tail -n 100 /srv/nemo/logs/congress-sync.log
   #
   # Deliberately NOT built from the *server anchor. That anchor requires
   # NEMO_MCP_TOKEN, and compose interpolates the whole file before merging, so
@@ -372,7 +378,7 @@ services:
   #
   # After the close, allowing for late consolidated prints -- with the scan
   # chained onto the same line rather than given a clock time of its own:
-  #   30 22 * * 1-5 cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-daily.lock docker compose --env-file ../.env run --rm research-daily && flock -n /var/lock/nemo-research-scan.lock docker compose --env-file ../.env run --rm research-scan
+  #   30 22 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-daily.lock docker compose --env-file ../.env run --rm research-daily && flock -n /var/lock/nemo-research-scan.lock docker compose --env-file ../.env run --rm research-scan; } >> /srv/nemo/logs/research-daily.log 2>&1 || tail -n 100 /srv/nemo/logs/research-daily.log
   #
   # This was two lines thirty minutes apart, which is a guess rather than a
   # dependency. The recorder does 15+ yfinance batches with retries, screens
@@ -483,7 +489,7 @@ services:
   #
   # Every twenty minutes through the session and a little past the close,
   # which is when 13Ds actually appear:
-  #   */20 13-23 * * 1-5 cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-watch.lock docker compose --env-file ../.env run --rm research-watch
+  #   */20 13-23 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-watch.lock docker compose --env-file ../.env run --rm research-watch; } >> /srv/nemo/logs/research-watch.log 2>&1 || tail -n 100 /srv/nemo/logs/research-watch.log
   research-watch:
     image: ${NEMO_IMAGE:-nemo-data:local}
     profiles: ["sync"]
@@ -535,7 +541,7 @@ services:
   #   docker compose --env-file ../.env run --rm research-score
   #   docker compose --env-file ../.env run --rm research-score --horizon-days 40
   #
-  #   0 7 * * 6 cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-score.lock docker compose --env-file ../.env run --rm research-score
+  #   0 7 * * 6 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-score.lock docker compose --env-file ../.env run --rm research-score; } >> /srv/nemo/logs/research-score.log 2>&1 || tail -n 100 /srv/nemo/logs/research-score.log
   research-score:
     image: ${NEMO_IMAGE:-nemo-data:local}
     profiles: ["sync"]
@@ -579,8 +585,8 @@ services:
   #
   # Submitted before the opening auction's 09:28 ET cutoff in both EDT and EST,
   # collected after the 09:30 open in both:
-  #   15 13 * * 1-5 cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-fills.lock docker compose --env-file ../.env run --rm research-fills submit
-  #   45 14 * * 1-5 cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-fills.lock docker compose --env-file ../.env run --rm research-fills collect
+  #   15 13 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-fills.lock docker compose --env-file ../.env run --rm research-fills submit; } >> /srv/nemo/logs/research-fills.log 2>&1 || tail -n 100 /srv/nemo/logs/research-fills.log
+  #   45 14 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-fills.lock docker compose --env-file ../.env run --rm research-fills collect; } >> /srv/nemo/logs/research-fills.log 2>&1 || tail -n 100 /srv/nemo/logs/research-fills.log
   research-fills:
     image: ${NEMO_FILLS_IMAGE:-nemo-fills:local}
     profiles: ["sync"]
@@ -617,7 +623,7 @@ services:
   # Safe to re-run: a quarter already in the record is never overwritten,
   # because a real observation outranks a reconstruction of it. Monthly is
   # plenty -- it only picks up names newly in the universe.
-  #   0 8 1 * * cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-seed.lock docker compose --env-file ../.env run --rm research-seed
+  #   0 8 1 * * cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-seed.lock docker compose --env-file ../.env run --rm research-seed; } >> /srv/nemo/logs/research-seed.log 2>&1 || tail -n 100 /srv/nemo/logs/research-seed.log
   research-seed:
     image: ${NEMO_IMAGE:-nemo-data:local}
     profiles: ["sync"]
@@ -649,7 +655,7 @@ services:
   #   docker compose --env-file ../.env run --rm research-announce --tickers JPM WMT TGT
   #
   # Safe to re-run and cheap after the first pass. Weekly is plenty:
-  #   0 9 * * 6 cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-announce.lock docker compose --env-file ../.env run --rm research-announce
+  #   0 9 * * 6 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-announce.lock docker compose --env-file ../.env run --rm research-announce; } >> /srv/nemo/logs/research-announce.log 2>&1 || tail -n 100 /srv/nemo/logs/research-announce.log
   research-announce:
     image: ${NEMO_IMAGE:-nemo-data:local}
     profiles: ["sync"]
@@ -687,7 +693,7 @@ services:
   # off the host as well -- a backup on the machine that dies is not a backup.
   #
   #   docker compose --env-file ../.env run --rm research-backup
-  #   15 3 * * * cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-backup.lock docker compose --env-file ../.env run --rm research-backup
+  #   15 3 * * * cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-backup.lock docker compose --env-file ../.env run --rm research-backup; } >> /srv/nemo/logs/research-backup.log 2>&1 || tail -n 100 /srv/nemo/logs/research-backup.log
   research-backup:
     image: ${NEMO_IMAGE:-nemo-data:local}
     profiles: ["sync"]

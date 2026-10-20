@@ -238,6 +238,12 @@ the operator to ignore the alert that matters.
 The cron lines are in [`deploy/README.md`](deploy/README.md).
 `testing/test_readme_counts.py` checks them against the compose file.
 
+Each cron line appends its output to a log file in `/srv/nemo/logs`. When a
+line fails, it prints the end of its log, and cron mails that output. Cron
+cannot send mail on a host that has no mail transfer agent. A stock Ubuntu
+cloud image has none. [`deploy/README.md`](deploy/README.md) gives the steps
+to set up mail and to rotate the logs.
+
 `research-status` shows the last run of every job, its state, and the open
 book. It reads the store and writes nothing. It exits 1 when a job crashed,
 failed, or is stale. Therefore cron can run it as a check. The `--json` flag
