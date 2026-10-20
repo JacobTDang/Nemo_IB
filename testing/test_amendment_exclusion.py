@@ -44,7 +44,7 @@ def test_the_filing_walk_excludes_amendments(monkeypatch):
     # test that proves the fix would fail because of the test that unit-checks
     # it, and only in the orders where this runs first.
     monkeypatch.setattr(su, "_filing_cache_lru", OrderedDict())
-    monkeypatch.setattr(su, "Company",
+    monkeypatch.setattr(su.registrant, "company",
                         lambda ticker: type("C", (), {"get_filings": get_filings})())
     su.get_latest_filing("MO", "10-K")
     assert seen.get("amendments") is False, (

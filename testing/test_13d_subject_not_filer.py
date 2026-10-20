@@ -97,7 +97,7 @@ def _install(monkeypatch, su, by_form):
         def get_filings(self, form=None, amendments=True):
             return _Filings(by_form.get(form, []))
 
-    monkeypatch.setattr(su, "Company", _Company)
+    monkeypatch.setattr(su.registrant, "company", _Company)
 
 
 def test_a_filing_the_company_made_about_someone_else_is_not_counted(

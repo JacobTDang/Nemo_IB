@@ -34,7 +34,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from edgar import Company, set_identity
+from edgar import set_identity
+
+from . import registrant
 
 # SEC fair access allows roughly 10 requests/second. Filings are fetched
 # sequentially and each one costs several requests, so this is a floor on the
@@ -517,7 +519,7 @@ def fetch_concept_series(ticker: str, concept: str, form: str = "10-Q",
     """
     _require_identity()
 
-    company = Company(ticker)
+    company = registrant.company(ticker)
     # Amendments are excluded. TSLA's most recent "10-K" is a 10-K/A carrying
     # the Part III proxy information and 37 fact rows -- no financial
     # statements. Left in, it takes a slot in the walk and every concept in the

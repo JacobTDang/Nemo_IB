@@ -56,7 +56,7 @@ def test_a_transient_failure_is_not_cached(monkeypatch):
     """The blip, then the recovery. The second call must reach SEC again."""
     calls, company = _company_returning(
         ConnectionError("SEC returned 503"), [_Filing()])
-    monkeypatch.setattr(su, "Company", company)
+    monkeypatch.setattr(su.registrant, "company", company)
 
     first = su.get_latest_filing("MO", "10-K")
     assert first is None, "a failed fetch still reports no filing"
@@ -72,7 +72,7 @@ def test_a_transient_failure_is_not_cached(monkeypatch):
 def test_a_genuine_absence_is_still_cached(monkeypatch):
     """The retry-storm protection this cache exists for must survive."""
     calls, company = _company_returning([])
-    monkeypatch.setattr(su, "Company", company)
+    monkeypatch.setattr(su.registrant, "company", company)
 
     assert su.get_latest_filing("NOFILINGS", "10-K") is None
     assert su.get_latest_filing("NOFILINGS", "10-K") is None
@@ -83,7 +83,7 @@ def test_a_genuine_absence_is_still_cached(monkeypatch):
 
 def test_a_success_is_still_cached(monkeypatch):
     calls, company = _company_returning([_Filing()])
-    monkeypatch.setattr(su, "Company", company)
+    monkeypatch.setattr(su.registrant, "company", company)
 
     assert su.get_latest_filing("MO", "10-K") is not None
     assert su.get_latest_filing("MO", "10-K") is not None
@@ -93,7 +93,7 @@ def test_a_success_is_still_cached(monkeypatch):
 def test_the_failure_is_logged(monkeypatch, caplog):
     """Swallowing it silently is what made this invisible for so long."""
     _, company = _company_returning(ConnectionError("SEC returned 503"))
-    monkeypatch.setattr(su, "Company", company)
+    monkeypatch.setattr(su.registrant, "company", company)
 
     with caplog.at_level("WARNING", logger=su.__name__):
         su.get_latest_filing("MO", "10-K")
@@ -119,7 +119,7 @@ def test_a_transient_xbrl_failure_is_not_cached(monkeypatch):
     """Worse than a failed fetch: the filing looks present but tags nothing."""
     filing = _FilingWithBrokenXBRL()
     _, company = _company_returning([filing])
-    monkeypatch.setattr(su, "Company", company)
+    monkeypatch.setattr(su.registrant, "company", company)
 
     first = su.get_latest_filing("MO", "10-K")
     assert first is not None and first["xbrl_data"] is None

@@ -1,5 +1,4 @@
 from typing import Any, Dict, List, Optional, Tuple
-from edgar import Company
 from edgar.xbrl import XBRL
 from collections import OrderedDict
 import pandas as pd
@@ -14,6 +13,10 @@ import threading
 # refuses to invent a contact address. Defaulting it here misrepresented the
 # caller to the SEC on every request.
 from tools.web_search_server.sec_series import _require_identity
+
+# Every registrant is read by its CIK from SEC's own ticker file. edgartools'
+# bundled map answers a ticker it lacks with an empty folder (#136).
+from tools.web_search_server import registrant
 
 # Structured warnings, built with the same helper the MCP dispatcher validates
 # against, so a caveat raised inside an extractor survives annotation instead
@@ -343,11 +346,13 @@ def get_latest_filing(ticker: str, form_type: str = '10-K') -> Optional[Dict[str
       return _filing_cache_lru[cache_key]
 
     _require_identity()
+    # Outside the try below, which turns every failure into a missing filing.
+    # A ticker SEC does not map is a refusal, and the caller reports it.
+    company = registrant.company(ticker)
 
     result = None
     cacheable = True
     try:
-      company = Company(ticker)
       # An amendment carries whatever the filer is correcting, which is often
       # Part III proxy information and no financial statements. Altria's most
       # recent 10-K is such a 10-K/A, and it made get_revenue_base report that
@@ -1737,7 +1742,7 @@ def get_schedule_13d_filings(ticker: str, limit: int = 15,
   _require_identity()
 
   try:
-    company = Company(ticker)
+    company = registrant.company(ticker)
   except Exception as e:
     return {'ticker': ticker, 'success': False,
             'error': f'Company lookup failed: {type(e).__name__}: {e}'}
@@ -1976,7 +1981,7 @@ def diff_10k(ticker: str, item: str = '1A',
   _require_identity()
 
   try:
-    company = Company(ticker)
+    company = registrant.company(ticker)
     filings = list(company.get_filings(form='10-K').head(10))
   except Exception as e:
     return {'ticker': ticker, 'success': False,
@@ -2375,7 +2380,7 @@ def get_company_filings_history(ticker: str, form_type: str = '10-K',
   _require_identity()
 
   try:
-    company = Company(ticker)
+    company = registrant.company(ticker)
     filings = company.get_filings(form=form_type)
   except Exception as e:
     return {'ticker': ticker, 'success': False,
@@ -2774,7 +2779,7 @@ def get_earnings_releases(ticker: str, max_quarters: int = 4,
   _require_identity()
 
   try:
-    company = Company(ticker)
+    company = registrant.company(ticker)
   except Exception as e:
     return {'ticker': ticker, 'success': False,
             'error': f'Company lookup failed: {type(e).__name__}: {e}'}

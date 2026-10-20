@@ -47,6 +47,7 @@ import threading
 from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
+from . import registrant
 from .sec_series import (
     NotCovered,
     _period_rank,
@@ -133,11 +134,9 @@ def _fetch_annual_filing_index(ticker: str) -> Dict[str, str]:
     lookup broke -- and swallowing it answered a rate limit with "NVDA has no
     annual report on EDGAR".
     """
-    from edgar import Company
-
     _require_identity()
     try:
-        company = Company(ticker)
+        company = registrant.company(ticker)
     except Exception as exc:  # noqa: BLE001 - reported, never masked
         raise AnnualIndexUnavailable(
             f"could not look up {ticker} on EDGAR: "
@@ -189,10 +188,8 @@ def _annual_facts(ticker: str, form: str):
     None when the filing has no parseable XBRL. CNI's 40-F is the live case:
     41 cover-page facts and no financial statements at all.
     """
-    from edgar import Company
-
     _require_identity()
-    company = Company(ticker)
+    company = registrant.company(ticker)
     _throttle()
     filings = company.get_filings(form=form, amendments=False).head(1)
     for filing in filings:

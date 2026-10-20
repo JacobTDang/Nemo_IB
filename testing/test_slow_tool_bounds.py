@@ -36,7 +36,7 @@ import urllib.request
 import pytest
 
 from tools.web_search_server import earnings_quality as eq
-from tools.web_search_server import sec_series
+from tools.web_search_server import registrant, sec_series
 from tools.web_search_server.sec_series import ConceptFact, FilingPoint
 
 
@@ -84,7 +84,7 @@ def _install_fake_edgar(monkeypatch, counters, accessions=("acc-2026", "acc-2025
             counters["amendments"] = amendments
             return filings
 
-    monkeypatch.setattr(sec_series, "Company", _FakeCompany)
+    monkeypatch.setattr(registrant, "company", _FakeCompany)
     monkeypatch.setattr(sec_series, "_require_identity", lambda: "test@example.invalid")
     monkeypatch.setattr(sec_series, "_throttle", lambda: None)
     return filings
@@ -331,7 +331,7 @@ def test_replacing_fetch_concept_series_still_works(monkeypatch):
     def explode(*args, **kwargs):  # pragma: no cover - must never run
         raise AssertionError("the shared walk ran despite a replaced seam")
 
-    monkeypatch.setattr(sec_series, "Company", explode)
+    monkeypatch.setattr(registrant, "company", explode)
 
     result = eq.get_working_capital_trends("FAKE")
     assert result["success"] is False

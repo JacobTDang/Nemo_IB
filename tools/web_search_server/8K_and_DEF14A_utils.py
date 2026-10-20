@@ -14,7 +14,7 @@ from dataclasses import dataclass, field, asdict
 from enum import Enum, auto
 from datetime import datetime
 import sys
-from edgar import Company, set_identity
+from edgar import set_identity
 from io import StringIO
 import pandas as pd
 import logging
@@ -41,6 +41,7 @@ if not logger.handlers:
 # testing/run_multi_company_verification.py loads this file by path (the
 # module name starts with a digit), which leaves it without a parent package.
 from tools.web_search_server.sec_series import _require_identity
+from tools.web_search_server import registrant
 
 # Regex constants
 _ITEM_NUM_RE = re.compile(r'(\d+\.\d+)')
@@ -1170,7 +1171,7 @@ class SECFilingParser:
         self._set_identity()
 
         try:
-            company = Company(ticker)
+            company = registrant.company(ticker)
             filings = company.get_filings(form='8-K')
             if not filings: return {'ticker': ticker, 'success': False, 'error': 'No 8-K found'}
             events_by_date = {}
@@ -1240,7 +1241,7 @@ class SECFilingParser:
         self._set_identity()
 
         try:
-            filings = Company(ticker).get_filings(form='DEF 14A')
+            filings = registrant.company(ticker).get_filings(form='DEF 14A')
             if not filings: return {'ticker': ticker, 'executives': [], 'candidates': [], 'success': False, 'error': 'No DEF 14A found'}
             latest = filings[0]
             html, text = safe_get_html(latest), safe_get_text(latest)
@@ -1675,7 +1676,7 @@ class SECFilingParser:
         self._set_identity()
 
         try:
-            filings = Company(ticker).get_filings(form='DEF 14A')
+            filings = registrant.company(ticker).get_filings(form='DEF 14A')
             if not filings:
                 # success:False with no error at all -- a caller could not log
                 # it, act on it, or tell it from any other failure. Foreign

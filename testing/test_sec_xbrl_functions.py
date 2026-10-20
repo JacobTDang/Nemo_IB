@@ -1186,7 +1186,7 @@ class TestErrorHandling:
 
     def test_network_error_handling(self):
         """Test handling of network errors."""
-        with patch('tools.web_search_server.sec_utils.Company') as mock_company:
+        with patch('tools.web_search_server.registrant.company') as mock_company:
             mock_company.side_effect = ConnectionError("Network error")
 
             result = get_revenue_base("AAPL")
@@ -1195,8 +1195,10 @@ class TestErrorHandling:
 
     def test_api_timeout_handling(self):
         """Test handling of API timeouts."""
-        with patch('tools.web_search_server.sec_utils.Company') as mock_company:
-            mock_company.side_effect = TimeoutError("API timeout")
+        with patch('tools.web_search_server.registrant.company') as mock_company:
+            # On the filing list, not the lookup: an unresolvable registrant
+            # is refused rather than reported as no filing.
+            mock_company.return_value.get_filings.side_effect = TimeoutError("API timeout")
 
             result = get_latest_filing("AAPL")
 
