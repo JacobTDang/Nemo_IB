@@ -142,6 +142,52 @@ def test_a_healthy_store_raises_nothing(store):
     assert report["attention"] == [], report["attention"]
 
 
+def test_a_job_that_is_not_due_yet_is_shown_but_not_raised(store, capsys):
+    """The store's second day. Score and announce run on Saturday and seed on
+    the 1st, so none of them has had a night to run on. Raising them failed
+    the noon check every weekday for two weeks for a known reason, which is
+    how a reader learns to stop reading it."""
+    store.start_run("daily_bars", as_of_date="2026-10-19")
+    store.finish_run(rows_written=1565, status="ok")
+
+    rc = status.main(["--as-of", "2026-10-20"])
+    out = capsys.readouterr().out
+
+    line = [x for x in out.splitlines() if " score " in x][0]
+    assert "never" in line, f"a job that has not run is hidden: {line!r}"
+    assert line.startswith("~"), f"expected a quiet mark, got: {line!r}"
+    assert rc == 0, "a store one day old fails its healthcheck"
+
+
+def test_a_job_that_never_ran_is_raised_once_the_store_outlives_its_tolerance(
+        store):
+    """Measured from the store's first run, with the job's own tolerance.
+    Score may be silent for ten days, so day ten is quiet and day eleven is an
+    outage -- the same line a job that ran once and stopped would cross."""
+    store.start_run("daily_bars", as_of_date="2026-10-09")
+    store.finish_run(rows_written=1565, status="ok")
+
+    def raised(as_of, job):
+        return any(a.startswith(job + " ") for a in
+                   status.collect(as_of=as_of)["attention"])
+
+    assert not raised("2026-10-19", "score")
+    assert raised("2026-10-20", "score"), (
+        "a weekly job with no run in eleven days was not raised")
+
+
+def test_each_job_that_never_ran_is_measured_on_its_own_tolerance(store):
+    """Six days in, a weeknight job with no run is an outage and a monthly one
+    is not due yet. One tolerance for every job gets one of them wrong."""
+    store.start_run("daily_bars", as_of_date="2026-10-09")
+    store.finish_run(rows_written=1565, status="ok")
+
+    attention = status.collect(as_of="2026-10-15")["attention"]
+
+    assert any(a.startswith("newcomers ") for a in attention)
+    assert not any(a.startswith("seed ") for a in attention)
+
+
 def test_the_exit_code_says_whether_anything_needs_attention(store, capsys):
     """So the command is usable in a cron healthcheck, not only by eye."""
     assert status.main(["--json"]) == 1, "a fresh store needs attention"

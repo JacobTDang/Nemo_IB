@@ -13,8 +13,11 @@ run log separates them -- so this reads the log rather than counting rows.
 Three states beyond the obvious, each of which looks like success to a reader
 counting rows:
 
-  `never`   - the job has no finished run at all. On a fresh volume that is
-              every job and it is fine. Three weeks in it is an outage.
+  `never`   - the job has no run at all. On a fresh volume that is every job
+              and it is fine. Three weeks in it is an outage. The line between
+              is the job's own tolerance, counted from the store's first run:
+              a Saturday job is not due on a Tuesday. A store with no runs at
+              all has nothing to count from, and is raised.
   `crashed` - a run started and never finished. The process died, and
               `missing_days` already refuses to count it as coverage.
   `stale`   - the last success is further back than the job's own tolerance.
@@ -108,6 +111,20 @@ def _store_exists() -> bool:
         return False
 
 
+def _first_run() -> Optional[str]:
+    """The earliest date any job ran for, or None on a store with no runs.
+
+    How long the store has been running, which is what separates a job that
+    has not been due yet from one that has stopped. Read from `as_of_date`,
+    the same date staleness is measured on, so `--as-of` moves both together.
+    """
+    with pit_store.connect() as conn:
+        row = conn.execute(
+            "SELECT min(as_of_date) FROM run_log WHERE as_of_date IS NOT NULL"
+        ).fetchone()
+    return row[0]
+
+
 def _last_run(job: str) -> Optional[Dict[str, Any]]:
     with pit_store.connect() as conn:
         row = conn.execute(
@@ -124,6 +141,7 @@ def _job_state(spec: Dict[str, Any], as_of: str) -> Dict[str, Any]:
     """
     job = spec["job"]
     out = {"job": job, "module": spec["module"], "every": spec["every"],
+           "stale_after_days": spec["stale_after_days"],
            "partial_is_normal": spec["partial_is_normal"],
            "optional": spec.get("optional", False),
            "last_run": None, "last_success": None, "state": "never",
@@ -222,11 +240,22 @@ def collect(as_of: Optional[str] = None) -> Dict[str, Any]:
     as_of = as_of or _today()
     jobs = [_job_state(spec, as_of) for spec in JOBS]
 
+    # A job with no run is raised only once the store has been running for
+    # longer than that job may be silent. On its second day the store has no
+    # Saturday score and no monthly seed, and raising them failed the noon
+    # check every weekday until the 1st -- for a known reason, which is how a
+    # reader learns to skip it. Before that line the job keeps its `~`.
+    first = _first_run()
+    store_age = (None if first is None else
+                 (date.fromisoformat(as_of) - date.fromisoformat(first)).days)
+
     attention: List[str] = []
     for job in jobs:
-        if job["state"] == "never" and job["optional"]:
-            continue
         if job["state"] == "never":
+            if job["optional"]:
+                continue
+            if store_age is not None and store_age <= job["stale_after_days"]:
+                continue
             attention.append(
                 f"{job['job']} has never completed a run (runs {job['every']})")
         elif job["state"] == "crashed":

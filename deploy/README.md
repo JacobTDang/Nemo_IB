@@ -505,7 +505,7 @@ separates them, so the report reads the log. Four states matter:
 
 | state | means |
 |---|---|
-| `never` | no finished run at all. Normal on a fresh volume, an outage three weeks in |
+| `never` | no run at all. Raised only when the store is older than that job's own tolerance. Until then the job is not due yet and shows `~`. A store with no runs is always raised |
 | `crashed` | a run started and never finished, so the process died |
 | `stale` | the last success is older than that job's own tolerance |
 | `failed` | the run finished and reported failure, with the reason |
