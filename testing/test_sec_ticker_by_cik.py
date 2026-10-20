@@ -18,6 +18,7 @@ import asyncio
 import json
 import pathlib
 from collections import OrderedDict
+from types import SimpleNamespace
 
 import edgar
 import pytest
@@ -28,6 +29,8 @@ from tools.web_search_server import sec_utils as su
 SENTINEL = -999999999
 DMC = 1047340
 AADX = 2118195
+NEWCO = 2200001
+HOUR = 3600
 
 # SEC's company_tickers.json, cut to the rows these tests ask about.
 SEC_TICKERS = {"DMC": DMC, "AADX": AADX, "BRK-B": 1067983, "GONE": 1234567}
@@ -103,6 +106,7 @@ def edgar_as_observed(monkeypatch):
     monkeypatch.setattr(edgar, "Company", _Company)
     monkeypatch.setattr(registrant, "_fetch_cik_map", lambda: dict(SEC_TICKERS))
     monkeypatch.setattr(registrant, "_cik_map_cache", None)
+    monkeypatch.setattr(registrant, "_cik_map_fetched_at", 0.0)
     # An address for the identity check, without handing edgartools a test
     # identity that would outlive this test.
     monkeypatch.setenv("SEC_EMAIL", "unit-test@example.invalid")
@@ -212,36 +216,90 @@ def test_the_latest_filing_tool_names_an_unmapped_ticker(edgar_as_observed):
 
 # ------------------------------------------------------------ the resolver
 
-def test_the_ticker_file_is_read_once_per_process(monkeypatch):
-    fetches = []
+@pytest.fixture
+def ticker_file(monkeypatch):
+    """SEC's ticker file, served from a script on a clock the test moves.
+
+    Each fetch takes the next entry of `responses` and raises it if it is an
+    exception. `fetches` counts the requests and `now` is the monotonic clock,
+    in seconds.
+    """
+    served = SimpleNamespace(responses=[], fetches=0, now=0.0)
 
     def fetch():
-        fetches.append(1)
-        return dict(SEC_TICKERS)
+        served.fetches += 1
+        response = served.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return dict(response)
 
     monkeypatch.setattr(registrant, "_fetch_cik_map", fetch)
+    monkeypatch.setattr(registrant, "monotonic", lambda: served.now)
     monkeypatch.setattr(registrant, "_cik_map_cache", None)
+    monkeypatch.setattr(registrant, "_cik_map_fetched_at", 0.0)
+    return served
+
+
+def test_a_hit_does_not_refetch_the_ticker_file(ticker_file):
+    ticker_file.responses = [SEC_TICKERS]
 
     assert registrant.cik_for("DMC") == DMC
     assert registrant.cik_for("AADX") == AADX
-    assert len(fetches) == 1, "SEC's ticker file was fetched on every lookup"
+    assert ticker_file.fetches == 1, "SEC's ticker file was fetched on every lookup"
 
 
-def test_a_failed_fetch_is_a_failure_not_an_unmapped_ticker(monkeypatch):
+def test_a_ticker_listed_after_the_first_fetch_resolves_once_the_hour_has_passed(
+        ticker_file):
+    """The server runs for weeks between restarts. A map kept for the life of
+    the process refused every name listed after it started."""
+    ticker_file.responses = [SEC_TICKERS, {**SEC_TICKERS, "NEWCO": NEWCO}]
+    assert registrant.cik_for("DMC") == DMC
+
+    ticker_file.now = HOUR + 1
+    assert registrant.cik_for("NEWCO") == NEWCO, (
+        "a name listed after the first fetch is refused until a restart")
+    assert ticker_file.fetches == 2
+
+
+def test_a_second_miss_inside_the_hour_makes_no_request(ticker_file):
+    """A junk ticker must not make every call fetch SEC's whole file."""
+    ticker_file.responses = [SEC_TICKERS, SEC_TICKERS]
+    assert registrant.cik_for("DMC") == DMC
+
+    ticker_file.now = 60
+    with pytest.raises(LookupError, match="ZZZZQ"):
+        registrant.cik_for("ZZZZQ")
+    assert ticker_file.fetches == 1, "a miss inside the hour refetched the file"
+
+    ticker_file.now = HOUR + 1
+    with pytest.raises(LookupError, match="ZZZZQ"):
+        registrant.cik_for("ZZZZQ")
+    assert ticker_file.fetches == 2, "a miss past the hour did not refresh"
+
+    ticker_file.now = HOUR + 600
+    with pytest.raises(LookupError, match="ZZZZQ"):
+        registrant.cik_for("ZZZZQ")
+    assert ticker_file.fetches == 2, (
+        "a second miss inside the hour of the refresh refetched the file")
+
+
+def test_a_failed_refresh_raises(ticker_file):
+    """Refused from the old map, a name SEC lists would read as unmapped
+    because of our outage."""
+    ticker_file.responses = [SEC_TICKERS, ConnectionError("SEC returned 503")]
+    assert registrant.cik_for("DMC") == DMC
+
+    ticker_file.now = HOUR + 1
+    with pytest.raises(RuntimeError, match="company_tickers.json.*503"):
+        registrant.cik_for("NEWCO")
+
+
+def test_a_failed_fetch_is_a_failure_not_an_unmapped_ticker(ticker_file):
     """A 503 says nothing about the ticker. Reported as one, it would refuse
     every name as unmapped; cached, it would do so until a restart."""
-    responses = [ConnectionError("SEC returned 503"), dict(SEC_TICKERS)]
+    ticker_file.responses = [ConnectionError("SEC returned 503"), SEC_TICKERS]
 
-    def fetch():
-        response = responses.pop(0)
-        if isinstance(response, Exception):
-            raise response
-        return response
-
-    monkeypatch.setattr(registrant, "_fetch_cik_map", fetch)
-    monkeypatch.setattr(registrant, "_cik_map_cache", None)
-
-    with pytest.raises(ConnectionError):
+    with pytest.raises(RuntimeError, match="company_tickers.json.*503"):
         registrant.cik_for("DMC")
     assert registrant.cik_for("DMC") == DMC, "the failed fetch was cached"
 
