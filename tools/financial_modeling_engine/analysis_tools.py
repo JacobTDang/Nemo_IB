@@ -1,6 +1,7 @@
 from tools.response_meta import annotating, warning
 from typing import Any, Dict, List, Optional
 import asyncio
+import functools
 from tools.financial_modeling_engine.corporate_actions import get_corporate_actions
 from tools.financial_modeling_engine.trading_metrics import get_trading_metrics
 import json
@@ -11,14 +12,15 @@ from .utils import get_data, calculate_percentiles, get_institutional_holdings, 
 from .options_quality import audit_options_metrics
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
+from mcp.types import (CallToolRequest, CallToolResult, ServerResult,
+                       TextContent, Tool)
 
 
 # ---------------------------------------------------------------------------
 # Tool descriptions
-# These are the single source of truth for what each tool needs.
-# Both the Probing Agent (to surface data requirements) and the
-# Financial Modeling Agent (to decide what to run) read these at runtime.
+# These are the single source of truth for what each tool needs. An MCP
+# client reads them from tools/list. It has no planner and no variable store,
+# so a description tells it which inputs to pass and where each comes from.
 # ---------------------------------------------------------------------------
 
 market_data_description = """Retrieves real-time market data for a company from Yahoo Finance including market cap, enterprise value, revenue, EBITDA, cash, debt, shares outstanding, beta, interest expense, and valuation multiples (P/E, P/B, EV/Revenue, EV/EBITDA, EV/EBIT).
@@ -65,34 +67,41 @@ backtest_signal_description = """Backtest a signal definition on historical pric
 
 analyze_exposures_description = """Decompose all active theses into latent factor buckets (ai_capex_long, rate_sensitive_long_duration, energy_long, china_exposure, commodity_supply_constrained, crypto_beta, biotech_speculative, etc.). Surfaces hidden concentration — the diversification illusion that a portfolio of NVDA/AMD/TSM/MSFT is really one AI-capex bet. Returns top concentrations with conviction-weighted sums and explicit warning flags when any factor exceeds 3 theses or 2.0 cumulative conviction. Run before sizing up any position."""
 
-wacc_tool_description = """Calculates Weighted Average Cost of Capital (WACC) using CAPM. Formula: WACC = (E/V)*Ke + (D/V)*Kd*(1-T).
+wacc_tool_description = """Calculates Weighted Average Cost of Capital (WACC) using CAPM. Formula: WACC = (E/V)*Ke + (D/V)*Kd*(1-T), where Ke = risk_free_rate + beta * equity_risk_premium.
 
-PASS NO ARGUMENTS. The execution engine automatically resolves all inputs (beta, risk_free_rate, cost_of_debt, tax_rate, market_cap, total_debt) from the variable store populated by prior tools. Plan it as: {"tool": "calculate_wacc", "arguments": {}}.
+Pass every input below. Nothing is filled in for you: a call without an input is refused, and the refusal names every input that is absent. Get each one from the tool beside it:
+- beta            <- get_market_data (beta)
+- market_cap      <- get_market_data (marketCap)
+- total_debt      <- get_market_data (totalDebt)
+- cost_of_debt    <- get_market_data (interestExpense / totalDebt, the pre-tax rate)
+- tax_rate        <- get_tax_rate (effective_tax_rate)
+- risk_free_rate  <- get_macro_snapshot (10Y Treasury yield)
+Optional:
+- equity_risk_premium  0.06 when absent. The value used is in inputs.equity_risk_premium of the result.
 
-Required prior tools (must have already run):
-- get_market_data(ticker)   -> beta, market_cap, total_debt, cost_of_debt
-- get_tax_rate(ticker)      -> tax_rate
-- get_macro_snapshot()      -> risk_free_rate (10Y Treasury)
-
-Should NOT use: If get_market_data, get_tax_rate, or get_macro_snapshot have not yet run."""
+Pass rates as decimals: 0.042 for 4.2%. get_tax_rate and get_macro_snapshot report percentages, so divide those by 100. Zero is a value: total_debt 0, cost_of_debt 0 and tax_rate 0 are used as given. market_cap must be greater than zero."""
 
 dcf_tool_description = """Calculates intrinsic equity value using a 5-year free cash flow DCF model. Returns enterprise value, equity value, and price per share.
 
-PASS ONLY TICKER. The execution engine automatically resolves ALL other inputs from the variable store. Plan it as: {"tool": "calculate_dcf", "arguments": {"ticker": "AAPL"}}. Never pass any numeric arguments -- they are populated automatically from prior tool results.
-
-THIS IS THE LAST TOOL TO RUN. All of the following must have already executed before planning calculate_dcf:
-1. get_revenue_base(ticker)        -> revenue_base
-2. get_ebitda_margin(ticker)       -> ebitda_margin
-3. get_capex_pct_revenue(ticker)   -> capex_pct_revenue
-4. get_depreciation(ticker)        -> depreciation
-5. get_tax_rate(ticker)            -> tax_rate
-6. get_market_data(ticker)         -> cash, debt, shares_outstanding_all_classes
-   (per-share output divides the share count, so it needs the all-class figure;
+Pass every input below. Nothing is filled in for you: a call without an input is refused, and the refusal names every input that is absent. Get each one from the tool beside it:
+- revenue_base        <- get_revenue_base (revenue_base, in dollars)
+- ebitda_margin       <- get_ebitda_margin (ebitda_margin_percent)
+- capex_pct_revenue   <- get_capex_pct_revenue (capex_pct_revenue)
+- depreciation        <- get_depreciation (d&a_pct; not d&a, which is in dollars and is refused)
+- tax_rate            <- get_tax_rate (effective_tax_rate)
+- cash                <- get_market_data (cash)
+- debt                <- get_market_data (totalDebt)
+- shares_outstanding  <- get_market_data (shares_outstanding_all_classes)
+  (per-share output divides the share count, so it needs the all-class figure;
    the provider's sharesOutstanding covers one class and is 2.0845x short for
    GOOGL, 1.5204x for BRK-B. Single-class filers are the same number.)
-7. get_basic_financials(ticker)    -> revenue_growth, terminal_multiple
-8. get_macro_snapshot()            -> risk_free_rate, terminal_growth
-9. calculate_wacc()                -> wacc"""
+- wacc                <- calculate_wacc (wacc)
+- revenue_growth      five annual growth rates. This is your forecast: anchor it on get_basic_financials (revenueGrowthTTMYoy) and get_forward_estimates.
+- terminal_growth     long-run growth after year five. This is your assumption: anchor it on get_macro_snapshot (real GDP growth). It must be below wacc.
+Optional:
+- terminal_multiple   <- get_basic_financials (evEbitdaTTM). When given, the terminal value is the lower of the perpetuity value and the exit-multiple value. When absent, the perpetuity value alone.
+
+Pass rates as decimals: 0.21 for 21%. The SEC tools report percentages (ebitda_margin_percent, capex_pct_revenue, d&a_pct, effective_tax_rate), so divide those by 100. Zero is a value: cash 0, debt 0, tax_rate 0, capex_pct_revenue 0, depreciation 0 and terminal_growth 0 are used as given. revenue_base, wacc and shares_outstanding must be greater than zero."""
 
 comps_tool_description = """Estimates a company's value by calculating valuation multiples (e.g., EV/EBITDA, P/E) for a set of comparable public companies and applying the median multiple to the target company.
 Should use: To get a quick valuation range based on current market sentiment and to see how a company is valued relative to its direct peers.
@@ -334,6 +343,87 @@ def as_rate(name: str, value, *, allow_negative: bool = False) -> float:
       f"the percentage this expects.")
 
 
+# What each calculator cannot run without, and where a caller gets it. The
+# schemas declare the same names required. Over MCP an absent one is refused
+# before the handler runs (_name_every_absent_input); the handlers refuse it
+# again for a caller of the method itself, which has no schema in front of it.
+DCF_INPUTS = {
+  'revenue_base': 'get_revenue_base',
+  'ebitda_margin': 'get_ebitda_margin',
+  'capex_pct_revenue': 'get_capex_pct_revenue',
+  'tax_rate': 'get_tax_rate',
+  'depreciation': 'get_depreciation (d&a_pct)',
+  'revenue_growth': 'your forecast, anchored on get_basic_financials',
+  'wacc': 'calculate_wacc',
+  'terminal_growth': 'your assumption, anchored on get_macro_snapshot',
+  'cash': 'get_market_data',
+  'debt': 'get_market_data (totalDebt)',
+  'shares_outstanding': 'get_market_data (shares_outstanding_all_classes)',
+}
+
+WACC_INPUTS = {
+  'beta': 'get_market_data',
+  'risk_free_rate': 'get_macro_snapshot',
+  'cost_of_debt': 'get_market_data (interestExpense / totalDebt)',
+  'tax_rate': 'get_tax_rate',
+  'market_cap': 'get_market_data (marketCap)',
+  'total_debt': 'get_market_data (totalDebt)',
+}
+
+
+def _refuse_absent(tool: str, args: Dict[str, Any], inputs: Dict[str, str]):
+  """A refusal naming every input in `inputs` that `args` lacks, or None.
+
+  These inputs used to read as 0 when absent. A planner that filled them in
+  from a variable store made that safe; it was retired, and an MCP client has
+  nothing like it. Cursor passed eight of calculate_dcf's inputs, and NVDA came
+  back at $117.41 a share with no tax, no capex and no D&A -- success: true.
+
+  None is absent: JSON null arrives as None. An empty list is absent too,
+  because revenue_growth with no years has nothing to project. Every absent
+  name is reported at once, so one more call is enough.
+  """
+  missing = [name for name in inputs
+             if args.get(name) is None or args.get(name) == []]
+  if not missing:
+    return None
+  sources = '; '.join(f"{name} from {inputs[name]}" for name in missing)
+  return [TextContent(type='text', text=json.dumps({
+    'success': False,
+    'error': (f"{tool} was called without {', '.join(missing)}. Every one is "
+              f"required and none is filled in: read as zero, an absent tax "
+              f"rate is a company that pays no tax. Pass {sources}."),
+    'missing_inputs': missing,
+    'ticker': args.get('ticker', ''),
+  }))]
+
+
+def _name_every_absent_input(name: str, schema: Optional[Dict[str, Any]],
+                             args: Dict[str, Any]) -> Optional[str]:
+  """Every required input `args` lacks and every null in it, in one message.
+
+  The SDK validates with jsonschema.validate, which reports the one error it
+  ranks highest. calculate_dcf called without tax_rate, capex_pct_revenue and
+  depreciation answered "'capex_pct_revenue' is a required property", and the
+  caller was two more refusals from the rest. A null was worse: "None is not
+  of type 'number'" names no input at all.
+
+  None when there is nothing to report; the SDK then validates the rest.
+  """
+  required = (schema or {}).get('required', [])
+  missing = [field for field in required if args.get(field) is None]
+  null = [field for field, value in args.items()
+          if value is None and field not in missing]
+  said = []
+  if missing:
+    said.append(f"{name} was called without {', '.join(missing)}. Each one is "
+                f"required, and null counts as absent")
+  if null:
+    said.append(f"{', '.join(null)} {'is' if len(null) == 1 else 'are'} null: "
+                f"pass a value or leave it out")
+  return "Input validation error: " + ". ".join(said) + "." if said else None
+
+
 def _dcf_math(revenue_base: float, ebitda_margin: float, capex_pct_revenue: float,
               tax_rate: float, depreciation: float, revenue_growth: list,
               wacc: float, terminal_growth: float, terminal_multiple: float,
@@ -375,9 +465,6 @@ def _dcf_math(revenue_base: float, ebitda_margin: float, capex_pct_revenue: floa
         f"arbitrarily large number rather than a valuation.")
   revenue_growth = [as_rate('revenue_growth', g, allow_negative=True)
                     for g in (revenue_growth or [])]
-
-  if terminal_growth == 0:
-    terminal_growth = 0.025  # GDP-match default
 
   # FCF projections
   fcf_projections = []
@@ -483,14 +570,21 @@ def _dcf_math(revenue_base: float, ebitda_margin: float, capex_pct_revenue: floa
   return output
 
 
-def _wacc_math(beta: float, risk_free_rate: float, equity_risk_premium: float = 0.06,
-               cost_of_debt: float = 0, tax_rate: float = 0,
-               market_cap: float = 0, total_debt: float = 0) -> dict:
+def _wacc_math(beta: float, risk_free_rate: float, equity_risk_premium: float,
+               cost_of_debt: float, tax_rate: float,
+               market_cap: float, total_debt: float) -> dict:
   """WACC via CAPM. All rate inputs as decimals."""
   equity_risk_premium = as_rate('equity_risk_premium', equity_risk_premium)
   risk_free_rate = as_rate('risk_free_rate', risk_free_rate)
   cost_of_debt = as_rate('cost_of_debt', cost_of_debt)
   tax_rate = as_rate('tax_rate', tax_rate)
+
+  # No debt is a capital structure; no equity is not one for a listed
+  # company. At market_cap 0 the equity weight is 0 and the answer is the
+  # after-tax cost of debt, reported as a cost of capital.
+  if market_cap <= 0:
+    return {'error': (f"market_cap must be greater than zero, received "
+                      f"{market_cap}. Pass marketCap from get_market_data.")}
 
   cost_of_equity = risk_free_rate + beta * equity_risk_premium
 
@@ -1632,21 +1726,21 @@ class Financial_Analysis:
           inputSchema={
             "type": "object",
             "properties": {
-              "ticker": {"type": "string", "description": "Company ticker symbol (e.g. 'NVDA')"},
-              "revenue_base": {"type": "number", "description": "SET TO 0 -- auto-resolved from get_revenue_base."},
-              "ebitda_margin": {"type": "number", "description": "SET TO 0 -- auto-resolved from get_ebitda_margin."},
-              "capex_pct_revenue": {"type": "number", "description": "SET TO 0 -- auto-resolved from get_capex_pct_revenue."},
-              "tax_rate": {"type": "number", "description": "SET TO 0 -- auto-resolved from get_tax_rate."},
-              "depreciation": {"type": "number", "description": "SET TO 0 -- auto-resolved from get_depreciation."},
-              "revenue_growth": {"type": "array", "description": "SET TO [0,0,0,0,0] -- auto-resolved from get_basic_financials.", "items": {"type": "number"}},
-              "wacc": {"type": "number", "description": "SET TO 0 -- auto-resolved from calculate_wacc."},
-              "terminal_growth": {"type": "number", "description": "SET TO 0 -- auto-resolved from get_macro_snapshot GDP."},
-              "terminal_multiple": {"type": "number", "description": "SET TO 0 -- auto-resolved from get_basic_financials evEbitdaTTM."},
-              "cash": {"type": "number", "description": "SET TO 0 -- auto-resolved from get_market_data."},
-              "debt": {"type": "number", "description": "SET TO 0 -- auto-resolved from get_market_data."},
-              "shares_outstanding": {"type": "number", "description": "SET TO 0 -- auto-resolved from get_market_data."}
+              "ticker": {"type": "string", "description": "Company ticker symbol (e.g. 'NVDA'). A label for the result; it fetches nothing."},
+              "revenue_base": {"type": "number", "description": "Required. Latest annual revenue in dollars, from get_revenue_base. Greater than zero."},
+              "ebitda_margin": {"type": "number", "description": "Required. Decimal: ebitda_margin_percent from get_ebitda_margin, divided by 100."},
+              "capex_pct_revenue": {"type": "number", "description": "Required. Decimal: capex_pct_revenue from get_capex_pct_revenue, divided by 100. 0 is used as given."},
+              "tax_rate": {"type": "number", "description": "Required. Decimal: effective_tax_rate from get_tax_rate, divided by 100. 0 is used as given."},
+              "depreciation": {"type": "number", "description": "Required. Decimal: d&a_pct from get_depreciation, divided by 100. Not d&a, which is in dollars. 0 is used as given."},
+              "revenue_growth": {"type": "array", "description": "Required. Five annual revenue growth rates as decimals: your forecast, anchored on get_basic_financials revenueGrowthTTMYoy and get_forward_estimates.", "items": {"type": "number"}},
+              "wacc": {"type": "number", "description": "Required. Decimal discount rate: wacc from calculate_wacc. Greater than zero."},
+              "terminal_growth": {"type": "number", "description": "Required. Decimal long-run growth after year five, below wacc: your assumption, anchored on get_macro_snapshot real GDP growth. 0 is used as given."},
+              "terminal_multiple": {"type": "number", "description": "Optional. Exit EV/EBITDA: evEbitdaTTM from get_basic_financials. When absent, the terminal value is the perpetuity value alone."},
+              "cash": {"type": "number", "description": "Required. Dollars: cash from get_market_data. 0 is used as given."},
+              "debt": {"type": "number", "description": "Required. Dollars: totalDebt from get_market_data. 0 is used as given."},
+              "shares_outstanding": {"type": "number", "description": "Required. shares_outstanding_all_classes from get_market_data, not sharesOutstanding. Greater than zero."}
             },
-            "required": ["ticker"],
+            "required": ["ticker", *DCF_INPUTS],
             # Every parameter here is a term in an arithmetic
             # expression, so one dropped silently changes the
             # number without changing its shape. `net_debt` was
@@ -1661,15 +1755,15 @@ class Financial_Analysis:
           inputSchema={
             "type": "object",
             "properties": {
-              "beta": {"type": "number", "description": "SET TO 0 -- auto-resolved from get_market_data."},
-              "risk_free_rate": {"type": "number", "description": "SET TO 0 -- auto-resolved from get_macro_snapshot."},
-              "equity_risk_premium": {"type": "number", "description": "ALWAYS pass 0.06 (standard 6% ERP). Do NOT pass 6."},
-              "cost_of_debt": {"type": "number", "description": "SET TO 0 -- auto-resolved from get_market_data."},
-              "tax_rate": {"type": "number", "description": "SET TO 0 -- auto-resolved from get_tax_rate."},
-              "market_cap": {"type": "number", "description": "SET TO 0 -- auto-resolved from get_market_data."},
-              "total_debt": {"type": "number", "description": "SET TO 0 -- auto-resolved from get_market_data."}
+              "beta": {"type": "number", "description": "Required. beta from get_market_data."},
+              "risk_free_rate": {"type": "number", "description": "Required. Decimal: the 10Y Treasury yield from get_macro_snapshot, divided by 100."},
+              "equity_risk_premium": {"type": "number", "description": "Optional. Decimal; 0.06 when absent. The value used is in inputs.equity_risk_premium of the result."},
+              "cost_of_debt": {"type": "number", "description": "Required. Decimal pre-tax rate: interestExpense / totalDebt from get_market_data. 0 is used as given."},
+              "tax_rate": {"type": "number", "description": "Required. Decimal: effective_tax_rate from get_tax_rate, divided by 100. 0 is used as given."},
+              "market_cap": {"type": "number", "description": "Required. Dollars: marketCap from get_market_data. Greater than zero."},
+              "total_debt": {"type": "number", "description": "Required. Dollars: totalDebt from get_market_data. 0 is used as given."}
             },
-            "required": [],
+            "required": [*WACC_INPUTS],
             # Every parameter here is a term in an arithmetic
             # expression, so one dropped silently changes the
             # number without changing its shape. `net_debt` was
@@ -1956,6 +2050,28 @@ warnings_per_tool={
         text=json.dumps({"success": False, "error": f"Unknown tool: {name}"})
       )]
 
+    # In front of the SDK's own handler, which validates against the declared
+    # schema and then calls the dispatcher above. Absent and null inputs are
+    # named here, all of them, and anything else is left to that validation.
+    # functools.wraps leaves __wrapped__, so a walk from the registered
+    # handler still reaches the annotating() config (tools/manifest.py).
+    validate_and_call = self.server.request_handlers[CallToolRequest]
+    declared: Dict[str, Dict[str, Any]] = {}
+
+    @functools.wraps(validate_and_call)
+    async def call_tool_naming_absent_inputs(req: CallToolRequest):
+      if not declared:
+        declared.update({t.name: t.inputSchema for t in await list_tools()})
+      refusal = _name_every_absent_input(
+        req.params.name, declared.get(req.params.name),
+        req.params.arguments or {})
+      if refusal:
+        return ServerResult(CallToolResult(
+          content=[TextContent(type="text", text=refusal)], isError=True))
+      return await validate_and_call(req)
+
+    self.server.request_handlers[CallToolRequest] = call_tool_naming_absent_inputs
+
   # ---- Tool implementations ----
 
   async def get_corporate_actions(self, ticker: str,
@@ -2180,44 +2296,56 @@ warnings_per_tool={
     return [TextContent(type="text", text=json.dumps(result))]
 
   async def calculate_dcf(self, args: Dict[str, Any]) -> List[TextContent]:
-    # A DCF with no revenue base produces enterprise_value 0 and
-    # price_per_share 0, which reads as a real valuation rather than a missing
-    # input and is exactly the kind of number that ends up in a thesis.
-    # calculate_wacc already refuses this way; match it.
-    if not args.get('revenue_base'):
+    refusal = _refuse_absent('calculate_dcf', args, DCF_INPUTS)
+    if refusal:
+      return refusal
+    # Zero is a value for cash, debt, a tax rate, capex and D&A: a company can
+    # have none of them. It is not a share count. _dcf_math answers one with a
+    # null price for calculate_scenario_dcf's grid; here, where every input is
+    # asked for, a zero is an absent field read as a number.
+    shares = args.get('shares_outstanding')
+    if shares <= 0:
       return [TextContent(type='text', text=json.dumps({
-        'error': ("revenue_base is zero or absent, cannot compute a DCF. "
-                  "Resolve it with get_revenue_base first, then pass it in."),
+        'success': False,
+        'error': (f"shares_outstanding must be greater than zero, received "
+                  f"{shares}. Pass shares_outstanding_all_classes from "
+                  f"get_market_data."),
         'ticker': args.get('ticker', ''),
       }))]
     result = _dcf_math(
-      revenue_base=args.get('revenue_base', 0),
-      ebitda_margin=args.get('ebitda_margin', 0),
-      capex_pct_revenue=args.get('capex_pct_revenue', 0),
-      tax_rate=args.get('tax_rate', 0),
-      depreciation=args.get('depreciation', 0),
-      # Declared as an array in the schema ("SET TO [0,0,0,0,0]"), so its
-      # absent default has to be a sequence rather than a scalar zero.
-      revenue_growth=args.get('revenue_growth') or [0, 0, 0, 0, 0],
-      wacc=args.get('wacc', 0),
-      terminal_growth=args.get('terminal_growth', 0),
-      terminal_multiple=args.get('terminal_multiple', 0),
-      cash=args.get('cash', 0),
-      debt=args.get('debt', 0),
-      shares_outstanding=args.get('shares_outstanding', 0),
+      revenue_base=args.get('revenue_base'),
+      ebitda_margin=args.get('ebitda_margin'),
+      capex_pct_revenue=args.get('capex_pct_revenue'),
+      tax_rate=args.get('tax_rate'),
+      depreciation=args.get('depreciation'),
+      revenue_growth=args.get('revenue_growth'),
+      wacc=args.get('wacc'),
+      terminal_growth=args.get('terminal_growth'),
+      # The one optional input. Absent, the terminal value is the perpetuity
+      # alone, as the description says; _dcf_math reads 0 that way.
+      terminal_multiple=args.get('terminal_multiple') or 0,
+      cash=args.get('cash'),
+      debt=args.get('debt'),
+      shares_outstanding=shares,
       ticker=args.get('ticker', ''),
     )
     return [TextContent(type='text', text=json.dumps(result))]
 
   async def calculate_wacc(self, args: Dict[str, Any]) -> List[TextContent]:
+    refusal = _refuse_absent('calculate_wacc', args, WACC_INPUTS)
+    if refusal:
+      return refusal
+    premium = args.get('equity_risk_premium')
     result = _wacc_math(
-      beta=args.get('beta', 0),
-      risk_free_rate=args.get('risk_free_rate', 0),
-      equity_risk_premium=args.get('equity_risk_premium', 0.06),
-      cost_of_debt=args.get('cost_of_debt', 0),
-      tax_rate=args.get('tax_rate', 0),
-      market_cap=args.get('market_cap', 0),
-      total_debt=args.get('total_debt', 0),
+      beta=args.get('beta'),
+      risk_free_rate=args.get('risk_free_rate'),
+      # The one default, and a stated one: the description names it and the
+      # result echoes the value used in inputs.equity_risk_premium.
+      equity_risk_premium=0.06 if premium is None else premium,
+      cost_of_debt=args.get('cost_of_debt'),
+      tax_rate=args.get('tax_rate'),
+      market_cap=args.get('market_cap'),
+      total_debt=args.get('total_debt'),
     )
     return [TextContent(type='text', text=json.dumps(result))]
 
@@ -2236,7 +2364,10 @@ warnings_per_tool={
       'tax_rate': args.get('tax_rate', 0),
       'depreciation': args.get('depreciation', 0),
       'wacc': args.get('wacc', 0),
-      'terminal_growth': args.get('terminal_growth', 0),
+      # Absent, the 2.5% this tool has always used. _dcf_math used to apply it
+      # to any zero, which turned calculate_dcf's explicit terminal_growth 0
+      # into 2.5%; a zero passed here is now used as given too.
+      'terminal_growth': args.get('terminal_growth', 0.025),
       'terminal_multiple': args.get('terminal_multiple', 0),
       'cash': args.get('cash', 0),
       'debt': args.get('debt', 0),
