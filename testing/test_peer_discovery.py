@@ -43,7 +43,8 @@ def test_leaked_array_refs_do_not_become_company_names():
 
 
 def test_unresolvable_ciks_are_counted_not_dropped_silently(monkeypatch):
-    monkeypatch.setattr(peers, "_fetch_sic_ciks", lambda sic, limit: [1, 2, 3, 2488])
+    monkeypatch.setattr(peers, "_fetch_sic_ciks", lambda sic: [1, 2, 3, 2488])
+    monkeypatch.setattr(peers, "_total_assets", lambda periods: {})
     monkeypatch.setattr(peers, "_ticker_map",
                         lambda: {2488: ("AMD", "ADVANCED MICRO DEVICES INC")})
     monkeypatch.setattr(peers, "_company_sic", lambda t: ("3674", "Semiconductors", 1045810))
@@ -54,7 +55,8 @@ def test_unresolvable_ciks_are_counted_not_dropped_silently(monkeypatch):
 
 
 def test_the_query_company_is_not_listed_as_its_own_peer(monkeypatch):
-    monkeypatch.setattr(peers, "_fetch_sic_ciks", lambda sic, limit: [1045810, 2488])
+    monkeypatch.setattr(peers, "_fetch_sic_ciks", lambda sic: [1045810, 2488])
+    monkeypatch.setattr(peers, "_total_assets", lambda periods: {})
     monkeypatch.setattr(peers, "_ticker_map", lambda: {
         1045810: ("NVDA", "NVIDIA CORP"), 2488: ("AMD", "ADVANCED MICRO DEVICES INC")})
     monkeypatch.setattr(peers, "_company_sic", lambda t: ("3674", "Semiconductors", 1045810))
@@ -107,6 +109,23 @@ def test_amd_is_discovered_as_a_peer_of_nvda():
 
 @network
 def test_unresolved_count_is_reported_honestly():
+    """Counted over the whole group, not the page. NVDA itself is one of the
+    filers matched and is neither a peer nor unresolved."""
     result = peers.find_peers_by_sic("NVDA", limit=40)
-    assert result["filers_matched"] >= len(result["peers"])
-    assert result["unresolved_count"] == result["filers_matched"] - len(result["peers"])
+    assert result["filers_matched"] >= result["peer_count"] >= len(result["peers"])
+    assert result["unresolved_count"] == (
+        result["filers_matched"] - result["peer_count"] - 1)
+
+
+@network
+def test_the_largest_semiconductor_filers_lead_nvdas_peers():
+    """EDGAR lists SIC 3674 in name order. Read one page and cut at the front,
+    and limit 10 returned AMD, ADTTF, ALMU and other A names; AVGO and MU
+    were not in it."""
+    result = peers.find_peers_by_sic("NVDA", limit=10)
+    assert result["success"] is True
+    tickers = [p["ticker"] for p in result["peers"]]
+    assert {"AVGO", "AMD", "INTC", "MU"} <= set(tickers), tickers
+    assets = [p["assets_usd"] for p in result["peers"]]
+    assert None not in assets
+    assert assets == sorted(assets, reverse=True)

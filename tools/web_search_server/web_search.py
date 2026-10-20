@@ -740,13 +740,16 @@ def _build_all_tools() -> List[Tool]:
             "not a finished comp table. And coverage is partial: an SIC query "
             "returns deregistered and private filers with no listed ticker, so "
             "compare 'peer_count' against 'filers_matched' -- 'unresolved_count' is "
-            "the gap."
+            "the gap.\n\n"
+            "Peers come largest first, by total assets (us-gaap:Assets, each "
+            "as of its own 'assets_as_of' balance-sheet date). Peers with no "
+            "assets follow in name order; 'unranked_count' counts them."
           ),
           inputSchema={
             "type": "object",
             "properties": {
               "ticker": {"type": "string", "description": "Ticker symbol"},
-              "limit":  {"type": "integer", "description": "Max filers to request from EDGAR", "default": 20}
+              "limit":  {"type": "integer", "description": "Max peers to return, largest total assets first", "default": 20}
             },
             "required": ["ticker"]
           }
