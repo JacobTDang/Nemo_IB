@@ -104,7 +104,7 @@ ICAHN = ("ICAHN CARL C", "0000921669")
 
 def _feed(monkeypatch, by_ticker, cik=INTC_CIK):
     """Install the one network seam: a ticker's Schedule 13 folder."""
-    def fetch(ticker):
+    def fetch(ticker, known_cik=None):
         if ticker not in by_ticker:
             raise LookupError(f"no fixture for {ticker}")
         return cik, by_ticker[ticker]
@@ -147,7 +147,7 @@ def test_a_feed_that_did_not_answer_is_not_a_quiet_day(store, monkeypatch):
     """The failure this whole module is built around. An SEC rate limit returns
     the same empty list as a day with no activism, and treating them alike puts
     a silent outage into the record as evidence that nothing happened."""
-    def throttled(ticker):
+    def throttled(ticker, cik=None):
         raise ConnectionError("SEC returned 429")
 
     monkeypatch.setattr(activist_watch, "_fetch_company_filings", throttled)
@@ -164,7 +164,7 @@ def test_a_feed_that_did_not_answer_is_not_a_quiet_day(store, monkeypatch):
 def test_a_partly_answered_pass_says_so(store, monkeypatch):
     """One name out of two is neither a working day nor an outage, and calling
     it either one throws away the number that tells them apart."""
-    def half(ticker):
+    def half(ticker, cik=None):
         if ticker == "AAPL":
             raise ConnectionError("SEC returned 429")
         return INTC_CIK, []
@@ -442,7 +442,7 @@ def test_the_watchlist_defaults_to_the_eligible_universe(store, monkeypatch):
                           recorded_at="2026-08-26T21:00:00Z")
     asked = []
 
-    def fetch(ticker):
+    def fetch(ticker, cik=None):
         asked.append(ticker)
         return INTC_CIK, []
 
@@ -463,7 +463,7 @@ def test_a_capped_pass_is_never_reported_as_full_coverage(store, monkeypatch):
         for i, t in enumerate(["AAA", "BBB", "CCC"])],
                           recorded_at="2026-08-26T21:00:00Z")
     monkeypatch.setattr(activist_watch, "_fetch_company_filings",
-                        lambda ticker: (INTC_CIK, []))
+                        lambda ticker, cik=None: (INTC_CIK, []))
 
     result = activist_watch.watch_pass(as_of="2026-08-26", max_tickers=2)
 
@@ -489,7 +489,7 @@ def test_a_capped_pass_rotates_so_no_name_is_never_watched(store, monkeypatch):
 
     asked = []
     monkeypatch.setattr(activist_watch, "_fetch_company_filings",
-                        lambda ticker: (asked.append(ticker), (INTC_CIK, []))[1])
+                        lambda ticker, cik=None: (asked.append(ticker), (INTC_CIK, []))[1])
 
     seen = set()
     for _ in range(4):
@@ -510,7 +510,7 @@ def test_consecutive_passes_take_different_slices(store, monkeypatch):
 
     asked = []
     monkeypatch.setattr(activist_watch, "_fetch_company_filings",
-                        lambda ticker: (asked.append(ticker), (INTC_CIK, []))[1])
+                        lambda ticker, cik=None: (asked.append(ticker), (INTC_CIK, []))[1])
 
     activist_watch.watch_pass(as_of="2026-08-26", max_tickers=3)
     first = list(asked)
@@ -532,7 +532,7 @@ def test_the_slice_wraps_rather_than_running_off_the_end(store, monkeypatch):
 
     asked = []
     monkeypatch.setattr(activist_watch, "_fetch_company_filings",
-                        lambda ticker: (asked.append(ticker), (INTC_CIK, []))[1])
+                        lambda ticker, cik=None: (asked.append(ticker), (INTC_CIK, []))[1])
 
     sizes = []
     for _ in range(6):
@@ -550,7 +550,7 @@ def test_the_note_says_which_slice_was_watched(store, monkeypatch):
         {"ticker": f"T{i}", "cik": str(i), "eligible": True}
         for i in range(10)], recorded_at="2026-08-26T21:00:00Z")
     monkeypatch.setattr(activist_watch, "_fetch_company_filings",
-                        lambda ticker: (INTC_CIK, []))
+                        lambda ticker, cik=None: (INTC_CIK, []))
 
     result = activist_watch.watch_pass(as_of="2026-08-26", max_tickers=3)
 
@@ -565,7 +565,7 @@ def test_a_cap_bigger_than_the_universe_watches_all_of_it(store, monkeypatch):
         for i in range(3)], recorded_at="2026-08-26T21:00:00Z")
     asked = []
     monkeypatch.setattr(activist_watch, "_fetch_company_filings",
-                        lambda ticker: (asked.append(ticker), (INTC_CIK, []))[1])
+                        lambda ticker, cik=None: (asked.append(ticker), (INTC_CIK, []))[1])
 
     result = activist_watch.watch_pass(as_of="2026-08-26", max_tickers=99)
 
@@ -587,7 +587,7 @@ def test_a_pass_stops_at_its_deadline_however_slow_the_vendor_is(store,
     clock = {"t": 0.0}
     monkeypatch.setattr(activist_watch.time, "monotonic", lambda: clock["t"])
 
-    def slow(ticker):
+    def slow(ticker, cik=None):
         clock["t"] += 2.0
         return INTC_CIK, []
 
@@ -613,7 +613,7 @@ def test_the_next_pass_resumes_where_the_deadline_stopped_the_last(store,
     monkeypatch.setattr(activist_watch.time, "monotonic", lambda: clock["t"])
     asked = []
 
-    def slow(ticker):
+    def slow(ticker, cik=None):
         clock["t"] += 2.0
         asked.append(ticker)
         return INTC_CIK, []
@@ -641,7 +641,7 @@ def test_the_cursor_wraps_and_covers_the_whole_watchlist(store, monkeypatch):
     monkeypatch.setattr(activist_watch.time, "monotonic", lambda: clock["t"])
     asked = []
 
-    def slow(ticker):
+    def slow(ticker, cik=None):
         clock["t"] += 2.0
         asked.append(ticker)
         return INTC_CIK, []
@@ -664,7 +664,7 @@ def test_a_pass_that_reaches_everyone_is_ok_and_leaves_no_debt(store,
         {"ticker": f"T{i}", "cik": str(i), "eligible": True}
         for i in range(3)], recorded_at="2026-08-26T21:00:00Z")
     monkeypatch.setattr(activist_watch, "_fetch_company_filings",
-                        lambda t: (INTC_CIK, []))
+                        lambda t, cik=None: (INTC_CIK, []))
 
     result = activist_watch.watch_pass(as_of="2026-08-26", max_seconds=600)
 
@@ -680,7 +680,7 @@ def test_the_note_says_what_stopped_the_pass(store, monkeypatch):
     clock = {"t": 0.0}
     monkeypatch.setattr(activist_watch.time, "monotonic", lambda: clock["t"])
 
-    def slow(ticker):
+    def slow(ticker, cik=None):
         clock["t"] += 2.0
         return INTC_CIK, []
 
@@ -711,7 +711,7 @@ def test_a_budgeted_pass_is_judged_on_what_it_tried_to_watch(store,
     clock = {"t": 0.0}
     monkeypatch.setattr(activist_watch.time, "monotonic", lambda: clock["t"])
 
-    def slow(ticker):
+    def slow(ticker, cik=None):
         clock["t"] += 2.0
         return INTC_CIK, []
 
@@ -739,7 +739,7 @@ def test_a_pass_that_reaches_nobody_it_tried_is_still_failed(store,
         {"ticker": f"T{i}", "cik": str(i), "eligible": True}
         for i in range(5)], recorded_at="2026-08-26T21:00:00Z")
 
-    def dead(ticker):
+    def dead(ticker, cik=None):
         raise RuntimeError("EDGAR refused")
 
     monkeypatch.setattr(activist_watch, "_fetch_company_filings", dead)
@@ -761,7 +761,7 @@ def test_the_universe_is_read_as_it_stood_on_the_day(store, monkeypatch):
                           recorded_at="2026-08-26T21:00:00Z")
     asked = []
     monkeypatch.setattr(activist_watch, "_fetch_company_filings",
-                        lambda ticker: (asked.append(ticker), (INTC_CIK, []))[1])
+                        lambda ticker, cik=None: (asked.append(ticker), (INTC_CIK, []))[1])
 
     activist_watch.watch_pass(as_of="2026-03-02")
 
@@ -775,7 +775,7 @@ def test_one_unreadable_filing_does_not_take_down_the_whole_sweep(
     other -- otherwise a single malformed row anywhere in the watchlist
     silences every name after it, and the pass dies without a finished run
     while the market is exactly where a 13D might be landing."""
-    def feed(ticker):
+    def feed(ticker, cik=None):
         if ticker == "BAD":
             # Genuinely subject-side -- header and file number both agree --
             # so it reaches the point where the timestamp is read.
@@ -814,7 +814,38 @@ def test_a_reported_event_matches_what_was_stored(store, monkeypatch):
     assert stored["accepted_at"] == "2026-08-26T20:31:15Z"
 
 
-def test_a_ticker_edgar_cannot_resolve_is_a_failure_not_a_quiet_day(store):
+def _edgar(monkeypatch, bundled, folders):
+    """edgartools behind the seam, as it stood on 2026-10-20.
+
+    `bundled` is the ticker map shipped inside the package; a ticker missing
+    from it gets the sentinel CIK and an empty folder, which is what the real
+    one does rather than raise. A CIK goes straight to the submissions index.
+    Returns every key the watcher asked for.
+    """
+    import edgar
+
+    from tools.web_search_server import sec_series
+
+    asked = []
+
+    class _Company:
+        def __init__(self, key):
+            asked.append(key)
+            self.cik = bundled.get(key, -999999999) if isinstance(key, str) \
+                else key
+            self.not_found = self.cik not in folders
+
+        def get_filings(self, form=None):
+            return [f for f in folders.get(self.cik, []) if f.form == form]
+
+    monkeypatch.setattr(edgar, "Company", _Company)
+    monkeypatch.setattr(sec_series, "_require_identity",
+                        lambda: "t@example.invalid")
+    return asked
+
+
+def test_a_ticker_edgar_cannot_resolve_is_a_failure_not_a_quiet_day(
+        store, monkeypatch):
     """Found live. `Company("PARA")` does not raise for a ticker EDGAR no
     longer maps -- it hands back a company whose CIK is the sentinel
     -999999999 and whose filing list is empty. Empty is the same shape a
@@ -822,10 +853,57 @@ def test_a_ticker_edgar_cannot_resolve_is_a_failure_not_a_quiet_day(store):
     as "nobody filed a 13D on it" every pass, forever, and would count as
     coverage while doing it. Exactly the confusion this module exists to
     prevent, arriving through the vendor rather than the network."""
-    with pytest.raises(LookupError, match="PARA"):
-        activist_watch._resolved_cik("PARA", -999999999)
+    _edgar(monkeypatch, bundled={}, folders={})
 
-    assert activist_watch._resolved_cik("INTC", 50863) == "50863"
+    result = activist_watch.watch_pass(["PARA"], as_of="2026-08-26")
+
+    assert result["status"] == "failed"
+    assert "PARA" in str(result["error"])
+    assert result["covered"] == 0, "an unresolvable name counted as coverage"
+
+
+DMC = ("DEL MONTE CORP", "0001047340")
+
+
+def test_a_name_edgartools_cannot_map_is_watched_by_its_cik(store,
+                                                            monkeypatch):
+    """Found on the homelab's first night (#130). edgartools maps a ticker
+    from a parquet file bundled with the package, and 103 of 1,810 eligible
+    names were missing from it. DMC was one: every pass refused it as
+    unresolvable while its folder held 14 SC 13D filings. The universe
+    recorded DMC's CIK from SEC's own file, and that is what the watcher asks
+    by."""
+    store.record_universe("2026-08-26", [
+        {"ticker": "DMC", "cik": "1047340", "eligible": True}],
+        recorded_at="2026-08-26T21:00:00Z")
+    stake = _Filing("d1", "SC 13D", "2026-08-26", "005-50281", DMC, ICAHN,
+                    acceptance_datetime="2026-08-26T20:31:15Z")
+    asked = _edgar(monkeypatch, bundled={}, folders={1047340: [stake]})
+
+    result = activist_watch.watch_pass(as_of="2026-08-26")
+
+    assert result["status"] == "ok", result["error"]
+    assert [e["accession"] for e in result["events"]] == ["d1"]
+    assert result["events"][0]["subject_cik"] == "1047340"
+    assert "DMC" not in asked, "the bundled ticker map was asked for DMC"
+
+
+def test_a_name_the_universe_has_no_cik_for_is_asked_for_by_ticker(
+        store, monkeypatch):
+    """A missing CIK is not a shared one, and not a CIK of zero either. The
+    name is still watched through its ticker, and the sentinel guard decides
+    whether that worked."""
+    store.record_universe("2026-08-26", [
+        {"ticker": "INTC", "cik": "", "eligible": True}],
+        recorded_at="2026-08-26T21:00:00Z")
+    asked = _edgar(monkeypatch, bundled={"INTC": 50863},
+                   folders={50863: [_activist_13d("a1")]})
+
+    result = activist_watch.watch_pass(as_of="2026-08-26")
+
+    assert result["status"] == "ok", result["error"]
+    assert result["new_events"] == 1
+    assert asked == ["INTC"]
 
 
 # --- the run log tells the difference ---------------------------------------
@@ -836,7 +914,7 @@ def test_each_pass_leaves_its_own_run_log_entry(store, monkeypatch):
     16:00 pass was throttled is visible as exactly that."""
     calls = {"n": 0}
 
-    def flaky(ticker):
+    def flaky(ticker, cik=None):
         calls["n"] += 1
         if calls["n"] > 1:
             raise ConnectionError("SEC returned 429")
@@ -980,9 +1058,10 @@ def test_a_failed_pass_still_reports_what_it_knew(store, monkeypatch):
 
 def test_a_fresh_store_is_created_by_the_pass_itself(tmp_path, monkeypatch):
     monkeypatch.setenv("NEMO_PIT_DB", str(tmp_path / "fresh.db"))
-    monkeypatch.setattr(activist_watch, "_watchlist", lambda as_of: ["INTC"])
+    monkeypatch.setattr(activist_watch, "_watchlist",
+                        lambda as_of: [("INTC", INTC_CIK)])
     monkeypatch.setattr(activist_watch, "_fetch_company_filings",
-                        lambda ticker: (INTC_CIK, []))
+                        lambda ticker, cik=None: (INTC_CIK, []))
 
     assert activist_watch.main(["--as-of", "2026-08-26"]) == 0
     assert activist_watch.last_run()["status"] == "ok"
@@ -1005,7 +1084,7 @@ def test_a_pass_prunes_the_filing_cache_as_it_goes(store, monkeypatch):
     from tools import filing_cache
 
     monkeypatch.setattr(activist_watch, "_fetch_company_filings",
-                        lambda ticker: (INTC_CIK, []))
+                        lambda ticker, cik=None: (INTC_CIK, []))
     asked = []
     monkeypatch.setattr(filing_cache, "prune_if_due",
                         lambda *a, **k: asked.append(1))
@@ -1020,7 +1099,7 @@ def test_a_name_that_failed_still_left_documents_in_the_cache(store,
     universe the failures are where an unpruned cache grows fastest."""
     from tools import filing_cache
 
-    def boom(ticker):
+    def boom(ticker, cik=None):
         raise ConnectionError("SEC returned 429")
 
     monkeypatch.setattr(activist_watch, "_fetch_company_filings", boom)

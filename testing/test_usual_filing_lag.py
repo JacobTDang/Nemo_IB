@@ -74,11 +74,11 @@ def test_the_live_helper_asks_both_sources_as_of_the_decision_date(monkeypatch):
 
     def eps_series(ticker, as_of=None):
         asked["series"] = as_of
-        return {"success": True, "error": None, "quarters": [
+        return {"success": True, "error": None, "cik": "0000000001", "quarters": [
             {"fiscal_period": p, "period_end": None, "known_at": d}
             for p, d in FILINGS.items()]}
 
-    def for_quarters(ticker, as_of=None, quarters=None):
+    def for_quarters(ticker, as_of=None, quarters=None, cik=None):
         asked["releases"] = as_of
         return {p: {"announced_date": d, "accession": f"acc-{p}"}
                 for p, d in RELEASES.items()}

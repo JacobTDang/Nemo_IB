@@ -32,7 +32,7 @@ from datetime import date, time, timedelta
 from typing import Any, Dict, List, Optional, Sequence
 from zoneinfo import ZoneInfo
 
-from research import daily_job, pit_store
+from research import daily_job, pit_store, registrant
 from tools import filing_cache
 
 EXCHANGE_TZ = ZoneInfo("America/New_York")
@@ -107,10 +107,18 @@ def _is_earnings(items: Any) -> bool:
     return any(str(c).strip() == EARNINGS_ITEM for c in codes)
 
 
-def _fetch_8k(ticker: str, limit: int = _MAX_FILINGS) -> List[Any]:
+def _fetch_8k(ticker: str, cik: Optional[str] = None,
+              limit: int = _MAX_FILINGS) -> List[Any]:
+    """A name's latest 8-Ks, asked for by `cik` when the caller has one.
+
+    By ticker, a name missing from the ticker map edgartools bundles came back
+    as an empty list, and was recorded as a company that files no earnings
+    releases -- 103 eligible names on 2026-10-19 (#130). `registrant.company`
+    asks by CIK, and refuses the empty answer when only a ticker is known.
+    """
     import os
 
-    from edgar import Company, set_identity
+    from edgar import set_identity
 
     email = os.environ.get("SEC_EMAIL", "").strip()
     if not email:
@@ -118,7 +126,8 @@ def _fetch_8k(ticker: str, limit: int = _MAX_FILINGS) -> List[Any]:
             "SEC_EMAIL is not set. SEC fair access requires a real contact "
             "address in the User-Agent header.")
     set_identity(email)
-    return list(Company(ticker).get_filings(form="8-K").head(limit))
+    return list(registrant.company(ticker, cik)
+                .get_filings(form="8-K").head(limit))
 
 
 def _quarters(ticker: str, as_of: Optional[str] = None) -> Dict[str, Dict]:
@@ -157,11 +166,11 @@ def classify(accepted_at) -> str:
     return "dmh"
 
 
-def earnings_releases(ticker: str,
-                      as_of: Optional[str] = None) -> List[Dict[str, Any]]:
+def earnings_releases(ticker: str, as_of: Optional[str] = None,
+                      cik: Optional[str] = None) -> List[Dict[str, Any]]:
     """Every Item 2.02 filing this company has made, newest first."""
     out = []
-    for filing in _fetch_8k(ticker):
+    for filing in _fetch_8k(ticker, cik=cik):
         if not _is_earnings(getattr(filing, "items", None)):
             continue
         day = str(filing.filing_date)
@@ -177,8 +186,8 @@ def earnings_releases(ticker: str,
 
 
 def for_quarters(ticker: str, as_of: Optional[str] = None,
-                 quarters: Optional[Dict[str, Dict]] = None
-                 ) -> Dict[str, Dict[str, Any]]:
+                 quarters: Optional[Dict[str, Dict]] = None,
+                 cik: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
     """The release that reported each quarter, keyed on fiscal period.
 
     A release belongs to a quarter if it fell after that quarter closed and no
@@ -190,7 +199,7 @@ def for_quarters(ticker: str, as_of: Optional[str] = None,
     fetches it for the filing dates and would otherwise fetch it again here,
     which over 595 names is 1,190 requests for the same data.
     """
-    releases = earnings_releases(ticker, as_of=as_of)
+    releases = earnings_releases(ticker, as_of=as_of, cik=cik)
     if not releases:
         return {}
 
@@ -211,7 +220,7 @@ def for_quarters(ticker: str, as_of: Optional[str] = None,
     return out
 
 
-def backfill(tickers: Sequence[str],
+def backfill(tickers: Optional[Sequence[str]] = None,
              as_of: Optional[str] = None) -> Dict[str, Any]:
     """Record every release found, dated and timed from the filing itself.
 
@@ -219,14 +228,20 @@ def backfill(tickers: Sequence[str],
     not see it -- the record is of when the market learned, and back-filling it
     with today's stamp would make it invisible to exactly the questions it
     exists to answer.
+
+    `tickers` defaults to the eligible universe as of the date, each name with
+    the CIK the screen recorded for it. A caller's own list carries no CIK, so
+    its names are asked for by ticker.
     """
     as_of = as_of or _today()
+    names = (daily_job.eligible_names(as_of) if tickers is None
+             else [(t, None) for t in tickers])
     run_id = pit_store.start_run("announce", as_of_date=as_of)
     written = 0
     covered = 0
     failed: List[str] = []
 
-    for ticker in tickers:
+    for ticker, cik in names:
         # Every 8-K read below is cached under /root/.edgar and nothing removes
         # one. The eviction that keeps the servers alive is an asyncio task in
         # the HTTP app's lifespan, and this process never starts it -- so a
@@ -237,7 +252,7 @@ def backfill(tickers: Sequence[str],
         # documents it already pulled counted against the cap.
         filing_cache.prune_if_due()
         try:
-            found = for_quarters(ticker, as_of=as_of)
+            found = for_quarters(ticker, as_of=as_of, cik=cik)
         except Exception as exc:  # noqa: BLE001 - counted and reported
             failed.append(f"{ticker}: {type(exc).__name__}: {exc}")
             continue
@@ -253,12 +268,12 @@ def backfill(tickers: Sequence[str],
     # `coverage_status` read this job exactly like the others.
     pit_store.finish_run(
         rows_written=written,
-        status=daily_job.coverage_status(covered, len(tickers)),
-        error=(f"{len(failed)} of {len(tickers)} lookups failed: "
+        status=daily_job.coverage_status(covered, len(names)),
+        error=(f"{len(failed)} of {len(names)} lookups failed: "
                + "; ".join(failed[:5])) if failed else None,
         run_id=run_id)
 
-    return {"tickers": len(tickers), "covered": covered, "written": written,
+    return {"tickers": len(names), "covered": covered, "written": written,
             "failed": failed}
 
 
@@ -282,12 +297,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--as-of", dest="as_of", default=None)
     args = parser.parse_args(argv)
 
-    names = args.tickers
-    if not names:
-        from research import daily_job
-        names = daily_job.eligible_tickers(args.as_of)
-
-    result = backfill(names, as_of=args.as_of)
+    # No names, or `--tickers` with none after it, is the eligible universe.
+    result = backfill(args.tickers or None, as_of=args.as_of)
     print(json.dumps(result, indent=2, default=str))
     return 1 if result["failed"] and not result["written"] else 0
 

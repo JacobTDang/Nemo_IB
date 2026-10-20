@@ -178,6 +178,80 @@ def test_a_name_edgar_refuses_is_reported_not_swallowed(store, monkeypatch):
     assert "503" in out["failed"][0]
 
 
+# --- which registrant the 8-Ks are read from --------------------------------
+#
+# edgartools maps a ticker from a parquet file bundled with the package, and a
+# ticker missing from it does not raise: `Company(ticker)` returns the sentinel
+# CIK -999999999 and an empty 8-K list. 103 of 1,810 eligible names were
+# missing on 2026-10-19 (#130), and each one was recorded as a company that
+# files no earnings releases.
+
+class _Filings(list):
+    def head(self, n):
+        return _Filings(self[:n])
+
+
+def _edgar(monkeypatch, bundled, folders):
+    """edgartools behind `_fetch_8k`, as it stood on 2026-10-20. Returns
+    every key it was asked for."""
+    import edgar
+
+    asked = []
+
+    class _Company:
+        def __init__(self, key):
+            asked.append(key)
+            self.cik = bundled.get(key, -999999999) if isinstance(key, str) \
+                else key
+            self.not_found = self.cik not in folders
+
+        def get_filings(self, form=None):
+            return _Filings(folders.get(self.cik, []))
+
+    monkeypatch.setattr(edgar, "Company", _Company)
+    monkeypatch.setattr(edgar, "set_identity", lambda identity: None)
+    monkeypatch.setenv("SEC_EMAIL", "t@example.invalid")
+    return asked
+
+
+def test_a_name_edgartools_cannot_map_is_read_by_its_cik(store, monkeypatch):
+    """DMC is missing from the bundled map. The weekly run recorded it as
+    having no Item 2.02 releases while its latest 40 8-Ks held 19. The
+    universe holds DMC's CIK from SEC's own file, and the run reads by it."""
+    store.record_universe("2026-03-20", [
+        {"ticker": "DMC", "cik": "1047340", "eligible": True}],
+        recorded_at="2026-03-20T21:00:00Z")
+    asked = _edgar(monkeypatch, bundled={}, folders={
+        1047340: [Filing("2026-02-11", "2.02,9.01", "2026-02-11T21:05:00")]})
+    monkeypatch.setattr(announcements, "_quarters",
+                        lambda t, as_of=None: QUARTERS)
+    monkeypatch.setattr("builtins.print", lambda *a, **k: None)
+
+    assert announcements.main(["--as-of", "2026-03-20"]) == 0
+
+    got = pit_store.announcements_as_of("DMC", "2026-03-20")
+    assert [(a["fiscal_period"], a["announced_date"]) for a in got] == \
+        [("2026Q1", "2026-02-11")]
+    assert "DMC" not in asked, "the bundled ticker map was asked for DMC"
+
+
+def test_a_ticker_edgartools_cannot_map_is_a_failure_not_a_quiet_name(
+        store, monkeypatch):
+    """With only a ticker to go on, an unresolvable name is reported as a
+    failed lookup. Recording it as a company with no releases is the silent
+    wrong answer #130 found."""
+    _edgar(monkeypatch, bundled={}, folders={})
+    monkeypatch.setattr(announcements, "_quarters",
+                        lambda t, as_of=None: QUARTERS)
+
+    out = announcements.backfill(["DMC"], as_of="2026-03-20")
+
+    assert out["written"] == 0
+    assert out["covered"] == 0
+    assert len(out["failed"]) == 1
+    assert out["failed"][0].startswith("DMC: LookupError")
+
+
 # --- the awkward filings ----------------------------------------------------
 
 def test_a_company_that_files_2_02_for_something_else(monkeypatch):

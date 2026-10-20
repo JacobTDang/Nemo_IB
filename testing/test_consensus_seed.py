@@ -404,6 +404,59 @@ def test_the_seeding_reports_how_many_were_announcement_dated(store,
     assert out["filing_dated"] == 1
 
 
+# --- which registrant the release is read from ------------------------------
+#
+# edgartools maps a ticker from a parquet file bundled with the package, and a
+# ticker missing from it does not raise: `Company(ticker)` returns the sentinel
+# CIK -999999999 and an empty 8-K list. 103 of 1,810 eligible names were
+# missing on 2026-10-19 (#130). A seed over the universe reads by the CIK the
+# universe recorded from SEC's own file.
+
+_REAL_ANNOUNCEMENTS = seed_consensus._announcements
+
+
+def test_a_name_edgartools_cannot_map_is_announcement_dated_by_its_cik(
+        store, monkeypatch):
+    import edgar
+
+    class _Filings(list):
+        def head(self, n):
+            return _Filings(self[:n])
+
+    class _Release:
+        def __init__(self, day):
+            self.filing_date, self.items = day, "2.02,9.01"
+            self.acceptance_datetime, self.accession_no = None, f"acc-{day}"
+
+    asked = []
+
+    class _Company:
+        def __init__(self, key):
+            asked.append(key)
+            self.cik = -999999999 if isinstance(key, str) else key
+            self.not_found = self.cik != 1047340
+
+        def get_filings(self, form=None):
+            return _Filings([_Release("2026-07-14"), _Release("2026-04-14")]
+                            if self.cik == 1047340 else [])
+
+    monkeypatch.setattr(edgar, "Company", _Company)
+    monkeypatch.setattr(edgar, "set_identity", lambda identity: None)
+    monkeypatch.setenv("SEC_EMAIL", "t@example.invalid")
+    monkeypatch.setattr(seed_consensus, "_announcements", _REAL_ANNOUNCEMENTS)
+    monkeypatch.setattr(seed_consensus, "_fetch_surprises",
+                        lambda t: SURPRISES)
+    monkeypatch.setattr("builtins.print", lambda *a, **k: None)
+    store.record_universe("2026-08-27", [
+        {"ticker": "DMC", "cik": "1047340", "eligible": True}],
+        recorded_at="2026-08-27T21:00:00Z")
+
+    assert seed_consensus.main([]) == 0
+
+    assert pit_store.actual_as_of("DMC", "2026Q4", "2026-07-14") == 4.74
+    assert "DMC" not in asked, "the bundled ticker map was asked for DMC"
+
+
 # --- one leaked session per name --------------------------------------------
 #
 # `asyncio.run` opens a loop, runs the call, and closes the loop. The aiohttp
