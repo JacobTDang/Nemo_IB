@@ -20,7 +20,7 @@ import re
 import statistics
 import time
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from research import _DOTENV_PATH, pit_store  # noqa: F401 - .env on import
 
@@ -917,9 +917,21 @@ def refresh_universe(as_of: Optional[str] = None) -> Dict[str, Any]:
 
 
 def eligible_tickers(as_of: Optional[str] = None) -> List[str]:
+    return [ticker for ticker, _ in eligible_names(as_of)]
+
+
+def eligible_names(as_of: Optional[str] = None
+                   ) -> List[Tuple[str, Optional[str]]]:
+    """Each eligible name with the CIK the screen recorded for it.
+
+    The CIK came from SEC's own ticker file. A job that reads EDGAR by it does
+    not depend on the ticker map edgartools bundles, which lacked 103 of 1,810
+    eligible names on 2026-10-19 (#130). A blank CIK is None: missing, not a
+    value two names could share.
+    """
     as_of = as_of or _today()
-    return [m["ticker"] for m in pit_store.universe_as_of(as_of)
-            if m["eligible"]]
+    return [(m["ticker"], m["cik"] or None)
+            for m in pit_store.universe_as_of(as_of) if m["eligible"]]
 
 
 # ------------------------------------------------------------- consensus

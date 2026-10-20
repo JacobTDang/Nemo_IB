@@ -98,17 +98,21 @@ def _stamp(day: str) -> str:
 
 
 def _announcements(ticker: str, as_of: Optional[str] = None,
-                   quarters: Optional[Dict[str, Dict]] = None
-                   ) -> Dict[str, Dict[str, Any]]:
+                   quarters: Optional[Dict[str, Dict]] = None,
+                   cik: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
     """When the market learned each quarter, from the Item 2.02 filing.
 
     Takes the series the caller already fetched for the filing dates rather
     than fetching it again -- over 595 names that was 1,190 EDGAR requests for
     one set of quarters.
+
+    Read by `cik` when the universe has one. By ticker, a name missing from
+    the map edgartools bundles is a failed lookup (#130).
     """
     from research import announcements
 
-    return announcements.for_quarters(ticker, as_of=as_of, quarters=quarters)
+    return announcements.for_quarters(ticker, as_of=as_of, quarters=quarters,
+                                      cik=cik)
 
 
 def _filing_dates(ticker: str,
@@ -124,9 +128,12 @@ def _filing_dates(ticker: str,
             for q in series["quarters"]}
 
 
-def seed(tickers: Sequence[str],
+def seed(tickers: Optional[Sequence[str]] = None,
          as_of: Optional[str] = None) -> Dict[str, Any]:
     """Reconstruct up to four quarters of both legs for each name.
+
+    `tickers` defaults to the eligible universe, each name with the CIK the
+    screen recorded for it. A caller's own list carries no CIK.
 
     The estimate is stamped at the filer's own period end, which is before the
     print by construction. The actual is stamped at the filing date, because it
@@ -136,6 +143,11 @@ def seed(tickers: Sequence[str],
     Never overwrites: a quarter already in the record was watched, and a real
     observation outranks a reconstruction of it.
     """
+    if tickers is None:
+        from research import daily_job
+        names = daily_job.eligible_names(as_of)
+    else:
+        names = [(t, None) for t in tickers]
     run_id = pit_store.start_run("seed", as_of_date=as_of or _today())
     written = 0
     incomplete = 0
@@ -151,7 +163,7 @@ def seed(tickers: Sequence[str],
     failed: List[str] = []
     seen = 0
 
-    for ticker in tickers:
+    for ticker, cik in names:
         # A vendor job that reaches EDGAR twice per name on the way: the filer
         # dates below and the Item 2.02 release after them. Both cache their
         # documents under /root/.edgar, the same 512MB tmpfs the watcher fills,
@@ -163,7 +175,8 @@ def seed(tickers: Sequence[str],
         try:
             rows = _fetch_surprises(ticker)
             dates = _filing_dates(ticker, as_of=as_of)
-            announced = _announcements(ticker, as_of=as_of, quarters=dates)
+            announced = _announcements(ticker, as_of=as_of, quarters=dates,
+                                       cik=cik)
         except Exception as exc:  # noqa: BLE001 - counted and reported
             failed.append(f"{ticker}: {type(exc).__name__}: {exc}")
             continue
@@ -245,11 +258,11 @@ def seed(tickers: Sequence[str],
     pit_store.finish_run(
         rows_written=written,
         status="failed" if failed and not written else "ok",
-        error=(f"{len(failed)} of {len(tickers)} names failed: "
+        error=(f"{len(failed)} of {len(names)} names failed: "
                + "; ".join(str(f) for f in failed[:5])) if failed else None,
         run_id=run_id)
 
-    return {"tickers": len(tickers), "quarters_seen": seen,
+    return {"tickers": len(names), "quarters_seen": seen,
             "written": written, "incomplete": incomplete, "undated": undated,
             "unmatched": unmatched, "duplicates": duplicates,
             "announcement_dated": announcement_dated,
@@ -278,12 +291,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="names to seed (default: today's eligible universe)")
     args = parser.parse_args(argv)
 
-    names = args.tickers
-    if not names:
-        from research import daily_job
-        names = daily_job.eligible_tickers()
-
-    result = seed(names)
+    # No names, or `--tickers` with none after it, is the eligible universe.
+    result = seed(args.tickers or None)
     print(json.dumps(result, indent=2, default=str))
     return 1 if result["failed"] and not result["written"] else 0
 

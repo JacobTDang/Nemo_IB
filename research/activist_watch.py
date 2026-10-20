@@ -51,7 +51,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from research import daily_job, pit_store
+from research import daily_job, pit_store, registrant
 from tools import filing_cache
 
 JOB = "activist_watch"
@@ -89,33 +89,11 @@ def _be_gentle() -> None:
     time.sleep(THROTTLE_SECONDS)
 
 
-def _resolved_cik(ticker: str, cik: Any) -> str:
-    """The registrant's CIK, or a refusal. Never a sentinel.
-
-    `Company("PARA")` does not raise for a ticker EDGAR no longer maps. It
-    returns a company whose CIK is -999999999 and whose filing list is empty --
-    observed live. Empty is the same shape a genuinely quiet company returns,
-    so without this the watchlist could rot one delisted name at a time, each
-    reporting "no 13Ds" forever and counting as coverage while it did. That is
-    the confusion this module exists to prevent, arriving through the vendor
-    instead of through the network.
-    """
-    try:
-        value = int(cik)
-    except (TypeError, ValueError):
-        value = -1
-    if value <= 0:
-        raise LookupError(
-            f"EDGAR does not map {ticker} to a registrant (CIK {cik!r}). "
-            f"Refused rather than treated as a company with no filings, which "
-            f"is what an empty result from an unresolvable ticker looks like.")
-    return str(value)
-
-
 # --------------------------------------------------------------- seam
 
-def _fetch_company_filings(ticker: str) -> Tuple[str, List[Any]]:
-    """A ticker's Schedule 13D folder, from the submissions index.
+def _fetch_company_filings(ticker: str,
+                           cik: Optional[str] = None) -> Tuple[str, List[Any]]:
+    """A name's Schedule 13D folder, from the submissions index.
 
     One network request: constructing the company fetches its submissions
     index and the form filters run in memory. Nothing here reads a document,
@@ -127,20 +105,23 @@ def _fetch_company_filings(ticker: str) -> Tuple[str, List[Any]]:
     it is an amendment, so accessions are deduped here rather than left to
     produce two events for one filing.
 
+    Asked for by `cik` when the watchlist has one. By ticker, a name missing
+    from the ticker map edgartools bundles comes back as the sentinel and is
+    refused -- correctly, but then it is never watched, and 103 eligible names
+    were missing on 2026-10-19 (#130). See `research.registrant`.
+
     The single seam every network call in this module sits behind, so the
     failure modes above can be tested without a network -- which is the only
     way they get covered at all.
     """
-    from edgar import Company
-
     from tools.web_search_server.sec_series import _require_identity
 
     # Refuses to invent a contact address, and sets edgartools' identity as a
     # side effect. SEC fair access requires a real one.
     _require_identity()
 
-    company = Company(ticker)
-    cik = _resolved_cik(ticker, company.cik)
+    company = registrant.company(ticker, cik)
+    cik = str(company.cik)
 
     seen: set = set()
     filings: List[Any] = []
@@ -161,15 +142,18 @@ def last_run() -> Optional[Dict[str, Any]]:
     return daily_job.last_run(JOB)
 
 
-def _watchlist(as_of: str) -> List[str]:
+def _watchlist(as_of: str) -> List[Tuple[str, Optional[str]]]:
     """Who to watch on `as_of`, read as the universe stood that day.
 
     Not a list in a config file. A name eligible in March and delisted in June
     was watched in March, and reading today's universe when replaying a March
     pass silently rewrites who was being observed -- the same survivorship the
     store exists to prevent, one level up.
+
+    Each name comes with the CIK the screen recorded from SEC's ticker file,
+    because that is what reaches its folder when edgartools' own map does not.
     """
-    return daily_job.eligible_tickers(as_of)
+    return daily_job.eligible_names(as_of)
 
 
 # ------------------------------------------------------------------ pass
@@ -216,7 +200,9 @@ def watch_pass(tickers: Optional[Sequence[str]] = None,
             f"observed when it was not -- run research.daily_job.refresh_"
             f"universe first.")
     else:
-        requested = [t for t in tickers if t]
+        # A caller's list carries no CIK, so each of these is asked for by
+        # ticker, and one edgartools cannot map is a failed lookup.
+        requested = [(t, None) for t in tickers if t]
         empty_reason = ("the watchlist was empty, so this pass watched nobody "
                         "and its silence means nothing")
 
@@ -256,7 +242,7 @@ def watch_pass(tickers: Optional[Sequence[str]] = None,
 
     watched = 0
     stopped_by = None
-    for ticker in requested:
+    for ticker, known_cik in requested:
         if deadline is not None and time.monotonic() >= deadline:
             stopped_by = "budget"
             break
@@ -277,7 +263,7 @@ def watch_pass(tickers: Optional[Sequence[str]] = None,
         # silence every name after it and leave the run unfinished, which is a
         # silent outage wearing the shape of a short watchlist.
         try:
-            cik, filings = _fetch_company_filings(ticker)
+            cik, filings = _fetch_company_filings(ticker, known_cik)
 
             known = pit_store.known_activist_accessions(ticker)
             fresh: List[Dict[str, Any]] = []

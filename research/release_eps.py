@@ -45,7 +45,7 @@ import time
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 
-from research import sue
+from research import registrant, sue
 
 VARIANT = "ts_release"
 
@@ -467,21 +467,25 @@ def signal_from_release(series: Dict[str, Any], fiscal_period: str,
 
 # ----------------------------------------------------------- reading EDGAR
 
-def _company(ticker: str):
+def _company(ticker: str, cik: Optional[str] = None):
     """`edgar.Company`, with the SEC identity set here rather than assumed.
 
     Every other EDGAR reader in the package sets it on its own path; relying
     on one of them having run first in this process is how a lone call from a
     driver script raised IdentityNotSetException.
+
+    Asked for by `cik` where the caller has one -- every caller here holds an
+    `eps_series`, which resolved the name through SEC's own ticker file. The
+    map edgartools bundles lacked 103 eligible names on 2026-10-19 (#130).
     """
-    from edgar import Company, set_identity
+    from edgar import set_identity
 
     email = os.environ.get("SEC_EMAIL")
     if not email:
         raise RuntimeError("SEC_EMAIL is not set; EDGAR requires a contact "
                            "address in the User-Agent and refuses without one")
     set_identity(f"{os.environ.get('NAME') or 'Investment Analyst'} {email}")
-    return Company(ticker)
+    return registrant.company(ticker, cik)
 
 
 def _exhibit_rank(attachment) -> Optional[int]:
@@ -632,10 +636,12 @@ def release_history(ticker: str) -> Dict[str, Any]:
     by_period = {q["fiscal_period"]: {"period_end": q.get("period_end"),
                                       "known_at": q["known_at"]}
                  for q in series["quarters"]}
-    releases = announcements.for_quarters(ticker, quarters=by_period)
+    releases = announcements.for_quarters(ticker, quarters=by_period,
+                                          cik=series["cik"])
     # One filings list for the name. Per accession it was 14 seconds a
     # release on JPMorgan, and every release lives in the same list.
-    filings = _company(ticker).get_filings(form="8-K") if releases else []
+    filings = (_company(ticker, series["cik"]).get_filings(form="8-K")
+               if releases else [])
 
     signals, extractions = [], []
     for period, release in sorted(releases.items()):
@@ -694,7 +700,8 @@ def sue_ts_release(ticker: str, as_of: Optional[str] = None) -> Dict[str, Any]:
         return {**sue._signal_shell(ticker, as_of), "error": series["error"],
                 "variant": VARIANT}
 
-    releases = announcements.earnings_releases(ticker, as_of=as_of)
+    releases = announcements.earnings_releases(ticker, as_of=as_of,
+                                               cik=series["cik"])
     if not releases:
         return {**sue._signal_shell(ticker, as_of), "variant": VARIANT,
                 "error": f"no Item 2.02 release on or before {as_of} for {ticker}"}
@@ -703,7 +710,8 @@ def sue_ts_release(ticker: str, as_of: Optional[str] = None) -> Dict[str, Any]:
     by_period = {q["fiscal_period"]: {"period_end": q.get("period_end"),
                                       "known_at": q["known_at"]}
                  for q in series["quarters"]}
-    mapped = announcements.for_quarters(ticker, as_of=as_of, quarters=by_period)
+    mapped = announcements.for_quarters(ticker, as_of=as_of, quarters=by_period,
+                                        cik=series["cik"])
     period = next((p for p, r in mapped.items()
                    if r.get("accession") == latest.get("accession")), None)
     if period is None:
@@ -714,8 +722,9 @@ def sue_ts_release(ticker: str, as_of: Optional[str] = None) -> Dict[str, Any]:
         fy, fq = sue._shift(last["fiscal_year"], last["fiscal_quarter"], back=-1)
         period = sue._period_key(fy, fq)
 
-    read = read_release(ticker, latest["accession"],
-                        period_end=_period_end_for(series, period))
+    read = read_release(
+        ticker, latest["accession"], period_end=_period_end_for(series, period),
+        filings=_company(ticker, series["cik"]).get_filings(form="8-K"))
     if read["eps"] is None:
         return {**sue._signal_shell(ticker, as_of), "variant": VARIANT,
                 "fiscal_period": period,
@@ -796,7 +805,8 @@ def usual_filing_lag_for(ticker: str, as_of: Optional[str] = None,
                                       "known_at": q["known_at"]}
                  for q in series["quarters"]}
     releases = announcements.for_quarters(ticker, as_of=as_of,
-                                          quarters=by_period)
+                                          quarters=by_period,
+                                          cik=series["cik"])
     lag = usual_filing_lag(
         {period: r["announced_date"] for period, r in releases.items()},
         {period: d["known_at"] for period, d in by_period.items()},

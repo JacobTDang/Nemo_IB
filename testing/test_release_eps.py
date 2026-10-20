@@ -269,7 +269,7 @@ def test_a_fetch_that_fails_costs_one_release_not_the_name(monkeypatch):
     series = _series()
     monkeypatch.setattr(sue, "eps_series", lambda t, as_of=None: series)
     monkeypatch.setattr(announcements, "for_quarters",
-                        lambda t, as_of=None, quarters=None: {
+                        lambda t, as_of=None, quarters=None, cik=None: {
                             "2026Q3": {"accession": "good", "announced_date": "2026-08-30"},
                             "2026Q4": {"accession": "bad", "announced_date": "2026-11-30"}})
 
@@ -285,7 +285,7 @@ def test_a_fetch_that_fails_costs_one_release_not_the_name(monkeypatch):
         def get_filings(self, form=None):
             return []
 
-    monkeypatch.setattr(release_eps, "_company", lambda ticker: _Company())
+    monkeypatch.setattr(release_eps, "_company", lambda ticker, cik=None: _Company())
 
     out = release_eps.release_history("AAA")
 
@@ -429,7 +429,7 @@ def _company_with(filings, monkeypatch):
 
         def get_filings(self, form=None):
             return filings
-    monkeypatch.setattr(release_eps, "_company", lambda ticker: _Company(ticker))
+    monkeypatch.setattr(release_eps, "_company", lambda ticker, cik=None: _Company(ticker))
 
 
 def test_exhibit_99_1_is_preferred_and_a_substring_match_on_99_2_is_not_enough(
@@ -602,7 +602,7 @@ def test_the_filings_list_is_fetched_once_per_name(monkeypatch):
     series = _series()
     monkeypatch.setattr(sue, "eps_series", lambda t, as_of=None: series)
     monkeypatch.setattr(announcements, "for_quarters",
-                        lambda t, as_of=None, quarters=None: {
+                        lambda t, as_of=None, quarters=None, cik=None: {
                             "2026Q3": {"accession": "a", "announced_date": "2026-08-30"},
                             "2026Q4": {"accession": "b", "announced_date": "2026-11-30"}})
 
@@ -612,7 +612,7 @@ def test_the_filings_list_is_fetched_once_per_name(monkeypatch):
             return [_Filing("a", [_Attachment("ex99-1.htm", "EX-99.1", APPLE)]),
                     _Filing("b", [_Attachment("ex99-1.htm", "EX-99.1", APPLE)])]
 
-    monkeypatch.setattr(release_eps, "_company", lambda ticker: _Company())
+    monkeypatch.setattr(release_eps, "_company", lambda ticker, cik=None: _Company())
 
     out = release_eps.release_history("AAA")
 
@@ -781,7 +781,7 @@ def test_a_filing_missing_from_the_list_says_so(monkeypatch):
         def get_filings(self, form=None):
             return [_Filing("other", [_Attachment("ex99-1.htm", "EX-99.1", APPLE)])]
 
-    monkeypatch.setattr(release_eps, "_company", lambda ticker: _Company())
+    monkeypatch.setattr(release_eps, "_company", lambda ticker, cik=None: _Company())
     monkeypatch.setattr(release_eps, "_filing_by_accession", lambda acc: None)
 
     out = release_eps.read_release("AAPL", "acc-not-listed")
@@ -798,12 +798,103 @@ def test_a_filing_missing_from_the_list_is_resolved_the_slow_way(monkeypatch):
         def get_filings(self, form=None):
             return [_Filing("other", [])]
 
-    monkeypatch.setattr(release_eps, "_company", lambda ticker: _Company())
+    monkeypatch.setattr(release_eps, "_company", lambda ticker, cik=None: _Company())
     monkeypatch.setattr(
         release_eps, "_filing_by_accession",
         lambda acc: _Filing(acc, [_Attachment("ex99-1.htm", "EX-99.1", APPLE)]))
 
     assert release_eps.read_release("AAPL", "old-acc")["eps"] == pytest.approx(2.02)
+
+
+# --- which registrant the releases are read from ----------------------------
+#
+# edgartools maps a ticker from a parquet file bundled with the package, and a
+# ticker missing from it does not raise: `Company(ticker)` returns the sentinel
+# CIK -999999999 and an empty 8-K list (#130). `eps_series` resolves through
+# SEC's own ticker file and hands back the CIK, so every read below asks by it.
+
+class _Release(_Filing):
+    """An Item 2.02 8-K as both `announcements` and the exhibit reader see
+    it: dated, timed, and carrying Apple's EX-99.1."""
+    def __init__(self, day):
+        super().__init__(f"acc-{day}",
+                         [_Attachment("ex99-1.htm", "EX-99.1", APPLE)])
+        self.filing_date = day
+        self.items = "2.02,9.01"
+        self.acceptance_datetime = None
+
+
+class _Filings(list):
+    def head(self, n):
+        return _Filings(self[:n])
+
+
+def _dmc(monkeypatch, days):
+    """DMC as #130 found it: missing from edgartools' bundled ticker map,
+    present under its CIK. Returns every key edgartools was asked for."""
+    import edgar
+
+    from research import sue
+
+    asked = []
+
+    class _Company:
+        def __init__(self, key):
+            asked.append(key)
+            self.cik = -999999999 if isinstance(key, str) else key
+            self.not_found = self.cik != 1047340
+
+        def get_filings(self, form=None):
+            return _Filings(_Release(d) for d in days) \
+                if self.cik == 1047340 else _Filings()
+
+    series = {**_series(), "ticker": "DMC", "cik": "0001047340",
+              "basis_unresolved": []}
+    monkeypatch.setattr(sue, "eps_series", lambda t, as_of=None: series)
+    monkeypatch.setattr(edgar, "Company", _Company)
+    monkeypatch.setattr(edgar, "set_identity", lambda identity: None)
+    monkeypatch.setenv("SEC_EMAIL", "t@example.invalid")
+    return asked
+
+
+# Inside each quarter's window in `_series`: after the period end on the 1st,
+# no later than the filing on the 15th.
+DMC_RELEASES = ["2026-12-10", "2026-09-10", "2026-06-10", "2026-03-10"]
+
+
+def test_the_history_of_a_name_edgartools_cannot_map_is_read_by_its_cik(
+        monkeypatch):
+    asked = _dmc(monkeypatch, DMC_RELEASES)
+
+    out = release_eps.release_history("DMC")
+
+    assert [(r["fiscal_period"], r["release_eps"]) for r in out["extractions"]] \
+        == [(p, pytest.approx(2.02))
+            for p in ("2026Q1", "2026Q2", "2026Q3", "2026Q4")]
+    assert "DMC" not in asked, "the bundled ticker map was asked for DMC"
+
+
+def test_the_nightly_signal_reads_a_name_edgartools_cannot_map_by_its_cik(
+        monkeypatch):
+    """The path the scanner takes when `SIGNAL_VARIANT` is `ts_release`.
+    Through the ticker it read "no Item 2.02 release" for a name with four."""
+    asked = _dmc(monkeypatch, DMC_RELEASES)
+
+    out = release_eps.sue_ts_release("DMC", as_of="2026-12-20")
+
+    assert out["fiscal_period"] == "2026Q4", out.get("error")
+    assert out["release_eps"] == pytest.approx(2.02)
+    assert "DMC" not in asked, "the bundled ticker map was asked for DMC"
+
+
+def test_the_filing_lag_of_a_name_edgartools_cannot_map_is_read_by_its_cik(
+        monkeypatch):
+    asked = _dmc(monkeypatch, DMC_RELEASES)
+
+    out = release_eps.usual_filing_lag_for("DMC", as_of="2026-12-31")
+
+    assert out["lag_days"] == 5, out["reason"]
+    assert "DMC" not in asked, "the bundled ticker map was asked for DMC"
 
 
 # --- the quarter word belongs to the comparison ------------------------------
