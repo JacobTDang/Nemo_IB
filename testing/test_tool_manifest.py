@@ -32,6 +32,7 @@ carries must appear in the manifest.
 import asyncio
 import datetime as dt
 import importlib
+import inspect
 import json
 
 import pytest
@@ -68,7 +69,9 @@ def _live_annotation_configs():
     """{server name: the config its `annotating(...)` dispatcher was built with}.
 
     Reached by hand through the MCP layer's own closure rather than through the
-    manifest's helper, for the same reason as above.
+    manifest's helper, for the same reason as above. A server may put a handler
+    of its own in front of the SDK's; it declares itself with functools.wraps,
+    and inspect.unwrap goes through it.
     """
     configs = {}
     for spec in SERVERS:
@@ -77,6 +80,7 @@ def _live_annotation_configs():
         for key, handler in instance.server.request_handlers.items():
             if "CallTool" not in str(key):
                 continue
+            handler = inspect.unwrap(handler)
             code = handler.__code__
             if "func" in code.co_freevars:
                 inner = handler.__closure__[

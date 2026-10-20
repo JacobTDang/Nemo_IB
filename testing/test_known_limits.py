@@ -12,6 +12,7 @@ reassurance that a limit is handled. So every curated entry is checked against
 the live catalogue, and a stale one fails here rather than misleading a reader.
 """
 import asyncio
+import inspect
 
 import pytest
 
@@ -50,11 +51,14 @@ def _annotation_config(instance):
 
     The MCP SDK wraps the registered function in its own handler and does not
     use functools.wraps, so there is no `__wrapped__` to follow. Ours is held
-    in the wrapping handler's closure.
+    in the wrapping handler's closure. A server may put a handler of its own in
+    front of the SDK's; it declares itself with functools.wraps, and
+    inspect.unwrap goes through it.
     """
     for key, handler in instance.server.request_handlers.items():
         if "CallTool" not in str(key):
             continue
+        handler = inspect.unwrap(handler)
         config = getattr(handler, "annotation_config", None)
         if config is not None:
             return config

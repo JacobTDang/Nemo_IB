@@ -76,12 +76,14 @@ def test_the_refusal_says_what_was_wrong():
         f"the refusal does not name the share count: {message[:160]}")
 
 
-def test_the_enterprise_value_survives_a_missing_share_count():
-    """The company is still worth what it is worth. Only the per-share figure
-    is unanswerable, so only it should go."""
+def test_a_zero_share_count_is_refused_whole():
+    """This used to keep the enterprise value and drop only the price, when a
+    planner could leave the share count unfilled. calculate_dcf now asks for
+    every input, so a zero here is an absent field read as a number -- the
+    same mistake that valued NVDA with no tax -- and the call is refused."""
     result = _call("calculate_dcf", {**BASE, "shares_outstanding": 0})
-    assert result.get("enterprise_value"), (
-        "a missing share count threw away the whole valuation")
+    assert result.get("success") is False
+    assert "enterprise_value" not in result
 
 
 def test_negative_revenue_is_not_a_company():

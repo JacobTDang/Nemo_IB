@@ -120,16 +120,16 @@ def test_every_registered_tool_name_has_a_dispatch_branch():
 # --------------------------------------------------------------------------
 # Schema/implementation contract.
 #
-# A tool declaring "required": [] promises an MCP client that it can be called
-# with no arguments. Claude reads that schema and does exactly that. If the
-# implementation then indexes args[...] with a bracket, the client gets a
-# KeyError for obeying the contract the tool published.
+# Over MCP the server validates arguments against the declared schema before
+# a handler runs. The handlers are also public methods, called with no schema
+# in front of them. If one indexes args[...] with a bracket, that caller gets
+# a KeyError instead of the refusal that names what is missing.
 # --------------------------------------------------------------------------
 
 @pytest.mark.parametrize("tool_name", ["calculate_dcf", "calculate_wacc"])
 def test_optional_argument_tools_survive_an_empty_call(tool_name):
-    """Both declare "required": [] and describe their numeric inputs as
-    'SET TO 0 -- auto-resolved'. Calling with none must not raise."""
+    """Called as a method with no arguments, each refuses rather than
+    raising."""
     import tools.financial_modeling_engine.analysis_tools as at
 
     server = at.Financial_Analysis()
@@ -140,8 +140,8 @@ def test_optional_argument_tools_survive_an_empty_call(tool_name):
 
 
 def test_declared_optional_arguments_are_read_with_get():
-    """Guards the whole family rather than the two known cases: a handler whose
-    schema says required=[] must not use bracket access on its args dict."""
+    """Guards the whole family rather than the two known cases: a handler
+    called as a method must not use bracket access on its args dict."""
     import inspect
     import re
 
@@ -166,9 +166,7 @@ def test_dcf_refuses_to_value_a_company_with_no_inputs():
 
     A KeyError is obviously broken. A DCF that quietly reports a zero
     enterprise value looks like a real valuation, and it is the kind of answer
-    that gets copied into a thesis. calculate_wacc already refuses this way --
-    "market_cap + total_debt is zero, cannot compute WACC" -- and the DCF
-    should match it.
+    that gets copied into a thesis.
     """
     import tools.financial_modeling_engine.analysis_tools as at
 
