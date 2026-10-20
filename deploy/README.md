@@ -320,20 +320,124 @@ docker compose --env-file ../.env run --rm research-daily               # every 
 docker compose --env-file ../.env run --rm research-scan
 ```
 
+Do the steps in
+[Where a cron line's output goes](#where-a-cron-lines-output-goes) before you
+install these lines. Without them, cron discards the output of a failed job.
+
 Cron lines, in the order they should run:
 
 ```cron
+MAILTO=you@example.com
 CRON_TZ=UTC
-30 22 * * 1-5 cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-daily.lock docker compose --env-file ../.env run --rm research-daily && flock -n /var/lock/nemo-research-scan.lock docker compose --env-file ../.env run --rm research-scan
-*/20 13-23 * * 1-5 cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-watch.lock docker compose --env-file ../.env run --rm research-watch
- 0  7 * * 6 cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-score.lock docker compose --env-file ../.env run --rm research-score
- 0  9 * * 6 cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-announce.lock docker compose --env-file ../.env run --rm research-announce
- 0  8 1 * * cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-seed.lock docker compose --env-file ../.env run --rm research-seed
- 0  6 * * * cd /srv/nemo/deploy && flock -n /var/lock/nemo-congress-sync.lock docker compose --env-file ../.env run --rm congress-sync
-15  3 * * * cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-backup.lock docker compose --env-file ../.env run --rm research-backup
- 0  4 * * * cd /srv/nemo/deploy && docker container prune -f --filter until=24h --filter label=com.docker.compose.project=deploy
-0 12 * * 1-5 cd /srv/nemo/deploy && docker compose --env-file ../.env run --rm research-status
+30 22 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-daily.lock docker compose --env-file ../.env run --rm research-daily && flock -n /var/lock/nemo-research-scan.lock docker compose --env-file ../.env run --rm research-scan; } >> /srv/nemo/logs/research-daily.log 2>&1 || tail -n 100 /srv/nemo/logs/research-daily.log
+*/20 13-23 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-watch.lock docker compose --env-file ../.env run --rm research-watch; } >> /srv/nemo/logs/research-watch.log 2>&1 || tail -n 100 /srv/nemo/logs/research-watch.log
+ 0  7 * * 6 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-score.lock docker compose --env-file ../.env run --rm research-score; } >> /srv/nemo/logs/research-score.log 2>&1 || tail -n 100 /srv/nemo/logs/research-score.log
+ 0  9 * * 6 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-announce.lock docker compose --env-file ../.env run --rm research-announce; } >> /srv/nemo/logs/research-announce.log 2>&1 || tail -n 100 /srv/nemo/logs/research-announce.log
+ 0  8 1 * * cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-seed.lock docker compose --env-file ../.env run --rm research-seed; } >> /srv/nemo/logs/research-seed.log 2>&1 || tail -n 100 /srv/nemo/logs/research-seed.log
+ 0  6 * * * cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-congress-sync.lock docker compose --env-file ../.env run --rm congress-sync; } >> /srv/nemo/logs/congress-sync.log 2>&1 || tail -n 100 /srv/nemo/logs/congress-sync.log
+15  3 * * * cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-backup.lock docker compose --env-file ../.env run --rm research-backup; } >> /srv/nemo/logs/research-backup.log 2>&1 || tail -n 100 /srv/nemo/logs/research-backup.log
+ 0  4 * * * cd /srv/nemo/deploy && { date -u; docker container prune -f --filter until=24h --filter label=com.docker.compose.project=deploy; } >> /srv/nemo/logs/docker-prune.log 2>&1 || tail -n 100 /srv/nemo/logs/docker-prune.log
+0 12 * * 1-5 cd /srv/nemo/deploy && { date -u; docker compose --env-file ../.env run --rm research-status; } >> /srv/nemo/logs/research-status.log 2>&1 || tail -n 100 /srv/nemo/logs/research-status.log
 ```
+
+### Where a cron line's output goes
+
+Cron reports a failure in one way only: it mails the output of the line to
+`MAILTO`. A stock Ubuntu cloud image has no mail transfer agent, so cron
+discards the output. The system log then shows
+`(CRON) info (No MTA installed, discarding output)`. The jobs run with `--rm`,
+so Docker deletes their container logs too. `run_log` does not close the gap.
+A job that fails before `start_run` writes no row, and `research-backup` and
+`congress-sync` write no row at all.
+
+Each line in the block above does two things:
+
+- It appends all of its output, from both streams, to a log file in
+  `/srv/nemo/logs`. A host with no mail still keeps the output.
+- When the line fails, it prints the last 100 lines of that log. Cron mails
+  only what a line prints, so cron mails only a failure.
+
+Each run writes the date as its first line. The lines after the last date line
+come from the run that failed. If no line follows the date, the job printed
+nothing: `flock` found the lock held. The mail shows only the end of the
+output. The log keeps all of it.
+
+The braces do not change the `&&` chain. The scan starts only after the
+recorder exits with zero. Each job keeps its own `flock`.
+
+Do these steps once, as the user that owns the crontab, before you install the
+lines.
+
+1. Make the log directory with mode 755. logrotate refuses to rotate logs in a
+   directory that a group other than root can write.
+
+   ```bash
+   mkdir -m 755 -p /srv/nemo/logs
+   ```
+
+2. Install a mail transfer agent. `msmtp-mta` is a small one. It sends the mail
+   through an SMTP relay that you already use.
+
+   ```bash
+   sudo apt-get install -y msmtp-mta
+   ```
+
+3. Write the relay settings to `~/.msmtprc`. This file holds a password, so
+   give it mode 600. msmtp refuses the file when other users can read it.
+
+   ```text
+   defaults
+   auth on
+   tls on
+   tls_trust_file /etc/ssl/certs/ca-certificates.crt
+   account relay
+   host smtp.example.com
+   port 587
+   from you@example.com
+   user you@example.com
+   password the-relay-password
+   account default : relay
+   ```
+
+   ```bash
+   chmod 600 ~/.msmtprc
+   ```
+
+4. Set `MAILTO` at the top of the crontab, as the block above shows. Use an
+   address that somebody reads.
+
+5. Make sure that cron mail arrives. Add this line below `MAILTO`. Wait one
+   minute, read the mail, and then remove the line.
+
+   ```cron
+   * * * * * echo "cron mail from $(hostname)"
+   ```
+
+   If no mail arrives, run `journalctl -u cron -n 20`. The text
+   `No MTA installed` means that cron found no mail transfer agent.
+
+6. Bound the logs. Write this to `/etc/logrotate.d/nemo`:
+
+   ```text
+   /srv/nemo/logs/*.log {
+       weekly
+       maxsize 10M
+       rotate 8
+       compress
+       copytruncate
+       missingok
+       notifempty
+   }
+   ```
+
+   Then examine it with `sudo logrotate -d /etc/logrotate.d/nemo`. This
+   command shows what logrotate will do, and it changes nothing.
+
+Each log keeps at most nine files: the current file and eight compressed
+copies. logrotate runs once a day, so a log can grow past 10M for up to one
+day. Keep `copytruncate`. A long run can still write to its log when logrotate
+starts. If logrotate moves the file, that run writes to the old file, and its
+failure prints the new, empty file. Then cron mails nothing.
 
 ### What a failed stage costs, and why the chain still uses `&&`
 
@@ -413,7 +517,8 @@ round trip already charged. When the book sits 10% of the gross target below
 its peak, the switch trips.
 
 A tripped switch makes `research-scan` file nothing and exit 1, which cron
-reports; `research-status` at noon exits 1 and names it under ATTENTION. It
+mails to `MAILTO`; `research-status` at noon exits 1 and names it under
+ATTENTION. It
 does not re-arm when equity recovers, because a switch that re-arms on a bounce
 trades straight through the drawdown it exists to stop. Re-arming is a
 decision, and the record keeps who made it and why:
@@ -468,8 +573,8 @@ them. The job never builds a live broker. Then add two lines to the same
 crontab, under its `CRON_TZ=UTC` line:
 
 ```cron
-15 13 * * 1-5 cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-fills.lock docker compose --env-file ../.env run --rm research-fills submit
-45 14 * * 1-5 cd /srv/nemo/deploy && flock -n /var/lock/nemo-research-fills.lock docker compose --env-file ../.env run --rm research-fills collect
+15 13 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-fills.lock docker compose --env-file ../.env run --rm research-fills submit; } >> /srv/nemo/logs/research-fills.log 2>&1 || tail -n 100 /srv/nemo/logs/research-fills.log
+45 14 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-fills.lock docker compose --env-file ../.env run --rm research-fills collect; } >> /srv/nemo/logs/research-fills.log 2>&1 || tail -n 100 /srv/nemo/logs/research-fills.log
 ```
 
 13:15 UTC is before the auction's 09:28 ET cutoff in summer and winter time,
@@ -516,8 +621,8 @@ not raise it. Every other job reporting `partial` is worth a look.
 
 The command exits `1` when anything needs attention, so it also works as a cron
 healthcheck rather than only by eye. The cron block above carries the line, at
-midday on a weekday, so a night that failed is seen the same day rather than
-the next time somebody looks.
+midday on a weekday, so a night that failed reaches the `MAILTO` inbox the
+same day rather than the next time somebody looks.
 
 For logs rather than state, `docker compose --env-file ../.env logs -f sec`
 follows one server, and `docker compose --env-file ../.env ps` shows which
@@ -954,6 +1059,11 @@ so 30MB each is the end of it. Every `docker compose run --rm` makes a new one,
 and an orphan left behind by a reboot keeps its 30MB — so the aggregate is
 bounded only by how many orphans accumulate. See
 [the cron block](#why-every-line-carries-a-flock-and-why-the-last-line-exists).
+
+The scheduled jobs run with `--rm`, so Docker deletes their container logs with
+the container. Their output stays in `/srv/nemo/logs` on the host, and
+logrotate bounds it. See
+[Where a cron line's output goes](#where-a-cron-lines-output-goes).
 
 By default a request logs as `POST /mcp/ 200 OK` and nothing about the payload.
 To see what a tool actually returned:
