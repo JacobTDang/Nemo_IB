@@ -52,6 +52,19 @@ def cache_dir() -> Path:
                                str(Path.home() / ".edgar")))
 
 
+def _is_migration_marker(path: Path) -> bool:
+    """A file edgartools writes once so it does not clear the HTTP cache again.
+
+    5.8.0 writes `_tcache/.locale_fix_457_applied`. 5.62.0 writes
+    `.migrations/locale_fix_457` and `.migrations/empty_response_fix_672`.
+    A missing marker makes the next import delete the cache the cap keeps.
+    """
+    if ".migrations" in path.parts:
+        return True
+    name = path.name
+    return name.startswith(".") and name.endswith("_applied")
+
+
 def prune(root: Any, cap_bytes: int | None = None,
           target_fraction: float = DEFAULT_TARGET_FRACTION) -> dict:
     """Evict least-recently-used files until `root` fits under the target.
@@ -77,6 +90,10 @@ def prune(root: Any, cap_bytes: int | None = None,
             stat = path.stat()
         except OSError as exc:            # vanished mid-walk, or unreadable
             report["failed"].append(f"{path}: {type(exc).__name__}: {exc}")
+            continue
+        # Not a cache entry. These are written once, so they are the oldest
+        # files, and deleting one makes the next import wipe the cache.
+        if _is_migration_marker(path.relative_to(root)):
             continue
         # What the filesystem charges, not the apparent length. tmpfs bills
         # whole pages, and edgartools' hishel cache writes three files per
