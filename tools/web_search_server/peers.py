@@ -51,6 +51,13 @@ def _parse_ciks(xml: str) -> List[int]:
 def _ticker_map() -> Dict[int, Tuple[str, str]]:
     """CIK -> (ticker, company name) for exchange-listed filers.
 
+    SEC lists one row per security. The first row for a CIK is the one kept.
+    On the live file that row is the common share for BAC, C, WFC, USB, COF
+    and GOOGL; the later rows are preferred shares or other classes. A dict
+    comprehension would keep the last row, and a peer named BAC-PS is the
+    preferred's price, not the company's. Alphabet has no unsuffixed ticker,
+    so "drop the class suffix" does not choose between GOOGL and GOOG.
+
     Cached for the process. The file is ~10k entries and changes slowly.
     """
     global _ticker_map_cache
@@ -58,10 +65,12 @@ def _ticker_map() -> Dict[int, Tuple[str, str]]:
         return _ticker_map_cache
     response = requests.get(_TICKER_MAP_URL, headers=_headers(), timeout=_TIMEOUT_S)
     response.raise_for_status()
-    _ticker_map_cache = {
-        int(row["cik_str"]): (row["ticker"], row["title"])
-        for row in response.json().values()
-    }
+    mapping: Dict[int, Tuple[str, str]] = {}
+    for row in response.json().values():
+        cik = int(row["cik_str"])
+        if cik not in mapping:
+            mapping[cik] = (row["ticker"], row["title"])
+    _ticker_map_cache = mapping
     return _ticker_map_cache
 
 

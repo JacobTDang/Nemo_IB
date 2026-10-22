@@ -80,6 +80,32 @@ def test_lookup_failure_is_reported_not_swallowed(monkeypatch):
     assert "edgar down" in result["error"]
 
 
+def test_a_preferred_share_listed_after_the_common_does_not_replace_it(monkeypatch):
+    """SEC lists one row per security. For a bank the common share comes first
+    and a preferred share follows. The map is one ticker per CIK, so the later
+    row must not become the name the peer set uses."""
+    payload = {
+        "0": {"cik_str": 70858, "ticker": "BAC", "title": "BANK OF AMERICA CORP /DE/"},
+        "1": {"cik_str": 70858, "ticker": "BAC-PS", "title": "BANK OF AMERICA CORP /DE/"},
+        "2": {"cik_str": 2488, "ticker": "AMD", "title": "ADVANCED MICRO DEVICES INC"},
+    }
+
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return payload
+
+    monkeypatch.setattr(peers, "_ticker_map_cache", None)
+    monkeypatch.setattr(peers, "_headers", lambda: {"User-Agent": "test"})
+    monkeypatch.setattr(peers.requests, "get", lambda *args, **kwargs: _Response())
+
+    mapping = peers._ticker_map()
+    assert mapping[70858] == ("BAC", "BANK OF AMERICA CORP /DE/")
+    assert mapping[2488] == ("AMD", "ADVANCED MICRO DEVICES INC")
+
+
 # ------------------------------------------------------------- live golden set
 
 @pytest.fixture(scope="module", autouse=True)
