@@ -2045,16 +2045,18 @@ def diff_10k(ticker: str, item: str = '1A',
 
   try:
     company = registrant.company(ticker)
-    raw_filings = company.get_filings(form='10-K')
-    filings = (list(raw_filings.head(10))
-               if hasattr(raw_filings, 'head') else list(raw_filings)[:10])
+    filings = list(company.get_filings(form='10-K').head(10))
     read_from = None
     if len(filings) < 2:
+      # A holding company that took the ticker has at most one 10-K of its
+      # own. Its own comes first, the co-registrant's continue the history:
+      # once it files its first, that is the current year and the
+      # predecessor's latest is the prior one.
       predecessor = registrant.predecessor_with_form(company, '10-K')
       if predecessor is not None:
-        pred_filings = predecessor.get_filings(form='10-K')
-        filings = (list(pred_filings.head(10))
-                   if hasattr(pred_filings, 'head') else list(pred_filings)[:10])
+        theirs = list(predecessor.get_filings(form='10-K').head(10))
+        filings = sorted(filings + theirs, key=lambda f: str(f.filing_date),
+                         reverse=True)[:10]
         read_from = {'name': predecessor.name, 'cik': int(predecessor.cik)}
   except Exception as e:
     return {'ticker': ticker, 'success': False,

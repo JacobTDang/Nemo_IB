@@ -229,14 +229,15 @@ def test_diff_10k_uses_successors_own_filings_when_it_has_two_10ks(monkeypatch):
     assert result["prior_filing_date"] == "2025-02-21"
 
 
-def test_diff_10k_reads_co_registrant_when_successor_has_fewer_than_two_10ks(
+def test_diff_10k_diffs_a_first_own_10k_against_the_predecessors_last(
         monkeypatch):
-    """A successor with only one 10-K has fewer than two 10-Ks, so it routes
-    to the predecessor's two 10-Ks."""
-    holdco_only_one = _Filing("0002115436-26-000010", filing_date="2026-02-20")
+    """Once the successor files its first 10-K it has one of its own. That is
+    the current year; the prior year is the predecessor's latest. Switching to
+    the predecessor's two would diff two years that are both out of date."""
+    holdco_first = _Filing("0002115436-27-000010", filing_date="2027-02-19")
     holdco = _Company(
         SUCCESSOR, "ExxonMobil Holdings Corp",
-        {"10-K": [holdco_only_one],
+        {"10-K": [holdco_first],
          "10-Q": [_Filing("0000034088-26-000093", form="10-Q")]})
     pred_cur = _Filing("0000034088-26-000045", filing_date="2026-02-18")
     pred_pri = _Filing("0000034088-25-000030", filing_date="2025-02-19")
@@ -248,6 +249,6 @@ def test_diff_10k_reads_co_registrant_when_successor_has_fewer_than_two_10ks(
 
     result = su.diff_10k("XOM")
     assert result["success"] is True
-    assert result["read_from"]["name"] == "EXXON MOBIL CORP"
+    assert result["current_filing_date"] == "2027-02-19"
+    assert result["prior_filing_date"] == "2026-02-18"
     assert result["read_from"]["cik"] == PREDECESSOR
-
