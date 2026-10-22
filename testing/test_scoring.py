@@ -567,6 +567,17 @@ def test_the_summary_splits_by_side(store):
     assert out["by_side"]["short"]["mean_net_bps"] == pytest.approx(990.0)
 
 
+def test_each_side_is_judged_as_one_of_two_comparisons():
+    """Splitting by side tests two books. Each is held to the bar for twice
+    the comparisons the caller declared, as the variant and timing splits
+    are; otherwise reading both sides doubles the chance one clears by luck."""
+    rows = [{**r, "side": side} for side in ("long", "short")
+            for r in _scored([50.0] * 40)]
+    out = scoring.split_by_side(rows, comparisons=3)
+    assert out["long"]["comparisons"] == 6
+    assert out["short"]["comparisons"] == 6
+
+
 def test_the_split_is_absent_rather_than_empty_when_nothing_scored(store):
     out = scoring.score_orders(as_of=DAYS[20], horizon_days=4)
     assert out["by_timing"] == {}

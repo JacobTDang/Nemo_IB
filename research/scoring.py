@@ -310,11 +310,15 @@ def split_by_timing(scored: List[Dict[str, Any]],
 
 def split_by_side(scored: List[Dict[str, Any]],
                   comparisons: int = 1) -> Dict[str, Any]:
-    """The same numbers per trade side (long, short)."""
+    """The same numbers per trade side (long, short).
+
+    Each side is one more comparison, as each variant and each hour is: read
+    both books and the bar for either has to allow for two tries.
+    """
     sides = sorted({r.get("side") or "unknown" for r in scored})
     return {side: _summarise(
         [r for r in scored if (r.get("side") or "unknown") == side],
-        comparisons=comparisons) for side in sides}
+        comparisons=comparisons * len(sides)) for side in sides}
 
 
 def _timing_of(order: Dict[str, Any], as_of: str) -> str:

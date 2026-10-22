@@ -26,7 +26,7 @@ This study measures the short side of the XBRL-timed (`ts`) arm across the same
 | universe | 870 distinct tickers across the 230 sessions (803 eligible per session) |
 | horizon | 20 sessions, spread window 252 |
 | borrow rate | flat 3.0% annualised (`--borrow-rate 0.03`) for Arm 1; charges ~24.2 bp per 20-session hold |
-| comparisons | 5, so the Bonferroni t threshold is 2.58 |
+| comparisons | 5, so the Bonferroni t threshold is 2.58 for the combined book; each side is one more split, so 10 and 2.81 per side |
 | consensus | stashed for the run so the scanner considered every eligible name, restored after |
 
 Two passes were run from the precomputed XBRL signal table:
@@ -48,16 +48,16 @@ Two passes were run from the precomputed XBRL signal table:
 
 The flat borrow rate on the short side did not distort the long book:
 - Both Pass A and Pass B generated exactly 542 long trades.
-- Long book returns are virtually identical: mean net +0.0 bp vs +0.4 bp, median net -50.8 bp vs -47.1 bp, and drift per sigma +7.7 bp vs +7.8 bp (CI [-27.5, +43.1]). The minor 0.35 bp variance arises solely from cohort ranking on dates where 20 candidates were selected.
+- 538 of the 542 long trades are the same in both passes, with the same net return. The other four are the same names (INVH, RCL, TEVA, UBSI) entered one session later in Pass B, on dates when the two-sided book also took a short. Mean net +0.0 bp vs +0.4 bp, median -50.8 bp vs -47.1 bp, drift per sigma +7.7 bp vs +7.8 bp.
 - Both agree with September's finding that the XBRL-timed long signal has no statistically significant edge (t = 0.01; 95% CI contains zero).
-- The difference in total long trades between this run (542) and September (611) comes from the CIK deduplication rule (PR #97, one line per issuer at the screen) applied consistently to the universe snapshot.
+- The September count (611) is not comparable with this run's. Its XBRL arm signalled 1,267 tickers; this run's signal table covers the 870 tickers in the snapshot's universe rows for the window. Pass A is the like-for-like baseline.
 
 ### Short book analysis
 
 83 short trades cleared the expected edge and cost gates:
 - **Returns**: Mean net return was +21.8 bps, with a median of +184.5 bps and a hit rate of 55.4% (46 winning trades out of 83).
 - **Financing cost**: Over the 20-session (~29 calendar day) holding period, shorts paid an average of 24.17 bps in borrow carry fees. Gross returns averaged +50.5 bps before borrow and execution costs.
-- **Statistical significance**: With high dispersion (standard error of 117.0 bps), the t-statistic is +0.19, well below the Bonferroni threshold of 2.58 (and below 2.00 unadjusted). The 95% confidence interval of the mean is wide: [-207.5, +251.1] bps.
+- **Statistical significance**: With high dispersion (standard error of 117.0 bps), the t-statistic is +0.19, well below the per-side Bonferroni threshold of 2.81 (and below 2.00 unadjusted). The 95% confidence interval of the mean is wide: [-207.5, +251.1] bps.
 - **Drift coefficient**: The estimated drift coefficient is -5.8 bps per sigma (95% CI [-83.1, +71.6]), which spans zero. Like the long side, the XBRL-timed short signal does not clear significance at this sample size.
 
 ## Arm 2: Real historical borrow rates
