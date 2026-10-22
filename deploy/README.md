@@ -1055,9 +1055,15 @@ ephemeral auth keys suit containers that come and go. Agents on a hosted
 platform you do not control need a public HTTPS address in front of the ports,
 such as a Cloudflare Tunnel or a reverse proxy with its own TLS certificate.
 Never publish the raw ports: the servers speak plain HTTP, and the token would
-cross the internet readable. The memory limits above were measured with one
-client; re-measure them under the fleet's real concurrency before trusting
-them.
+cross the internet readable.
+
+The memory limits above were first measured with one client. On 2026-10-22,
+three MCP sessions ran through the gateway at the same time, one for each
+agent. Each session called twelve SEC, market and macro tools for two tickers:
+72 calls in 55 seconds, from a fresh start. The SEC server reached 1,201 MiB
+of its 1,500 MiB limit. Each other service stayed below 30 percent of its
+limit. Three agents fit. Before you add more agents, measure again or
+increase the SEC server's limit.
 
 ### Why not OAuth
 
