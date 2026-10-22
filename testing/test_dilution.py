@@ -214,3 +214,24 @@ def test_small_change_is_flat_not_a_buyback():
     shares = dilution.get_share_count_series("MSFT", limit=3)
     assert shares["direction"] in ("flat", "buyback")
     assert abs(shares["change_pct"]) < 2.0
+
+
+@pytest.mark.parametrize("failing_form", ["S-3", "424B5"])
+def test_shelf_activity_fails_loud_when_get_filings_raises(monkeypatch, failing_form):
+    """A failed SEC request must report success=False naming the form that failed,
+    never an empty shelf."""
+    monkeypatch.setenv("SEC_EMAIL", "analyst@example.com")
+
+    class FakeCompany:
+        def get_filings(self, form: str):
+            if form == failing_form:
+                raise RuntimeError("connection reset by peer")
+            return []
+
+    monkeypatch.setattr(dilution.registrant, "company", lambda ticker: FakeCompany())
+
+    res = dilution.get_shelf_activity("FAKE")
+    assert res["success"] is False
+    assert "error" in res
+    assert failing_form in res["error"]
+
