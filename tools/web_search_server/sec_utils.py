@@ -2045,16 +2045,29 @@ def diff_10k(ticker: str, item: str = '1A',
 
   try:
     company = registrant.company(ticker)
-    filings = list(company.get_filings(form='10-K').head(10))
+    raw_filings = company.get_filings(form='10-K')
+    filings = (list(raw_filings.head(10))
+               if hasattr(raw_filings, 'head') else list(raw_filings)[:10])
+    read_from = None
+    if len(filings) < 2:
+      predecessor = registrant.predecessor_with_form(company, '10-K')
+      if predecessor is not None:
+        pred_filings = predecessor.get_filings(form='10-K')
+        filings = (list(pred_filings.head(10))
+                   if hasattr(pred_filings, 'head') else list(pred_filings)[:10])
+        read_from = {'name': predecessor.name, 'cik': int(predecessor.cik)}
   except Exception as e:
     return {'ticker': ticker, 'success': False,
             'error': f'company/filings lookup failed: {type(e).__name__}: {e}'}
 
   if len(filings) < 2:
-    return {'ticker': ticker, 'success': False,
-            'error': _filing_miss(
-              ticker, '10-K',
-              f'Need 2+ 10-K filings to diff, found {len(filings)}')}
+    payload = {'ticker': ticker, 'success': False,
+               'error': _filing_miss(
+                 ticker, '10-K',
+                 f'Need 2+ 10-K filings to diff, found {len(filings)}')}
+    if read_from:
+      payload = _with_read_from(payload, {'read_from': read_from})
+    return payload
 
   def _filing_year(f):
     return int(str(f.filing_date)[:4])
@@ -2081,16 +2094,22 @@ def diff_10k(ticker: str, item: str = '1A',
       prior_f = filings[1]
 
   if item not in ('1A', '7'):
-    return {'ticker': ticker, 'success': False,
-            'error': f'Unsupported item {item!r} — currently 1A and 7 are supported'}
+    payload = {'ticker': ticker, 'success': False,
+               'error': f'Unsupported item {item!r} — currently 1A and 7 are supported'}
+    if read_from:
+      payload = _with_read_from(payload, {'read_from': read_from})
+    return payload
 
   cur_text = _extract_section_from_filing_obj(current_f, item)
   pri_text = _extract_section_from_filing_obj(prior_f, item)
   if not cur_text or not pri_text:
-    return {'ticker': ticker, 'success': False,
-            'error': 'Could not extract Item section from one or both filings',
-            'current_section_extracted': cur_text is not None,
-            'prior_section_extracted': pri_text is not None}
+    payload = {'ticker': ticker, 'success': False,
+               'error': 'Could not extract Item section from one or both filings',
+               'current_section_extracted': cur_text is not None,
+               'prior_section_extracted': pri_text is not None}
+    if read_from:
+      payload = _with_read_from(payload, {'read_from': read_from})
+    return payload
 
   # Paragraph-level diff. Split on blank lines (\n\s*\n) then normalize
   # whitespace so the diff isn't dominated by formatting drift.
@@ -2128,7 +2147,7 @@ def diff_10k(ticker: str, item: str = '1A',
       if len(pri_chunk) > n:
         removed.extend(pri_chunk[n:])
 
-  return {
+  result = {
     'ticker':                  ticker,
     'success':                 True,
     'error':                   None,
@@ -2146,6 +2165,9 @@ def diff_10k(ticker: str, item: str = '1A',
     'removed_paragraphs':      [p[:600] for p in removed[:max_changes]],
     'changed_paragraphs':      changed[:max_changes],
   }
+  if read_from:
+    result = _with_read_from(result, {'read_from': read_from})
+  return result
 
 
 # Cue phrases that say which way a named company sits relative to the filer.

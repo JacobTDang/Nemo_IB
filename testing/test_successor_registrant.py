@@ -19,14 +19,27 @@ AGENT_PREFIX = 1193125
 
 
 class _Filing:
-    def __init__(self, accession, form="10-K"):
+    def __init__(self, accession, form="10-K", filing_date="2026-02-18"):
         self.accession_number = accession
         self.form = form
-        self.filing_date = "2026-02-18"
+        self.filing_date = filing_date
         self.filing_url = "https://example.invalid/" + accession
 
     def xbrl(self):
         return object()
+
+    def text(self):
+        return (
+            " " * 35000
+            + "ITEM 1A. RISK FACTORS\n\n"
+            + f"Sample risk factor paragraph for {self.accession_number} that is long enough to count.\n\n"
+            + "ITEM 1B"
+        )
+
+
+class _FilingsList(list):
+    def head(self, n):
+        return _FilingsList(self[:n])
 
 
 class _Company:
@@ -43,8 +56,8 @@ class _Company:
             rows = []
             for group in self._by_form.values():
                 rows.extend(group)
-            return rows
-        return list(self._by_form.get(form, []))
+            return _FilingsList(rows)
+        return _FilingsList(self._by_form.get(form, []))
 
 
 def _install(monkeypatch, companies, ticker_company):
@@ -163,3 +176,78 @@ def test_a_shared_accession_must_be_listed_under_both_registrants(monkeypatch):
     found = su.get_latest_filing("XOM", "10-K")
     assert not found.get("accession_number")
     assert "ExxonMobil Holdings Corp" in found["error"]
+
+
+def test_diff_10k_reads_predecessors_two_10ks_when_successor_has_no_10k(
+        monkeypatch):
+    """The successor has no 10-K, but lists a 10-Q under the predecessor's CIK.
+    The predecessor has two 10-Ks. diff_10k reads the predecessor's two 10-Ks
+    and names it in read_from."""
+    ten_k_cur = _Filing("0000034088-26-000045", filing_date="2026-02-18")
+    ten_k_pri = _Filing("0000034088-25-000030", filing_date="2025-02-19")
+    holdco = _Company(
+        SUCCESSOR, "ExxonMobil Holdings Corp",
+        {"10-Q": [_Filing("0000034088-26-000093", form="10-Q")]})
+    predecessor = _Company(
+        PREDECESSOR, "EXXON MOBIL CORP",
+        {"10-K": [ten_k_cur, ten_k_pri],
+         "10-Q": [_Filing("0000034088-26-000093", form="10-Q")]})
+    _install(monkeypatch, {PREDECESSOR: predecessor}, holdco)
+
+    result = su.diff_10k("XOM")
+    assert result["success"] is True
+    assert result["read_from"]["name"] == "EXXON MOBIL CORP"
+    assert result["read_from"]["cik"] == PREDECESSOR
+    assert "EXXON MOBIL CORP" in result.get("note", "")
+    assert str(PREDECESSOR) in result.get("note", "")
+    assert result["current_filing_date"] == "2026-02-18"
+    assert result["prior_filing_date"] == "2025-02-19"
+
+
+def test_diff_10k_uses_successors_own_filings_when_it_has_two_10ks(monkeypatch):
+    """A successor with its own two 10-Ks is diffed from its own filings, not
+    from any co-registrant."""
+    holdco_cur = _Filing("0002115436-26-000010", filing_date="2026-02-20")
+    holdco_pri = _Filing("0002115436-25-000005", filing_date="2025-02-21")
+    holdco = _Company(
+        SUCCESSOR, "ExxonMobil Holdings Corp",
+        {"10-K": [holdco_cur, holdco_pri],
+         "10-Q": [_Filing("0000034088-26-000093", form="10-Q")]})
+    pred_cur = _Filing("0000034088-26-000045", filing_date="2026-02-18")
+    pred_pri = _Filing("0000034088-25-000030", filing_date="2025-02-19")
+    predecessor = _Company(
+        PREDECESSOR, "EXXON MOBIL CORP",
+        {"10-K": [pred_cur, pred_pri],
+         "10-Q": [_Filing("0000034088-26-000093", form="10-Q")]})
+    _install(monkeypatch, {PREDECESSOR: predecessor}, holdco)
+
+    result = su.diff_10k("XOM")
+    assert result["success"] is True
+    assert result.get("read_from") is None
+    assert "read_from" not in result
+    assert result["current_filing_date"] == "2026-02-20"
+    assert result["prior_filing_date"] == "2025-02-21"
+
+
+def test_diff_10k_reads_co_registrant_when_successor_has_fewer_than_two_10ks(
+        monkeypatch):
+    """A successor with only one 10-K has fewer than two 10-Ks, so it routes
+    to the predecessor's two 10-Ks."""
+    holdco_only_one = _Filing("0002115436-26-000010", filing_date="2026-02-20")
+    holdco = _Company(
+        SUCCESSOR, "ExxonMobil Holdings Corp",
+        {"10-K": [holdco_only_one],
+         "10-Q": [_Filing("0000034088-26-000093", form="10-Q")]})
+    pred_cur = _Filing("0000034088-26-000045", filing_date="2026-02-18")
+    pred_pri = _Filing("0000034088-25-000030", filing_date="2025-02-19")
+    predecessor = _Company(
+        PREDECESSOR, "EXXON MOBIL CORP",
+        {"10-K": [pred_cur, pred_pri],
+         "10-Q": [_Filing("0000034088-26-000093", form="10-Q")]})
+    _install(monkeypatch, {PREDECESSOR: predecessor}, holdco)
+
+    result = su.diff_10k("XOM")
+    assert result["success"] is True
+    assert result["read_from"]["name"] == "EXXON MOBIL CORP"
+    assert result["read_from"]["cik"] == PREDECESSOR
+
