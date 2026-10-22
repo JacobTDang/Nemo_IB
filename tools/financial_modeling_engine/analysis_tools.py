@@ -164,7 +164,7 @@ Pass every input below. Nothing is filled in for you: a call without an input is
 - tax_rate            <- get_tax_rate (effective_tax_rate divided by 100)
 - market_cap          <- get_market_data (marketCap); the FCF yield divides by it
 
-Zero is a value: total_debt 0, cash 0, interest_expense 0, depreciation_abs 0, capex_abs 0 and tax_rate 0 are used as given. ebitda and market_cap must be greater than zero."""
+Zero is a value: total_debt 0, cash 0, interest_expense 0, depreciation_abs 0, capex_abs 0 and tax_rate 0 are used as given. With interest_expense 0, interest_coverage is null and interest_coverage_note says why: there is no interest to cover. ebitda and market_cap must be greater than zero."""
 
 capital_returns_description = """Calculates shareholder return profile: FCF yield, dividend yield, buyback yield, total shareholder yield, and payout ratio sustainability.
 
@@ -910,13 +910,12 @@ def _credit_profile_math(total_debt: float, cash: float, ebitda: float,
   net_debt = total_debt - cash
   ebit = ebitda - depreciation_abs
 
-  # Interest expense is acceptable as zero (debt-free companies). Treat as
-  # large-but-finite so interest_coverage produces a meaningful "infinite" signal.
-  safe_interest = interest_expense if interest_expense > 0 else 1.0
-
   net_debt_ebitda = net_debt / ebitda
   total_debt_ebitda = total_debt / ebitda
-  interest_coverage = ebit / safe_interest
+  # Zero interest is a debt-free company, and coverage of no interest is not
+  # defined. It used to be EBIT over a stand-in of $1: 115,000,000,000x for a
+  # company with $115bn of EBIT, a number shaped like an answer.
+  interest_coverage = ebit / interest_expense if interest_expense > 0 else None
 
   # FCF approximation: NOPAT + D&A - CapEx
   nopat = max(0.0, ebit) * (1 - tax_rate)
@@ -941,7 +940,8 @@ def _credit_profile_math(total_debt: float, cash: float, ebitda: float,
     'net_debt': round(net_debt, 2),
     'net_debt_ebitda': round(net_debt_ebitda, 2),
     'total_debt_ebitda': round(total_debt_ebitda, 2),
-    'interest_coverage': round(interest_coverage, 2),
+    'interest_coverage': (round(interest_coverage, 2)
+                          if interest_coverage is not None else None),
     'ebit': round(ebit, 2),
     'fcf_estimate': round(fcf_estimate, 2),
     'fcf_yield_pct': round(fcf_estimate / market_cap * 100, 2),
@@ -957,6 +957,10 @@ def _credit_profile_math(total_debt: float, cash: float, ebitda: float,
       'market_cap': market_cap,
     }
   }
+  if interest_coverage is None:
+    result['interest_coverage_note'] = (
+        f"interest_coverage is not reported because interest_expense was "
+        f"{interest_expense!r}: there is no interest for EBIT to cover.")
   return result
 
 
@@ -1950,7 +1954,7 @@ class Financial_Analysis:
               "total_debt": {"type": "number", "description": "Required. Dollars: totalDebt from get_market_data. 0 is used as given."},
               "cash": {"type": "number", "description": "Required. Dollars: cash from get_market_data. 0 is used as given."},
               "ebitda": {"type": "number", "description": "Required. Dollars: revenue_base from get_revenue_base times ebitda_margin_percent from get_ebitda_margin, divided by 100. Greater than zero."},
-              "interest_expense": {"type": "number", "description": "Required. Dollars a year: interestExpense from get_market_data. 0 is used as given."},
+              "interest_expense": {"type": "number", "description": "Required. Dollars a year: interestExpense from get_market_data. 0 is used as given; interest_coverage is then null."},
               "depreciation_abs": {"type": "number", "description": "Required. Dollars a year: d&a from get_depreciation. Not d&a_pct. 0 is used as given."},
               "capex_abs": {"type": "number", "description": "Required. Dollars a year: revenue_base from get_revenue_base times capex_pct_revenue from get_capex_pct_revenue, divided by 100. 0 is used as given."},
               "tax_rate": {"type": "number", "description": "Required. Decimal: effective_tax_rate from get_tax_rate, divided by 100. 0 is used as given."},

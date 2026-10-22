@@ -604,6 +604,17 @@ def test_zero_is_a_value_in_a_credit_profile_where_a_company_can_have_none():
             f"{name} was passed as 0 and used as {payload['inputs'][name]}")
 
 
+def test_a_company_with_no_interest_has_no_coverage_not_a_coverage_over_one_dollar():
+    """Zero interest is a debt-free company. EBIT over a stand-in of $1 is a
+    number with no meaning, shaped like an answer."""
+    is_error, text, payload = _call("calculate_credit_profile",
+                                    {**CREDIT_FULL, "interest_expense": 0})
+
+    assert _ran(is_error, payload), text[:300]
+    assert payload["interest_coverage"] is None, payload["interest_coverage"]
+    assert "interest_expense" in payload["interest_coverage_note"]
+
+
 def test_a_credit_profile_without_market_cap_is_refused_not_stripped_of_its_yield():
     is_error, text, payload = _call("calculate_credit_profile",
                                     _without(CREDIT_FULL, "market_cap"))
