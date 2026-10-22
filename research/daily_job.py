@@ -173,6 +173,22 @@ FETCH_CANARY = "SPY"
 # recorded; they exist to be compared against.
 CLOSED_PROBE_DAYS = 7
 
+# How many names with no session on the day a bar run writes into its run-log
+# row. An ordinary night has a handful. A vendor that has not published the day
+# for most of the universe would put eighteen hundred into one row, which is
+# the night the row most needs to stay readable. The run's result carries all
+# of them.
+NO_SESSION_NAMED = 20
+
+# The largest share of the names recorded, in percent, that a bar run takes on
+# the vendor's word as having had no session on the day. Delistings and halts
+# among names that passed a liquidity screen come a few at a time: 3 of 1,806
+# and 5 of 1,812 on the first two homelab nights, about 0.3%. A larger share
+# is a vendor that has not published the day for those names, and read as
+# `ok` it would never be replayed, with one run-log line as the only trace.
+# Two percent is about six times the nights measured, and 36 of 1,800 names.
+NO_SESSION_MAX_PERCENT = 2
+
 # A short pause between batches. 52 of them arriving as fast as the process can
 # issue them is what provokes the rate limiting in the first place, and half a
 # second each costs a nightly job under half a minute.
@@ -511,9 +527,13 @@ def coverage_status(covered: int, requested: int) -> str:
     return "ok" if covered >= requested else "partial"
 
 
-def _bars_status(covered: int, answered: int, requested: int,
+def _bars_status(covered: int, reachable: int, requested: int,
                  probe_answered: bool, failures: List[str]) -> str:
     """A bar run's verdict, measured against what could be reached.
+
+    `reachable` is the caller's count: the names the vendor answered for in
+    the window, less any the vendor said had no session on the day (see
+    `_no_session_believed`).
 
     `covered >= requested` was the old rule and `requested` is the nightly ask,
     which deliberately contains names expected to be empty. So every weekday
@@ -532,9 +552,14 @@ def _bars_status(covered: int, answered: int, requested: int,
       hundred names lost to a 502 would read as two hundred companies that do
       not trade.
 
-      Every name the vendor answered for in the window has its session. A
-      shell that answers nowhere is not a hole in the record; a name that
-      printed on Monday and is missing on Tuesday is.
+      Every name the vendor answered for in the window has its session, or
+      the vendor said it had none. A shell that answers nowhere is not a hole
+      in the record. Nor is a name that printed on Monday and not on Tuesday
+      while the market did: a halt, a delisting, a thin name that did not
+      trade. The vendor answered for it in the same response, so the absence
+      is its answer, and counted here it made every night `partial` (#148).
+      The caller names it instead. A name that has the session and did not
+      reach the store is still a hole.
     """
     if requested == 0:
         # Asked for nothing, so there was nothing to reach. A run over an empty
@@ -542,8 +567,51 @@ def _bars_status(covered: int, answered: int, requested: int,
         return "ok"
     if not probe_answered:
         return "failed"
-    status = coverage_status(covered, answered)
+    status = coverage_status(covered, reachable)
     return "partial" if failures and status == "ok" else status
+
+
+def _no_session_believed(no_session: int, covered: int) -> bool:
+    """Whether the names with no session on the day can be taken at the
+    vendor's word.
+
+    Only while they are a small share of the names recorded: at most
+    `NO_SESSION_MAX_PERCENT`. The index had the session, and delistings and
+    halts among names that passed a liquidity screen come a few at a time.
+    More than that is a vendor that has not published the day for them, and
+    the only place that difference shows on the night is in the count. Not
+    believed, they stay in the denominator, the night is `partial` or
+    `failed`, and it stays a gap that backfill replays.
+
+    Never believed when nothing was recorded, which the share already says:
+    any name at all is more than two percent of none. Excused there, every
+    name answering without the day would leave nothing to measure, and a
+    night that wrote no session would read as complete.
+
+    In whole numbers, so the edge of the share is exactly where it says.
+    """
+    return 100 * no_session <= NO_SESSION_MAX_PERCENT * covered
+
+
+def _last_before(rows: List[Dict[str, Any]], as_of: str) -> Optional[str]:
+    """The last session in `rows` before `as_of`, or None if it has none."""
+    earlier = [r["trade_date"] for r in rows if r["trade_date"] < as_of]
+    return max(earlier) if earlier else None
+
+
+def _name_no_session(no_session: Dict[str, Optional[str]]) -> str:
+    """Each name with the last session it had, newest first.
+
+    Newest first because the names that went quiet tonight are tonight's
+    news; one silent since last week was named every night since.
+    """
+    ordered = sorted(sorted(no_session.items()),
+                     key=lambda item: item[1] or "", reverse=True)
+    named = [f"{ticker} (last {last})" if last
+             else f"{ticker} (no earlier session in the window)"
+             for ticker, last in ordered[:NO_SESSION_NAMED]]
+    rest = len(ordered) - len(named)
+    return ", ".join(named) + (f", and {rest} more" if rest else "")
 
 
 # ------------------------------------------------------------------ bars
@@ -614,6 +682,11 @@ def record_daily_bars(tickers: List[str],
     # the rotation slice of the registrant list and is thousands of names
     # expected to be empty.
     answered = 0
+    # Names it answered for with no session on the day, each with the last
+    # session it did have. Only once the index has the day: without it there
+    # is no evidence the day was a session at all.
+    no_session: Dict[str, Optional[str]] = {}
+    session_held = any(r["trade_date"] == as_of for r in index_rows)
     source = _source(as_of)
     for ticker in tickers:
         rows = fetched.get(ticker) or []
@@ -624,9 +697,14 @@ def record_daily_bars(tickers: List[str],
             continue
         answered += 1
         if not any(r["trade_date"] == as_of for r in rows):
-            # Present in the window but absent on the day. The window is wider
-            # than the session being recorded, so this is the same absence as
-            # above rather than coverage.
+            # Present in the window but absent on the day, in the same
+            # response that carried the index's session. Nothing is written --
+            # a session the vendor did not report is not a session -- and the
+            # name is reported rather than counted. Not "rows end before the
+            # day": a replay's window runs past it, and a one-day halt there
+            # must read as it would have live.
+            if session_held:
+                no_session[ticker] = _last_before(rows, as_of)
             continue
         # One ticker's write is one ticker's problem. A locked database or a
         # value the recorder refuses used to propagate out of here, which
@@ -651,23 +729,38 @@ def record_daily_bars(tickers: List[str],
     except Exception as exc:  # noqa: BLE001 - reported, never masked
         failures.append(f"{FETCH_CANARY}: {type(exc).__name__}: {exc}")
 
-    status = _bars_status(covered, answered, len(tickers), bool(index_rows),
+    believed = _no_session_believed(len(no_session), covered)
+    reachable = answered - len(no_session) if believed else answered
+    status = _bars_status(covered, reachable, len(tickers), bool(index_rows),
                           failures)
-    detail = (f"{covered} of {answered} reachable tickers recorded, "
+    detail = (f"{covered} of {reachable} reachable tickers recorded, "
               f"{len(tickers)} asked")
     if tickers and not index_rows:
         detail = (f"{FETCH_CANARY} returned no session anywhere in the window, "
                   f"so the vendor did not answer and no absence here means "
                   f"anything; {detail}")
+    # On an `ok` night too. The vendor's word is all that separates a name
+    # with no session from a bar it has not published yet, so the names are
+    # where an operator reads the run, with the last session each one had.
+    if no_session and believed:
+        detail = (f"{detail}; no session on {as_of} for {len(no_session)} the "
+                  f"vendor answered for in the window: "
+                  f"{_name_no_session(no_session)}")
+    elif no_session:
+        detail = (f"{detail}; {len(no_session)} the vendor answered for in the "
+                  f"window have no session on {as_of} although "
+                  f"{FETCH_CANARY} does, more than {NO_SESSION_MAX_PERCENT}% "
+                  f"of the {covered} that do, so they are counted as missed: "
+                  f"{_name_no_session(no_session)}")
     if failures:
         detail = f"{detail}; {len(failures)} lost: " \
                  + " | ".join(failures[:3])
     pit_store.finish_run(rows_written=written, status=status,
                          error=None if status == "ok" and not failures
-                         else detail)
+                         and not no_session else detail)
     return {"status": status, "written": written, "covered": covered,
-            "answered": answered, "requested": len(tickers),
-            "source": source, "failures": failures}
+            "answered": answered, "no_session": no_session,
+            "requested": len(tickers), "source": source, "failures": failures}
 
 
 def bootstrap_history(tickers: List[str], lookback_days: int = 730,

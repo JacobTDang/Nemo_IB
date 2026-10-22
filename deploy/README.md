@@ -634,6 +634,18 @@ separates them, so the report reads the log. Four states matter:
 a time-bounded slice of the watchlist by design. The report knows that and does
 not raise it. Every other job reporting `partial` is worth a look.
 
+`daily_bars` is `partial` when the vendor does not answer, when the run loses
+a batch, or when a write fails. Some names have bars earlier in the week but
+no bar on the session. These names did not trade that day: a halt, a
+delisting, or a thin name. They do not make the night `partial`. The run
+writes each ticker and its last session in the `error` field, also on an `ok`
+night. Only the vendor says that such a name did not trade, and one night
+cannot show a bar that the vendor publishes late. Thus the run accepts this
+answer only for a small number of names: at most 2 percent of the names that
+have a bar. On the first two nights the number was 0.3 percent. If more names
+have no bar, the cause can be a vendor that did not publish the day. The night
+is then `partial`, or `failed` if no name has a bar, and backfill replays it.
+
 The command exits `1` when anything needs attention, so it also works as a cron
 healthcheck rather than only by eye. The cron block above carries the line, at
 midday on a weekday, so a night that failed reaches the `MAILTO` inbox the

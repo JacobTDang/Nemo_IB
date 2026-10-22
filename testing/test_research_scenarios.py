@@ -258,9 +258,16 @@ def test_a_delisting_keeps_the_history_and_stops_the_series(wire, store):
     # It stays in the universe record for the dates it was in it.
     early = {m["ticker"] for m in pit_store.universe_as_of(SESSIONS[82])}
     assert "N02" in early
-    # ...and the run that lost it is partial, not ok.
-    run = daily_job.last_run("daily_bars")
-    assert run["status"] in ("partial", "ok")
+    # ...and the night it went quiet names it, with the last session it had.
+    # One name in six is far more than the share of a night that delistings
+    # take, so in a universe this small that night stays a gap: from one night
+    # alone a delisting and a vendor that skipped a name look the same.
+    with pit_store.connect() as conn:
+        quiet = conn.execute(
+            "SELECT status, error FROM run_log "
+            "WHERE job = 'daily_bars' AND as_of_date = ?", (gone,)).fetchone()
+    assert quiet["status"] == "partial"
+    assert f"N02 (last {SESSIONS[85]})" in quiet["error"], quiet["error"]
 
 
 # --- the exchange shut ------------------------------------------------------
