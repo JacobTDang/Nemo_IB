@@ -284,6 +284,7 @@ def test_the_universe_keeps_one_line_per_issuer_the_most_liquid(store,
     _bars(store, "BRK-A", volume=40_000)     # $4M a day: clears the floor
     _bars(store, "BRK-B", volume=4_000_000)
     _bars(store, "OTHER", volume=4_000_000)
+    _bars(store, daily_job.FETCH_CANARY, volume=1_000_000)
     _registrants(monkeypatch, [("BRK-A", "1067983"), ("BRK-B", "1067983"),
                                ("OTHER", "111111")])
 

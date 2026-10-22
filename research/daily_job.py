@@ -20,7 +20,7 @@ import re
 import statistics
 import time
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from research import _DOTENV_PATH, pit_store  # noqa: F401 - .env on import
 
@@ -33,6 +33,13 @@ MIN_MEDIAN_DOLLAR_VOLUME = 500_000.0
 MIN_PRICE = 5.0
 MIN_HISTORY_SESSIONS = 60
 SCREEN_LOOKBACK_SESSIONS = 60
+
+# How many exchange sessions a ticker may miss before the universe screen
+# rejects it as no longer trading. A one-day halt or a thin name skipping a
+# single session must stay eligible. Any name that has not traded for two or
+# more exchange sessions is treated as stopped trading and excluded so stale
+# prices or unexecutable orders never reach the scanner or broker.
+MAX_MISSED_SESSIONS = 1
 
 _SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 
@@ -899,7 +906,8 @@ def _share_class_problem(ticker: str) -> Optional[str]:
     return None
 
 
-def _screen(ticker: str, as_of: str) -> Dict[str, Any]:
+def _screen(ticker: str, as_of: str,
+            canary_dates: Optional[Sequence[str]] = None) -> Dict[str, Any]:
     """Eligible, or the reason not -- never a bare exclusion.
 
     "No history" and "too thin" are different facts about a name, and a screen
@@ -917,6 +925,23 @@ def _screen(ticker: str, as_of: str) -> Dict[str, Any]:
                 "exclusion_reason": (
                     f"insufficient history: {len(bars)} sessions recorded, "
                     f"{MIN_HISTORY_SESSIONS} required")}
+
+    if canary_dates is None:
+        canary_bars = pit_store.bars_as_of(FETCH_CANARY, as_of)
+        canary_dates = sorted({b["trade_date"] for b in canary_bars
+                               if b.get("trade_date")})
+
+    if not canary_dates:
+        return {"eligible": False,
+                "exclusion_reason": (
+                    f"canary {FETCH_CANARY} has no recorded sessions on or "
+                    f"before {as_of}; exchange calendar unavailable")}
+
+    last_session = bars[-1]["trade_date"]
+    missed_sessions = sum(1 for d in canary_dates if d > last_session)
+    if missed_sessions > MAX_MISSED_SESSIONS:
+        return {"eligible": False,
+                "exclusion_reason": f"no session since {last_session}"}
 
     window = bars[-SCREEN_LOOKBACK_SESSIONS:]
     closes = [b["close"] for b in window if b["close"] is not None]
@@ -993,7 +1018,12 @@ def refresh_universe(as_of: Optional[str] = None) -> Dict[str, Any]:
                              error=f"{type(exc).__name__}: {exc}")
         return {"status": "failed", "error": str(exc)}
 
-    entries = [{**reg, **_screen(reg["ticker"], as_of)} for reg in registrants]
+    canary_bars = pit_store.bars_as_of(FETCH_CANARY, as_of)
+    canary_dates = sorted({b["trade_date"] for b in canary_bars
+                           if b.get("trade_date")})
+    entries = [{**reg, **_screen(reg["ticker"], as_of,
+                                 canary_dates=canary_dates)}
+               for reg in registrants]
     collapsed = _one_line_per_issuer(entries)
     eligible = sum(1 for e in entries if e["eligible"])
 
