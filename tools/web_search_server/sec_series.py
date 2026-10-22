@@ -419,7 +419,7 @@ class FilingPoint:
         convenience translation shares the period *and* the context with the
         reporting-currency fact, so both rank identically and the winner was
         whichever row pandas produced first. Candidates are narrowed to one
-        currency before ranking; point.read_from = filing.read_from `currency` to ask for the translation
+        currency before ranking; pass `currency` to ask for the translation
         deliberately, and get None rather than a substitute if it is absent.
 
         Nor is ranking enough when the caller wants a period of a particular

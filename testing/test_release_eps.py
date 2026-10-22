@@ -420,8 +420,9 @@ class _Filing:
     """Shaped like edgartools' Filing as the fetch layer uses it: the index
     page lists the documents. `attachments` is deliberately absent, because
     reaching for it parses the whole submission."""
-    def __init__(self, accession_no, documents):
+    def __init__(self, accession_no, documents, filing_date="2026-08-30"):
         self.accession_no, self.homepage = accession_no, _Homepage(documents)
+        self.filing_date = filing_date
 
 
 def _company_with(filings, monkeypatch):

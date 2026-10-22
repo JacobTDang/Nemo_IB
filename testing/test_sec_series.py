@@ -346,6 +346,23 @@ class _FakeFacts:
         return _FakeQuery(self._frame)
 
 
+class _Listing(list):
+    """edgartools' filing list: iterable, and `head(n)` for the newest n."""
+    def head(self, n):
+        return _Listing(self[:n])
+
+
+class _FakeCompany:
+    """A registrant with one filing of every form and no co-registrant."""
+    cik = 1
+
+    def __init__(self, filings):
+        self._filings = filings
+
+    def get_filings(self, form=None, amendments=True, **kwargs):
+        return _Listing(self._filings)
+
+
 class _FakeFiling:
     def __init__(self, frame, contexts, filing_date="2026-07-29"):
         self._xbrl = type("X", (), {"facts": _FakeFacts(frame),
@@ -363,9 +380,8 @@ def _fake_edgar(monkeypatch, frame, contexts=None):
 
     monkeypatch.setattr(ss, "_require_identity", lambda: "test")
     filings = [_FakeFiling(frame, contexts or {})]
-    monkeypatch.setattr(ss.registrant, "company", lambda ticker: type("C", (), {
-        "get_filings": lambda self, form, amendments=True: type("F", (), {
-            "head": lambda self, limit: filings})()})())
+    monkeypatch.setattr(ss.registrant, "company",
+                        lambda ticker: _FakeCompany(filings))
 
 
 def _frame(rows):
@@ -457,7 +473,7 @@ def test_amendments_are_excluded_from_the_filing_walk(monkeypatch):
         # An amendment carries almost no XBRL; returning it here would stand
         # in for the real 10-K and answer "not covered" for every concept.
         filings = [_FakeFiling(frame, {})]
-        return type("F", (), {"head": lambda self, limit: filings})()
+        return _Listing(filings)
 
     monkeypatch.setattr(ss, "_require_identity", lambda: "test")
     monkeypatch.setattr(ss.registrant, "company", lambda ticker: type(

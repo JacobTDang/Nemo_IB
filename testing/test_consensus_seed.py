@@ -436,7 +436,7 @@ def test_a_name_edgartools_cannot_map_is_announcement_dated_by_its_cik(
             self.cik = -999999999 if isinstance(key, str) else key
             self.not_found = self.cik != 1047340
 
-        def get_filings(self, form=None):
+        def get_filings(self, form=None, **kwargs):
             return _Filings([_Release("2026-07-14"), _Release("2026-04-14")]
                             if self.cik == 1047340 else [])
 

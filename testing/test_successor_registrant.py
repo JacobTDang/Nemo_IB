@@ -414,6 +414,30 @@ def test_ordinary_company_with_long_history_never_calls_predecessor_with_form(
     assert not called
 
 
+
+def test_a_heavy_filer_is_judged_on_its_whole_history_not_the_newest_page(
+        monkeypatch):
+    """A bank files 80 8-Ks in well under three years. Judged on the newest
+    `limit` only, its history looks short and every call pays for a
+    co-registrant search it cannot need."""
+    from tools.web_search_server import registrant
+
+    recent = [_Filing(f"0000019617-26-{i:06d}", form="8-K",
+                      filing_date=f"2026-{1 + i % 9:02d}-{1 + i % 27:02d}")
+              for i in range(80)]
+    old = [_Filing("0000019617-20-000040", form="8-K", filing_date="2020-03-01")]
+    comp = _Company(19617, "JPMorgan Chase & Co", {"8-K": recent + old})
+
+    def _fail_if_called(c, form):
+        raise AssertionError("searched for a co-registrant of a long history")
+
+    monkeypatch.setattr(registrant, "predecessor_with_form", _fail_if_called)
+
+    filings, read_from = registrant.filings_history(
+        comp, form="8-K", limit=80, since="2024-01-01")
+    assert len(filings) == 80
+    assert read_from is None
+
 def test_predecessor_with_form_caches_result_per_cik_and_form(monkeypatch):
     """predecessor_with_form caches results so repeated calls for (cik, form)
     do not re-parse filings."""
