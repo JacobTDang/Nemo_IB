@@ -111,65 +111,76 @@ scenario_dcf_description = """Runs the DCF model under three scenarios (Bear / B
 
 Every price in the payload -- the headline bear/base/bull price and every cell of terminal_sensitivity -- uses the same conservative min(perpetuity, exit multiple) terminal value, so the grid cell at terminal_sensitivity_base_multiple equals that scenario's headline price. terminal_value_method on each scenario names which of the two is binding; where the perpetuity binds across the whole sweep the row is flat and terminal_sensitivity_floor_note says so.
 
-MODELING PHASE ONLY -- called by the Financial Modeling Agent, not the execution engine.
+Pass every input below. Nothing is filled in for you: a call without an input is refused, and the refusal names every input that is absent. Get each one from the tool beside it:
+- revenue_base        <- get_revenue_base (revenue_base, in dollars)
+- capex_pct_revenue   <- get_capex_pct_revenue (capex_pct_revenue)
+- depreciation        <- get_depreciation (d&a_pct; not d&a, which is in dollars and is refused)
+- tax_rate            <- get_tax_rate (effective_tax_rate)
+- cash                <- get_market_data (cash)
+- debt                <- get_market_data (totalDebt)
+- shares_outstanding  <- get_market_data (shares_outstanding_all_classes)
+  (every price in this model is a per-share figure, so it needs the all-class
+   count; the provider's sharesOutstanding covers one class)
+- wacc                <- calculate_wacc (wacc)
+- terminal_growth     long-run growth after year five. This is your assumption: anchor it on get_macro_snapshot (real GDP growth). It must be below wacc.
+- bear_growth, base_growth, bull_growth   five annual growth rates for each case. These are your forecasts: anchor base_growth on get_basic_financials (revenueGrowthTTMYoy), and bear_growth and bull_growth on the low and high revenue estimates from get_forward_estimates.
+- bear_margin, base_margin, bull_margin   EBITDA margin for each case. These are your assumptions: anchor them on get_ebitda_margin (ebitda_margin_percent) and the margin trend in get_financial_statements (ic, annual).
+Optional:
+- terminal_multiple   <- get_basic_financials (evEbitdaTTM). When given, the terminal value is the lower of the perpetuity value and the exit-multiple value, and the result carries terminal_sensitivity. When absent, the perpetuity value alone, and no terminal_sensitivity.
 
-Data that must be in the variable store before modeling:
-- revenue_base          <- get_revenue_base
-- ebitda_margin         <- get_ebitda_margin
-- capex_pct_revenue     <- get_capex_pct_revenue
-- depreciation          <- get_depreciation
-- tax_rate              <- get_tax_rate
-- cash, debt, shares_outstanding_all_classes, beta  <- get_market_data
-  (all-class, not the provider's single-class sharesOutstanding -- every price
-   in this model is a per-share figure)
-- risk_free_rate        <- get_macro_snapshot
-- revenueGrowthTTMYoy, evEbitdaTTM      <- get_basic_financials
-- forward estimate low/high revenue     <- get_forward_estimates (for bear/bull anchors)
-- historical income statement           <- get_financial_statements ic annual (for margin trend)"""
+Pass rates as decimals: 0.21 for 21%. The SEC tools report percentages (ebitda_margin_percent, capex_pct_revenue, d&a_pct, effective_tax_rate), so divide those by 100. Zero is a value: cash 0, debt 0, tax_rate 0, capex_pct_revenue 0, depreciation 0 and terminal_growth 0 are used as given. revenue_base, wacc and shares_outstanding must be greater than zero."""
 
 lbo_description = """Leveraged buyout model. Computes IRR and MOIC to equity given entry EV, debt structure (leverage turns, interest rate), and exit multiple over a hold period.
 
-Refuses rather than modelling an impossible structure: entry EBITDA at or below zero (nothing to lever, to service the debt, or to price the exit off), an exit_multiple at or below zero (a non-positive exit enterprise value), a hold_years below 1, and acquisition debt meeting or exceeding entry_ev. Each refusal names the input to change.
+Refuses rather than modelling an impossible structure: entry EBITDA at or below zero (nothing to lever, to service the debt, or to price the exit off), an exit_multiple at or below zero (a non-positive exit enterprise value), a hold_years below 1, a revenue_growth list shorter than hold_years, and acquisition debt meeting or exceeding entry_ev. Each refusal names the input to change.
 
-MODELING PHASE ONLY -- called by the Financial Modeling Agent, not the execution engine.
 ONLY run when the user query involves M&A, private equity, buyout potential, or takeout analysis.
 
-Data that must be in the variable store before modeling:
-- market_cap, totalDebt, totalCash, shares_outstanding_all_classes  <- get_market_data
-- revenue_base          <- get_revenue_base
-- ebitda_margin         <- get_ebitda_margin
-- capex_pct_revenue     <- get_capex_pct_revenue
-- depreciation          <- get_depreciation
-- tax_rate              <- get_tax_rate
-- revenueGrowthTTMYoy   <- get_basic_financials (hold period growth)
-- risk_free_rate        <- get_macro_snapshot
-- HY credit spread      <- get_credit_spreads (for debt pricing)
-- evEbitdaTTM           <- get_basic_financials (exit multiple anchor)"""
+Pass every input below. Nothing is filled in for you: a call without an input is refused, and the refusal names every input that is absent. Get each one from the tool beside it:
+- entry_ev            your offer for the whole enterprise, in dollars: marketCap + totalDebt - cash from get_market_data, plus your premium. Greater than zero.
+- revenue_base        <- get_revenue_base (revenue_base, in dollars)
+- ebitda_margin       <- get_ebitda_margin (ebitda_margin_percent)
+- capex_pct_revenue   <- get_capex_pct_revenue (capex_pct_revenue)
+- depreciation        <- get_depreciation (d&a_pct; not d&a, which is in dollars and is refused)
+- tax_rate            <- get_tax_rate (effective_tax_rate)
+- revenue_growth      one annual growth rate for each year of the hold. This is your forecast: anchor it on get_basic_financials (revenueGrowthTTMYoy). A list shorter than hold_years is refused; no rate is repeated to fill it.
+- debt_interest_rate  your all-in rate on the acquisition debt: the 10Y Treasury yield from get_macro_snapshot plus the HY spread from get_credit_spreads.
+- leverage_turns      your structure: acquisition debt as a multiple of entry EBITDA (revenue_base x ebitda_margin), for example 4.5.
+- exit_multiple       your assumption: EV/EBITDA at exit, anchored on get_basic_financials (evEbitdaTTM).
+Optional:
+- hold_years          years held, at least 1. 5 when absent. The value used is hold_years in the result.
+
+Pass rates as decimals: 0.21 for 21%. The SEC tools report percentages (ebitda_margin_percent, capex_pct_revenue, d&a_pct, effective_tax_rate), and so do get_macro_snapshot and get_credit_spreads, so divide those by 100. Zero is a value: capex_pct_revenue 0, depreciation 0, tax_rate 0, debt_interest_rate 0 and leverage_turns 0 (an all-equity deal) are used as given. entry_ev, revenue_base, ebitda_margin and exit_multiple must be greater than zero."""
 
 credit_profile_description = """Computes key credit metrics: Net Debt/EBITDA, Interest Coverage (EBIT/Interest), leverage label (Investment Grade through Distressed), and FCF yield.
 
-MODELING PHASE ONLY -- called by the Financial Modeling Agent, not the execution engine.
+Pass every input below. Nothing is filled in for you: a call without an input is refused, and the refusal names every input that is absent. Every input is in dollars except tax_rate. Get each one from the tool beside it:
+- total_debt          <- get_market_data (totalDebt)
+- cash                <- get_market_data (cash)
+- ebitda              <- get_revenue_base (revenue_base) x get_ebitda_margin (ebitda_margin_percent divided by 100)
+- interest_expense    <- get_market_data (interestExpense)
+- depreciation_abs    <- get_depreciation (d&a, in dollars; not d&a_pct)
+- capex_abs           <- get_revenue_base (revenue_base) x get_capex_pct_revenue (capex_pct_revenue divided by 100)
+- tax_rate            <- get_tax_rate (effective_tax_rate divided by 100)
+- market_cap          <- get_market_data (marketCap); the FCF yield divides by it
 
-Data that must be in the variable store before modeling:
-- totalDebt, totalCash, interest_expense, market_cap  <- get_market_data
-- revenue_base          <- get_revenue_base
-- ebitda_margin         <- get_ebitda_margin
-- depreciation          <- get_depreciation
-- capex_pct_revenue     <- get_capex_pct_revenue
-- tax_rate              <- get_tax_rate"""
+Zero is a value: total_debt 0, cash 0, interest_expense 0, depreciation_abs 0, capex_abs 0 and tax_rate 0 are used as given. With interest_expense 0, interest_coverage is null and interest_coverage_note says why: there is no interest to cover. ebitda and market_cap must be greater than zero."""
 
 capital_returns_description = """Calculates shareholder return profile: FCF yield, dividend yield, buyback yield, total shareholder yield, and payout ratio sustainability.
 
-MODELING PHASE ONLY -- called by the Financial Modeling Agent, not the execution engine.
-
-Data that must be in the variable store before modeling:
-- market_cap, shares_outstanding_all_classes  <- get_market_data
+Pass every input below. Nothing is filled in for you: a call without an input is refused, and the refusal names every input that is absent. Every input is in dollars except tax_rate and shares_outstanding. Get each one from the tool beside it:
+- market_cap          <- get_market_data (marketCap)
+- ebitda              <- get_revenue_base (revenue_base) x get_ebitda_margin (ebitda_margin_percent divided by 100)
+- capex_abs           <- get_revenue_base (revenue_base) x get_capex_pct_revenue (capex_pct_revenue divided by 100)
+- tax_rate            <- get_tax_rate (effective_tax_rate divided by 100)
+- depreciation_abs    <- get_depreciation (d&a, in dollars; not d&a_pct)
+- dividends_paid      <- get_financial_statements (statement cf, freq annual: dividendsPaid). The sign does not matter; the tool takes the magnitude.
+- shares_repurchased  <- dollars spent on buybacks, not a count of shares: get_financial_statements (statement cf, freq annual: repurchaseOfCapitalStock) or get_buyback_history (ttm_repurchase). The sign does not matter.
+- shares_outstanding  <- get_market_data (shares_outstanding_all_classes)
   (dividend and buyback per share divide the share count; the provider's
    sharesOutstanding is one class where market_cap is all of them)
-- revenue_base, ebitda_margin             <- get_revenue_base, get_ebitda_margin
-- capex_pct_revenue, depreciation         <- get_capex_pct_revenue, get_depreciation
-- tax_rate                                <- get_tax_rate
-- dividendsPaid, repurchaseOfCapitalStock <- get_financial_statements cf annual"""
+
+Zero is a value: dividends_paid 0 is a company that pays none, shares_repurchased 0 is one that buys back none, and tax_rate 0, capex_abs 0 and depreciation_abs 0 are used as given. A statement that lacks the line is not a company that pays none: find the figure before you pass 0. market_cap, ebitda and shares_outstanding must be greater than zero."""
 
 
 # ---------------------------------------------------------------------------
@@ -370,6 +381,64 @@ WACC_INPUTS = {
   'total_debt': 'get_market_data (totalDebt)',
 }
 
+# The scenario model runs _dcf_math three times, so the inputs it shares with
+# calculate_dcf come from the same places. The growth rates and margins are one
+# per case instead of one.
+SCENARIO_DCF_INPUTS = {
+  'bear_growth': 'your bear-case forecast, anchored on the low revenue '
+                 'estimate from get_forward_estimates',
+  'base_growth': 'your base-case forecast, anchored on get_basic_financials',
+  'bull_growth': 'your bull-case forecast, anchored on the high revenue '
+                 'estimate from get_forward_estimates',
+  'bear_margin': 'your bear-case assumption, anchored on get_ebitda_margin',
+  'base_margin': 'your base-case assumption, anchored on get_ebitda_margin',
+  'bull_margin': 'your bull-case assumption, anchored on get_ebitda_margin',
+  **{name: DCF_INPUTS[name] for name in (
+    'revenue_base', 'capex_pct_revenue', 'tax_rate', 'depreciation', 'wacc',
+    'terminal_growth', 'cash', 'debt', 'shares_outstanding')},
+}
+
+LBO_INPUTS = {
+  'entry_ev': 'your offer: marketCap + totalDebt - cash from get_market_data, '
+              'plus your premium',
+  'revenue_base': DCF_INPUTS['revenue_base'],
+  'ebitda_margin': DCF_INPUTS['ebitda_margin'],
+  'capex_pct_revenue': DCF_INPUTS['capex_pct_revenue'],
+  'depreciation': DCF_INPUTS['depreciation'],
+  'tax_rate': DCF_INPUTS['tax_rate'],
+  'revenue_growth': 'your forecast, one rate per year of the hold, anchored '
+                    'on get_basic_financials',
+  'debt_interest_rate': 'your assumption: the 10Y yield from '
+                        'get_macro_snapshot plus the HY spread from '
+                        'get_credit_spreads',
+  'leverage_turns': 'your structure: acquisition debt as a multiple of entry '
+                    'EBITDA',
+  'exit_multiple': 'your assumption, anchored on get_basic_financials',
+}
+
+CREDIT_PROFILE_INPUTS = {
+  'total_debt': 'get_market_data (totalDebt)',
+  'cash': 'get_market_data (cash)',
+  'ebitda': 'get_revenue_base x get_ebitda_margin',
+  'interest_expense': 'get_market_data (interestExpense)',
+  'depreciation_abs': 'get_depreciation (d&a, in dollars)',
+  'capex_abs': 'get_revenue_base x get_capex_pct_revenue',
+  'tax_rate': 'get_tax_rate',
+  'market_cap': 'get_market_data (marketCap)',
+}
+
+CAPITAL_RETURNS_INPUTS = {
+  'market_cap': 'get_market_data (marketCap)',
+  'ebitda': 'get_revenue_base x get_ebitda_margin',
+  'capex_abs': 'get_revenue_base x get_capex_pct_revenue',
+  'tax_rate': 'get_tax_rate',
+  'depreciation_abs': 'get_depreciation (d&a, in dollars)',
+  'dividends_paid': 'get_financial_statements (cf, annual)',
+  'shares_repurchased': 'get_financial_statements (cf, annual) or '
+                        'get_buyback_history, in dollars',
+  'shares_outstanding': 'get_market_data (shares_outstanding_all_classes)',
+}
+
 
 def _refuse_absent(tool: str, args: Dict[str, Any], inputs: Dict[str, str]):
   """A refusal naming every input in `inputs` that `args` lacks, or None.
@@ -394,6 +463,27 @@ def _refuse_absent(tool: str, args: Dict[str, Any], inputs: Dict[str, str]):
               f"required and none is filled in: read as zero, an absent tax "
               f"rate is a company that pays no tax. Pass {sources}."),
     'missing_inputs': missing,
+    'ticker': args.get('ticker', ''),
+  }))]
+
+
+def _refuse_no_share_count(args: Dict[str, Any]):
+  """A refusal when shares_outstanding is not above zero, or None.
+
+  Zero is a value for cash, debt, a tax rate, capex and D&A: a company can have
+  none of them. It is not a share count. Every price these models return is a
+  per-share figure, so where every input is asked for a zero is an absent field
+  read as a number. Call after _refuse_absent, which has already refused an
+  absent one.
+  """
+  shares = args.get('shares_outstanding')
+  if shares > 0:
+    return None
+  return [TextContent(type='text', text=json.dumps({
+    'success': False,
+    'error': (f"shares_outstanding must be greater than zero, received "
+              f"{shares}. Pass shares_outstanding_all_classes from "
+              f"get_market_data."),
     'ticker': args.get('ticker', ''),
   }))]
 
@@ -666,6 +756,17 @@ def _lbo_math(entry_ev: float, revenue_base: float, ebitda_margin: float,
       f"entry and exit inside a zero-length hold, so there is no return to "
       f"annualise. Raise hold_years.")
 
+  # A growth rate for every year of the hold, or a refusal. Short of that the
+  # loop below filled the missing years with the last rate given, or with 3%
+  # for an empty list: a growth assumption nobody made, in a model whose exit
+  # value is built on the final year's revenue.
+  if len(revenue_growth) < hold_years:
+    raise ValueError(
+      f"revenue_growth has {len(revenue_growth)} rate(s) for a hold_years of "
+      f"{hold_years}. Each year of the hold needs a growth rate, and none is "
+      f"repeated or invented to fill the gap. Pass {hold_years} rates, or "
+      f"lower hold_years.")
+
   entry_ebitda = revenue_base * ebitda_margin
   # Every figure below is sized off entry EBITDA: the debt, the exit
   # enterprise value, and the cash that services the debt in between. With
@@ -709,8 +810,7 @@ def _lbo_math(entry_ev: float, revenue_base: float, ebitda_margin: float,
   year_by_year = []
 
   for yr in range(hold_years):
-    growth = revenue_growth[yr] if yr < len(revenue_growth) else (revenue_growth[-1] if revenue_growth else 0.03)
-    current_revenue *= (1 + growth)
+    current_revenue *= (1 + revenue_growth[yr])
     ebitda = current_revenue * ebitda_margin
     da = current_revenue * depreciation
     ebit = ebitda - da
@@ -780,7 +880,7 @@ def _lbo_math(entry_ev: float, revenue_base: float, ebitda_margin: float,
 def _credit_profile_math(total_debt: float, cash: float, ebitda: float,
                           interest_expense: float, depreciation_abs: float,
                           capex_abs: float, tax_rate: float,
-                          market_cap: float = 0) -> dict:
+                          market_cap: float) -> dict:
   """
   Key credit metrics from capital structure and income data.
 
@@ -796,19 +896,26 @@ def _credit_profile_math(total_debt: float, cash: float, ebitda: float,
       'success': False,
     }
 
+  # The FCF yield divides by it. An absent market_cap used to read as 0, and
+  # the yield was left out of the result without a word.
+  if market_cap <= 0:
+    return {
+      'error': f'_credit_profile_math: market_cap must be positive, got {market_cap}',
+      'success': False,
+    }
+
   if tax_rate > 1:
     tax_rate /= 100
 
   net_debt = total_debt - cash
   ebit = ebitda - depreciation_abs
 
-  # Interest expense is acceptable as zero (debt-free companies). Treat as
-  # large-but-finite so interest_coverage produces a meaningful "infinite" signal.
-  safe_interest = interest_expense if interest_expense > 0 else 1.0
-
   net_debt_ebitda = net_debt / ebitda
   total_debt_ebitda = total_debt / ebitda
-  interest_coverage = ebit / safe_interest
+  # Zero interest is a debt-free company, and coverage of no interest is not
+  # defined. It used to be EBIT over a stand-in of $1: 115,000,000,000x for a
+  # company with $115bn of EBIT, a number shaped like an answer.
+  interest_coverage = ebit / interest_expense if interest_expense > 0 else None
 
   # FCF approximation: NOPAT + D&A - CapEx
   nopat = max(0.0, ebit) * (1 - tax_rate)
@@ -833,9 +940,11 @@ def _credit_profile_math(total_debt: float, cash: float, ebitda: float,
     'net_debt': round(net_debt, 2),
     'net_debt_ebitda': round(net_debt_ebitda, 2),
     'total_debt_ebitda': round(total_debt_ebitda, 2),
-    'interest_coverage': round(interest_coverage, 2),
+    'interest_coverage': (round(interest_coverage, 2)
+                          if interest_coverage is not None else None),
     'ebit': round(ebit, 2),
     'fcf_estimate': round(fcf_estimate, 2),
+    'fcf_yield_pct': round(fcf_estimate / market_cap * 100, 2),
     'credit_label': credit_label,
     'inputs': {
       'total_debt': total_debt,
@@ -845,10 +954,13 @@ def _credit_profile_math(total_debt: float, cash: float, ebitda: float,
       'depreciation_abs': depreciation_abs,
       'capex_abs': capex_abs,
       'tax_rate': tax_rate,
+      'market_cap': market_cap,
     }
   }
-  if market_cap > 0:
-    result['fcf_yield_pct'] = round(fcf_estimate / market_cap * 100, 2)
+  if interest_coverage is None:
+    result['interest_coverage_note'] = (
+        f"interest_coverage is not reported because interest_expense was "
+        f"{interest_expense!r}: there is no interest for EBIT to cover.")
   return result
 
 
@@ -1000,8 +1112,8 @@ def _scenario_dcf_math(base_inputs: dict,
 
 def _capital_returns_math(market_cap: float, ebitda: float, capex_abs: float,
                            tax_rate: float, depreciation_abs: float,
-                           dividends_paid: float = 0, shares_repurchased: float = 0,
-                           shares_outstanding: float = 0) -> dict:
+                           dividends_paid: float, shares_repurchased: float,
+                           shares_outstanding: float) -> dict:
   """
   Shareholder return profile from cash flow and market data.
 
@@ -1017,6 +1129,15 @@ def _capital_returns_math(market_cap: float, ebitda: float, capex_abs: float,
   if ebitda <= 0:
     return {
       'error': f'_capital_returns_math: ebitda must be positive, got {ebitda}',
+      'success': False,
+    }
+
+  # The per-share figures divide by it. Absent, it used to read as 0 and they
+  # were left out of the result without a word.
+  if shares_outstanding <= 0:
+    return {
+      'error': (f'_capital_returns_math: shares_outstanding must be positive, '
+                f'got {shares_outstanding}'),
       'success': False,
     }
 
@@ -1058,13 +1179,12 @@ def _capital_returns_math(market_cap: float, ebitda: float, capex_abs: float,
     'dividend_yield_pct': round(div_yield * 100, 2),
     'buyback_yield_pct': round(buyback_yield * 100, 2),
     'total_shareholder_yield_pct': round((div_yield + buyback_yield) * 100, 2),
+    'dividend_per_share': round(div_abs / shares_outstanding, 4),
+    'buyback_per_share': round(buyback_abs / shares_outstanding, 4),
     'sustainability': sustainability,
   }
   if payout_ratio is not None:
     result['payout_ratio_pct'] = round(payout_ratio * 100, 2)
-  if shares_outstanding > 0:
-    result['dividend_per_share'] = round(div_abs / shares_outstanding, 4)
-    result['buyback_per_share'] = round(buyback_abs / shares_outstanding, 4)
   return result
 
 
@@ -1541,16 +1661,6 @@ def _revisions_momentum_math(trends: list) -> dict:
 # MCP Server
 # ---------------------------------------------------------------------------
 
-# Tools only the execution engine should plan -- used to filter the tool list
-# shown to the orchestrator when building the execution plan.
-MODELING_PHASE_TOOLS = {
-  'calculate_scenario_dcf',
-  'calculate_lbo',
-  'calculate_credit_profile',
-  'calculate_capital_returns',
-}
-
-
 class Financial_Analysis:
   def __init__(self, args=None):
     self.server = Server("Financial_Analysis")
@@ -1779,32 +1889,31 @@ class Financial_Analysis:
           inputSchema={
             "type": "object",
             "properties": {
-              "ticker": {"type": "string", "description": "Company ticker"},
-              "bear_growth": {"type": "array", "items": {"type": "number"}, "description": "5 annual growth rates for bear case (decimals)"},
-              "base_growth": {"type": "array", "items": {"type": "number"}, "description": "5 annual growth rates for base case (decimals)"},
-              "bull_growth": {"type": "array", "items": {"type": "number"}, "description": "5 annual growth rates for bull case (decimals)"},
-              "bear_margin": {"type": "number", "description": "EBITDA margin for bear case (decimal)"},
-              "base_margin": {"type": "number", "description": "EBITDA margin for base case (decimal)"},
-              "bull_margin": {"type": "number", "description": "EBITDA margin for bull case (decimal)"},
-              "revenue_base": {"type": "number"},
-              "capex_pct_revenue": {"type": "number"},
-              "tax_rate": {"type": "number"},
-              "depreciation": {"type": "number"},
-              "wacc": {"type": "number"},
-              "terminal_growth": {"type": "number"},
-              "terminal_multiple": {"type": "number"},
-              "cash": {"type": "number"},
-              "debt": {"type": "number"},
-              "shares_outstanding": {"type": "number"}
+              "ticker": {"type": "string", "description": "Company ticker symbol (e.g. 'MSFT'). A label for the result; it fetches nothing."},
+              "bear_growth": {"type": "array", "items": {"type": "number"}, "description": "Required. Five annual revenue growth rates as decimals for the bear case: your forecast, anchored on the low revenue estimate from get_forward_estimates."},
+              "base_growth": {"type": "array", "items": {"type": "number"}, "description": "Required. Five annual revenue growth rates as decimals for the base case: your forecast, anchored on get_basic_financials revenueGrowthTTMYoy."},
+              "bull_growth": {"type": "array", "items": {"type": "number"}, "description": "Required. Five annual revenue growth rates as decimals for the bull case: your forecast, anchored on the high revenue estimate from get_forward_estimates."},
+              "bear_margin": {"type": "number", "description": "Required. Decimal EBITDA margin for the bear case: your assumption, anchored on ebitda_margin_percent from get_ebitda_margin, divided by 100."},
+              "base_margin": {"type": "number", "description": "Required. Decimal EBITDA margin for the base case: your assumption, anchored on ebitda_margin_percent from get_ebitda_margin, divided by 100."},
+              "bull_margin": {"type": "number", "description": "Required. Decimal EBITDA margin for the bull case: your assumption, anchored on ebitda_margin_percent from get_ebitda_margin, divided by 100."},
+              "revenue_base": {"type": "number", "description": "Required. Latest annual revenue in dollars, from get_revenue_base. Greater than zero."},
+              "capex_pct_revenue": {"type": "number", "description": "Required. Decimal: capex_pct_revenue from get_capex_pct_revenue, divided by 100. 0 is used as given."},
+              "tax_rate": {"type": "number", "description": "Required. Decimal: effective_tax_rate from get_tax_rate, divided by 100. 0 is used as given."},
+              "depreciation": {"type": "number", "description": "Required. Decimal: d&a_pct from get_depreciation, divided by 100. Not d&a, which is in dollars. 0 is used as given."},
+              "wacc": {"type": "number", "description": "Required. Decimal discount rate: wacc from calculate_wacc. Greater than zero."},
+              "terminal_growth": {"type": "number", "description": "Required. Decimal long-run growth after year five, below wacc: your assumption, anchored on get_macro_snapshot real GDP growth. 0 is used as given."},
+              "terminal_multiple": {"type": "number", "description": "Optional. Exit EV/EBITDA: evEbitdaTTM from get_basic_financials. When absent, the terminal value is the perpetuity value alone and there is no terminal_sensitivity."},
+              "cash": {"type": "number", "description": "Required. Dollars: cash from get_market_data. 0 is used as given."},
+              "debt": {"type": "number", "description": "Required. Dollars: totalDebt from get_market_data. 0 is used as given."},
+              "shares_outstanding": {"type": "number", "description": "Required. shares_outstanding_all_classes from get_market_data, not sharesOutstanding. Greater than zero."}
             },
-            "required": ["ticker", "bear_growth", "base_growth", "bull_growth",
-                         "bear_margin", "base_margin", "bull_margin"],
-                         # Every parameter here is a term in an arithmetic
-                         # expression, so one dropped silently changes the
-                         # number without changing its shape. `net_debt` was
-                         # accepted, never read, and the valuation came back
-                         # confident and wrong.
-                         "additionalProperties": False
+            "required": ["ticker", *SCENARIO_DCF_INPUTS],
+            # Every parameter here is a term in an arithmetic
+            # expression, so one dropped silently changes the
+            # number without changing its shape. `net_debt` was
+            # accepted, never read, and the valuation came back
+            # confident and wrong.
+            "additionalProperties": False
           }
         ),
         Tool(
@@ -1813,28 +1922,26 @@ class Financial_Analysis:
           inputSchema={
             "type": "object",
             "properties": {
-              "ticker": {"type": "string"},
-              "entry_ev": {"type": "number", "description": "Total acquisition EV in dollars"},
-              "revenue_base": {"type": "number", "description": "Current annual revenue"},
-              "ebitda_margin": {"type": "number", "description": "EBITDA margin (decimal)"},
-              "capex_pct_revenue": {"type": "number", "description": "CapEx as % of revenue (decimal)"},
-              "depreciation": {"type": "number", "description": "D&A as % of revenue (decimal)"},
-              "tax_rate": {"type": "number", "description": "Effective tax rate (decimal)"},
-              "revenue_growth": {"type": "array", "items": {"type": "number"}, "description": "Annual growth rates for hold period"},
-              "debt_interest_rate": {"type": "number", "description": "All-in interest rate on acquisition debt (decimal, e.g. 0.08)"},
-              "leverage_turns": {"type": "number", "description": "Acquisition debt as multiple of entry EBITDA (e.g. 4.5)"},
-              "exit_multiple": {"type": "number", "description": "EV/EBITDA at exit"},
-              "hold_years": {"type": "integer", "description": "Hold period in years (default 5)"}
+              "ticker": {"type": "string", "description": "Company ticker symbol. A label for the result; it fetches nothing."},
+              "entry_ev": {"type": "number", "description": "Required. Dollars: your offer for the whole enterprise, marketCap + totalDebt - cash from get_market_data, plus your premium. Greater than zero."},
+              "revenue_base": {"type": "number", "description": "Required. Latest annual revenue in dollars, from get_revenue_base. Greater than zero."},
+              "ebitda_margin": {"type": "number", "description": "Required. Decimal: ebitda_margin_percent from get_ebitda_margin, divided by 100. Greater than zero."},
+              "capex_pct_revenue": {"type": "number", "description": "Required. Decimal: capex_pct_revenue from get_capex_pct_revenue, divided by 100. 0 is used as given."},
+              "depreciation": {"type": "number", "description": "Required. Decimal: d&a_pct from get_depreciation, divided by 100. Not d&a, which is in dollars. 0 is used as given."},
+              "tax_rate": {"type": "number", "description": "Required. Decimal: effective_tax_rate from get_tax_rate, divided by 100. 0 is used as given."},
+              "revenue_growth": {"type": "array", "items": {"type": "number"}, "description": "Required. One annual revenue growth rate as a decimal for each year of the hold: your forecast, anchored on get_basic_financials revenueGrowthTTMYoy. A list shorter than hold_years is refused."},
+              "debt_interest_rate": {"type": "number", "description": "Required. Decimal all-in rate on the acquisition debt, for example 0.08: your assumption, the 10Y yield from get_macro_snapshot plus the HY spread from get_credit_spreads, both divided by 100. 0 is used as given."},
+              "leverage_turns": {"type": "number", "description": "Required. Acquisition debt as a multiple of entry EBITDA, for example 4.5: your structure. 0 is an all-equity deal and is used as given."},
+              "exit_multiple": {"type": "number", "description": "Required. EV/EBITDA at exit: your assumption, anchored on evEbitdaTTM from get_basic_financials. Greater than zero."},
+              "hold_years": {"type": "integer", "description": "Optional. Years held, at least 1; 5 when absent. The value used is hold_years in the result."}
             },
-            "required": ["ticker", "entry_ev", "revenue_base", "ebitda_margin",
-                         "capex_pct_revenue", "depreciation", "tax_rate",
-                         "revenue_growth", "debt_interest_rate", "leverage_turns", "exit_multiple"],
-                         # Every parameter here is a term in an arithmetic
-                         # expression, so one dropped silently changes the
-                         # number without changing its shape. `net_debt` was
-                         # accepted, never read, and the valuation came back
-                         # confident and wrong.
-                         "additionalProperties": False
+            "required": ["ticker", *LBO_INPUTS],
+            # Every parameter here is a term in an arithmetic
+            # expression, so one dropped silently changes the
+            # number without changing its shape. `net_debt` was
+            # accepted, never read, and the valuation came back
+            # confident and wrong.
+            "additionalProperties": False
           }
         ),
         Tool(
@@ -1843,24 +1950,23 @@ class Financial_Analysis:
           inputSchema={
             "type": "object",
             "properties": {
-              "ticker": {"type": "string"},
-              "total_debt": {"type": "number", "description": "Total debt in dollars"},
-              "cash": {"type": "number", "description": "Cash and equivalents in dollars"},
-              "ebitda": {"type": "number", "description": "Annual EBITDA in dollars"},
-              "interest_expense": {"type": "number", "description": "Annual interest expense in dollars"},
-              "depreciation_abs": {"type": "number", "description": "Annual D&A in dollars"},
-              "capex_abs": {"type": "number", "description": "Annual CapEx in dollars"},
-              "tax_rate": {"type": "number", "description": "Effective tax rate (decimal)"},
-              "market_cap": {"type": "number", "description": "Market cap in dollars (for FCF yield)"}
+              "ticker": {"type": "string", "description": "Company ticker symbol. A label for the result; it fetches nothing."},
+              "total_debt": {"type": "number", "description": "Required. Dollars: totalDebt from get_market_data. 0 is used as given."},
+              "cash": {"type": "number", "description": "Required. Dollars: cash from get_market_data. 0 is used as given."},
+              "ebitda": {"type": "number", "description": "Required. Dollars: revenue_base from get_revenue_base times ebitda_margin_percent from get_ebitda_margin, divided by 100. Greater than zero."},
+              "interest_expense": {"type": "number", "description": "Required. Dollars a year: interestExpense from get_market_data. 0 is used as given; interest_coverage is then null."},
+              "depreciation_abs": {"type": "number", "description": "Required. Dollars a year: d&a from get_depreciation. Not d&a_pct. 0 is used as given."},
+              "capex_abs": {"type": "number", "description": "Required. Dollars a year: revenue_base from get_revenue_base times capex_pct_revenue from get_capex_pct_revenue, divided by 100. 0 is used as given."},
+              "tax_rate": {"type": "number", "description": "Required. Decimal: effective_tax_rate from get_tax_rate, divided by 100. 0 is used as given."},
+              "market_cap": {"type": "number", "description": "Required. Dollars: marketCap from get_market_data. The FCF yield divides by it. Greater than zero."}
             },
-            "required": ["ticker", "total_debt", "cash", "ebitda",
-                         "interest_expense", "depreciation_abs", "capex_abs", "tax_rate"],
-                         # Every parameter here is a term in an arithmetic
-                         # expression, so one dropped silently changes the
-                         # number without changing its shape. `net_debt` was
-                         # accepted, never read, and the valuation came back
-                         # confident and wrong.
-                         "additionalProperties": False
+            "required": ["ticker", *CREDIT_PROFILE_INPUTS],
+            # Every parameter here is a term in an arithmetic
+            # expression, so one dropped silently changes the
+            # number without changing its shape. `net_debt` was
+            # accepted, never read, and the valuation came back
+            # confident and wrong.
+            "additionalProperties": False
           }
         ),
         Tool(
@@ -1869,17 +1975,17 @@ class Financial_Analysis:
           inputSchema={
             "type": "object",
             "properties": {
-              "ticker": {"type": "string"},
-              "market_cap": {"type": "number", "description": "Market cap in dollars"},
-              "ebitda": {"type": "number", "description": "Annual EBITDA in dollars"},
-              "capex_abs": {"type": "number", "description": "Annual CapEx in dollars"},
-              "tax_rate": {"type": "number", "description": "Effective tax rate (decimal)"},
-              "depreciation_abs": {"type": "number", "description": "Annual D&A in dollars"},
-              "dividends_paid": {"type": "number", "description": "Dividends paid from CF statement (negative = outflow)"},
-              "shares_repurchased": {"type": "number", "description": "Share repurchases from CF statement (negative = outflow)"},
-              "shares_outstanding": {"type": "number", "description": "Total shares outstanding"}
+              "ticker": {"type": "string", "description": "Company ticker symbol. A label for the result; it fetches nothing."},
+              "market_cap": {"type": "number", "description": "Required. Dollars: marketCap from get_market_data. Every yield divides by it. Greater than zero."},
+              "ebitda": {"type": "number", "description": "Required. Dollars: revenue_base from get_revenue_base times ebitda_margin_percent from get_ebitda_margin, divided by 100. Greater than zero."},
+              "capex_abs": {"type": "number", "description": "Required. Dollars a year: revenue_base from get_revenue_base times capex_pct_revenue from get_capex_pct_revenue, divided by 100. 0 is used as given."},
+              "tax_rate": {"type": "number", "description": "Required. Decimal: effective_tax_rate from get_tax_rate, divided by 100. 0 is used as given."},
+              "depreciation_abs": {"type": "number", "description": "Required. Dollars a year: d&a from get_depreciation. Not d&a_pct. 0 is used as given."},
+              "dividends_paid": {"type": "number", "description": "Required. Dollars a year: dividendsPaid from get_financial_statements (statement cf, freq annual). The sign does not matter. 0 is a company that pays none; a statement without the line is not that company."},
+              "shares_repurchased": {"type": "number", "description": "Required. Dollars a year spent on buybacks, not a count of shares: repurchaseOfCapitalStock from get_financial_statements (cf, annual) or ttm_repurchase from get_buyback_history. The sign does not matter. 0 is a company that buys back none."},
+              "shares_outstanding": {"type": "number", "description": "Required. shares_outstanding_all_classes from get_market_data, not sharesOutstanding. Greater than zero."}
             },
-            "required": ["ticker", "market_cap", "ebitda", "capex_abs", "tax_rate", "depreciation_abs"],
+            "required": ["ticker", *CAPITAL_RETURNS_INPUTS],
             # Every parameter here is a term in an arithmetic
             # expression, so one dropped silently changes the
             # number without changing its shape. `net_debt` was
@@ -2299,19 +2405,9 @@ warnings_per_tool={
     refusal = _refuse_absent('calculate_dcf', args, DCF_INPUTS)
     if refusal:
       return refusal
-    # Zero is a value for cash, debt, a tax rate, capex and D&A: a company can
-    # have none of them. It is not a share count. _dcf_math answers one with a
-    # null price for calculate_scenario_dcf's grid; here, where every input is
-    # asked for, a zero is an absent field read as a number.
-    shares = args.get('shares_outstanding')
-    if shares <= 0:
-      return [TextContent(type='text', text=json.dumps({
-        'success': False,
-        'error': (f"shares_outstanding must be greater than zero, received "
-                  f"{shares}. Pass shares_outstanding_all_classes from "
-                  f"get_market_data."),
-        'ticker': args.get('ticker', ''),
-      }))]
+    refusal = _refuse_no_share_count(args)
+    if refusal:
+      return refusal
     result = _dcf_math(
       revenue_base=args.get('revenue_base'),
       ebitda_margin=args.get('ebitda_margin'),
@@ -2326,7 +2422,7 @@ warnings_per_tool={
       terminal_multiple=args.get('terminal_multiple') or 0,
       cash=args.get('cash'),
       debt=args.get('debt'),
-      shares_outstanding=shares,
+      shares_outstanding=args.get('shares_outstanding'),
       ticker=args.get('ticker', ''),
     )
     return [TextContent(type='text', text=json.dumps(result))]
@@ -2350,59 +2446,60 @@ warnings_per_tool={
     return [TextContent(type='text', text=json.dumps(result))]
 
   async def calculate_scenario_dcf(self, args: Dict[str, Any]) -> List[TextContent]:
-    # Same refusal as calculate_dcf: this runs _dcf_math three times, so a
-    # missing revenue_base produces three price targets of 0 instead of one.
-    if not args.get('revenue_base'):
-      return [TextContent(type='text', text=json.dumps({
-        'error': ("revenue_base is zero or absent, cannot compute a scenario DCF. "
-                  "Resolve it with get_revenue_base first, then pass it in."),
-        'ticker': args.get('ticker', ''),
-      }))]
+    # This runs _dcf_math three times, so an input read as 0 produces three
+    # price targets built on it instead of one.
+    refusal = (_refuse_absent('calculate_scenario_dcf', args, SCENARIO_DCF_INPUTS)
+               or _refuse_no_share_count(args))
+    if refusal:
+      return refusal
     base_inputs = {
-      'revenue_base': args.get('revenue_base', 0),
-      'capex_pct_revenue': args.get('capex_pct_revenue', 0),
-      'tax_rate': args.get('tax_rate', 0),
-      'depreciation': args.get('depreciation', 0),
-      'wacc': args.get('wacc', 0),
-      # Absent, the 2.5% this tool has always used. _dcf_math used to apply it
-      # to any zero, which turned calculate_dcf's explicit terminal_growth 0
-      # into 2.5%; a zero passed here is now used as given too.
-      'terminal_growth': args.get('terminal_growth', 0.025),
-      'terminal_multiple': args.get('terminal_multiple', 0),
-      'cash': args.get('cash', 0),
-      'debt': args.get('debt', 0),
-      'shares_outstanding': args.get('shares_outstanding', 0),
+      'revenue_base': args.get('revenue_base'),
+      'capex_pct_revenue': args.get('capex_pct_revenue'),
+      'tax_rate': args.get('tax_rate'),
+      'depreciation': args.get('depreciation'),
+      'wacc': args.get('wacc'),
+      'terminal_growth': args.get('terminal_growth'),
+      # The one optional input. Absent, the terminal value is the perpetuity
+      # alone and there is no terminal_sensitivity, as the description says.
+      'terminal_multiple': args.get('terminal_multiple') or 0,
+      'cash': args.get('cash'),
+      'debt': args.get('debt'),
+      'shares_outstanding': args.get('shares_outstanding'),
       'ticker': args.get('ticker', ''),
       # ebitda_margin and revenue_growth are supplied per-scenario
-      'ebitda_margin': args.get('base_margin', 0),
-      'revenue_growth': args.get('base_growth', [0, 0, 0, 0, 0]),
     }
     result = _scenario_dcf_math(
       base_inputs=base_inputs,
-      bear_growth=args['bear_growth'],
-      base_growth=args['base_growth'],
-      bull_growth=args['bull_growth'],
-      bear_margin=args['bear_margin'],
-      base_margin=args['base_margin'],
-      bull_margin=args['bull_margin'],
+      bear_growth=args.get('bear_growth'),
+      base_growth=args.get('base_growth'),
+      bull_growth=args.get('bull_growth'),
+      bear_margin=args.get('bear_margin'),
+      base_margin=args.get('base_margin'),
+      bull_margin=args.get('bull_margin'),
     )
     result['ticker'] = args.get('ticker', '')
     return [TextContent(type='text', text=json.dumps(result))]
 
   async def calculate_lbo(self, args: Dict[str, Any]) -> List[TextContent]:
+    refusal = _refuse_absent('calculate_lbo', args, LBO_INPUTS)
+    if refusal:
+      return refusal
+    hold = args.get('hold_years')
     try:
       result = _lbo_math(
-        entry_ev=args['entry_ev'],
-        revenue_base=args['revenue_base'],
-        ebitda_margin=args['ebitda_margin'],
-        capex_pct_revenue=args['capex_pct_revenue'],
-        depreciation=args['depreciation'],
-        tax_rate=args['tax_rate'],
-        revenue_growth=args['revenue_growth'],
-        debt_interest_rate=args['debt_interest_rate'],
-        leverage_turns=args['leverage_turns'],
-        exit_multiple=args['exit_multiple'],
-        hold_years=args.get('hold_years', 5),
+        entry_ev=args.get('entry_ev'),
+        revenue_base=args.get('revenue_base'),
+        ebitda_margin=args.get('ebitda_margin'),
+        capex_pct_revenue=args.get('capex_pct_revenue'),
+        depreciation=args.get('depreciation'),
+        tax_rate=args.get('tax_rate'),
+        revenue_growth=args.get('revenue_growth'),
+        debt_interest_rate=args.get('debt_interest_rate'),
+        leverage_turns=args.get('leverage_turns'),
+        exit_multiple=args.get('exit_multiple'),
+        # The one optional input, and a stated default: the description names
+        # it and the result echoes the value used in hold_years.
+        hold_years=5 if hold is None else hold,
       )
     except ValueError as e:
       # Unfundable capital structure -- surface the refusal rather than a model.
@@ -2413,29 +2510,36 @@ warnings_per_tool={
     return [TextContent(type='text', text=json.dumps(result))]
 
   async def calculate_credit_profile(self, args: Dict[str, Any]) -> List[TextContent]:
+    refusal = _refuse_absent('calculate_credit_profile', args, CREDIT_PROFILE_INPUTS)
+    if refusal:
+      return refusal
     result = _credit_profile_math(
-      total_debt=args['total_debt'],
-      cash=args['cash'],
-      ebitda=args['ebitda'],
-      interest_expense=args['interest_expense'],
-      depreciation_abs=args['depreciation_abs'],
-      capex_abs=args['capex_abs'],
-      tax_rate=args['tax_rate'],
-      market_cap=args.get('market_cap', 0),
+      total_debt=args.get('total_debt'),
+      cash=args.get('cash'),
+      ebitda=args.get('ebitda'),
+      interest_expense=args.get('interest_expense'),
+      depreciation_abs=args.get('depreciation_abs'),
+      capex_abs=args.get('capex_abs'),
+      tax_rate=args.get('tax_rate'),
+      market_cap=args.get('market_cap'),
     )
     result['ticker'] = args.get('ticker', '')
     return [TextContent(type='text', text=json.dumps(result))]
 
   async def calculate_capital_returns(self, args: Dict[str, Any]) -> List[TextContent]:
+    refusal = _refuse_absent('calculate_capital_returns', args,
+                             CAPITAL_RETURNS_INPUTS)
+    if refusal:
+      return refusal
     result = _capital_returns_math(
-      market_cap=args['market_cap'],
-      ebitda=args['ebitda'],
-      capex_abs=args['capex_abs'],
-      tax_rate=args['tax_rate'],
-      depreciation_abs=args['depreciation_abs'],
-      dividends_paid=args.get('dividends_paid', 0),
-      shares_repurchased=args.get('shares_repurchased', 0),
-      shares_outstanding=args.get('shares_outstanding', 0),
+      market_cap=args.get('market_cap'),
+      ebitda=args.get('ebitda'),
+      capex_abs=args.get('capex_abs'),
+      tax_rate=args.get('tax_rate'),
+      depreciation_abs=args.get('depreciation_abs'),
+      dividends_paid=args.get('dividends_paid'),
+      shares_repurchased=args.get('shares_repurchased'),
+      shares_outstanding=args.get('shares_outstanding'),
     )
     result['ticker'] = args.get('ticker', '')
     return [TextContent(type='text', text=json.dumps(result))]

@@ -20,6 +20,7 @@ def test_credit_math_rejects_zero_ebitda():
   result = _credit_profile_math(
     total_debt=5e9, cash=1e9, ebitda=0,
     interest_expense=1e9, depreciation_abs=1e9, capex_abs=1e9, tax_rate=0.21,
+    market_cap=3e12,
   )
   assert result.get('error'), f"should return error dict, got {result}"
   assert 'ebitda' in result['error'].lower()
@@ -41,6 +42,7 @@ def test_credit_math_normal_inputs():
 def test_capital_returns_math_rejects_zero_market_cap():
   result = _capital_returns_math(
     market_cap=0, ebitda=120e9, capex_abs=15e9, tax_rate=0.21, depreciation_abs=12e9,
+    dividends_paid=-2e9, shares_repurchased=-3e9, shares_outstanding=1e9,
   )
   assert result.get('error'), f"should return error: {result}"
   assert 'market_cap' in result['error'].lower()
