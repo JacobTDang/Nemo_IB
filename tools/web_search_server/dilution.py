@@ -933,6 +933,21 @@ def _split_warnings(ticker: str, adjustment: Dict[str, Any],
     return warnings
 
 
+class ShelfFilingsUnavailable(RuntimeError):
+    """The SEC filings for shelf activity could not be loaded.
+
+    Distinct from a filer that has no shelf registrations or takedowns. Raised
+    so a failed SEC request reports success=False naming the form rather than
+    reporting "no active shelf" -- which is the answer for a filer with none.
+    """
+
+    def __init__(self, form: str, ticker: str, exc: Exception) -> None:
+        super().__init__(
+            f"failed to load {form} filings for {ticker}: "
+            f"{type(exc).__name__}: {exc}")
+        self.form = form
+
+
 def get_shelf_activity(ticker: str, lookback_days: int = 730) -> Dict[str, Any]:
     """Shelf registrations and takedowns in the window.
 
@@ -949,7 +964,9 @@ def get_shelf_activity(ticker: str, lookback_days: int = 730) -> Dict[str, Any]:
             out: List[Dict[str, Any]] = []
             try:
                 filings = company.get_filings(form=form_name)
-            except Exception:
+            except Exception as exc:
+                raise ShelfFilingsUnavailable(form_name, ticker, exc) from exc
+            if not filings:
                 return out
             for filing in filings:
                 filed = getattr(filing, "filing_date", None)
@@ -973,13 +990,16 @@ def get_shelf_activity(ticker: str, lookback_days: int = 730) -> Dict[str, Any]:
         registrations = _recent("S-3")
         takedowns = _recent("424B5")
     except Exception as exc:  # noqa: BLE001 - reported, not swallowed
-        return {
+        failure: Dict[str, Any] = {
             "ticker": ticker,
             "success": False,
             "error": f"{type(exc).__name__}: {exc}",
             "s3_registrations": [],
             "b5_takedowns": [],
         }
+        if hasattr(exc, "form"):
+            failure["failed_form"] = exc.form
+        return failure
 
     return {
         "ticker": ticker,
