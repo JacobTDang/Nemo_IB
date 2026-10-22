@@ -1978,51 +1978,96 @@ def get_schedule_13d_filings(ticker: str, limit: int = 15,
   }
 
 
-def _extract_section_from_filing_obj(filing_obj, item: str) -> Optional[str]:
-  """Helper for diff_10k: extract Item 1A or Item 7 body text from any
-  10-K filing object. Mirrors logic in extract_risk_factors / extract_mda
-  but operates on an arbitrary filing (not just the latest)."""
-  try:
-    text = filing_obj.text()
-  except Exception:
+# A 10-K names an item in the table of contents and again where the body
+# starts. "RIS K" is the letter-spaced form some filings use for "RISK".
+_ITEM_1A_HEADER = re.compile(
+    r'ITEM\s+1A\.?\s+(?:RIS\s?K|RISK)\s+FACTORS', re.IGNORECASE)
+_ITEM_1B = re.compile(r'ITEM\s+1B\b', re.IGNORECASE)
+_ITEM_7_HEADER = re.compile(
+    r'ITEM\s+7\.?\s+MANAGEMENT.{0,5}S?\s+DISCUSSION', re.IGNORECASE)
+_ITEM_7A = re.compile(r'ITEM\s+7A\b', re.IGNORECASE)
+_ITEM_8 = re.compile(r'ITEM\s+8\b', re.IGNORECASE)
+
+
+def _at_line_start(text: str, index: int) -> bool:
+  """True when `index` is the first non-space character on its line.
+
+  A cross-reference ("see Item 1A. Risk Factors") sits mid-line. The contents
+  entry and the body header each begin a line.
+  """
+  j = index
+  while j > 0 and text[j - 1] in ' \t':
+    j -= 1
+  return j == 0 or text[j - 1] == '\n'
+
+
+def _end_after(text: str, origin: int, patterns) -> Optional[int]:
+  """Where the section ends: the first pattern that matches, else the next.
+
+  Item 7 ends at Item 7A. Item 8 is the end only when there is no Item 7A,
+  so a sentence that cites "Item 8 of this Form 10-K" does not close Item 7.
+  """
+  for pattern in patterns:
+    hit = pattern.search(text, origin)
+    if hit:
+      return hit.start()
+  return None
+
+
+def _body_header_start(text: str, header, end_patterns) -> Optional[int]:
+  """The header the body follows, not the table-of-contents line.
+
+  The contents entry's next end marker is the contents line for the following
+  item, a short distance away. The body header's next end marker is the end
+  of the section. The match with the furthest end marker is the body. A
+  fixed character offset is not: Apple's Item 1A body header is before
+  character 30,000.
+  """
+  matches = [m for m in header.finditer(text) if _at_line_start(text, m.start())]
+  if not matches:
+    matches = list(header.finditer(text))
+  if not matches:
     return None
+  best = matches[0].start()
+  best_distance = -1
+  for match in matches:
+    end = _end_after(text, match.end(), end_patterns)
+    distance = (end - match.start()) if end is not None else (len(text) - match.start())
+    if distance > best_distance:
+      best_distance = distance
+      best = match.start()
+  return best
+
+
+def _section_text(text: str, start: int, end_patterns, cap: int) -> str:
+  """The section from `start` through the end marker, or `cap` characters."""
+  end = _end_after(text, start + 200, end_patterns)
+  if end is None:
+    end = min(start + cap, len(text))
+  return text[start:end]
+
+
+def _extract_section_from_filing_obj(filing_obj, item: str) -> Optional[str]:
+  """Item 1A or Item 7 body text from one 10-K filing object.
+
+  `text()` is not caught. A failed read of the filing is a failure, not an
+  Item the filing does not contain.
+  """
+  text = filing_obj.text()
   if not text:
     return None
 
   if item == '1A':
-    # Body header (skip TOC): require uppercase "ITEM 1A" + "RIS K|RISK FACTORS"
-    m = re.search(r'ITEM\s+1A\.?\s+(?:RIS\s?K|RISK)\s+FACTORS', text, re.IGNORECASE)
-    if m and m.start() < 30000:
-      m2 = re.search(r'ITEM\s+1A\.?\s+(?:RIS\s?K|RISK)\s+FACTORS',
-                     text[30000:], re.IGNORECASE)
-      if m2:
-        start = 30000 + m2.start()
-      else:
-        return None
-    elif m:
-      start = m.start()
-    else:
+    start = _body_header_start(text, _ITEM_1A_HEADER, (_ITEM_1B,))
+    if start is None:
       return None
-    end_m = re.search(r'ITEM\s+1B\b', text[start + 200:], re.IGNORECASE)
-    end = start + 200 + end_m.start() if end_m else min(start + 200000, len(text))
-    return text[start:end]
+    return _section_text(text, start, (_ITEM_1B,), 200000)
 
   if item == '7':
-    m = re.search(r'ITEM\s+7\.?\s+MANAGEMENT.{0,5}S?\s+DISCUSSION',
-                  text, re.IGNORECASE)
-    if not m:
+    start = _body_header_start(text, _ITEM_7_HEADER, (_ITEM_7A, _ITEM_8))
+    if start is None:
       return None
-    start = m.start()
-    if start < 30000:
-      m2 = re.search(r'ITEM\s+7\.?\s+MANAGEMENT.{0,5}S?\s+DISCUSSION',
-                     text[30000:], re.IGNORECASE)
-      if m2:
-        start = 30000 + m2.start()
-    end_m = re.search(r'ITEM\s+7A\b', text[start + 200:], re.IGNORECASE)
-    if not end_m:
-      end_m = re.search(r'ITEM\s+8\b', text[start + 200:], re.IGNORECASE)
-    end = start + 200 + end_m.start() if end_m else min(start + 250000, len(text))
-    return text[start:end]
+    return _section_text(text, start, (_ITEM_7A, _ITEM_8), 250000)
 
   return None
 
@@ -2984,34 +3029,18 @@ def extract_mda(ticker: str, form_type: str = '10-K',
 
     # Body header. Apostrophe in "Management's" is sometimes Unicode 0x2019,
     # sometimes 0x27, sometimes encoded as '?' after charset translation.
-    # Allow any single char (or none) between "MANAGEMENT" and "S DISCUSSION".
-    header_match = re.search(
-      r'ITEM\s+7\.?\s+MANAGEMENT.{0,5}S?\s+DISCUSSION', text, re.IGNORECASE)
-    if not header_match:
-      header_match = re.search(r'ITEM\s+7\b\s*\n', text[50000:])
-      if header_match:
-        header_match = type('M', (), {
-          'start': lambda self=None, off=50000 + header_match.start(): off
-        })()
-    if not header_match:
+    # The contents line and the body header both match; the body is the one
+    # whose Item 7A (or Item 8, when there is no 7A) is furthest away.
+    start = _body_header_start(text, _ITEM_7_HEADER, (_ITEM_7A, _ITEM_8))
+    if start is None:
+      bare = re.search(r'ITEM\s+7\b\s*\n', text[50000:])
+      if bare:
+        start = 50000 + bare.start()
+    if start is None:
       return {'ticker': ticker, 'success': False,
               'error': 'Could not locate Item 7 header in filing text'}
 
-    # Filings can have the heading appear in the TOC and again in the body.
-    # If the first match is before offset 30k, find a later occurrence.
-    start = header_match.start()
-    if start < 30000:
-      next_m = re.search(r'ITEM\s+7\.?\s+MANAGEMENT.{0,5}S?\s+DISCUSSION',
-                         text[30000:], re.IGNORECASE)
-      if next_m:
-        start = 30000 + next_m.start()
-
-    # End at Item 7A or Item 8 (Financial Statements)
-    end_m = re.search(r'ITEM\s+7A\b', text[start + 200:], re.IGNORECASE)
-    if not end_m:
-      end_m = re.search(r'ITEM\s+8\b', text[start + 200:], re.IGNORECASE)
-    end = (start + 200 + end_m.start()) if end_m else min(start + 250000, len(text))
-    section = text[start:end]
+    section = _section_text(text, start, (_ITEM_7A, _ITEM_8), 250000)
 
     # Sub-section heading detection. MD&A headings are typically Title Case
     # (not all-caps like risk factors), so we look for both.
@@ -3100,28 +3129,24 @@ def extract_risk_factors(ticker: str, form_type: str = '10-K',
     if not text:
       return {'ticker': ticker, 'success': False, 'error': 'Empty filing text'}
 
-    # Body header — SEC filers sometimes letter-space "RISK" as "RIS K" in
-    # HTML; allow optional whitespace inside.
-    header_match = re.search(r'ITEM\s+1A\.?\s+(?:RIS\s?K|RISK)\s+FACTORS',
-                             text, re.IGNORECASE)
-    if not header_match:
-      # Fallback: any standalone "RISK FACTORS" header after offset 30k (past TOC)
+    # Body header. The contents line matches too; the body is the header
+    # whose Item 1B is furthest away. "RIS K" is letter-spaced "RISK".
+    start = _body_header_start(text, _ITEM_1A_HEADER, (_ITEM_1B,))
+    if start is None:
+      # A filing that never writes "Item 1A" still has a risk-factors header
+      # past the contents page.
       tail = text[30000:]
-      m = re.search(r'(?:RIS\s?K|RISK)\s+FACTORS', tail)
-      if m:
-        header_match = type('M', (), {'start': lambda self=None, off=30000 + m.start(): off})()
+      bare = re.search(r'(?:RIS\s?K|RISK)\s+FACTORS', tail)
+      if bare:
+        start = 30000 + bare.start()
       else:
         return {'ticker': ticker, 'success': False,
                 'error': 'Could not locate Item 1A header in filing text'}
 
-    start = header_match.start()
-    # End at Item 1B (Unresolved Staff Comments) — first occurrence after start
-    end_m = re.search(r'ITEM\s+1B\b', text[start + 200:], re.IGNORECASE)
-    end = (start + 200 + end_m.start()) if end_m else min(start + 200000, len(text))
-    section = text[start:end]
+    section = _section_text(text, start, (_ITEM_1B,), 200000)
 
     # Sub-section heading detection. Look for lines that:
-    #   - have 70%+ uppercase letters
+    #   - are 70%+ uppercase, or title case ("Risks Related to ...")
     #   - length 8-150 chars
     #   - don't include digits (skip "Item 1A" markers / pagination)
     #   - typically contain 'RISKS' or known risk-category keywords
@@ -3136,7 +3161,21 @@ def extract_risk_factors(ticker: str, form_type: str = '10-K',
       s = line.strip()
       if 8 <= len(s) <= 150 and not any(c.isdigit() for c in s):
         letters = [c for c in s if c.isalpha()]
-        if letters and sum(1 for c in letters if c.isupper()) / len(letters) >= 0.70:
+        upper_ratio = (sum(1 for c in letters if c.isupper()) / len(letters)
+                       if letters else 0)
+        # All-caps headings, and the title-case lines these filings actually
+        # use: "Risks Related to Our Industry and Markets", "Macroeconomic
+        # and Industry Risks". A sentence or a bullet is not a heading.
+        words = s.split()
+        capped = sum(1 for w in words if w[:1].isupper())
+        title = (
+          s[:1].isalpha()
+          and not s.endswith(('.', '!', '?', ';', ',', ':'))
+          and 2 <= len(words) <= 14
+          and capped >= 2
+          and capped / len(words) >= 0.5
+        )
+        if letters and (upper_ratio >= 0.70 or title):
           # Skip the "ITEM 1A" repeated page header
           if re.match(r'ITEM\s+1A', s, re.IGNORECASE) and len(s) < 30:
             continue
