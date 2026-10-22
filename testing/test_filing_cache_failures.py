@@ -49,7 +49,11 @@ def _company_returning(*responses):
             raise response
         return response
 
-    return calls, lambda ticker: type("C", (), {"get_filings": get_filings})()
+    return calls, lambda ticker: type("C", (), {
+        "get_filings": get_filings,
+        "name": "No Filings Co",
+        "cik": 999,
+    })()
 
 
 def test_a_transient_failure_is_not_cached(monkeypatch):
@@ -74,9 +78,14 @@ def test_a_genuine_absence_is_still_cached(monkeypatch):
     calls, company = _company_returning([])
     monkeypatch.setattr(su.registrant, "company", company)
 
-    assert su.get_latest_filing("NOFILINGS", "10-K") is None
-    assert su.get_latest_filing("NOFILINGS", "10-K") is None
-    assert calls["n"] == 1, (
+    first = su.get_latest_filing("NOFILINGS", "10-K")
+    second = su.get_latest_filing("NOFILINGS", "10-K")
+    assert first["xbrl_data"] is None
+    assert "No Filings Co" in first["error"] and "999" in first["error"]
+    assert second["error"] == first["error"]
+    # One call lists the form. The next lists every filing, looking for a
+    # co-registrant accession. The second get_latest_filing is the cache.
+    assert calls["n"] == 2, (
         "a company that genuinely files nothing is a stable fact; asking "
         "SEC again on every call is the retry storm the cache prevents")
 

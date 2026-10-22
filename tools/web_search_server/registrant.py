@@ -126,6 +126,93 @@ def cik_for(ticker: str) -> int:
     return cik
 
 
+def _accession_cik(accession: str) -> Optional[int]:
+    """The CIK written into an accession number, or None.
+
+    An accession is `CCCCCCCCCC-YY-SSSSSS`. The first ten digits are the CIK
+    of the filer that submitted it. A filing agent uses a number that is not
+    a CIK; that prefix is not a registrant.
+    """
+    head = str(accession).split("-", 1)[0]
+    if len(head) != 10 or not head.isdigit():
+        return None
+    return int(head)
+
+
+def _company_by_cik(cik: int):
+    """The registrant for `cik`, or None when SEC has no such submissions."""
+    from edgar import Company
+
+    found = Company(int(cik))
+    if getattr(found, "not_found", False):
+        return None
+    if int(getattr(found, "cik", -1)) in (-1, -999999999):
+        return None
+    return found
+
+
+# Reports a registrant files about itself. A co-registrant link is one of
+# these listed under both CIKs. Anything else in a company's list can be
+# another party's filing about it: a SCHEDULE 13G sits under the subject's CIK
+# with the holder's CIK in its accession, and a holder such as BlackRock files
+# 10-Ks of its own.
+_OWN_REPORTS = frozenset({"10-K", "10-K/A", "10-Q", "10-Q/A", "8-K", "8-K/A"})
+
+
+def _accession_of(filing) -> str:
+    return (getattr(filing, "accession_number", None)
+            or getattr(filing, "accession_no", None) or "")
+
+
+def predecessor_with_form(company, form_type: str):
+    """A co-registrant that has filed `form_type`, or None.
+
+    SEC lists a co-registrant filing under both CIKs. The accession begins
+    with the CIK that submitted it. Only a report in `_OWN_REPORTS` that SEC
+    lists under both CIKs links them. XOM's 2026-08-03 10-Q is
+    0000034088-26-000093 under both ExxonMobil Holdings Corp (2115436) and
+    EXXON MOBIL CORP (34088), and the filing names both as filers. The
+    holding company's 8-K12B names only itself, so it does not supply the
+    predecessor. A prefix that is not a registrant is a filing agent, not a
+    predecessor. More than one co-registrant with the form is a refusal:
+    choosing one would be a guess.
+    """
+    own = int(company.cik)
+    listed = company.get_filings(trigger_full_load=False)
+    shared: Dict[int, set] = {}
+    for filing in listed:
+        if getattr(filing, "form", None) not in _OWN_REPORTS:
+            continue
+        accession = _accession_of(filing)
+        cik = _accession_cik(accession)
+        if cik is None or cik == own:
+            continue
+        shared.setdefault(cik, set()).add(accession)
+
+    found = []
+    for cik, accessions in shared.items():
+        other = _company_by_cik(cik)
+        if other is None:
+            continue
+        # The prefix says only who submitted the filing. SEC listing the same
+        # accession under the other CIK is what makes it a co-registrant.
+        theirs = {_accession_of(f)
+                  for f in other.get_filings(trigger_full_load=False)}
+        if not accessions & theirs:
+            continue
+        if other.get_filings(form=form_type, amendments=False):
+            found.append(other)
+    if len(found) > 1:
+        names = ", ".join(
+            f"{item.name} (CIK {int(item.cik)})" for item in found)
+        raise RuntimeError(
+            f"CIK {own} lists filings submitted by more than one registrant "
+            f"that has a {form_type}: {names}. Refused rather than choosing.")
+    if not found:
+        return None
+    return found[0]
+
+
 def company(ticker: str):
     """`edgar.Company` for the registrant behind `ticker`, built from its CIK.
 
