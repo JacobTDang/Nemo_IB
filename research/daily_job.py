@@ -906,8 +906,18 @@ def _share_class_problem(ticker: str) -> Optional[str]:
     return None
 
 
+def _exchange_sessions(as_of: str) -> List[str]:
+    """The exchange's sessions on or before `as_of`, as the canary recorded them.
+
+    Read once per screen date, not once per name: a replay screens thousands
+    of names on each of hundreds of dates.
+    """
+    return sorted({b["trade_date"]
+                   for b in pit_store.bars_as_of(FETCH_CANARY, as_of)})
+
+
 def _screen(ticker: str, as_of: str,
-            canary_dates: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+            canary_dates: Sequence[str]) -> Dict[str, Any]:
     """Eligible, or the reason not -- never a bare exclusion.
 
     "No history" and "too thin" are different facts about a name, and a screen
@@ -925,11 +935,6 @@ def _screen(ticker: str, as_of: str,
                 "exclusion_reason": (
                     f"insufficient history: {len(bars)} sessions recorded, "
                     f"{MIN_HISTORY_SESSIONS} required")}
-
-    if canary_dates is None:
-        canary_bars = pit_store.bars_as_of(FETCH_CANARY, as_of)
-        canary_dates = sorted({b["trade_date"] for b in canary_bars
-                               if b.get("trade_date")})
 
     if not canary_dates:
         return {"eligible": False,
@@ -1018,11 +1023,18 @@ def refresh_universe(as_of: Optional[str] = None) -> Dict[str, Any]:
                              error=f"{type(exc).__name__}: {exc}")
         return {"status": "failed", "error": str(exc)}
 
-    canary_bars = pit_store.bars_as_of(FETCH_CANARY, as_of)
-    canary_dates = sorted({b["trade_date"] for b in canary_bars
-                           if b.get("trade_date")})
-    entries = [{**reg, **_screen(reg["ticker"], as_of,
-                                 canary_dates=canary_dates)}
+    # Without the canary's sessions no name can be told apart from one that
+    # stopped trading. Screened anyway, every name was recorded ineligible
+    # under a stage that read `ok`, and the universe row outlives the run.
+    canary_dates = _exchange_sessions(as_of)
+    if not canary_dates:
+        detail = (f"{FETCH_CANARY} has no recorded session on or before "
+                  f"{as_of}, so no name can be screened for having stopped "
+                  f"trading; nothing was recorded")
+        pit_store.finish_run(rows_written=0, status="failed", error=detail)
+        return {"status": "failed", "error": detail}
+
+    entries = [{**reg, **_screen(reg["ticker"], as_of, canary_dates)}
                for reg in registrants]
     collapsed = _one_line_per_issuer(entries)
     eligible = sum(1 for e in entries if e["eligible"])
