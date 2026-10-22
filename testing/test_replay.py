@@ -567,10 +567,16 @@ def test_the_scanner_no_longer_rejects_that_decision_for_it(store,
 
 def test_a_fresh_store_is_created_by_the_replay_itself(tmp_path, monkeypatch):
     """A replay is the most likely of all of these to be the first command run
-    against a new volume."""
+    against a new volume.
+
+    It creates the schema, then refuses for the reason that matters -- no
+    canary sessions to screen against -- rather than dying on "no such
+    table", or reporting no trades from a universe nobody could screen."""
     monkeypatch.setenv("NEMO_PIT_DB", str(tmp_path / "fresh.db"))
     replay.load_signals({})
-    assert replay.main(["--dates", DAYS[10], "--tickers", "AAA"]) == 0
+    with pytest.raises(RuntimeError, match="SPY"):
+        replay.main(["--dates", DAYS[10], "--tickers", "AAA"])
+    assert pit_store.bars_as_of("AAA", DAYS[10]) == []
 
 
 def test_a_replay_built_store_says_its_bars_were_backfilled(tmp_path, monkeypatch):
@@ -619,3 +625,41 @@ def test_a_replayed_signal_says_it_is_the_time_series_variant():
 
     assert signal["success"] is True
     assert signal["variant"] == "ts"
+
+
+# --- the exchange calendar the screen counts missed sessions against --------
+
+def _store_bars(store, tickers, days):
+    from research import daily_job
+    for ticker in tickers:
+        store.record_bars(ticker, [
+            {"trade_date": d, "open": 100.0, "high": 101.0, "low": 99.0,
+             "close": 100.0, "volume": 5e6} for d in days],
+            recorded_at=f"{days[-1]}T21:00:00Z")
+    return daily_job
+
+
+def test_a_replay_date_reads_the_exchange_calendar_once(store, monkeypatch):
+    """Per ticker, the canary's sessions were re-read for every name on every
+    decision date -- about a million reads for the September roster."""
+    days = DAYS[:61]
+    daily_job = _store_bars(store, ["A", "B", "C", "SPY"], days)
+    reads = []
+    real = pit_store.bars_as_of
+    monkeypatch.setattr(pit_store, "bars_as_of", lambda ticker, as_of: (
+        reads.append(ticker), real(ticker, as_of))[1])
+
+    replay._refresh_universe_for(["A", "B", "C"], days[-1])
+
+    assert reads.count(daily_job.FETCH_CANARY) == 1
+
+
+def test_a_replay_store_without_the_canary_is_refused(store):
+    """A snapshot with no canary sessions cannot say which names still traded.
+    Screened anyway, every decision date has an empty universe and the replay
+    reports no trades as if the signal had found none."""
+    days = DAYS[:61]
+    _store_bars(store, ["A"], days)
+
+    with pytest.raises(RuntimeError, match="SPY"):
+        replay._refresh_universe_for(["A"], days[-1])

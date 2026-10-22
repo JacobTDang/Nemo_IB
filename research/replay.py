@@ -247,10 +247,18 @@ def _refresh_universe_for(tickers: Sequence[str], as_of: str) -> int:
     network call each time. A replay's universe is the set it built a store
     for.
     """
+    sessions = daily_job._exchange_sessions(as_of)
+    if not sessions:
+        # Screened anyway, every name is ineligible on every date and the
+        # replay reports no trades as if the signal had found none.
+        raise RuntimeError(
+            f"the replay store has no {daily_job.FETCH_CANARY} session on or "
+            f"before {as_of}, so no name can be screened for having stopped "
+            f"trading")
     entries = []
     for index, ticker in enumerate(tickers):
         entries.append({"ticker": ticker, "cik": str(index),
-                        **daily_job._screen(ticker, as_of)})
+                        **daily_job._screen(ticker, as_of, sessions)})
     return pit_store.record_universe(as_of, entries,
                                      recorded_at=_stamp(as_of))
 

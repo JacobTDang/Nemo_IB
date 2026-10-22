@@ -82,7 +82,7 @@ def test_the_reason_says_it_is_reading_the_ticker_not_a_data_field():
 def test_the_screen_refuses_a_preferred_before_it_looks_at_any_bars(store):
     """Cheapest first, and it is a property of the ticker rather than of the
     tape: a preferred with a decade of history is still a preferred."""
-    out = daily_job._screen("MS-PA", "2026-03-03")
+    out = daily_job._screen("MS-PA", "2026-03-03", ["2026-03-03"])
 
     assert out["eligible"] is False
     assert "preferred" in out["exclusion_reason"]
@@ -90,7 +90,7 @@ def test_the_screen_refuses_a_preferred_before_it_looks_at_any_bars(store):
 
 def test_a_common_share_still_gets_the_liquidity_screen(store):
     """The new gate must not shadow the old ones."""
-    out = daily_job._screen("MSFT", "2026-03-03")
+    out = daily_job._screen("MSFT", "2026-03-03", ["2026-03-03"])
 
     assert out["eligible"] is False
     assert "insufficient history" in out["exclusion_reason"]
@@ -284,6 +284,7 @@ def test_the_universe_keeps_one_line_per_issuer_the_most_liquid(store,
     _bars(store, "BRK-A", volume=40_000)     # $4M a day: clears the floor
     _bars(store, "BRK-B", volume=4_000_000)
     _bars(store, "OTHER", volume=4_000_000)
+    _bars(store, daily_job.FETCH_CANARY, volume=1_000_000)
     _registrants(monkeypatch, [("BRK-A", "1067983"), ("BRK-B", "1067983"),
                                ("OTHER", "111111")])
 

@@ -135,6 +135,8 @@ def test_an_excluded_name_carries_its_reason(store, monkeypatch):
                       recorded_at="2026-03-02T21:00:00Z")
     store.record_bars("THIN", _bars(*sessions, volume=10),
                       recorded_at="2026-03-02T21:00:00Z")
+    store.record_bars(daily_job.FETCH_CANARY, _bars(*sessions),
+                      recorded_at="2026-03-02T21:00:00Z")
 
     daily_job.refresh_universe(as_of="2026-03-03")
 
@@ -150,12 +152,161 @@ def test_a_name_with_no_history_is_excluded_for_that_reason(store, monkeypatch):
     trades are different facts and a screen that conflates them is unauditable."""
     monkeypatch.setattr(daily_job, "_fetch_sec_tickers", lambda: [
         {"ticker": "NEW", "cik": "3", "name": "New Co"}])
+    store.record_bars(daily_job.FETCH_CANARY, _bars("2026-03-02"),
+                      recorded_at="2026-03-02T21:00:00Z")
 
     daily_job.refresh_universe(as_of="2026-03-03")
 
     member = store.universe_as_of("2026-03-03")[0]
     assert member["eligible"] is False
     assert "histor" in member["exclusion_reason"].lower()
+
+
+# --- staleness: names that stopped trading ----------------------------------
+
+def test_screen_excludes_ticker_stopped_trading_five_sessions_ago(store):
+    """A name with 60 good sessions that stopped 5 exchange sessions ago is
+    not eligible and the reason names its last session."""
+    from datetime import date, timedelta
+    dates = [(date(2026, 1, 1) + timedelta(days=i)).isoformat() for i in range(65)]
+    ticker_dates = dates[:60]
+    last_traded = ticker_dates[-1]
+    as_of = dates[-1]
+
+    store.record_bars("OLD", _bars(*ticker_dates, volume=1_000_000),
+                      recorded_at=f"{as_of}T21:00:00Z")
+    store.record_bars(daily_job.FETCH_CANARY, _bars(*dates, volume=1_000_000),
+                      recorded_at=f"{as_of}T21:00:00Z")
+
+    out = daily_job._screen("OLD", as_of, daily_job._exchange_sessions(as_of))
+
+    assert out["eligible"] is False
+    assert out["exclusion_reason"] is not None
+    assert "no session since" in out["exclusion_reason"].lower()
+    assert last_traded in out["exclusion_reason"]
+
+
+def test_screen_keeps_ticker_that_skipped_one_session_eligible(store):
+    """A one-day halt or a thin name skipping a single session must remain eligible."""
+    from datetime import date, timedelta
+    dates = [(date(2026, 1, 1) + timedelta(days=i)).isoformat() for i in range(61)]
+    ticker_dates = dates[:60]
+    as_of = dates[-1]
+
+    store.record_bars("SKIPPED", _bars(*ticker_dates, volume=1_000_000),
+                      recorded_at=f"{as_of}T21:00:00Z")
+    store.record_bars(daily_job.FETCH_CANARY, _bars(*dates, volume=1_000_000),
+                      recorded_at=f"{as_of}T21:00:00Z")
+
+    out = daily_job._screen("SKIPPED", as_of, daily_job._exchange_sessions(as_of))
+
+    assert out["eligible"] is True
+    assert out["exclusion_reason"] is None
+
+
+def test_screen_excludes_ticker_that_missed_more_than_allowed_sessions(store):
+    """Missing more than MAX_MISSED_SESSIONS exchange sessions excludes the ticker."""
+    from datetime import date, timedelta
+    dates = [(date(2026, 1, 1) + timedelta(days=i)).isoformat() for i in range(62)]
+    ticker_dates = dates[:60]
+    last_traded = ticker_dates[-1]
+    as_of = dates[-1]
+
+    store.record_bars("STALE", _bars(*ticker_dates, volume=1_000_000),
+                      recorded_at=f"{as_of}T21:00:00Z")
+    store.record_bars(daily_job.FETCH_CANARY, _bars(*dates, volume=1_000_000),
+                      recorded_at=f"{as_of}T21:00:00Z")
+
+    out = daily_job._screen("STALE", as_of, daily_job._exchange_sessions(as_of))
+
+    assert out["eligible"] is False
+    assert out["exclusion_reason"] is not None
+    assert "no session since" in out["exclusion_reason"].lower()
+    assert last_traded in out["exclusion_reason"]
+
+
+
+def test_screen_session_after_holiday_excludes_no_one(store):
+    """Counting sessions against the canary's exchange days ensures that
+    holidays and weekends never count as missed sessions."""
+    from datetime import date, timedelta
+    friday_dates = [(date(2026, 1, 1) + timedelta(days=i)).isoformat() for i in range(60)]
+    tuesday = "2026-03-10"
+    all_sessions = [*friday_dates, tuesday]
+
+    store.record_bars("ACTIVE", _bars(*all_sessions, volume=1_000_000),
+                      recorded_at=f"{tuesday}T21:00:00Z")
+    store.record_bars(daily_job.FETCH_CANARY, _bars(*all_sessions, volume=1_000_000),
+                      recorded_at=f"{tuesday}T21:00:00Z")
+
+    out = daily_job._screen("ACTIVE", tuesday, daily_job._exchange_sessions(tuesday))
+
+    assert out["eligible"] is True
+    assert out["exclusion_reason"] is None
+
+
+def test_screen_refuses_when_canary_is_missing(store):
+    """When the canary has no recorded sessions on or before as_of, the screen
+    refuses loudly with a clear reason rather than silently passing or failing."""
+    from datetime import date, timedelta
+    dates = [(date(2026, 1, 1) + timedelta(days=i)).isoformat() for i in range(60)]
+    as_of = dates[-1]
+    store.record_bars("GOOD", _bars(*dates, volume=1_000_000),
+                      recorded_at=f"{as_of}T21:00:00Z")
+
+    out = daily_job._screen("GOOD", as_of, daily_job._exchange_sessions(as_of))
+
+    assert out["eligible"] is False
+    assert out["exclusion_reason"] is not None
+    assert daily_job.FETCH_CANARY in out["exclusion_reason"]
+    assert "exchange calendar unavailable" in out["exclusion_reason"].lower()
+
+
+
+
+def test_a_universe_with_no_exchange_calendar_is_a_failed_stage(store,
+                                                                 monkeypatch):
+    """Without the canary's sessions no name can be told apart from one that
+    stopped trading. Screened anyway, every name was recorded ineligible and
+    the stage read `ok` -- and the universe row outlives the run, so the
+    scanner would draw from an empty universe until the next night."""
+    monkeypatch.setattr(daily_job, "_fetch_sec_tickers", lambda: [
+        {"ticker": "GOOD", "cik": "1", "name": "Good Co"}])
+    sessions = [f"2026-01-{d:02d}" for d in range(1, 32)] + \
+               [f"2026-02-{d:02d}" for d in range(1, 30)]
+    store.record_bars("GOOD", _bars(*sessions),
+                      recorded_at="2026-03-02T21:00:00Z")
+
+    out = daily_job.refresh_universe(as_of="2026-03-03")
+
+    assert out["status"] == "failed"
+    assert daily_job.FETCH_CANARY in out["error"]
+    assert store.universe_as_of("2026-03-03") == [], \
+        "a universe screened with no exchange calendar was recorded"
+    assert store.missing_days("universe", "2026-03-03", "2026-03-03") == \
+        ["2026-03-03"]
+
+
+def test_the_exchange_calendar_is_read_once_per_universe(store, monkeypatch):
+    """Read per ticker, a replay re-reads the canary's two years of sessions
+    for every name on every decision date: about a million reads for one
+    replay of the September roster."""
+    sessions = [f"2026-01-{d:02d}" for d in range(1, 32)] + \
+               [f"2026-02-{d:02d}" for d in range(1, 30)]
+    for ticker in ("A", "B", "C", daily_job.FETCH_CANARY):
+        store.record_bars(ticker, _bars(*sessions),
+                          recorded_at="2026-03-02T21:00:00Z")
+    monkeypatch.setattr(daily_job, "_fetch_sec_tickers", lambda: [
+        {"ticker": t, "cik": str(i), "name": t}
+        for i, t in enumerate(("A", "B", "C"))])
+    reads = []
+    real = pit_store.bars_as_of
+    monkeypatch.setattr(pit_store, "bars_as_of", lambda ticker, as_of: (
+        reads.append(ticker), real(ticker, as_of))[1])
+
+    daily_job.refresh_universe(as_of="2026-03-03")
+
+    assert reads.count(daily_job.FETCH_CANARY) == 1
 
 
 # --- consensus: the series with a clock on it -------------------------------
