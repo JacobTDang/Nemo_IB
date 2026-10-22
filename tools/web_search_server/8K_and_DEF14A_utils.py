@@ -42,9 +42,9 @@ if not logger.handlers:
 # module name starts with a digit), which leaves it without a parent package.
 from tools.web_search_server.sec_series import _require_identity
 from tools.web_search_server import registrant
+from tools.web_search_server.filing_reads import filing_label, index_items
 
 # Regex constants
-_ITEM_NUM_RE = re.compile(r'(\d+\.\d+)')
 _MONEY_RE = re.compile(r'(?:\$\s*\d{1,3}(?:,\d{3})+(?:\.\d{2})?|\d{1,3}(?:,\d{3})+(?:\.\d{2})?)')
 _YEAR_RE = re.compile(r'\b(19|20)\d{2}\b')
 
@@ -265,33 +265,29 @@ BOARD_TABLE_NEGATIVE = ['committee', 'meeting', 'attendance']
 # HELPER FUNCTIONS & CLEANING
 # =============================================================================
 
-def normalize_item_numbers(items: List[Any]) -> List[str]:
-    out: List[str] = []
-    for it in items:
-        if it is None: continue
-        s = str(it).strip()
-        m = _ITEM_NUM_RE.search(s)
-        if m: out.append(m.group(1))
-        elif re.fullmatch(r'\d+\.\d+', s): out.append(s)
-    return sorted(set(out), key=lambda x: float(x))
+def filing_text(filing: Any) -> str:
+    """The filing's text, or "" when it has none.
 
-def safe_get_text(filing: Any) -> str:
-    if filing is None: return ""
+    A read that fails raises and names the filing. It used to return "" as
+    well, so an outage read as an 8-K with no body, or a proxy with no
+    executives and no board (#138).
+    """
     try:
-        if hasattr(filing, 'text') and callable(filing.text):
-            result = filing.text()
-            return str(result) if result is not None else ""
-    except Exception: pass
-    return ""
+        result = filing.text()
+    except Exception as e:
+        raise RuntimeError(f"Could not read the text of {filing_label(filing)}: "
+                           f"{type(e).__name__}: {e}") from e
+    return str(result) if result is not None else ""
 
-def safe_get_html(filing: Any) -> str:
-    if filing is None: return ""
+def filing_html(filing: Any) -> str:
+    """The filing's HTML, or "" when it has none. A failed read raises, as
+    in `filing_text`."""
     try:
-        if hasattr(filing, 'html') and callable(filing.html):
-            result = filing.html()
-            return str(result) if result is not None else ""
-    except Exception: pass
-    return ""
+        result = filing.html()
+    except Exception as e:
+        raise RuntimeError(f"Could not read the HTML of {filing_label(filing)}: "
+                           f"{type(e).__name__}: {e}") from e
+    return str(result) if result is not None else ""
 
 def safe_get_filing_date(filing: Any) -> Optional[str]:
     if filing is None: return None
@@ -663,7 +659,7 @@ class DynamicEventClassifier:
 
         candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
         weight, score, sub_type, matched_kw, item_def, evidence = candidates[0]
-        base_confidence = 0.6 if items_source == "eightk_obj" else 0.4
+        base_confidence = 0.6 if items_source == "filing_index" else 0.4
 
         return ClassificationResult(
             sub_type or self._category_to_str(item_def.category),
@@ -1177,11 +1173,12 @@ class SECFilingParser:
             events_by_date = {}
             for i, filing in enumerate(filings):
                 if i >= limit: break
-                text = safe_get_text(filing)
-                items, source = safe_get_8k_items(filing)
-                if not items:
-                    items = normalize_item_numbers(re.findall(r'Item\s+(\d+\.\d+)', text, re.I))
-                    source = "regex"
+                text = filing_text(filing)
+                # From the filing index, not the document: `obj().items`
+                # parsed the 8-K, and while SEC refused edgartools' index URL
+                # (#138) that failed silently into `sec_items: []`.
+                items = index_items(filing)
+                source = "filing_index"
 
                 cls = self.event_classifier.classify_from_items(items, text, source)
                 date_key = safe_get_filing_date(filing) or f"unknown_{i}"
@@ -1244,7 +1241,7 @@ class SECFilingParser:
             filings = registrant.company(ticker).get_filings(form='DEF 14A')
             if not filings: return {'ticker': ticker, 'executives': [], 'candidates': [], 'success': False, 'error': 'No DEF 14A found'}
             latest = filings[0]
-            html, text = safe_get_html(latest), safe_get_text(latest)
+            html, text = filing_html(latest), filing_text(latest)
 
             execs = self._extract_compensation_from_tables(html)
 
@@ -1693,7 +1690,7 @@ class SECFilingParser:
                               f'20-F or 40-F instead.'),
                 }
             latest = filings[0]
-            html, text = safe_get_html(latest), safe_get_text(latest)
+            html, text = filing_html(latest), filing_text(latest)
 
             members, board_df = self._extract_board_from_tables(html, debug=debug)
 
@@ -2332,20 +2329,6 @@ class SECFilingParser:
             "independent_unknown": unknown,
             "independence_pct_known": round((ind_true / known_total) * 100, 1) if known_total > 0 else None
         }
-
-def safe_get_8k_items(filing: Any) -> Tuple[List[str], str]:
-    items_list: List[str] = []
-    source = "regex"
-    if filing is None: return items_list, source
-    try:
-        if hasattr(filing, 'obj') and callable(filing.obj):
-            eightk_obj = filing.obj()
-            obj_items = getattr(eightk_obj, 'items', None)
-            if obj_items:
-                norm = normalize_item_numbers(list(obj_items))
-                if norm: return norm, "eightk_obj"
-    except Exception: pass
-    return items_list, source
 
 # Wrapper functions
 def extract_8k_events(ticker: str, limit: int = 10, debug: bool = False): return SECFilingParser().extract_8k_events(ticker, limit)

@@ -18,6 +18,9 @@ from tools.web_search_server.sec_series import _require_identity
 # bundled map answers a ticker it lacks with an empty folder (#136).
 from tools.web_search_server import registrant
 
+# 8-K items come from the filing index, not from parsing the document (#138).
+from tools.web_search_server.filing_reads import filing_label, index_items
+
 # Structured warnings, built with the same helper the MCP dispatcher validates
 # against, so a caveat raised inside an extractor survives annotation instead
 # of being dropped or rejected for shape.
@@ -2794,17 +2797,21 @@ def get_earnings_releases(ticker: str, max_quarters: int = 4,
   for f in filings:
     if len(releases) >= max_quarters:
       break
+    # The items come from the filing index, which arrives with the filing
+    # list. Parsing the document for them failed on every filing while SEC
+    # refused edgartools' index URL (#138), and the swallowed failure read as
+    # "no Item 2.02" -- a claim about the company, sourced from our outage.
     try:
-      do = f.data_object()
-      items = list(do.items) if do and do.items else []
-    except Exception:
-      items = []
+      items = index_items(f)
+    except ValueError as e:
+      return {'ticker': ticker, 'success': False,
+              'quarters_requested': max_quarters, 'error': str(e)}
 
-    has_results = any('2.02' in i for i in items)
-    if not has_results:
+    if '2.02' not in items:
       continue
 
-    # Find EX-99.1 (the earnings release attachment)
+    # Find EX-99.1 (the earnings release attachment). A failed read names the
+    # filing: a release with no text reads as a filer that attached nothing.
     ex99_text = None
     ex99_doc = None
     try:
@@ -2812,14 +2819,14 @@ def get_earnings_releases(ticker: str, max_quarters: int = 4,
         doc = (getattr(a, 'document', '') or '').lower()
         descr = (getattr(a, 'description', '') or '').lower()
         if 'ex99' in doc or 'ex-99' in descr:
-          try:
-            ex99_text = a.text() if callable(getattr(a, 'text', None)) else None
-            ex99_doc = a.document
-          except Exception:
-            ex99_text = None
+          ex99_text = a.text() if callable(getattr(a, 'text', None)) else None
+          ex99_doc = a.document
           break
-    except Exception:
-      pass
+    except Exception as e:
+      return {'ticker': ticker, 'success': False,
+              'quarters_requested': max_quarters,
+              'error': (f'Could not read the EX-99 press release of '
+                        f'{filing_label(f)}: {type(e).__name__}: {e}')}
 
     releases.append({
       'filing_date':       str(f.filing_date),
@@ -4399,7 +4406,11 @@ def _fiscal_year_in(sentence: str, offset: int) -> Optional[int]:
 
 
 def _tokens(sentence: str) -> set:
-  return {w for w in re.findall(r'[a-z0-9%]+', sentence.lower()) if w}
+  # "22 %" is "22%". edgartools renders an inline XBRL fact and its "%" as two
+  # words, so a disclosure the notes repeat gained a word its MD&A copy lacks
+  # and was kept as a second customer (#138).
+  joined = re.sub(r'(\d)\s+%', r'\1%', sentence.lower())
+  return {w for w in re.findall(r'[a-z0-9%]+', joined) if w}
 
 
 def _first_repeat_index(sentence: str, seen) -> Optional[int]:

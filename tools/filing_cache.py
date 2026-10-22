@@ -11,9 +11,10 @@ Sizes are what the filesystem allocates (`st_blocks`), because that is what
 fills a tmpfs: tens of thousands of tiny metadata files each cost a page.
 
 Pruning is by access time, so a filing being read repeatedly survives while one
-fetched once months ago does not. It trims to a fraction of the cap rather than
-to the cap itself, because a single filing can be 89MB and trimming to exactly
-the limit would refill on the next fetch.
+fetched once months ago does not. It evicts a cached response whole: the body
+with its .meta and .lock, never one of them alone. It trims to a fraction of
+the cap rather than to the cap itself, because a single filing can be 89MB and
+trimming to exactly the limit would refill on the next fetch.
 
 Two callers drive it, on the same cap and the same interval. The HTTP servers
 run `prune_and_log` as a background task off the app's lifespan, sleeping
@@ -65,9 +66,22 @@ def _is_migration_marker(path: Path) -> bool:
     return name.startswith(".") and name.endswith("_applied")
 
 
+# The sidecars edgartools writes beside each cached body. From edgartools 5.62
+# (httpxthrottlecache 0.7) a body without its .meta is not a cache miss: every
+# read of that URL raises FileNotFoundError until the body goes too, and AAPL
+# and JPM answered "No filing found" in a live run (#138). Evicted file by
+# file, the oldest .meta could go while its body stayed.
+_SIDECARS = (".meta", ".lock")
+
+
+def _entry_of(path: Path) -> Path:
+    """The cached response a file belongs to, named by its body."""
+    return path.with_suffix("") if path.suffix in _SIDECARS else path
+
+
 def prune(root: Any, cap_bytes: int | None = None,
           target_fraction: float = DEFAULT_TARGET_FRACTION) -> dict:
-    """Evict least-recently-used files until `root` fits under the target.
+    """Evict least-recently-used entries until `root` fits under the target.
 
     Returns what it did rather than logging and forgetting: a prune that
     quietly failed would leave the disk full while reporting that it cleaned.
@@ -82,7 +96,7 @@ def prune(root: Any, cap_bytes: int | None = None,
     if not report["existed"]:
         return report
 
-    entries = []
+    entries: dict[Path, list] = {}
     for path in root.rglob("*"):
         try:
             if not path.is_file():
@@ -96,32 +110,40 @@ def prune(root: Any, cap_bytes: int | None = None,
         if _is_migration_marker(path.relative_to(root)):
             continue
         # What the filesystem charges, not the apparent length. tmpfs bills
-        # whole pages, and edgartools' hishel cache writes three files per
+        # whole pages, and edgartools' HTTP cache writes three files per
         # object -- body, a sub-kilobyte .meta, an empty .lock -- so on a
         # live cache the page charge ran 1.39x the st_size sum and the 512m
         # mount filled under a 400MB cap without a single prune (issue #98).
-        entries.append((stat.st_atime, stat.st_blocks * 512, path))
+        entries.setdefault(_entry_of(path), []).append(
+            (stat.st_atime, stat.st_blocks * 512, path))
 
-    total = sum(size for _, size, _ in entries)
+    total = sum(size for files in entries.values() for _, size, _ in files)
     report["bytes_before"] = total
     report["bytes_after"] = total
     if total <= cap_bytes:
         return report
 
     target = int(cap_bytes * target_fraction)
-    entries.sort(key=lambda item: item[0])          # oldest access first
+    # Oldest entry first. An entry is as recent as its most recently read
+    # file: a read touches the body, while the .meta may date from the fetch.
+    oldest_first = sorted(entries.values(),
+                          key=lambda files: max(atime for atime, _, _ in files))
 
-    for _, size, path in entries:
+    for files in oldest_first:
         if total <= target:
             break
-        try:
-            os.remove(path)
-        except OSError as exc:
-            report["failed"].append(f"{path}: {type(exc).__name__}: {exc}")
-            continue
-        total -= size
-        report["bytes_removed"] += size
-        report["removed_files"] += 1
+        # The body before its sidecars, and a body that refuses keeps them.
+        # A sidecar left behind is harmless; a body left alone is not.
+        for _, size, path in sorted(files,
+                                    key=lambda f: f[2].suffix in _SIDECARS):
+            try:
+                os.remove(path)
+            except OSError as exc:
+                report["failed"].append(f"{path}: {type(exc).__name__}: {exc}")
+                break
+            total -= size
+            report["bytes_removed"] += size
+            report["removed_files"] += 1
 
     report["bytes_after"] = total
     return report

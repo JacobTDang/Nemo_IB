@@ -30,10 +30,10 @@ Thank you claude sonnet 4.5, they could never make me hate you
             'event_type': 'management_change',
             'category': 'MANAGEMENT_CHANGE',
             'sec_items': ['5.02', '9.01'],
-            'items_source': 'eightk_obj',
+            'items_source': 'filing_index',
             'confidence': 0.85,
             'evidence': {
-                'strategy': 'eightk_obj',
+                'strategy': 'filing_index',
                 'snippet': 'Item 5.02. Departure of Directors...',
                 'location': {'line_range': [45, 52]}
             },

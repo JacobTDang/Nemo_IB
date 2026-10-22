@@ -154,6 +154,87 @@ def test_the_report_says_how_much_it_freed(tmp_path):
     assert report["bytes_after"] == 0
 
 
+# --- an entry is three files, and goes as one ----------------------------------
+#
+# edgartools caches each response as a body with two sidecars: `<body>.meta`
+# and `<body>.lock`. From edgartools 5.62 (httpxthrottlecache 0.7) a body whose
+# .meta is gone is not a cache miss. Every read of that URL raises
+# `FileNotFoundError: ...json-97a42994.meta`, until something removes the body
+# as well. Seen live on 2026-10-20: AAPL and JPM answered "No filing found" in
+# five tests, each on a body whose .meta was gone. Evicted file by file, the
+# oldest .meta can go while its body stays. Evicted by entry, it cannot.
+
+
+def _entry(root, name, size, atime, meta_atime=None):
+    body = _write(root / name, size, atime=atime)
+    meta_time = atime if meta_atime is None else meta_atime
+    _write(root / f"{name}.meta", 100, atime=meta_time)
+    _write(root / f"{name}.lock", 0, atime=meta_time)
+    return body
+
+
+def _orphaned_bodies(root):
+    """Bodies whose .meta is gone: the state edgartools cannot read."""
+    return sorted(p.name for p in root.rglob("*")
+                  if p.is_file() and p.suffix not in (".meta", ".lock")
+                  and not p.with_name(p.name + ".meta").exists())
+
+
+def test_an_entry_is_evicted_whole_never_its_meta_alone(tmp_path):
+    now = time.time()
+    # The .meta of `old` is the oldest file in the cache, and evicting it
+    # alone is enough to get under the target. That is the trap.
+    _entry(tmp_path, "submissions-CIK0000320193.json-97a42994", 4_000,
+           atime=now - 100, meta_atime=now - 9_000)
+    _entry(tmp_path, "submissions-CIK0001045810.json-0ff0d803", 4_000, atime=now)
+    meta_charge = _allocated(tmp_path / "submissions-CIK0000320193.json-97a42994.meta")
+    total = sum(_allocated(p) for p in tmp_path.iterdir())
+
+    filing_cache.prune(tmp_path, cap_bytes=total - 1,
+                       target_fraction=(total - meta_charge + 1) / (total - 1))
+
+    assert _orphaned_bodies(tmp_path) == [], (
+        "a body was left without its .meta, which edgartools 5.62 cannot read")
+    assert (tmp_path / "submissions-CIK0001045810.json-0ff0d803.meta").exists()
+
+
+def test_an_entry_is_as_recent_as_its_most_recently_read_file(tmp_path):
+    """A read touches the body. The entry is in use even when its .meta was
+    written long ago, so an older single file goes first."""
+    now = time.time()
+    _entry(tmp_path, "in-use.json-1", 4_000, atime=now, meta_atime=now - 9_000)
+    stale = _write(tmp_path / "stale.txt", 4_000, atime=now - 5_000)
+    total = sum(_allocated(p) for p in tmp_path.iterdir())
+
+    filing_cache.prune(tmp_path, cap_bytes=total - 1,
+                       target_fraction=(total - _allocated(stale) + 1) / (total - 1))
+
+    assert not stale.exists(), "kept the stale file and evicted an entry in use"
+    assert (tmp_path / "in-use.json-1").exists()
+    assert (tmp_path / "in-use.json-1.meta").exists()
+
+
+def test_a_body_that_cannot_be_removed_keeps_its_meta(tmp_path, monkeypatch):
+    """The body goes first. If it refuses, its .meta must stay: a surviving
+    body with no .meta is the one state worse than no eviction at all."""
+    now = time.time()
+    _entry(tmp_path, "submissions-CIK0000019617.json-0ff0d803", 8_000,
+           atime=now - 1_000)
+    real_remove = os.remove
+
+    def _refuse_bodies(path):
+        if not str(path).endswith((".meta", ".lock")):
+            raise PermissionError("read-only")
+        real_remove(path)
+
+    monkeypatch.setattr(filing_cache.os, "remove", _refuse_bodies)
+    report = filing_cache.prune(tmp_path, cap_bytes=1_000)
+
+    assert report["failed"], "the refused removal was not reported"
+    assert _orphaned_bodies(tmp_path) == [], (
+        "the .meta went although its body could not")
+
+
 # --- the janitor has to actually run -----------------------------------------
 #
 # A pruner nothing calls is a pruner that does not exist. The cache filled in a
@@ -307,7 +388,7 @@ def test_a_due_prune_evicts_for_real(monkeypatch, tmp_path):
 
 def test_the_pruner_measures_what_the_filesystem_charges_not_apparent_size(
         tmp_path):
-    """tmpfs charges whole pages and hishel writes three files per object,
+    """tmpfs charges whole pages and edgartools writes three files per object,
     two of them tiny. On a live cache the page charge ran 1.39x the apparent
     sum, so the 512m mount filled at ~370MB apparent, under a 400MB cap, and
     the pruner never fired. Issue #98.
