@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import threading
 from time import monotonic
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -157,6 +157,7 @@ def _company_by_cik(cik: int):
 # with the holder's CIK in its accession, and a holder such as BlackRock files
 # 10-Ks of its own.
 _OWN_REPORTS = frozenset({"10-K", "10-K/A", "10-Q", "10-Q/A", "8-K", "8-K/A"})
+_PREDECESSOR_CACHE: Dict[Tuple[int, str], Any] = {}
 
 
 def _accession_of(filing) -> str:
@@ -178,6 +179,10 @@ def predecessor_with_form(company, form_type: str):
     choosing one would be a guess.
     """
     own = int(company.cik)
+    cache_key = (own, form_type)
+    if cache_key in _PREDECESSOR_CACHE:
+        return _PREDECESSOR_CACHE[cache_key]
+
     listed = company.get_filings(trigger_full_load=False)
     shared: Dict[int, set] = {}
     for filing in listed:
@@ -208,9 +213,9 @@ def predecessor_with_form(company, form_type: str):
         raise RuntimeError(
             f"CIK {own} lists filings submitted by more than one registrant "
             f"that has a {form_type}: {names}. Refused rather than choosing.")
-    if not found:
-        return None
-    return found[0]
+    res = found[0] if found else None
+    _PREDECESSOR_CACHE[cache_key] = res
+    return res
 
 
 def company(ticker: str):
@@ -230,3 +235,89 @@ def company(ticker: str):
             f"SEC has no submissions for {ticker} under CIK {cik}. Refused "
             f"rather than read as a company with no filings.")
     return found
+
+
+def filings_history(
+    comp,
+    form: str,
+    limit: Optional[int] = None,
+    min_count: Optional[int] = None,
+    since: Optional[str] = None,
+    amendments: bool = True,
+) -> Tuple[List[Any], Optional[Dict[str, Any]]]:
+    """A form's filing history across `comp` and its co-registrant.
+
+    Returns `(filings, read_from)`.
+    Own filings come first, then the co-registrant's, ordered newest first by
+    filing_date.
+    The co-registrant is only queried when the registrant's own history is
+    short for the purpose:
+      - if not own: True
+      - elif since is provided: oldest own filing date > since
+      - elif min_count is provided: len(own) < min_count
+      - else: False
+    When filings from the co-registrant are added, `read_from` is
+    `{'name': predecessor.name, 'cik': int(predecessor.cik)}`; otherwise None.
+    """
+    if amendments is False:
+        raw_own = comp.get_filings(form=form, amendments=False)
+    else:
+        raw_own = comp.get_filings(form=form)
+    if hasattr(raw_own, "head"):
+        own = list(raw_own.head(limit) if limit is not None else (raw_own if hasattr(raw_own, "__iter__") else raw_own.head(100)))
+    else:
+        own = list(raw_own)
+
+    if not own:
+        is_short = True
+    elif since is not None:
+        oldest_date = min(str(getattr(f, "filing_date", "")) for f in own)
+        is_short = oldest_date > str(since)
+    elif min_count is not None:
+        is_short = len(own) < min_count
+    else:
+        is_short = False
+
+    if not is_short:
+        if limit is not None:
+            own = own[:limit]
+        return own, None
+
+    predecessor = predecessor_with_form(comp, form)
+    if predecessor is None:
+        if limit is not None:
+            own = own[:limit]
+        return own, None
+
+    co_info = {"name": predecessor.name, "cik": int(predecessor.cik)}
+    if amendments is False:
+        raw_theirs = predecessor.get_filings(form=form, amendments=False)
+    else:
+        raw_theirs = predecessor.get_filings(form=form)
+    if hasattr(raw_theirs, "head"):
+        theirs = list(raw_theirs.head(limit) if limit is not None else (raw_theirs if hasattr(raw_theirs, "__iter__") else raw_theirs.head(100)))
+    else:
+        theirs = list(raw_theirs)
+
+    seen_accessions = {_accession_of(f) for f in own if _accession_of(f)}
+    added_from_theirs = []
+    for f in theirs:
+        acc = _accession_of(f)
+        if acc and acc in seen_accessions:
+            continue
+        f.read_from = co_info
+        added_from_theirs.append(f)
+
+    if not added_from_theirs:
+        if limit is not None:
+            own = own[:limit]
+        return own, None
+
+    combined = own + added_from_theirs
+    combined.sort(key=lambda f: str(getattr(f, "filing_date", "")), reverse=True)
+    if limit is not None:
+        combined = combined[:limit]
+
+    used_theirs = any(f in added_from_theirs for f in combined)
+    return combined, (co_info if used_theirs else None)
+

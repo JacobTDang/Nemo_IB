@@ -818,7 +818,7 @@ def get_share_count_series(ticker: str, limit: int = 8,
         "calendar_events_not_applied": rejected,
     })
 
-    return {
+    result = {
         "ticker": ticker,
         "success": True,
         "latest_total": latest_total,
@@ -837,6 +837,12 @@ def get_share_count_series(ticker: str, limit: int = 8,
         "warnings": _split_warnings(ticker, adjustment, unexplained,
                                     source_error) + basis_warnings,
     }
+    co = next((getattr(p, "read_from", None) for p in points if getattr(p, "read_from", None)), None)
+    if co:
+        result["read_from"] = co
+        result["note"] = (f"Read from {co['name']} (CIK {co['cik']}), "
+                          f"the registrant that filed it.")
+    return result
 
 
 def _class_changes(by_class: Dict[str, List[Dict[str, Any]]],

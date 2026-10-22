@@ -64,3 +64,23 @@ def company(ticker: str, cik: Optional[str] = None):
             f"SEC has no submissions for {ticker} under CIK {found.cik}. "
             f"Refused rather than treated as a company with no filings.")
     return found
+
+
+def filings_history(
+    comp,
+    form: str,
+    limit: Optional[int] = None,
+    min_count: Optional[int] = None,
+    since: Optional[str] = None,
+    amendments: bool = True,
+):
+    from tools.web_search_server import registrant as server_registrant
+
+    return server_registrant.filings_history(
+        comp,
+        form=form,
+        limit=limit,
+        min_count=min_count,
+        since=since,
+        amendments=amendments,
+    )

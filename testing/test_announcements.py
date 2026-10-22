@@ -205,7 +205,7 @@ def _edgar(monkeypatch, bundled, folders):
                 else key
             self.not_found = self.cik not in folders
 
-        def get_filings(self, form=None):
+        def get_filings(self, form=None, **kw):
             return _Filings(folders.get(self.cik, []))
 
     monkeypatch.setattr(edgar, "Company", _Company)

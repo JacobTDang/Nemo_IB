@@ -108,7 +108,8 @@ def _is_earnings(items: Any) -> bool:
 
 
 def _fetch_8k(ticker: str, cik: Optional[str] = None,
-              limit: int = _MAX_FILINGS) -> List[Any]:
+              limit: int = _MAX_FILINGS,
+              since: Optional[str] = None) -> List[Any]:
     """A name's latest 8-Ks, asked for by `cik` when the caller has one.
 
     By ticker, a name missing from the ticker map edgartools bundles came back
@@ -126,8 +127,10 @@ def _fetch_8k(ticker: str, cik: Optional[str] = None,
             "SEC_EMAIL is not set. SEC fair access requires a real contact "
             "address in the User-Agent header.")
     set_identity(email)
-    return list(registrant.company(ticker, cik)
-                .get_filings(form="8-K").head(limit))
+    comp = registrant.company(ticker, cik)
+    filings, _ = registrant.filings_history(
+        comp, form="8-K", limit=limit, since=since)
+    return filings
 
 
 def _quarters(ticker: str, as_of: Optional[str] = None) -> Dict[str, Dict]:
@@ -167,21 +170,28 @@ def classify(accepted_at) -> str:
 
 
 def earnings_releases(ticker: str, as_of: Optional[str] = None,
-                      cik: Optional[str] = None) -> List[Dict[str, Any]]:
+                      cik: Optional[str] = None,
+                      since: Optional[str] = None) -> List[Dict[str, Any]]:
     """Every Item 2.02 filing this company has made, newest first."""
+    if since is None:
+        base_year = int((as_of or _today())[:4])
+        since = f"{base_year - 3}-01-01"
     out = []
-    for filing in _fetch_8k(ticker, cik=cik):
+    for filing in _fetch_8k(ticker, cik=cik, since=since):
         if not _is_earnings(getattr(filing, "items", None)):
             continue
         day = str(filing.filing_date)
         if as_of and day > as_of:
             continue
-        out.append({
+        rec = {
             "ticker": ticker.upper(),
             "announced_date": day,
             "timing": classify(getattr(filing, "acceptance_datetime", None)),
             "accession": getattr(filing, "accession_no", None),
-        })
+        }
+        if getattr(filing, "read_from", None):
+            rec["read_from"] = filing.read_from
+        out.append(rec)
     return sorted(out, key=lambda r: r["announced_date"], reverse=True)
 
 
@@ -199,11 +209,9 @@ def for_quarters(ticker: str, as_of: Optional[str] = None,
     fetches it for the filing dates and would otherwise fetch it again here,
     which over 595 names is 1,190 requests for the same data.
     """
-    releases = earnings_releases(ticker, as_of=as_of, cik=cik)
-    if not releases:
-        return {}
-
     known = quarters if quarters is not None else _quarters(ticker, as_of=as_of)
+    since = min((d["period_end"] for d in (known or {}).values() if d.get("period_end")), default=None)
+    releases = earnings_releases(ticker, as_of=as_of, cik=cik, since=since)
     out: Dict[str, Dict[str, Any]] = {}
     for period, dates in (known or {}).items():
         period_end, known_at = dates.get("period_end"), dates.get("known_at")

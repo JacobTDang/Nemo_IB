@@ -530,7 +530,8 @@ def _exhibits(ticker: str, accession: str, filings=None) -> List[Any]:
     resolve one accession.
     """
     if filings is None:
-        filings = _company(ticker).get_filings(form="8-K")
+        comp = _company(ticker)
+        filings, _ = registrant.filings_history(comp, form="8-K")
     filing = next((f for f in filings
                    if getattr(f, "accession_no", None) == accession), None)
     if filing is None:
@@ -646,8 +647,12 @@ def release_history(ticker: str) -> Dict[str, Any]:
                                           cik=series["cik"])
     # One filings list for the name. Per accession it was 14 seconds a
     # release on JPMorgan, and every release lives in the same list.
-    filings = (_company(ticker, series["cik"]).get_filings(form="8-K")
-               if releases else [])
+    if releases:
+        comp = _company(ticker, series["cik"])
+        since = min((q["period_end"] for q in series["quarters"] if q.get("period_end")), default=None)
+        filings, _ = registrant.filings_history(comp, form="8-K", since=since)
+    else:
+        filings = []
 
     signals, extractions = [], []
     for period, release in sorted(releases.items()):
@@ -655,6 +660,8 @@ def release_history(ticker: str) -> Dict[str, Any]:
                   "announced_date": release["announced_date"],
                   "release_eps": None, "xbrl_eps": None, "basis": None,
                   "exhibit": None, "agrees_with_xbrl": None, "reason": None}
+        if release.get("read_from"):
+            record["read_from"] = release["read_from"]
         if not release.get("accession"):
             record["reason"] = "the release carries no accession to fetch"
             extractions.append(record)
@@ -728,16 +735,27 @@ def sue_ts_release(ticker: str, as_of: Optional[str] = None) -> Dict[str, Any]:
         fy, fq = sue._shift(last["fiscal_year"], last["fiscal_quarter"], back=-1)
         period = sue._period_key(fy, fq)
 
+    comp = _company(ticker, series["cik"])
+    since = min((q["period_end"] for q in series["quarters"] if q.get("period_end")), default=None)
+    filings, _ = registrant.filings_history(comp, form="8-K", since=since)
     read = read_release(
         ticker, latest["accession"], period_end=_period_end_for(series, period),
-        filings=_company(ticker, series["cik"]).get_filings(form="8-K"))
+        filings=filings)
     if read["eps"] is None:
-        return {**sue._signal_shell(ticker, as_of), "variant": VARIANT,
-                "fiscal_period": period,
-                "error": f"{ticker} {period} release: {read['reason']}"}
-    return signal_from_release(series, period, read["eps"],
-                               latest["announced_date"], as_of=as_of,
-                               accession=latest.get("accession"))
+        res = {**sue._signal_shell(ticker, as_of), "variant": VARIANT,
+               "fiscal_period": period,
+               "error": f"{ticker} {period} release: {read['reason']}"}
+        if latest.get("read_from"):
+            res["read_from"] = latest["read_from"]
+        return res
+    sig = signal_from_release(series, period, read["eps"],
+                              latest["announced_date"], as_of=as_of,
+                              accession=latest.get("accession"))
+    if latest.get("read_from"):
+        sig["read_from"] = latest["read_from"]
+        sig["note"] = (f"Read from {latest['read_from']['name']} (CIK {latest['read_from']['cik']}), "
+                       f"the registrant that filed it.")
+    return sig
 
 
 # --------------------------------------------------------- the filing lag

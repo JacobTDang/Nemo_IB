@@ -2090,19 +2090,8 @@ def diff_10k(ticker: str, item: str = '1A',
 
   try:
     company = registrant.company(ticker)
-    filings = list(company.get_filings(form='10-K').head(10))
-    read_from = None
-    if len(filings) < 2:
-      # A holding company that took the ticker has at most one 10-K of its
-      # own. Its own comes first, the co-registrant's continue the history:
-      # once it files its first, that is the current year and the
-      # predecessor's latest is the prior one.
-      predecessor = registrant.predecessor_with_form(company, '10-K')
-      if predecessor is not None:
-        theirs = list(predecessor.get_filings(form='10-K').head(10))
-        filings = sorted(filings + theirs, key=lambda f: str(f.filing_date),
-                         reverse=True)[:10]
-        read_from = {'name': predecessor.name, 'cik': int(predecessor.cik)}
+    filings, read_from = registrant.filings_history(
+        company, form='10-K', limit=10, min_count=2)
   except Exception as e:
     return {'ticker': ticker, 'success': False,
             'error': f'company/filings lookup failed: {type(e).__name__}: {e}'}
@@ -2513,7 +2502,8 @@ def get_company_filings_history(ticker: str, form_type: str = '10-K',
 
   try:
     company = registrant.company(ticker)
-    filings = company.get_filings(form=form_type)
+    filings, read_from = registrant.filings_history(
+        company, form=form_type, limit=n, min_count=n)
   except Exception as e:
     return {'ticker': ticker, 'success': False,
             'error': f'company/filings fetch failed: {type(e).__name__}: {e}'}
@@ -2526,7 +2516,7 @@ def get_company_filings_history(ticker: str, form_type: str = '10-K',
 
   out_filings = []
   try:
-    for f in filings.head(n):
+    for f in filings[:n]:
       # URL access
       url = None
       for attr in ['filing_url', 'url', 'filing_details_url', 'document_url']:
@@ -2545,19 +2535,22 @@ def get_company_filings_history(ticker: str, form_type: str = '10-K',
         has_xbrl = x is not None
       except Exception:
         has_xbrl = False
-      out_filings.append({
+      record = {
         'filing_date':      str(f.filing_date),
         'form':             f.form,
         'accession_number': f.accession_number,
         'url':              url,
         'has_xbrl_data':    has_xbrl,
-      })
+      }
+      if getattr(f, 'read_from', None):
+        record['read_from'] = f.read_from
+      out_filings.append(record)
   except Exception as e:
     return {'ticker': ticker, 'success': False,
             'error': f'filings iteration failed: {type(e).__name__}: {e}',
             'partial': out_filings}
 
-  return {
+  result = {
     'ticker':           ticker,
     'success':          True,
     'error':            None,
@@ -2565,6 +2558,11 @@ def get_company_filings_history(ticker: str, form_type: str = '10-K',
     'filings_returned': len(out_filings),
     'filings':          out_filings,
   }
+  if read_from:
+    result['read_from'] = read_from
+    result['note'] = (f"Read from {read_from['name']} (CIK {read_from['cik']}), "
+                      f"the registrant that filed it.")
+  return result
 
 
 def get_patent_filings(company_name: str, years_back: int = 5,
