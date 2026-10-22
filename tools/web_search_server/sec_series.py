@@ -298,6 +298,7 @@ class FilingPoint:
     form: str
     accession: str
     facts: List[ConceptFact] = field(default_factory=list)
+    read_from: Optional[Dict[str, Any]] = None
 
     def deduplicated(self) -> List[ConceptFact]:
         """Facts with exact duplicates removed.
@@ -524,7 +525,8 @@ def fetch_concept_series(ticker: str, concept: str, form: str = "10-Q",
     # the Part III proxy information and 37 fact rows -- no financial
     # statements. Left in, it takes a slot in the walk and every concept in the
     # real 10-K behind it reads as untagged.
-    filings = company.get_filings(form=form, amendments=False).head(limit)
+    filings, read_from = registrant.filings_history(
+        company, form=form, limit=limit, min_count=limit, amendments=False)
 
     points: List[FilingPoint] = []
     for filing in filings:
@@ -543,10 +545,13 @@ def fetch_concept_series(ticker: str, concept: str, form: str = "10-Q",
             continue
 
         if point is not None:
+            if getattr(filing, "read_from", None):
+                point.read_from = filing.read_from
             points.append(point)
 
     if not points:
         raise NotCovered(
             f"{ticker}: concept {concept!r} found in none of the last "
             f"{limit} {form} filings")
+
     return points

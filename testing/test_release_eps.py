@@ -282,7 +282,9 @@ def test_a_fetch_that_fails_costs_one_release_not_the_name(monkeypatch):
     monkeypatch.setattr(release_eps, "read_release", fetch)
 
     class _Company:
-        def get_filings(self, form=None):
+        cik = 1
+
+        def get_filings(self, form=None, **kw):
             return []
 
     monkeypatch.setattr(release_eps, "_company", lambda ticker, cik=None: _Company())
@@ -418,16 +420,19 @@ class _Filing:
     """Shaped like edgartools' Filing as the fetch layer uses it: the index
     page lists the documents. `attachments` is deliberately absent, because
     reaching for it parses the whole submission."""
-    def __init__(self, accession_no, documents):
+    def __init__(self, accession_no, documents, filing_date="2026-08-30"):
         self.accession_no, self.homepage = accession_no, _Homepage(documents)
+        self.filing_date = filing_date
 
 
 def _company_with(filings, monkeypatch):
     class _Company:
+        cik = 1
+
         def __init__(self, ticker):
             pass
 
-        def get_filings(self, form=None):
+        def get_filings(self, form=None, **kw):
             return filings
     monkeypatch.setattr(release_eps, "_company", lambda ticker, cik=None: _Company(ticker))
 
@@ -607,7 +612,9 @@ def test_the_filings_list_is_fetched_once_per_name(monkeypatch):
                             "2026Q4": {"accession": "b", "announced_date": "2026-11-30"}})
 
     class _Company:
-        def get_filings(self, form=None):
+        cik = 1
+
+        def get_filings(self, form=None, **kw):
             calls["n"] += 1
             return [_Filing("a", [_Attachment("ex99-1.htm", "EX-99.1", APPLE)]),
                     _Filing("b", [_Attachment("ex99-1.htm", "EX-99.1", APPLE)])]
@@ -778,7 +785,9 @@ def test_a_filing_missing_from_the_list_says_so(monkeypatch):
     carry one. The filing was not in the list the lookup searched, and the
     reason blamed the exhibit."""
     class _Company:
-        def get_filings(self, form=None):
+        cik = 1
+
+        def get_filings(self, form=None, **kw):
             return [_Filing("other", [_Attachment("ex99-1.htm", "EX-99.1", APPLE)])]
 
     monkeypatch.setattr(release_eps, "_company", lambda ticker, cik=None: _Company())
@@ -795,7 +804,9 @@ def test_a_filing_missing_from_the_list_is_resolved_the_slow_way(monkeypatch):
     the page, a list that came back short -- is resolved through the
     quarterly index before the release is given up on."""
     class _Company:
-        def get_filings(self, form=None):
+        cik = 1
+
+        def get_filings(self, form=None, **kw):
             return [_Filing("other", [])]
 
     monkeypatch.setattr(release_eps, "_company", lambda ticker, cik=None: _Company())
@@ -844,7 +855,7 @@ def _dmc(monkeypatch, days):
             self.cik = -999999999 if isinstance(key, str) else key
             self.not_found = self.cik != 1047340
 
-        def get_filings(self, form=None):
+        def get_filings(self, form=None, **kw):
             return _Filings(_Release(d) for d in days) \
                 if self.cik == 1047340 else _Filings()
 

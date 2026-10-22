@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import threading
 from time import monotonic
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -157,6 +157,7 @@ def _company_by_cik(cik: int):
 # with the holder's CIK in its accession, and a holder such as BlackRock files
 # 10-Ks of its own.
 _OWN_REPORTS = frozenset({"10-K", "10-K/A", "10-Q", "10-Q/A", "8-K", "8-K/A"})
+_PREDECESSOR_CACHE: Dict[Tuple[int, str], Any] = {}
 
 
 def _accession_of(filing) -> str:
@@ -178,6 +179,10 @@ def predecessor_with_form(company, form_type: str):
     choosing one would be a guess.
     """
     own = int(company.cik)
+    cache_key = (own, form_type)
+    if cache_key in _PREDECESSOR_CACHE:
+        return _PREDECESSOR_CACHE[cache_key]
+
     listed = company.get_filings(trigger_full_load=False)
     shared: Dict[int, set] = {}
     for filing in listed:
@@ -208,9 +213,9 @@ def predecessor_with_form(company, form_type: str):
         raise RuntimeError(
             f"CIK {own} lists filings submitted by more than one registrant "
             f"that has a {form_type}: {names}. Refused rather than choosing.")
-    if not found:
-        return None
-    return found[0]
+    res = found[0] if found else None
+    _PREDECESSOR_CACHE[cache_key] = res
+    return res
 
 
 def company(ticker: str):
@@ -230,3 +235,48 @@ def company(ticker: str):
             f"SEC has no submissions for {ticker} under CIK {cik}. Refused "
             f"rather than read as a company with no filings.")
     return found
+
+
+def filings_history(
+    comp,
+    form: str,
+    limit: Optional[int] = None,
+    min_count: Optional[int] = None,
+    since: Optional[str] = None,
+    amendments: bool = True,
+) -> Tuple[List[Any], Optional[Dict[str, Any]]]:
+    """A form's filing history across `comp` and its co-registrant, newest first.
+
+    Returns `(filings, read_from)`. The co-registrant (`predecessor_with_form`)
+    is searched only when the registrant's own history is short for the
+    caller: it has none of the form, or its oldest is after `since`, or it has
+    fewer than `min_count`. Judged on the whole own history, not the newest
+    `limit`: a bank's newest 80 8-Ks span a couple of years, and each search
+    costs SEC requests. Each co-registrant filing carries `read_from`, and so
+    does the result when any of them is among the filings returned.
+    """
+    own = list(comp.get_filings(form=form, amendments=amendments))
+    if not own:
+        short = True
+    elif since is not None:
+        short = min(str(f.filing_date) for f in own) > str(since)
+    elif min_count is not None:
+        short = len(own) < min_count
+    else:
+        short = False
+
+    predecessor = predecessor_with_form(comp, form) if short else None
+    if predecessor is None:
+        return own[:limit], None
+
+    read_from = {"name": predecessor.name, "cik": int(predecessor.cik)}
+    held = {_accession_of(f) for f in own}
+    theirs = [f for f in predecessor.get_filings(form=form,
+                                                 amendments=amendments)
+              if _accession_of(f) not in held]
+    for filing in theirs:
+        filing.read_from = read_from
+    combined = sorted(own + theirs, key=lambda f: str(f.filing_date),
+                      reverse=True)[:limit]
+    used = any(getattr(f, "read_from", None) for f in combined)
+    return combined, (read_from if used else None)
