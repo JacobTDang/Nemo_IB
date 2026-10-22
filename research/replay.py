@@ -375,6 +375,7 @@ def _score(orders: List[Dict[str, Any]], horizon_days: int,
     return {"scored": scored, "skipped": skipped,
             "by_timing": scoring.split_by_timing(scored, comparisons),
             "by_variant": scoring.split_by_variant(scored, comparisons),
+            "by_side": scoring.split_by_side(scored, comparisons),
             **scoring._summarise(scored, comparisons=comparisons)}
 
 
