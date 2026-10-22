@@ -56,6 +56,41 @@ def test_the_least_recently_used_file_goes_first(tmp_path):
     assert (tmp_path / "new.txt").exists(), "evicted the file still in use"
 
 
+def test_a_prune_keeps_the_applied_marker_in_tcache_when_it_is_oldest(tmp_path):
+    """edgartools 5.8.0 writes `_tcache/.locale_fix_457_applied` once. The next
+    import deletes the HTTP cache when that file is missing, so the pruner
+    must not treat it as an old cache entry."""
+    now = time.time()
+    marker = tmp_path / "_tcache" / ".locale_fix_457_applied"
+    marker.parent.mkdir()
+    _write(marker, 32, atime=now - 100_000)
+    _write(tmp_path / "_tcache" / "body", 8_000, atime=now)
+
+    filing_cache.prune(tmp_path, cap_bytes=4_000, target_fraction=0.5)
+
+    assert marker.exists()
+    assert not (tmp_path / "_tcache" / "body").exists()
+
+
+def test_a_prune_keeps_files_under_migrations_when_they_are_oldest(tmp_path):
+    """edgartools 5.62.0 writes `.migrations/locale_fix_457` and
+    `empty_response_fix_672`. Neither name ends in `_applied`. A missing
+    marker makes the next import delete the HTTP cache."""
+    now = time.time()
+    migrations = tmp_path / ".migrations"
+    migrations.mkdir()
+    locale = _write(migrations / "locale_fix_457", 32, atime=now - 100_000)
+    empty = _write(migrations / "empty_response_fix_672", 32, atime=now - 90_000)
+    (tmp_path / "_tcache").mkdir()
+    _write(tmp_path / "_tcache" / "body", 8_000, atime=now)
+
+    filing_cache.prune(tmp_path, cap_bytes=4_000, target_fraction=0.5)
+
+    assert locale.exists()
+    assert empty.exists()
+    assert not (tmp_path / "_tcache" / "body").exists()
+
+
 def test_pruning_leaves_headroom_rather_than_trimming_to_the_cap(tmp_path):
     now = time.time()
     for i in range(10):
