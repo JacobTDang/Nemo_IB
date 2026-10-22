@@ -553,22 +553,44 @@ class TestGetLatestFiling:
             assert 'accession_number' in result
 
     def test_get_latest_filing_invalid_ticker(self, rate_limiter):
-        """Test with invalid ticker symbol."""
+        """A ticker SEC does not map is a refusal, and the message names it."""
         rate_limiter.wait()
-        result = get_latest_filing("INVALIDTICKER12345")
-
-        # Should return None for invalid tickers
-        assert result is None
+        ticker = "INVALIDTICKER12345"
+        with pytest.raises(LookupError) as caught:
+            get_latest_filing(ticker)
+        assert f"does not map {ticker} to a registrant" in str(caught.value)
 
     def test_get_latest_filing_empty_ticker(self):
-        """Test with empty ticker string."""
-        result = get_latest_filing("")
-        assert result is None
+        """An empty ticker is the same refusal, and the message names it."""
+        ticker = ""
+        with pytest.raises(LookupError) as caught:
+            get_latest_filing(ticker)
+        assert f"does not map {ticker} to a registrant" in str(caught.value)
 
     def test_get_latest_filing_special_characters(self):
-        """Test with ticker containing special characters."""
-        result = get_latest_filing("$%^&*")
-        assert result is None
+        """Special characters are not a ticker, and the message names them."""
+        ticker = "$%^&*"
+        with pytest.raises(LookupError) as caught:
+            get_latest_filing(ticker)
+        assert f"does not map {ticker} to a registrant" in str(caught.value)
+
+    def test_the_mcp_handler_reports_an_unmapped_ticker(self):
+        """The handler turns the LookupError into success: false and keeps
+        the reason. Folded into "No filing found", it reads as a fact about
+        a company."""
+        import asyncio
+        import json
+
+        from tools.web_search_server.web_search import WebSearchServer
+
+        ticker = "INVALIDTICKER12345"
+        content = asyncio.run(
+            WebSearchServer.get_latest_filing(None, ticker, "10-K"))
+        result = json.loads(content[0].text)
+
+        assert result["success"] is False
+        assert ticker in result["error"]
+        assert "LookupError" in result["error"]
 
     def test_get_latest_filing_form_10k(self, rate_limiter):
         """Test explicitly requesting 10-K form."""
