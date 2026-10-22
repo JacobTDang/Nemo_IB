@@ -55,9 +55,11 @@ def test_a_partial_fetch_is_recorded_as_partial(store, monkeypatch):
 
     Half of what, though: the ratio is against the names the vendor answered
     for, not against the ask. MSFT traded during the window and then had no bar
-    on the session itself, which is a hole in a series that exists. A name that
-    answered nowhere in the window is a different fact and the next section is
-    about it.
+    on the session itself. A few such names in a hundred are halts and
+    delistings and are named, not counted (see the section on names with no
+    session); half the names missing a session the index had is the vendor,
+    not the names. A name that answered nowhere in the window is a different
+    fact and the next section is about it.
     """
     monkeypatch.setattr(daily_job, "_fetch_bars", lambda tickers, **kw: {
         "AAPL": _bars("2026-03-03"), "MSFT": _bars("2026-03-02"),
@@ -1229,8 +1231,8 @@ def test_a_rerun_reports_the_rows_it_actually_wrote(store, monkeypatch):
 #
 # So `ok` is measured against reachability instead: the probe answered, no
 # batch was lost, and every name the vendor answered for in the window has its
-# session. A shell that answers nowhere is not a hole in the record; it is the
-# record.
+# session or had none that day. A shell that answers nowhere is not a hole in
+# the record; it is the record.
 
 
 def test_a_name_the_vendor_never_answered_for_is_not_a_hole(store, monkeypatch):
@@ -1247,23 +1249,6 @@ def test_a_name_the_vendor_never_answered_for_is_not_a_hole(store, monkeypatch):
         "an ordinary night wrote to the error column, where an operator "
         "scanning for real errors has to read it")
     assert store.missing_days("daily_bars", "2026-03-03", "2026-03-03") == []
-
-
-def test_a_name_that_traded_in_the_window_but_not_on_the_day_is_a_hole(
-        store, monkeypatch):
-    """The other side of it, and the reason the window is wider than the
-    session: a name the vendor answered for two days ago and not today has a
-    series with a gap in it, which is exactly what `partial` is for."""
-    monkeypatch.setattr(daily_job, "_fetch_bars", lambda tickers, **kw: {
-        "AAPL": _bars("2026-03-03"), "HALTED": _bars("2026-03-02"),
-        daily_job.FETCH_CANARY: _bars("2026-03-02", "2026-03-03")})
-
-    result = daily_job.record_daily_bars(["AAPL", "HALTED"],
-                                         as_of="2026-03-03")
-
-    assert result["status"] == "partial"
-    assert store.bars_as_of("HALTED", "2026-03-03") == [], (
-        "a session the vendor did not report was written anyway")
 
 
 def test_a_probe_that_did_not_answer_is_a_failed_night(store, monkeypatch):
@@ -1297,6 +1282,257 @@ def test_a_lost_batch_is_never_a_complete_night(store, monkeypatch):
 
     assert result["status"] == "partial"
     assert "502" in str(daily_job.last_run("daily_bars")["error"])
+
+
+# --- a name with no session on the day is the vendor's answer, not a hole ---
+#
+# The window is wider than the session so that a holiday can be told from a
+# vendor that did not answer. It also brings back names that printed earlier
+# in the week and not on the day: a delisting, a halt, a thin name that did
+# not trade. The vendor answered for each of them in the same response, so the
+# absence is its answer, not a lost fetch. Counted against coverage, they made
+# every night `partial` (issue #148): 1,806 of 1,810 on 2026-10-20 and 1,812 of
+# 1,817 on 2026-10-21, both in `missing_days`, and the gap report could no
+# longer point at a night really missed.
+#
+# What one night cannot tell apart is a name with no session from a vendor
+# that has not yet published that name's bar. So each one is named, with the
+# last session it did have, where an operator reads the run, and the vendor's
+# word is taken only for a small share of the names recorded: 3 of 1,806 and 5
+# of 1,812 on the homelab nights, about 0.3%.
+
+NIGHT = "2026-10-21"
+# Enough that three quiet names are a small share of them, as on a real night.
+TRADED = [f"N{i:03d}" for i in range(200)]
+QUIET = {"ACVA": "2026-10-16", "BZH": "2026-10-19", "TJGC": "2026-10-20"}
+
+
+def _night_with_quiet_names():
+    """The 2026-10-21 shape: names with the session, and names the vendor
+    answered for in the window whose rows stop before it."""
+    fetched = {t: _bars("2026-10-20", NIGHT) for t in TRADED}
+    fetched.update({t: _bars("2026-10-15", last) for t, last in QUIET.items()})
+    fetched[daily_job.FETCH_CANARY] = _bars("2026-10-20", NIGHT)
+    return fetched
+
+
+def test_a_name_with_no_session_on_the_day_is_named_not_counted(
+        store, monkeypatch):
+    monkeypatch.setattr(daily_job, "_fetch_bars",
+                        lambda tickers, **kw: _night_with_quiet_names())
+
+    result = daily_job.record_daily_bars([*TRADED, *QUIET], as_of=NIGHT)
+
+    assert result["status"] == "ok", (
+        "names the vendor answered for with no session on the day made the "
+        "night partial")
+    assert store.missing_days("daily_bars", NIGHT, NIGHT) == []
+    assert result["no_session"] == QUIET
+    error = str(daily_job.last_run("daily_bars")["error"])
+    # Newest first: the names that went quiet tonight are tonight's news.
+    assert (f"no session on {NIGHT} for 3 the vendor answered for in the "
+            f"window: TJGC (last 2026-10-20), BZH (last 2026-10-19), "
+            f"ACVA (last 2026-10-16)") in error, (
+        f"the run log does not name them: {error!r}")
+    for ticker in QUIET:
+        assert store.bars_as_of(ticker, "2026-10-22") == [], (
+            "a session the vendor did not report was written anyway")
+
+
+def test_a_lost_batch_is_still_partial_beside_names_with_no_session(
+        store, monkeypatch):
+    """A lost batch's names are absent from the response, not answered without
+    a session. Excusing the second must not excuse the first."""
+    def fetch(tickers, **kw):
+        kw["failures"].append(
+            "batch 2 of 2 failed after 3 attempts (200 tickers, M..Z): "
+            "ConnectionError: 502")
+        return _night_with_quiet_names()
+
+    monkeypatch.setattr(daily_job, "_fetch_bars", fetch)
+
+    result = daily_job.record_daily_bars([*TRADED, *QUIET], as_of=NIGHT)
+
+    assert result["status"] == "partial"
+    assert store.missing_days("daily_bars", NIGHT, NIGHT) == [NIGHT]
+    error = str(daily_job.last_run("daily_bars")["error"])
+    assert "502" in error and "ACVA (last 2026-10-16)" in error, error
+
+
+def test_a_failed_write_is_still_partial_beside_names_with_no_session(
+        store, monkeypatch):
+    """The name has the session and it did not reach the store. That is a
+    hole, whatever the names around it did."""
+    import sqlite3
+
+    monkeypatch.setattr(daily_job, "_fetch_bars",
+                        lambda tickers, **kw: _night_with_quiet_names())
+    real = daily_job._record_ticker
+    broken = TRADED[0]
+
+    def flaky(ticker, rows, stamp, keep=None, source="recorded"):
+        if ticker == broken:
+            raise sqlite3.OperationalError("database is locked")
+        return real(ticker, rows, stamp, keep=keep, source=source)
+
+    monkeypatch.setattr(daily_job, "_record_ticker", flaky)
+
+    result = daily_job.record_daily_bars([*TRADED, *QUIET], as_of=NIGHT)
+
+    assert result["status"] == "partial"
+    error = str(daily_job.last_run("daily_bars")["error"])
+    assert f"{broken}: OperationalError: database is locked" in error, error
+    assert "no session on 2026-10-21 for 3" in error, error
+
+
+def _night_of(recorded, quiet):
+    """`recorded` names with the session; `quiet` named ones whose last
+    session was the day before, which is the case a late vendor looks like."""
+    fetched = {f"N{i:03d}": _bars("2026-10-20", NIGHT) for i in range(recorded)}
+    fetched.update({t: _bars("2026-10-19", "2026-10-20") for t in quiet})
+    fetched[daily_job.FETCH_CANARY] = _bars("2026-10-20", NIGHT)
+    return fetched
+
+
+def test_no_session_names_up_to_two_percent_of_those_recorded_are_believed(
+        store, monkeypatch):
+    """The edge of the share, from inside: 2 of 100."""
+    fetched = _night_of(100, ["Q1", "Q2"])
+    monkeypatch.setattr(daily_job, "_fetch_bars",
+                        lambda tickers, **kw: fetched)
+
+    result = daily_job.record_daily_bars(
+        [t for t in fetched if t != daily_job.FETCH_CANARY], as_of=NIGHT)
+
+    assert result["status"] == "ok", (
+        "2 names with no session beside 100 recorded made the night a gap")
+    assert result["no_session"] == {"Q1": "2026-10-20", "Q2": "2026-10-20"}
+
+
+def test_one_name_past_two_percent_of_those_recorded_is_not_believed(
+        store, monkeypatch):
+    """The edge of the share, from outside: 3 of 100. The index traded, and
+    delistings and halts among names that passed a liquidity screen come a few
+    at a time. A vendor that has not published the day for 300 of 1,800 would
+    otherwise read `ok`, never be replayed, and leave one line in the run log
+    as the only trace. Past the share the night stays a gap so that backfill
+    replays it, and the names are still listed."""
+    fetched = _night_of(100, ["Q1", "Q2", "Q3"])
+    monkeypatch.setattr(daily_job, "_fetch_bars",
+                        lambda tickers, **kw: fetched)
+
+    result = daily_job.record_daily_bars(
+        [t for t in fetched if t != daily_job.FETCH_CANARY], as_of=NIGHT)
+
+    assert result["status"] == "partial"
+    assert store.missing_days("daily_bars", NIGHT, NIGHT) == [NIGHT]
+    error = str(daily_job.last_run("daily_bars")["error"])
+    assert ("3 the vendor answered for in the window have no session on "
+            "2026-10-21 although SPY does, more than 2% of the 100 that do, "
+            "so they are counted as missed: Q1 (last 2026-10-20), "
+            "Q2 (last 2026-10-20), Q3 (last 2026-10-20)") in error, error
+
+
+def test_no_name_with_a_session_the_index_had_is_a_failed_night(
+        store, monkeypatch):
+    """Every name answered and none has the day. Excused, there would be
+    nothing left to measure, and a night that recorded nothing would read as
+    complete."""
+    fetched = {t: _bars("2026-10-19", "2026-10-20") for t in ("AAPL", "MSFT")}
+    fetched[daily_job.FETCH_CANARY] = _bars("2026-10-20", NIGHT)
+    monkeypatch.setattr(daily_job, "_fetch_bars",
+                        lambda tickers, **kw: fetched)
+
+    result = daily_job.record_daily_bars(["AAPL", "MSFT"], as_of=NIGHT)
+
+    assert result["status"] == "failed"
+    assert store.missing_days("daily_bars", NIGHT, NIGHT) == [NIGHT]
+
+
+def test_a_probe_that_did_not_answer_says_no_name_lacked_a_session(
+        store, monkeypatch):
+    """Without the index there is no evidence that the day was a session at
+    all, so "no session" is a claim this run cannot make about anybody."""
+    monkeypatch.setattr(daily_job, "_fetch_bars", lambda tickers, **kw: {
+        "AAPL": _bars(NIGHT), "BZH": _bars("2026-10-19")})
+
+    result = daily_job.record_daily_bars(["AAPL", "BZH"], as_of=NIGHT)
+
+    assert result["status"] == "failed"
+    assert result["no_session"] == {}
+    assert "no session on" not in str(daily_job.last_run("daily_bars")["error"])
+
+
+def test_a_replayed_night_names_a_one_day_halt_as_a_live_one_would(
+        store, monkeypatch):
+    """A replay's window runs through today, so a name halted on the day has
+    sessions on both sides of it. Watched live the same night would have named
+    it; replayed, it must read the same, or backfill turns it into a gap that
+    no replay can ever close.
+
+    RESUMED was halted from before the window opened and traded again after
+    the day, so it has no earlier session to name -- and says so rather than
+    printing a None."""
+    _clock(monkeypatch, "2026-10-22T22:30:00")
+    day = "2026-10-14"
+    fetched = {t: _bars("2026-10-13", day, "2026-10-15") for t in TRADED}
+    fetched["HALT"] = _bars("2026-10-13", "2026-10-15")
+    fetched["RESUMED"] = _bars("2026-10-15", "2026-10-16")
+    fetched[daily_job.FETCH_CANARY] = _bars("2026-10-13", day, "2026-10-15")
+    monkeypatch.setattr(daily_job, "_fetch_bars",
+                        lambda tickers, **kw: fetched)
+
+    result = daily_job.record_daily_bars([*TRADED, "HALT", "RESUMED"],
+                                         as_of=day)
+
+    assert result["status"] == "ok"
+    assert result["no_session"] == {"HALT": "2026-10-13", "RESUMED": None}
+    error = str(daily_job.last_run("daily_bars")["error"])
+    assert ("HALT (last 2026-10-13), RESUMED (no earlier session in the "
+            "window)") in error, error
+
+
+def test_the_run_log_names_the_newest_and_counts_the_rest(store, monkeypatch):
+    """A vendor that has not published the day for most of the universe would
+    put eighteen hundred names in one run-log row, on exactly the night the
+    row must be read. The result carries all of them; the row carries the
+    ones that went quiet most recently."""
+    cap = daily_job.NO_SESSION_NAMED
+    fetched = {f"T{i:02d}": _bars("2026-10-20", NIGHT) for i in range(cap + 6)}
+    recent = {f"R{i:02d}": "2026-10-20" for i in range(cap)}
+    older = {f"O{i:02d}": "2026-10-16" for i in range(5)}
+    fetched.update({t: _bars(last) for t, last in {**recent, **older}.items()})
+    fetched[daily_job.FETCH_CANARY] = _bars("2026-10-20", NIGHT)
+    monkeypatch.setattr(daily_job, "_fetch_bars",
+                        lambda tickers, **kw: fetched)
+
+    result = daily_job.record_daily_bars(
+        [t for t in fetched if t != daily_job.FETCH_CANARY], as_of=NIGHT)
+
+    assert result["status"] == "partial"
+    assert result["no_session"] == {**recent, **older}
+    error = str(daily_job.last_run("daily_bars")["error"])
+    assert error.count("(last ") == cap, error
+    assert all(f"{t} (last 2026-10-20)" in error for t in recent), error
+    assert "and 5 more" in error, error
+
+
+def test_a_session_bootstrap_already_wrote_still_counts(store, monkeypatch):
+    """`--bootstrap` writes tonight's session before the nightly pass runs, so
+    that pass writes nothing for the names that traded. They are still
+    recorded. Counted by rows written, the night would have recorded nothing,
+    and the names with no session would make it a failed night."""
+    monkeypatch.setattr(daily_job, "_fetch_bars",
+                        lambda tickers, **kw: _night_with_quiet_names())
+    names = [*TRADED, *QUIET]
+    daily_job.bootstrap_history(names, as_of=NIGHT)
+
+    result = daily_job.record_daily_bars(names, as_of=NIGHT)
+
+    assert result["written"] == 0
+    assert result["covered"] == len(TRADED)
+    assert result["status"] == "ok"
+    assert result["no_session"] == QUIET
 
 
 # --- and the gap report, which nothing called -------------------------------
