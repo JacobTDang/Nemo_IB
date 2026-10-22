@@ -218,7 +218,7 @@ def facts():
     A filer whose latest 10-K cannot be fetched or parsed is recorded as a
     fetch failure and asserted on, never quietly dropped.
     """
-    from edgar import Company
+    from tools.web_search_server import registrant
     from tools.web_search_server.sec_series import (
         _require_identity, _throttle, concept_point)
 
@@ -229,8 +229,17 @@ def facts():
     for ticker in ALL_TICKERS:
         _throttle()
         try:
-            filing = Company(ticker).get_filings(
-                form="10-K", amendments=False).head(1)[0]
+            # The same resolution the tools use. Company(ticker) still reads
+            # edgartools' bundled map, which kept XOM on CIK 34088 after SEC
+            # moved the ticker to the holding company.
+            company = registrant.company(ticker)
+            filings = company.get_filings(form="10-K", amendments=False)
+            if not filings:
+                predecessor = registrant.predecessor_with_form(company, "10-K")
+                if predecessor is not None:
+                    filings = predecessor.get_filings(
+                        form="10-K", amendments=False)
+            filing = filings.head(1)[0]
             xbrl = filing.xbrl()
             if xbrl is None:
                 raise ValueError("filing carries no XBRL")

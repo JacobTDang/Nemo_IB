@@ -1592,7 +1592,7 @@ warnings_per_tool={
         'error': f'{type(e).__name__}: {e}',
         'success': False
       }))]
-    if result:
+    if result and result.get('accession_number'):
       # Convert to JSON-serializable format
       json_result = {
         'ticker': ticker,
@@ -1601,13 +1601,15 @@ warnings_per_tool={
         'url': result.get('url'),
         'accession_number': result.get('accession_number'),
         'has_xbrl_data': result.get('xbrl_data') is not None,
+        'read_from': result.get('read_from'),
         'success': True
       }
     else:
       json_result = {
         'ticker': ticker,
         'form_type': form_type,
-        'error': 'No filing found',
+        'error': (result or {}).get('error') or 'No filing found',
+        'read_from': (result or {}).get('read_from'),
         'success': False
       }
     return [TextContent(type="text", text=safe_json_dumps(json_result))]

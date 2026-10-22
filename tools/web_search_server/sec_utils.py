@@ -299,6 +299,39 @@ def filter_annual_data(xbrl, concept: str, form_type: str = '10-K') -> Optional[
   return _fact_result(_consolidated_fact(xbrl, concept, span_days=span),
                       concept)
 
+def _with_read_from(payload: Dict[str, Any], filing) -> Dict[str, Any]:
+  """Say when the filing that was read is not the ticker's own registrant.
+
+  A predecessor read that is silent looks like the holding company's own
+  10-K. The sentence names the registrant and the CIK of the filing.
+  """
+  read_from = (filing or {}).get("read_from") if isinstance(filing, dict) else None
+  if not read_from:
+    return payload
+  payload = dict(payload)
+  payload["read_from"] = read_from
+  sentence = (f"Read from {read_from['name']} (CIK {read_from['cik']}), "
+              f"the registrant that filed it.")
+  if payload.get("error"):
+    payload["error"] = f"{payload['error']} {sentence}"
+  elif payload.get("note"):
+    payload["note"] = f"{payload['note']} {sentence}"
+  else:
+    payload["note"] = sentence
+  return payload
+
+
+def _stated_miss(filing, ticker: str, form_type: str, fallback: str) -> str:
+  """The refusal already on the filing, or `fallback` when there is none.
+
+  A registrant with no filing of the form asked for is named on the filing.
+  A later reader that substitutes "No XBRL data available" hides that.
+  """
+  if isinstance(filing, dict) and filing.get("error"):
+    fallback = filing["error"]
+  return _filing_miss(ticker, form_type, fallback)
+
+
 def _filing_miss(ticker: str, form_type: str, fallback: str) -> str:
   """Say "this filer uses a different form" when that is why nothing was found.
 
@@ -362,8 +395,23 @@ def get_latest_filing(ticker: str, form_type: str = '10-K') -> Optional[Dict[str
       # Altria does not tag revenue. fetch_concept_series already excludes
       # them; this is the other path into EDGAR, and it feeds ten tools.
       filings = company.get_filings(form=form_type, amendments=False)
+      read_from = None
+      if not filings:
+        predecessor = registrant.predecessor_with_form(company, form_type)
+        if predecessor is not None:
+          filings = predecessor.get_filings(form=form_type, amendments=False)
+          read_from = {"name": predecessor.name, "cik": int(predecessor.cik)}
 
-      if filings:
+      if not filings:
+        # Cached: a registrant with no such form will not grow one mid-session.
+        # The message names who was asked. "No XBRL data available" does not.
+        result = {
+          'xbrl_data': None,
+          'accession_number': None,
+          'error': (f"{company.name} (CIK {int(company.cik)}) has filed no "
+                    f"{form_type}."),
+        }
+      elif filings:
         latest_filing = filings[0]
         try:
           xbrl_data = latest_filing.xbrl()
@@ -389,6 +437,8 @@ def get_latest_filing(ticker: str, form_type: str = '10-K') -> Optional[Dict[str
           'filing_object': latest_filing,
           'xbrl_data': xbrl_data,
         }
+        if read_from:
+          result['read_from'] = read_from
     except Exception as exc:  # noqa: BLE001 - reason is logged, not swallowed
       logger.warning("SEC filing fetch failed for %s %s: %s",
                      ticker, form_type, exc)
@@ -435,19 +485,19 @@ def get_disclosures_names(ticker:str, form_type: str = '10-K') -> Dict[str, Any]
             disclosures.append(disclosure_name)
 
         if disclosures:
-          return {
+          return _with_read_from({
             'ticker': ticker,
             'success': True,
             'error': None,
             'disclosure_names': disclosures
-          }
+          }, filing_data)
         else:
-          return{
+          return _with_read_from({
             'ticker': ticker,
             'success': False,
             'error': f'Unable to find any disclosure in {ticker} statements',
             'disclosure_names': None
-          }
+          }, filing_data)
 
       except Exception as e:
         return{
@@ -468,7 +518,7 @@ def get_disclosures_names(ticker:str, form_type: str = '10-K') -> Dict[str, Any]
   return {
     'ticker': ticker,
     'success': False,
-    'error': _filing_miss(ticker, form_type,
+    'error': _stated_miss(filing_data, ticker, form_type,
                           f'Unable to get disclosures for {ticker}'),
     'disclosure_names': None
   }
@@ -588,7 +638,7 @@ def extract_disclosure_data(ticker: str, disclosure_name: str, form_type: str = 
       return {
         'ticker': ticker,
         'success': False,
-        'error': _filing_miss(ticker, form_type,
+        'error': _stated_miss(latest_filing, ticker, form_type,
                               f"Unable to get latest filing for {ticker}")
       }
   except Exception as e:
@@ -654,7 +704,7 @@ def get_revenue_base(ticker: str, form_type: str= "10-K") -> Dict[str, Any]:
         result = filter_annual_data(xbrl, concept, form_type)
         if result:
           currency = result.get('currency')
-          return {
+          return _with_read_from({
             'ticker': ticker,
             'revenue_base': float(result['value']),  # raw units, not scaled
             'currency': currency,
@@ -667,12 +717,19 @@ def get_revenue_base(ticker: str, form_type: str= "10-K") -> Dict[str, Any]:
                      f'built on this must use a matching share count and '
                      f'price, or convert both consistently.'),
             'success': True
-          }
+          }, filing_data)
 
-      return {
+      return _with_read_from({
         'ticker': ticker,
         'error': _filing_miss(ticker, form_type,
                               'No revenue concept found'),
+        'success': False
+      }, filing_data)
+
+    if filing_data and filing_data.get('error'):
+      return {
+        'ticker': ticker,
+        'error': _filing_miss(ticker, form_type, filing_data['error']),
         'success': False
       }
 
@@ -774,11 +831,12 @@ def get_ebitda_margin(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
   """
   try:
     filing = get_latest_filing(ticker, form_type)
-    if not filing or not filing['xbrl_data']:
-      return _ebitda_result(
+    if not filing or not filing.get('xbrl_data'):
+      missed = (filing or {}).get('error') or (
+          f'Unable to get latest filing for {ticker}')
+      return _with_read_from(_ebitda_result(
         ticker, 'not_covered',
-        _filing_miss(ticker, form_type,
-                     f'Unable to get latest filing for {ticker}'))
+        _filing_miss(ticker, form_type, missed)), filing)
 
     xbrl = filing['xbrl_data']
 
@@ -824,14 +882,14 @@ def get_ebitda_margin(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
     currency = revenue_data.get('currency') if revenue_data['success'] else None
 
     if operating_income is None:
-      return _ebitda_result(
+      return _with_read_from(_ebitda_result(
         ticker, 'not_covered', _ebitda_not_covered(ticker, form_type, xbrl),
         d_and_a=d_and_a, d_and_a_concept=d_and_a_concept, revenue=revenue,
-        currency=currency)
+        currency=currency), filing)
 
     if d_and_a is None:
       tried = ', '.join(DA_CONCEPTS[:-1])
-      return _ebitda_result(
+      return _with_read_from(_ebitda_result(
         ticker, 'not_covered',
         f"{ticker} tags no depreciation and amortisation total in its "
         f"{form_type} ({tried}), nor us-gaap:Depreciation beside "
@@ -840,22 +898,22 @@ def get_ebitda_margin(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
         f"margin by the whole of D&A.",
         operating_income=operating_income,
         operating_income_concept=operating_income_concept,
-        revenue=revenue, currency=currency, period_end=period_end)
+        revenue=revenue, currency=currency, period_end=period_end), filing)
 
     if not revenue:
-      return _ebitda_result(
+      return _with_read_from(_ebitda_result(
         ticker, 'not_covered', revenue_data.get('error'),
         operating_income=operating_income,
         operating_income_concept=operating_income_concept,
         d_and_a=d_and_a, d_and_a_concept=d_and_a_concept,
-        period_end=period_end)
+        period_end=period_end), filing)
 
-    return _ebitda_result(
+    return _with_read_from(_ebitda_result(
       ticker, 'full', None,
       operating_income=operating_income,
       operating_income_concept=operating_income_concept,
       d_and_a=d_and_a, d_and_a_concept=d_and_a_concept,
-      revenue=revenue, currency=currency, period_end=period_end)
+      revenue=revenue, currency=currency, period_end=period_end), filing)
 
   except Exception as e:  # noqa: BLE001 - reported, never swallowed
     return _ebitda_result(
@@ -907,10 +965,10 @@ def get_capex_pct_revenue(ticker: str, form_type: str = '10-K') -> Dict[str, Any
             total_capex += result['value']
 
         if total_capex == 0:
-          return{
+          return _with_read_from({
             'error': f'Unable to find any concepts for {ticker}',
             'success': False
-          }
+          }, filing)
 
       # now that we have the capex value we can get the percentage
       revenue_data = get_revenue_base(ticker, form_type)
@@ -919,7 +977,7 @@ def get_capex_pct_revenue(ticker: str, form_type: str = '10-K') -> Dict[str, Any
       revenue = revenue_data['revenue_base']  # already in raw dollars
       capex_pct = (total_capex / revenue) * 100
 
-      return{
+      return _with_read_from({
         'error': None,
         'success': True,
         'ticker': ticker,
@@ -928,10 +986,10 @@ def get_capex_pct_revenue(ticker: str, form_type: str = '10-K') -> Dict[str, Any
         'capex_pct_revenue': float(capex_pct),
         'capex_concept_used': capex_concept_used,
         'period_end': revenue_data['period_end']
-      }
+      }, filing)
     else:
       return {
-        'error': _filing_miss(ticker, form_type,
+        'error': _stated_miss(filing, ticker, form_type,
                               f"Unable to get xbrl data for: {ticker}"),
         'success': False
       }
@@ -974,22 +1032,22 @@ def get_tax_rate(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
       # default used to be 0.0, which returned an effective rate of 0% for a
       # filer whose tax line the chain could not reach.
       if tax_expense is None:
-        return{
+        return _with_read_from({
           'error': (f'{ticker} tags no income tax expense concept in its '
                     f'{form_type}. Tried: {", ".join(TAX_EXPENSE_CONCEPTS)}'),
           'success': False
-        }
+        }, filing)
 
       # calulate the effective tax rate: Effective tax rate = provision for income taxes / earnings before taxes
       if pretax_income != 0: # prevent divide by 0 error
         effective_tax_rate = (tax_expense / pretax_income) * 100
       else:
-        return{
+        return _with_read_from({
           'error': f"pretax income is 0, unable to calculate effective tax rate",
           'success': False
-        }
+        }, filing)
 
-      return{
+      return _with_read_from({
         'error': None,
         'success': True,
         'effective_tax_rate': effective_tax_rate,
@@ -997,11 +1055,11 @@ def get_tax_rate(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
         'tax_concept_used': tax_concept_used,
         'pretax_income': pretax_income,
         'pretax_concept_used': pretax_concept_used
-      }
+      }, filing)
 
     else:
       return{
-        'error': _filing_miss(ticker, form_type,
+        'error': _stated_miss(filing, ticker, form_type,
                               f'Unable to get xbrl data for {ticker}'),
         'success': False
       }
@@ -1032,10 +1090,10 @@ def get_depreciation(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
           break
 
       if d_a_value == 0.0:
-        return{
+        return _with_read_from({
           'error': f"Unable to find concept for {ticker}: Concepts used = {list(DA_CONCEPTS)}",
           'success': False
-        }
+        }, filing)
 
       revenue_data = get_revenue_base(ticker, form_type)
 
@@ -1047,18 +1105,18 @@ def get_depreciation(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
       # now we have the d_a value and revenue so we can calulate deprceication %
       d_a_pct = (d_a_value / revenue) * 100
 
-      return{
+      return _with_read_from({
         'error': None,
         'success': True,
         'd&a_pct': d_a_pct,
         'concept': d_a_concept,
         'd&a': d_a_value,
         'revenue': revenue
-      }
+      }, filing)
 
     else:
       return{
-        'error': _filing_miss(ticker, form_type,
+        'error': _stated_miss(filing, ticker, form_type,
                               f"Unable to get filing for {ticker}"),
         'success': False
       }
@@ -1225,14 +1283,16 @@ def get_margin_breakdown(ticker: str, form_type: str = '10-K') -> Dict[str, Any]
   try:
     filing_data = get_latest_filing(ticker, form_type)
     if not filing_data or not filing_data.get('xbrl_data'):
-      return {'error': _filing_miss(ticker, form_type,
+      return {'error': _stated_miss(filing_data, ticker, form_type,
                                     f'No filing found for {ticker}'),
               'success': False}
 
     xbrl = filing_data['xbrl_data']
     rev_tuple = _get_revenue_from_xbrl(xbrl, form_type)
     if rev_tuple is None:
-      return {'ticker': ticker, 'error': 'No revenue concept found', 'success': False}
+      return _with_read_from(
+          {'ticker': ticker, 'error': 'No revenue concept found', 'success': False},
+          filing_data)
     revenue, period_end = rev_tuple
 
     result = {'ticker': ticker, 'revenue': revenue, 'period_end': period_end, 'success': True}
@@ -1305,7 +1365,7 @@ def get_margin_breakdown(ticker: str, form_type: str = '10-K') -> Dict[str, Any]
     if 'gross_profit' not in result:
       print(f"[Validate SEC] {ticker}: gross_profit XBRL concept not found (expected for banks/financials)",
             file=sys.stderr, flush=True)
-    return result
+    return _with_read_from(result, filing_data)
 
   except Exception as e:
     return {'ticker': ticker, 'error': f'get_margin_breakdown failed: {e}', 'success': False}
@@ -1364,7 +1424,7 @@ def get_historical_fcf(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
   try:
     filing_data = get_latest_filing(ticker, form_type)
     if not filing_data or not filing_data.get('xbrl_data'):
-      return {'error': _filing_miss(ticker, form_type,
+      return {'error': _stated_miss(filing_data, ticker, form_type,
                                     f'No filing found for {ticker}'),
               'success': False}
 
@@ -1435,7 +1495,7 @@ def get_historical_fcf(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
                   f'cash flow cannot be computed. Tried: '
                   f'{", ".join(CAPEX_CONCEPTS)}'),
       })
-      return result
+      return _with_read_from(result, filing_data)
 
     fcf = ocf - capex
     result.update({
@@ -1445,7 +1505,7 @@ def get_historical_fcf(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
       'success': True,
       'error': None,
     })
-    return result
+    return _with_read_from(result, filing_data)
   except Exception as e:
     return {'ticker': ticker, 'error': f'get_historical_fcf failed: {e}', 'success': False}
 
@@ -1459,7 +1519,7 @@ def get_working_capital(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
   try:
     filing_data = get_latest_filing(ticker, form_type)
     if not filing_data or not filing_data.get('xbrl_data'):
-      return {'error': _filing_miss(ticker, form_type, 'No filing'),
+      return {'error': _stated_miss(filing_data, ticker, form_type, 'No filing'),
               'success': False}
 
     xbrl = filing_data['xbrl_data']
@@ -1482,7 +1542,7 @@ def get_working_capital(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
     nwc = ca['value'] - cl['value']
     revenue = rev_tuple[0] if rev_tuple else None
 
-    return {
+    return _with_read_from({
       'ticker': ticker,
       'current_assets': ca['value'],
       'current_liabilities': cl['value'],
@@ -1493,7 +1553,7 @@ def get_working_capital(ticker: str, form_type: str = '10-K') -> Dict[str, Any]:
       'accounts_payable': ap['value'] if ap else None,
       'period_end': ca['period_end'],
       'success': True
-    }
+    }, filing_data)
   except Exception as e:
     return {'ticker': ticker, 'error': f'get_working_capital failed: {e}', 'success': False}
 
