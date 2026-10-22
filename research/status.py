@@ -186,8 +186,21 @@ def _job_state(spec: Dict[str, Any], as_of: str) -> Dict[str, Any]:
         if age > spec["stale_after_days"]:
             out["state"] = "stale"
 
-    start = (date.fromisoformat(as_of) - timedelta(days=14)).isoformat()
-    out["gaps"] = len(pit_store.missing_days(job, start, as_of))
+    # Gaps in the trailing 14-day window.
+    # Clamped to the first date the job ever ran for: before that the job did
+    # not exist, so those weekdays are not missed nights (matches
+    # `daily_job.coverage_gaps`).
+    # Ends on the day before `as_of`: `research-status` runs at midday (12:00
+    # UTC) while nightly jobs run at 22:30 UTC, so today is not counted as a
+    # gap before its run is due (matches `daily_job.backfill`, "never today").
+    first = pit_store.first_run(job)
+    window_start = (date.fromisoformat(as_of) - timedelta(days=14)).isoformat()
+    start = max(window_start, first) if first else window_start
+    yesterday = (date.fromisoformat(as_of) - timedelta(days=1)).isoformat()
+    if start > yesterday:
+        out["gaps"] = 0
+    else:
+        out["gaps"] = len(pit_store.missing_days(job, start, yesterday))
     return out
 
 

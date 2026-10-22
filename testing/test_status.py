@@ -286,6 +286,61 @@ def test_the_store_summary_counts_rows_and_bytes(store):
     assert summary["path"].endswith(".db")
 
 
+# --- gap window: clamped to first_run, ending on yesterday ("never today") ---
+
+def test_job_first_run_three_days_ago_reports_no_gaps_from_before_first_run(store):
+    """Before its first run the job did not exist, so those weekdays are not
+    missed nights. The window must clamp to first_run(job)."""
+    # 2026-10-22 is Thursday. 14 days back is 2026-10-08.
+    # First run on Monday 2026-10-19 (3 days before 2026-10-22).
+    # Ran Monday, Tuesday, Wednesday.
+    for day in ["2026-10-19", "2026-10-20", "2026-10-21"]:
+        store.start_run("scan", as_of_date=day)
+        store.finish_run(rows_written=10, status="ok")
+
+    row = _job(status.collect(as_of="2026-10-22"), "scan")
+
+    assert row["gaps"] == 0
+
+
+def test_job_that_ran_every_weekday_through_yesterday_reports_zero_gaps_before_todays_run(
+        store):
+    """research-status runs at midday (12:00 UTC) while nightly jobs run at
+    22:30 UTC. The window must end on the day before as_of so today is not
+    counted as a gap before its run is due."""
+    # 2026-10-22 is Thursday.
+    # Job has run every weekday from 2026-10-08 through 2026-10-21.
+    weekdays = [
+        "2026-10-08", "2026-10-09",
+        "2026-10-12", "2026-10-13", "2026-10-14", "2026-10-15", "2026-10-16",
+        "2026-10-19", "2026-10-20", "2026-10-21",
+    ]
+    for day in weekdays:
+        store.start_run("scan", as_of_date=day)
+        store.finish_run(rows_written=10, status="ok")
+
+    row = _job(status.collect(as_of="2026-10-22"), "scan")
+
+    assert row["gaps"] == 0
+
+
+def test_weekday_really_missed_inside_window_is_still_counted_as_gap(store):
+    """A genuine missed weekday between first_run and yesterday must still
+    be counted as a gap."""
+    # First run on 2026-10-15 (Thu).
+    # Ran 2026-10-15, 2026-10-16 (Fri).
+    # Missed 2026-10-19 (Mon).
+    # Ran 2026-10-20 (Tue), 2026-10-21 (Wed).
+    for day in ["2026-10-15", "2026-10-16", "2026-10-20", "2026-10-21"]:
+        store.start_run("scan", as_of_date=day)
+        store.finish_run(rows_written=10, status="ok")
+
+    row = _job(status.collect(as_of="2026-10-22"), "scan")
+
+    assert row["gaps"] == 1
+
+
+
 def _job(report, name):
     match = [j for j in report["jobs"] if j["job"] == name]
     assert match, f"{name} not in the report"
