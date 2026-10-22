@@ -550,6 +550,23 @@ def test_the_summary_splits_by_the_hour(store):
     assert out["by_timing"]["bmo"]["mean_net_bps"] < 0
 
 
+def test_the_summary_splits_by_side(store):
+    """Long and short are fundamentally different books; an aggregate mean over
+    both hides whether edge exists on either side, and the split is free."""
+    _calendar(store)
+    _order(store, ticker="L", side="long", session=DAYS[1], cost_bps=0.0)
+    _bars(store, "L", [100.0] * 3 + [110.0] * 5)
+    _order(store, ticker="S", side="short", session=DAYS[1], cost_bps=0.0, borrow_bps=10.0)
+    _bars(store, "S", [100.0] * 3 + [90.0] * 5)
+
+    out = scoring.score_orders(as_of=DAYS[20], horizon_days=4)
+    assert out["sample"] == 2
+    assert out["by_side"]["long"]["sample"] == 1
+    assert out["by_side"]["short"]["sample"] == 1
+    assert out["by_side"]["long"]["mean_net_bps"] == pytest.approx(1000.0)
+    assert out["by_side"]["short"]["mean_net_bps"] == pytest.approx(990.0)
+
+
 def test_the_split_is_absent_rather_than_empty_when_nothing_scored(store):
     out = scoring.score_orders(as_of=DAYS[20], horizon_days=4)
     assert out["by_timing"] == {}

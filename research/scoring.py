@@ -120,6 +120,7 @@ def score_orders(as_of: Optional[str] = None,
             "gate": gate,
             "by_timing": split_by_timing(scored, comparisons),
             "by_variant": split_by_variant(scored, comparisons),
+            "by_side": split_by_side(scored, comparisons),
             **_summarise(scored, comparisons=comparisons)}
 
 
@@ -305,6 +306,15 @@ def split_by_timing(scored: List[Dict[str, Any]],
     return {hour: _summarise(
         [r for r in scored if (r.get("timing") or "unknown") == hour],
         comparisons=comparisons * len(hours)) for hour in hours}
+
+
+def split_by_side(scored: List[Dict[str, Any]],
+                  comparisons: int = 1) -> Dict[str, Any]:
+    """The same numbers per trade side (long, short)."""
+    sides = sorted({r.get("side") or "unknown" for r in scored})
+    return {side: _summarise(
+        [r for r in scored if (r.get("side") or "unknown") == side],
+        comparisons=comparisons) for side in sides}
 
 
 def _timing_of(order: Dict[str, Any], as_of: str) -> str:
