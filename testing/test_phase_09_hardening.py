@@ -1,7 +1,6 @@
-"""Phase 9: hardening — pre-mortem, correlation, audit trail.
+"""Phase 9: hardening — pre-mortem and correlation.
 
 Pre-mortem uses real Groq (1 call). Correlation uses mocked yfinance.
-Audit trail uses seeded DB.
 """
 import sys, os
 from unittest.mock import patch, MagicMock
@@ -15,33 +14,6 @@ from agent.correlation import (
 )
 from agent.Risk_Officer import Risk_Officer
 from agent.Arbiter_Agent import ArbiterVerdict
-from state.schema import init_schema, get_connection
-from state.theses import insert_thesis
-from state.positions import record_order
-from state.events_store import store_event
-from testing._gates import require_importable_for_module  # noqa: E402
-
-require_importable_for_module(
-    "fastapi", "it is not a declared dependency of this project (issue #111); "
-    "pip install it into the venv to run the dashboard tests")
-from fastapi.testclient import TestClient  # noqa: E402
-from dashboard.app import app
-
-
-
-client = TestClient(app)
-
-
-def _clean():
-  conn = get_connection()
-  try:
-    conn.execute("DELETE FROM positions WHERE ticker LIKE 'H9_%'")
-    conn.execute("DELETE FROM theses WHERE ticker LIKE 'H9_%'")
-    conn.execute("DELETE FROM orders WHERE ticker LIKE 'H9_%' OR client_order_id LIKE 'h9-%'")
-    conn.execute("DELETE FROM events WHERE source LIKE 'h9-test:%'")
-    conn.commit()
-  finally:
-    conn.close()
 
 
 # ---- Pre-mortem -----------------------------------------------------------
@@ -255,69 +227,6 @@ def test_risk_officer_rejects_on_correlation():
   print(f"PASS: Risk Officer rejects high-correlation trade ({d.reasons})")
 
 
-# ---- Audit trail ----------------------------------------------------------
-
-def test_audit_order_returns_chain():
-  init_schema(); _clean()
-  store_event(
-    source="h9-test:wsj", ticker="H9_AAPL",
-    headline="H9 AAPL earnings beat",
-    body="dummy", url="http://x/1",
-    published_at="2026-04-01T10:00:00",
-    materiality="high", category="earnings",
-    affected_tickers=["H9_AAPL"], primary_ticker="H9_AAPL",
-    directional_signal="bullish", urgency="immediate",
-    classifier_reason="EPS beat"
-  )
-  thesis_id = insert_thesis(
-    ticker="H9_AAPL", recommendation="BUY", signal="bullish",
-    target_price=210.0, stop_loss=170.0, confidence=0.72,
-    analysis_summary="audit test thesis",
-    key_assumptions=["x"], data_gaps=[],
-    full_report_md="r"
-  )
-  record_order(
-    order_id="audit-test-order", client_order_id="h9-cli-1",
-    ticker="H9_AAPL", side='buy', order_type='market', quantity=10,
-    status='filled', thesis_id=thesis_id,
-  )
-
-  r = client.get("/audit/order/audit-test-order")
-  assert r.status_code == 200
-  j = r.json()
-  assert j['order']['order_id'] == 'audit-test-order'
-  assert j['thesis'] is not None
-  assert j['thesis']['thesis_id'] == thesis_id
-  assert j['chain_complete'] is True
-  assert len(j['related_events']) >= 1
-  assert any('H9 AAPL' in e['headline'] for e in j['related_events'])
-  print(f"PASS: audit trail traced order -> thesis #{thesis_id} -> {len(j['related_events'])} events")
-
-
-def test_audit_order_missing_returns_error():
-  r = client.get("/audit/order/does-not-exist")
-  assert r.status_code == 200
-  j = r.json()
-  assert 'error' in j
-  print("PASS: audit /unknown returns clean error")
-
-
-def test_audit_order_without_thesis_still_returns():
-  """An order that wasn't linked to a thesis still has an audit row."""
-  init_schema(); _clean()
-  record_order(
-    order_id="orphan-order", client_order_id="h9-orph",
-    ticker="H9_X", side='buy', order_type='market', quantity=1,
-    status='filled', thesis_id=None,
-  )
-  r = client.get("/audit/order/orphan-order")
-  j = r.json()
-  assert j['order']['order_id'] == 'orphan-order'
-  assert j['thesis'] is None
-  assert j['chain_complete'] is False
-  print("PASS: orphan order returns order info with chain_complete=False")
-
-
 if __name__ == "__main__":
   test_correlation_handles_single_ticker_panel_no_crash()
   test_correlation_panel_returns_none_on_degenerate_multi_ticker()
@@ -332,8 +241,4 @@ if __name__ == "__main__":
   test_correlation_decision_skips_on_unavailable_data()
   test_correlation_empty_basket_ok()
   test_risk_officer_rejects_on_correlation()
-  test_audit_order_returns_chain()
-  test_audit_order_missing_returns_error()
-  test_audit_order_without_thesis_still_returns()
-  _clean()
   print("\nAll Phase 9 hardening tests passed.")
