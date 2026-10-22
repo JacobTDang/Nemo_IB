@@ -66,11 +66,17 @@ FETCH_RETRY_BACKOFF = 3.0
 
 # Phrases that name the diluted per-share figure. Each requires "diluted", so
 # a basic-EPS sentence never matches.
+# "fully" sits between "per" and "diluted" in a bank headline ("$1.83 per
+# fully diluted common share"). "per basic and diluted share" is one figure
+# for both bases, which is not a basic figure. "(diluted)" after "per common
+# share" is the same label written the other way around.
 _DILUTED = re.compile(
-    r"(?:per\s+diluted\s+(?:common\s+)?share"
+    r"(?:per\s+(?:fully\s+)?diluted\s+(?:common\s+)?share"
     r"|diluted\s+(?:net\s+)?(?:earnings|income|loss|eps)(?:\s+per\s+(?:common\s+)?share)?"
     r"|(?:earnings|income|loss)\s+per\s+diluted\s+(?:common\s+)?share"
-    r"|diluted\s+eps)", re.I)
+    r"|diluted\s+eps"
+    r"|per\s+basic\s+and\s+diluted\s+share"
+    r"|per\s+(?:common\s+)?share\s*\(\s*diluted\s*\))", re.I)
 
 # The unqualified form banks use: "$7.70 per share", "EPS of $7.70". Accepted
 # only in a sentence that is about earnings and not about a distribution.
