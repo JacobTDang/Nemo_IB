@@ -627,7 +627,7 @@ separates them, so the report reads the log. Four states matter:
 |---|---|
 | `never` | no run at all. Raised only when the store is older than that job's own tolerance. Until then the job is not due yet and shows `~`. A store with no runs is always raised |
 | `crashed` | a run started and never finished, so the process died |
-| `stale` | the last success is older than that job's own tolerance |
+| `stale` | the last finished run is older than that job's own tolerance. A job that runs on weekdays counts weekdays, so a weekend does not make it stale |
 | `failed` | the run finished and reported failure, with the reason |
 
 `activist_watch` is expected to report `partial` every pass, because it watches

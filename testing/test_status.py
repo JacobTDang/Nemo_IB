@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import json
 import pathlib
+from datetime import date, timedelta
 
 import pytest
 
-from research import pit_store, status
+from research import pit_store, scanner, status
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -339,6 +340,103 @@ def test_weekday_really_missed_inside_window_is_still_counted_as_gap(store):
 
     assert row["gaps"] == 1
 
+
+# --- staleness measured in weekdays for weekday jobs -----------------------
+
+def test_a_friday_run_read_on_monday_is_not_stale(store):
+    """activist_watch runs on weekdays (13-23 UTC) and research-status runs
+    at 12:00 UTC. On Monday at 12:00, Friday's run is one weekday old, not
+    three calendar days old, so it is not stale."""
+    # 2026-10-23 is Friday, 2026-10-26 is Monday.
+    store.start_run("activist_watch", as_of_date="2026-10-23")
+    store.finish_run(rows_written=10, status="ok")
+
+    row = _job(status.collect(as_of="2026-10-26"), "activist_watch")
+
+    assert row["age_days"] == 1
+    assert row["state"] == "ok"
+
+
+def test_a_weekday_job_that_missed_a_whole_weekday_is_stale(store):
+    """A weekday job that missed a whole weekday (e.g. last run Thursday, read
+    Monday at 12:00) missed Friday; age is two weekdays and the job is stale."""
+    # 2026-10-22 is Thursday, 2026-10-26 is Monday.
+    store.start_run("activist_watch", as_of_date="2026-10-22")
+    store.finish_run(rows_written=10, status="ok")
+
+    row = _job(status.collect(as_of="2026-10-26"), "activist_watch")
+
+    assert row["age_days"] == 2
+    assert row["state"] == "stale"
+
+
+def test_a_saturday_job_still_uses_calendar_days(store):
+    """Score runs on Saturday and its tolerance is calendar days, not
+    weekdays. Silent for 11 calendar days (which is only 8 weekdays), it
+    must be reported as stale."""
+    # 2026-10-10 is Saturday. 2026-10-21 is Wednesday (11 calendar days later,
+    # but only 8 weekdays: Oct 12-16 and 19-21). Tolerance is 10 days.
+    store.start_run("score", as_of_date="2026-10-10")
+    store.finish_run(rows_written=10, status="ok")
+
+    row = _job(status.collect(as_of="2026-10-21"), "score")
+
+    assert row["age_days"] == 11
+    assert row["state"] == "stale"
+
+
+def test_a_weeknight_job_that_missed_one_night_is_not_stale(store):
+    """The tolerance is the schedule plus room for one missed run. Thursday's
+    run read on Monday missed only Friday night."""
+    store.start_run("daily_bars", as_of_date="2026-10-22")
+    store.finish_run(rows_written=10, status="ok")
+
+    row = _job(status.collect(as_of="2026-10-26"), "daily_bars")
+
+    assert row["age_days"] == 2
+    assert row["state"] == "ok"
+
+
+def test_a_weeknight_job_that_missed_two_nights_is_stale(store):
+    """Wednesday's run read on Monday missed Thursday and Friday nights."""
+    store.start_run("daily_bars", as_of_date="2026-10-21")
+    store.finish_run(rows_written=10, status="ok")
+
+    report = status.collect(as_of="2026-10-26")
+
+    assert _job(report, "daily_bars")["state"] == "stale"
+    assert ("daily_bars last ran 3 weekdays ago, for 2026-10-21"
+            in report["attention"])
+
+
+def test_a_recorder_is_raised_before_the_scanner_refuses_it():
+    """The scanner refuses once a recorder's last run is more than
+    MAX_RECORDER_GAP_DAYS calendar days old. The report counts weekdays for
+    these jobs, so its tolerance must still be crossed first, on every
+    weekday it runs and whatever day the last run was."""
+    monday = date(2026, 10, 5)
+    for spec in [s for s in status.JOBS if s["job"] in scanner.RECORDER_JOBS]:
+        for offset in range(14):
+            as_of = monday + timedelta(days=offset)
+            if as_of.weekday() >= 5:
+                continue
+            for gap in range(scanner.MAX_RECORDER_GAP_DAYS + 1, 21):
+                last = as_of - timedelta(days=gap)
+                age = status._age(spec, as_of.isoformat(), last.isoformat())
+                assert age > spec["stale_after_days"], (
+                    f"{spec['job']} last ran {last}, read {as_of}: the scanner "
+                    f"refuses it and the report calls it fresh")
+
+
+def test_a_weekday_job_that_never_ran_is_not_due_over_a_weekend(store):
+    """The store's first run was Friday. On Monday a weeknight job with no run
+    has had one weekday to run on, not three days."""
+    store.start_run("daily_bars", as_of_date="2026-10-23")
+    store.finish_run(rows_written=1565, status="ok")
+
+    attention = status.collect(as_of="2026-10-26")["attention"]
+
+    assert not any(a.startswith("newcomers ") for a in attention), attention
 
 
 def _job(report, name):
