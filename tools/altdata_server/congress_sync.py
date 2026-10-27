@@ -209,7 +209,7 @@ def sync_house_ptrs(year: int, max_filings: Optional[int] = None,
 
     store.record_sync(f"house_ptr_{year}", filings_seen=len(by_id),
                       filings_parsed=parsed, filings_failed=failed + scanned,
-                      cursor=str(year))
+                      cursor=str(year), success=(blocked is None))
     _log(f"[house {year}] seen={len(by_id)} held={already_held} "
          f"parsed={parsed} scans={scanned} errors={failed} "
          f"remaining={remaining}"
@@ -309,7 +309,7 @@ def sync_senate_ptrs(days: int = 90, max_filings: Optional[int] = None,
 
     store.record_sync("senate_ptr", filings_seen=len(by_id),
                       filings_parsed=parsed, filings_failed=failed + scanned,
-                      cursor=since)
+                      cursor=since, success=(blocked is None))
     _log(f"[senate {days}d] seen={len(by_id)} held={already_held} "
          f"parsed={parsed} scans={scanned} errors={failed} "
          f"remaining={remaining}"
@@ -558,7 +558,7 @@ def sync_senate_annuals(since: str = "01/01/2026",
 
     store.record_sync("senate_annual", filings_seen=len(by_id),
                       filings_parsed=parsed, filings_failed=failed + scanned,
-                      cursor=since)
+                      cursor=since, success=(blocked is None))
     _log(f"[senate annual] seen={len(by_id)} held={already_held} "
          f"parsed={parsed} scans={scanned} errors={failed} "
          f"remaining={remaining}"

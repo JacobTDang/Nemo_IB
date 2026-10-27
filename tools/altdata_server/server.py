@@ -137,7 +137,9 @@ def _run_subprocess(runner_path: str, tool_name: str, kwargs: dict,
 # ---------------------------------------------------------------------------
 
 def _envelope(data: Any, tool: str, ticker: str = "",
-               errors: Optional[List[str]] = None) -> Dict[str, Any]:
+               errors: Optional[List[str]] = None,
+               warnings: Optional[List[Dict[str, Any]]] = None
+               ) -> Dict[str, Any]:
     payload = {
         "domain": "alt_data",
         "ticker": ticker,
@@ -147,6 +149,8 @@ def _envelope(data: Any, tool: str, ticker: str = "",
         "data": data,
         "metadata": {"errors": errors or []},
     }
+    if warnings:
+        payload["warnings"] = warnings
     if errors:
         # Beside `success`, where a caller looks. The reason was already here
         # in metadata.errors and in data.error, and neither is the key anyone
@@ -158,9 +162,12 @@ def _envelope(data: Any, tool: str, ticker: str = "",
     return payload
 
 
-def _ok(tool: str, data: Any, ticker: str = "") -> List[TextContent]:
+def _ok(tool: str, data: Any, ticker: str = "",
+        warnings: Optional[List[Dict[str, Any]]] = None) -> List[TextContent]:
     return [TextContent(type="text",
-                        text=json.dumps(_envelope(data, tool, ticker), default=str))]
+                        text=json.dumps(_envelope(data, tool, ticker,
+                                                  warnings=warnings),
+                                        default=str))]
 
 
 def _err(tool: str, msg: str, ticker: str = "") -> List[TextContent]:
@@ -169,7 +176,8 @@ def _err(tool: str, msg: str, ticker: str = "") -> List[TextContent]:
                                         default=str))]
 
 
-def _fail(tool: str, data: Any, msg: str, ticker: str = "") -> List[TextContent]:
+def _fail(tool: str, data: Any, msg: str, ticker: str = "",
+          warnings: Optional[List[Dict[str, Any]]] = None) -> List[TextContent]:
     """A lookup that could not be performed, with its diagnostic payload kept.
 
     `_err` drops the data, which throws away what was tried and why it failed.
@@ -177,11 +185,14 @@ def _fail(tool: str, data: Any, msg: str, ticker: str = "") -> List[TextContent]
     the providers/queries attempted), so the failure envelope carries it.
     """
     return [TextContent(type="text",
-                        text=json.dumps(_envelope(data, tool, ticker, errors=[msg]),
+                        text=json.dumps(_envelope(data, tool, ticker, errors=[msg],
+                                                  warnings=warnings),
                                         default=str))]
 
 
-def _dispatch(tool: str, result: Dict[str, Any], ticker: str = "") -> List[TextContent]:
+def _dispatch(tool: str, result: Dict[str, Any], ticker: str = "",
+              warnings: Optional[List[Dict[str, Any]]] = None
+              ) -> List[TextContent]:
     """Route a fetcher result to the success or failure envelope.
 
     `success: false` in the fetcher payload means the lookup could not be
@@ -191,8 +202,9 @@ def _dispatch(tool: str, result: Dict[str, Any], ticker: str = "") -> List[TextC
     """
     if result.get("success") is False:
         return _fail(tool, result,
-                     result.get("error") or f"{tool} lookup failed", ticker)
-    return _ok(tool, result, ticker)
+                     result.get("error") or f"{tool} lookup failed", ticker,
+                     warnings=warnings)
+    return _ok(tool, result, ticker, warnings=warnings)
 
 
 # ---------------------------------------------------------------------------
@@ -2952,6 +2964,37 @@ warnings_per_tool={
     )
 
     @staticmethod
+    def _sync_warnings(chamber: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Name each chamber whose store is older than its sync tolerance.
+
+        A blocked or failed sync leaves the store as it was, so without this
+        an answer read from it is as old as the last sync that worked and
+        says nothing about it.
+        """
+        from . import congress_store as cstore
+
+        found = []
+        for target in [chamber] if chamber else ["house", "senate"]:
+            last = cstore.last_successful_sync(target)
+            if last is None:
+                found.append(warning(
+                    "no_successful_sync",
+                    f"No {target} sync has completed unblocked, so {target} "
+                    f"filings may be missing from this answer.",
+                    chamber=target))
+                continue
+            age = datetime.now(timezone.utc) - datetime.fromisoformat(last)
+            if age > timedelta(days=cstore.CONGRESS_SYNC_STALE_DAYS):
+                found.append(warning(
+                    "stale_chamber_sync",
+                    f"The last {target} sync that completed unblocked ran at "
+                    f"{last}, {age.days} days ago, past the "
+                    f"{cstore.CONGRESS_SYNC_STALE_DAYS}-day tolerance. Filings "
+                    f"made since then are not in this answer.",
+                    chamber=target, last_successful_sync=last))
+        return found
+
+    @staticmethod
     def _mark_empty(result: Dict[str, Any]) -> Dict[str, Any]:
         """An empty store must never read as an empty record."""
         if not result.get("coverage", {}).get("total"):
@@ -2980,7 +3023,8 @@ warnings_per_tool={
         except Exception as exc:  # noqa: BLE001 - surfaced, never masked
             return _err("get_congress_trades",
                         f"{type(exc).__name__}: {str(exc)[:200]}")
-        return _dispatch("get_congress_trades", self._mark_empty(result))
+        return _dispatch("get_congress_trades", self._mark_empty(result),
+                         warnings=self._sync_warnings(args.get("chamber")))
 
     async def congress_leaderboard(self, args: Dict[str, Any]) -> List[TextContent]:
         from . import congress_queries as queries
@@ -2998,7 +3042,8 @@ warnings_per_tool={
         except Exception as exc:  # noqa: BLE001 - surfaced, never masked
             return _err("get_congress_leaderboard",
                         f"{type(exc).__name__}: {str(exc)[:200]}")
-        return _dispatch("get_congress_leaderboard", self._mark_empty(result))
+        return _dispatch("get_congress_leaderboard", self._mark_empty(result),
+                         warnings=self._sync_warnings(args.get("chamber")))
 
     async def congress_holdings(self, args: Dict[str, Any]) -> List[TextContent]:
         from . import congress_queries as queries
@@ -3019,7 +3064,8 @@ warnings_per_tool={
         except Exception as exc:  # noqa: BLE001 - surfaced, never masked
             return _err("get_congress_holdings",
                         f"{type(exc).__name__}: {str(exc)[:200]}")
-        return _dispatch("get_congress_holdings", self._mark_empty(result))
+        return _dispatch("get_congress_holdings", self._mark_empty(result),
+                         warnings=self._sync_warnings("senate"))
 
     async def congress_coverage(self, args: Dict[str, Any]) -> List[TextContent]:
         from . import congress_store as cstore
@@ -3041,7 +3087,8 @@ warnings_per_tool={
         overall["by_chamber"] = per_chamber
         overall["note"] = note
         overall["database"] = cstore.current_db_path()
-        return _dispatch("get_congress_coverage", overall)
+        return _dispatch("get_congress_coverage", overall,
+                         warnings=self._sync_warnings())
 
     async def taiwan_monthly_revenue(self, args: Dict[str, Any]) -> List[TextContent]:
         codes = args.get("company_codes", [])

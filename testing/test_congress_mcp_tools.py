@@ -7,6 +7,7 @@ from an empty store is the most misleading answer this pipeline could give.
 It has to say that it is empty and how to fill it.
 """
 import json
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -91,3 +92,65 @@ async def test_every_congress_tool_is_registered_and_dispatchable(server):
                  "get_congress_coverage"):
         assert f'name="{name}"' in source, f"{name} is not advertised"
         assert f'if name == "{name}"' in source, f"{name} has no dispatch branch"
+
+
+def _synced(source, when):
+    with store.connect() as conn:
+        conn.execute(
+            """INSERT INTO sync_state(source, last_synced_at, last_cursor,
+                    filings_seen, filings_parsed, filings_failed)
+               VALUES(?, ?, NULL, 1, 1, 0)""", (source, when))
+
+
+def _hours_ago(hours):
+    return (datetime.now(timezone.utc)
+            - timedelta(hours=hours)).isoformat(timespec="seconds")
+
+
+def _sync_warnings(body):
+    """The envelope carries `warnings` only when there is one; the server's
+    annotation adds the empty list on the way out."""
+    return {w["chamber"]: w["code"] for w in body.get("warnings", [])
+            if w["code"] in ("stale_chamber_sync", "no_successful_sync")}
+
+
+async def test_coverage_reports_each_chambers_last_successful_sync(
+        server, empty_store):
+    _synced("house_ptr_2026", "2026-10-26T06:00:00+00:00")
+    _synced("senate_ptr", "2026-10-23T06:00:00+00:00")
+
+    data = _payload(await server.congress_coverage({}))["data"]
+
+    assert data["by_chamber"]["house"]["last_successful_sync"] == (
+        "2026-10-26T06:00:00+00:00")
+    assert data["by_chamber"]["senate"]["last_successful_sync"] == (
+        "2026-10-23T06:00:00+00:00")
+
+
+async def test_a_chamber_past_its_sync_tolerance_is_named_in_every_answer(
+        server, empty_store):
+    """The daily sync's tolerance is three days: a Senate store four days
+    behind is named, a House store two days behind is not."""
+    _synced("house_ptr_2026", _hours_ago(48))
+    _synced("senate_ptr", _hours_ago(96))
+
+    both = _payload(await server.congress_trades({"ticker": "NVDA"}))
+    house = _payload(await server.congress_trades({"ticker": "NVDA",
+                                                   "chamber": "house"}))
+    board = _payload(await server.congress_leaderboard({"kind": "tickers"}))
+    held = _payload(await server.congress_holdings({"ticker": "MSFT"}))
+    coverage = _payload(await server.congress_coverage({}))
+
+    assert _sync_warnings(both) == {"senate": "stale_chamber_sync"}
+    assert _sync_warnings(house) == {}
+    assert _sync_warnings(board) == {"senate": "stale_chamber_sync"}
+    assert _sync_warnings(held) == {"senate": "stale_chamber_sync"}
+    assert _sync_warnings(coverage) == {"senate": "stale_chamber_sync"}
+
+
+async def test_a_chamber_that_never_synced_is_named(server, empty_store):
+    _synced("house_ptr_2026", _hours_ago(1))
+
+    body = _payload(await server.congress_trades({"ticker": "NVDA"}))
+
+    assert _sync_warnings(body) == {"senate": "no_successful_sync"}

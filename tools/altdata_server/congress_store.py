@@ -39,6 +39,15 @@ _DEFAULT_DB_PATH = os.path.join(_REPO_ROOT, "db_cache", "congress.db")
 PERMANENTLY_UNREADABLE = ("scanned",)
 PARSED = "parsed"
 
+# How old a chamber's last successful sync may be before every answer about
+# that chamber says so. The sync runs every day at 06:00 UTC, so three days is
+# room for two missed runs, and a source that refuses every run is named on
+# the third day.
+CONGRESS_SYNC_STALE_DAYS = 3
+
+# The sync_state sources that feed each chamber.
+_CHAMBER_SOURCES = {"house": "house_*", "senate": "senate_*"}
+
 
 def current_db_path() -> str:
     """Resolve the path on every call, never at import.
@@ -592,25 +601,41 @@ def coverage(chamber: Optional[str] = None) -> Dict[str, Any]:
         "parsed": parsed,
         "unparsed": total - parsed,
         "complete": total > 0 and parsed == total,
+        "last_successful_sync": last_successful_sync(chamber),
     }
 
 
 # -------------------------------------------------------------- sync state
 
+def last_successful_sync(chamber: Optional[str] = None) -> Optional[str]:
+    """When the newest unblocked sync ran, for one chamber or for all."""
+    pattern = "*" if chamber is None else _CHAMBER_SOURCES[chamber]
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT MAX(last_synced_at) FROM sync_state WHERE source GLOB ?",
+            (pattern,)).fetchone()
+    return row[0]
+
+
 def record_sync(source: str, filings_seen: int, filings_parsed: int,
-                filings_failed: int, cursor: Optional[str] = None) -> None:
+                filings_failed: int, cursor: Optional[str] = None,
+                success: bool = True) -> None:
+    """Record a run. A blocked run keeps the last successful time, so the
+    store never looks newer than the last run that read the source."""
     with connect() as conn:
         conn.execute(
             """INSERT INTO sync_state(source, last_synced_at, last_cursor,
                     filings_seen, filings_parsed, filings_failed)
                VALUES(?,?,?,?,?,?)
                ON CONFLICT(source) DO UPDATE SET
-                 last_synced_at = excluded.last_synced_at,
+                 last_synced_at = COALESCE(excluded.last_synced_at,
+                                           sync_state.last_synced_at),
                  last_cursor    = excluded.last_cursor,
                  filings_seen   = excluded.filings_seen,
                  filings_parsed = excluded.filings_parsed,
                  filings_failed = excluded.filings_failed""",
-            (source, _now(), cursor, filings_seen, filings_parsed, filings_failed))
+            (source, _now() if success else None, cursor, filings_seen,
+             filings_parsed, filings_failed))
 
 
 def sync_state(source: str) -> Optional[Dict[str, Any]]:
