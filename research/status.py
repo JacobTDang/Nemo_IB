@@ -38,7 +38,8 @@ from research import pit_store
 
 # Every scheduled job, the module that runs it, and how long it may be silent
 # before silence is a problem. The tolerances are the jobs' own schedules plus
-# room for one missed run, not round numbers.
+# room for one missed run, not round numbers. A job that runs only on weekdays
+# counts them in weekdays (see `_age`), so a weekend is not silence.
 #
 # `partial_is_normal` marks a job whose steady state is partial coverage.
 # `activist_watch` watches a time-bounded slice of the watchlist on purpose, so
@@ -50,24 +51,25 @@ from research import pit_store
 # report that quietly omits a job is worse than no report.
 JOBS = (
     {"job": "daily_bars", "module": "research.daily_job",
-     "every": "weeknight", "stale_after_days": 5,
+     "every": "weeknight", "stale_after_days": 2,
      "partial_is_normal": False},
     {"job": "newcomers", "module": "research.daily_job",
-     "every": "weeknight", "stale_after_days": 5,
+     "every": "weeknight", "stale_after_days": 2,
      "partial_is_normal": False},
     {"job": "universe", "module": "research.daily_job",
-     "every": "weeknight", "stale_after_days": 5,
+     "every": "weeknight", "stale_after_days": 2,
      "partial_is_normal": False},
     {"job": "consensus", "module": "research.daily_job",
-     "every": "weeknight", "stale_after_days": 5,
+     "every": "weeknight", "stale_after_days": 2,
      "partial_is_normal": False},
     {"job": "scan", "module": "research.scanner",
-     "every": "weeknight", "stale_after_days": 5,
+     "every": "weeknight", "stale_after_days": 2,
      "partial_is_normal": False},
     {"job": "activist_watch", "module": "research.activist_watch",
-     "every": "20 minutes", "stale_after_days": 2,
+     "every": "20 minutes", "stale_after_days": 1,
      # Bounded by a clock, so one pass covers a slice and never the
-     # whole watchlist. See `research.activist_watch`.
+     # whole watchlist. See `research.activist_watch`. One weekday with
+     # no finished pass is already dozens of missed runs.
      "partial_is_normal": True},
     {"job": "score", "module": "research.scoring",
      "every": "Saturday", "stale_after_days": 10,
@@ -82,10 +84,10 @@ JOBS = (
     # are in .env, so a job that has never run is shown, not raised. Once it
     # has run, a failure or a stall is raised like any other.
     {"job": "fill_submit", "module": "tools.alpaca.fills",
-     "every": "weekday", "stale_after_days": 5,
+     "every": "weekday", "stale_after_days": 2,
      "partial_is_normal": False, "optional": True},
     {"job": "fill_collect", "module": "tools.alpaca.fills",
-     "every": "weekday", "stale_after_days": 5,
+     "every": "weekday", "stale_after_days": 2,
      "partial_is_normal": False, "optional": True},
 )
 
@@ -93,6 +95,8 @@ JOBS = (
 HEADLINE_TABLES = ("daily_bar", "universe_snapshot", "consensus_snapshot",
                    "announcement", "paper_order", "activist_filing",
                    "borrow_rate", "run_log")
+
+WEEKDAY_SCHEDULES = ("weeknight", "weekday", "20 minutes")
 
 
 def _today() -> str:
@@ -131,6 +135,24 @@ def _last_run(job: str) -> Optional[Dict[str, Any]]:
             "SELECT * FROM run_log WHERE job = ? ORDER BY run_id DESC LIMIT 1",
             (job,)).fetchone()
     return dict(row) if row else None
+
+
+def _age(spec: Dict[str, Any], as_of: str, since: str) -> int:
+    """Days from `since` to `as_of`, in the unit of the job's tolerance.
+
+    A weekday job counts only the weekdays after `since`, up to and including
+    `as_of`: Friday to Monday is one. The noon check runs before the day's
+    first pass, so Friday is the latest run a Monday reading can see.
+    """
+    start, end = date.fromisoformat(since), date.fromisoformat(as_of)
+    if spec["every"] not in WEEKDAY_SCHEDULES:
+        return (end - start).days
+    return sum(1 for n in range(1, (end - start).days + 1)
+               if (start + timedelta(days=n)).weekday() < 5)
+
+
+def _age_unit(spec: Dict[str, Any]) -> str:
+    return "weekdays" if spec["every"] in WEEKDAY_SCHEDULES else "days"
 
 
 def _job_state(spec: Dict[str, Any], as_of: str) -> Dict[str, Any]:
@@ -180,8 +202,7 @@ def _job_state(spec: Dict[str, Any], as_of: str) -> Dict[str, Any]:
     # on the last run that finished, whatever it concluded. A job that has
     # stopped is caught regardless of which status word it used.
     if row["as_of_date"]:
-        age = (date.fromisoformat(as_of)
-               - date.fromisoformat(row["as_of_date"])).days
+        age = _age(spec, as_of, row["as_of_date"])
         out["age_days"] = age
         if age > spec["stale_after_days"]:
             out["state"] = "stale"
@@ -259,15 +280,14 @@ def collect(as_of: Optional[str] = None) -> Dict[str, Any]:
     # check every weekday until the 1st -- for a known reason, which is how a
     # reader learns to skip it. Before that line the job keeps its `~`.
     first = _first_run()
-    store_age = (None if first is None else
-                 (date.fromisoformat(as_of) - date.fromisoformat(first)).days)
 
     attention: List[str] = []
     for job in jobs:
         if job["state"] == "never":
             if job["optional"]:
                 continue
-            if store_age is not None and store_age <= job["stale_after_days"]:
+            if (first is not None
+                    and _age(job, as_of, first) <= job["stale_after_days"]):
                 continue
             attention.append(
                 f"{job['job']} has never completed a run (runs {job['every']})")
@@ -277,7 +297,8 @@ def collect(as_of: Optional[str] = None) -> Dict[str, Any]:
                 f"finished it")
         elif job["state"] == "stale":
             attention.append(
-                f"{job['job']} last ran {job['age_days']} days ago, for "
+                f"{job['job']} last ran {job['age_days']} {_age_unit(job)} "
+                f"ago, for "
                 f"{job['last_run']}")
         elif job["state"] == "failed":
             attention.append(
