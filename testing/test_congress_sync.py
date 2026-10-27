@@ -524,6 +524,83 @@ def test_the_composed_default_asks_for_holdings_as_well_as_trades():
     assert "--senate" in command and "--house" in command
 
 
+def test_a_blocked_senate_run_keeps_the_last_successful_sync(db, monkeypatch):
+    """The Senate has refused every run since 2026-10-24. Had each blocked run
+    stamped the time, the store would look current while holding nothing
+    newer than the last run that worked."""
+    with store.connect() as conn:
+        conn.execute(
+            """INSERT INTO sync_state(source, last_synced_at, last_cursor,
+                    filings_seen, filings_parsed, filings_failed)
+               VALUES('senate_ptr', '2026-10-23T06:00:00+00:00',
+                      '10/23/2026', 158, 150, 8)""")
+    monkeypatch.setattr(sync, "senate_session", lambda: object())
+    monkeypatch.setattr(sync, "search_senate_ptrs", lambda session, since: [
+        {"uuid": "u-1", "first": "Jane", "last": "Doe", "office": "Senator",
+         "filed_date": "10/25/2026", "kind": "ptr"}])
+    monkeypatch.setattr(sync, "_throttle", lambda: None)
+
+    def refused(session, uuid):
+        raise DisclosureBlocked(f"Senate PTR {uuid}: refused with HTTP 403")
+    monkeypatch.setattr(sync, "fetch_senate_ptr", refused)
+
+    result = sync.sync_senate_ptrs(days=90)
+
+    assert result["blocked"]
+    assert store.last_successful_sync("senate") == "2026-10-23T06:00:00+00:00"
+    assert store.sync_state("senate_ptr")["filings_failed"] == 1
+
+
+def test_a_blocked_house_run_keeps_the_last_successful_sync(db, house):
+    with store.connect() as conn:
+        conn.execute(
+            """INSERT INTO sync_state(source, last_synced_at, last_cursor,
+                    filings_seen, filings_parsed, filings_failed)
+               VALUES('house_ptr_2026', '2026-10-23T06:00:00+00:00', '2026',
+                      1, 1, 0)""")
+    house(2, blocked=("1",))
+
+    result = sync.sync_house_ptrs(2026)
+
+    assert result["blocked"]
+    assert store.last_successful_sync("house") == "2026-10-23T06:00:00+00:00"
+
+
+def test_a_blocked_senate_annual_run_keeps_the_last_successful_sync(
+        db, monkeypatch):
+    with store.connect() as conn:
+        conn.execute(
+            """INSERT INTO sync_state(source, last_synced_at, last_cursor,
+                    filings_seen, filings_parsed, filings_failed)
+               VALUES('senate_annual', '2026-10-23T06:00:00+00:00',
+                      '01/01/2026', 40, 40, 0)""")
+    monkeypatch.setattr(sync, "senate_session", lambda: object())
+    monkeypatch.setattr(sync, "search_senate_annuals", lambda session, since: [
+        {"uuid": "a-1", "first": "Jane", "last": "Doe", "office": "Senator",
+         "filed_date": "05/15/2026", "kind": "annual", "calendar_year": 2025,
+         "amendment": 0}])
+    monkeypatch.setattr(sync, "_throttle", lambda: None)
+
+    def refused(session, uuid):
+        raise DisclosureBlocked(f"Senate annual {uuid}: refused with HTTP 403")
+    monkeypatch.setattr(sync, "fetch_senate_annual", refused)
+
+    result = sync.sync_senate_annuals()
+
+    assert result["blocked"]
+    assert store.sync_state("senate_annual")["last_synced_at"] == (
+        "2026-10-23T06:00:00+00:00")
+
+
+def test_an_unblocked_senate_run_records_its_time(db, monkeypatch):
+    monkeypatch.setattr(sync, "senate_session", lambda: object())
+    monkeypatch.setattr(sync, "search_senate_ptrs", lambda session, since: [])
+
+    sync.sync_senate_ptrs(days=90)
+
+    assert store.last_successful_sync("senate") is not None
+
+
 def _composed_congress_sync_command():
     import pathlib
 

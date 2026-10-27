@@ -24,6 +24,7 @@ the filing.
 from __future__ import annotations
 
 import hashlib
+import html
 import io
 import re
 import time
@@ -101,6 +102,15 @@ class DisclosureBlocked(DisclosureUnavailable):
     """
 
 
+class BotProtectionBlocked(DisclosureBlocked):
+    """The site's bot protection refused the request.
+
+    Not a rate limit. A rate limit lifts after a wait; bot protection gives
+    the same answer at any pace, so it is never retried. It is reported, not
+    worked around.
+    """
+
+
 # The House Clerk and the Senate publish no rate limit. This interval is
 # deliberate politeness rather than a measured ceiling: the whole backfill is
 # a few hundred requests and there is nothing to gain by going faster.
@@ -144,6 +154,26 @@ def _retry_after(response: Any, fallback: float) -> float:
         return fallback
 
 
+# Akamai's refusal page. It entity-encodes its text, so the reference that
+# identifies the refusal is read after unescaping.
+_AKAMAI_REFERENCE = re.compile(r"Reference #([0-9A-Za-z.]+)")
+
+
+def _refuse_bot_protection(describe: str, response: Any) -> None:
+    """Raise when the response is Akamai's bot protection page."""
+    if getattr(response, "status_code", None) != 403:
+        return
+    server = (getattr(response, "headers", None) or {}).get("Server", "")
+    text = html.unescape(getattr(response, "text", "") or "")
+    if "AkamaiGHost" not in server or "Access Denied" not in text:
+        return
+    reference = _AKAMAI_REFERENCE.search(text)
+    raise BotProtectionBlocked(
+        f"{describe}: the site's bot protection refused the request"
+        + (f" (Reference #{reference.group(1)})" if reference else "")
+        + ". It gives the same answer at any pace, so it is not retried.")
+
+
 def _request(describe: str, call) -> Any:
     """One HTTP call that answers a refusal by waiting rather than repeating.
 
@@ -154,6 +184,7 @@ def _request(describe: str, call) -> Any:
     delay = _BACKOFF_BASE_S
     for attempt in range(1, MAX_ATTEMPTS + 1):
         response = call()
+        _refuse_bot_protection(describe, response)
         if getattr(response, "status_code", 200) not in RATE_LIMITED_STATUSES:
             return response
         if attempt == MAX_ATTEMPTS:

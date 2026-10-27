@@ -534,3 +534,56 @@ def test_a_forbidden_response_backs_off_rather_than_failing_instantly(
 
     filing = ct.fetch_house_ptr("20026537", 2025, session=session)
     assert len(filing["transactions"]) == 1
+
+
+# ----------------------------------------------------------- bot protection
+
+# The page Akamai served the Senate agreement POST on 2026-10-26, with the
+# entity encoding it really uses.
+_AKAMAI_PAGE = (
+    '<HTML><HEAD>\n<TITLE>Access Denied</TITLE>\n</HEAD><BODY>\n'
+    '<H1>Access Denied</H1>\n \nYou don\'t have permission to access '
+    '"http&#58;&#47;&#47;efdsearch&#46;senate&#46;gov&#47;search&#47;home&#47;"'
+    ' on this server.<P>\nReference&#32;&#35;18&#46;d2dc717&#46;1729753200'
+    '&#46;1234567\n<P>https&#58;&#47;&#47;errors&#46;edgesuite&#46;net\n'
+    '</BODY>\n</HTML>\n')
+
+
+def _akamai_refusal():
+    return _Response(403, text=_AKAMAI_PAGE, headers={"Server": "AkamaiGHost"})
+
+
+def test_a_bot_protection_refusal_is_not_reported_as_a_rate_limit(_offline):
+    with pytest.raises(ct.BotProtectionBlocked) as raised:
+        ct._request("the Senate prohibition agreement", _akamai_refusal)
+
+    message = str(raised.value)
+    assert "bot protection" in message
+    assert "Reference #18.d2dc717.1729753200.1234567" in message
+    assert "caller's rate" not in message
+
+
+def test_a_bot_protection_refusal_is_never_retried(monkeypatch, _offline):
+    """Bot protection gives the same answer at any pace, so a wait buys
+    nothing and four attempts look more like the traffic it blocks."""
+    delays = []
+    monkeypatch.setattr(ct, "_sleep", delays.append)
+    session = _Session(_akamai_refusal())
+
+    with pytest.raises(ct.BotProtectionBlocked):
+        ct._request("the Senate prohibition agreement",
+                    lambda: session.get("http://example.invalid"))
+
+    assert session.calls == 1
+    assert delays == []
+
+
+def test_a_bot_protection_refusal_stops_the_senate_session(monkeypatch,
+                                                          _offline):
+    csrf_page = ('<form><input type="hidden" name="csrfmiddlewaretoken" '
+                 'value="token" /></form>')
+    session = _Session(_Response(200, text=csrf_page), _akamai_refusal())
+    monkeypatch.setattr("requests.Session", lambda: session)
+
+    with pytest.raises(ct.BotProtectionBlocked):
+        ct.senate_session()

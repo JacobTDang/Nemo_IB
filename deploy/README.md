@@ -315,6 +315,13 @@ safe to cron; nothing already parsed is fetched twice.
   columns must be read geometrically from the header rectangles rather than from
   the extracted text, and that parser is not built. The tool description states
   the limit, so the gap is visible to a caller rather than silent.
+- Since 2026-10-24 the Senate eFD site refuses the sync. Its Akamai bot
+  protection answers the agreement request with HTTP 403. The sync does not
+  retry this answer and reports it as bot protection, not as a rate limit.
+  `get_congress_coverage` shows the last unblocked sync of each chamber. When
+  that sync is more than 3 days old, each congressional tool that reads the
+  chamber adds a `stale_chamber_sync` warning. Issue #173 holds the decision
+  about a different Senate source.
 - `analyze_exposures` and `get_thesis_evolution` read book state. The entrypoint
   creates the schema so the queries run rather than failing on a missing table.
   A data-source host holds no positions, so `analyze_exposures` answering with
