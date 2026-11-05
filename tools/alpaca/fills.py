@@ -48,10 +48,18 @@ NOTE = ("Paper fills are simulated from quotes: they measure the quoted spread "
         "live orders measure impact.")
 
 
-def client_order_id(order_as_of: str, ticker: str, leg: str) -> str:
-    """Deterministic, so a second run cannot send a leg twice: the store
-    refuses the row and the broker refuses the id."""
-    return f"nemo-{order_as_of}-{ticker}-{leg}"
+def client_order_id(order_as_of: str, ticker: str, leg: str,
+                    attempt: int = 1) -> str:
+    """Deterministic per attempt, so a second run cannot send the same
+    attempt twice: the store refuses the row and the broker refuses the id.
+
+    Attempt 1 keeps the original id shape so rows already at the broker stay
+    addressable; later remainder exits append the attempt number (issue #189).
+    """
+    base = f"nemo-{order_as_of}-{ticker}-{leg}"
+    if attempt <= 1:
+        return base
+    return f"{base}-{attempt}"
 
 
 def _today() -> str:
@@ -69,7 +77,33 @@ def _last_close(ticker: str, as_of: str) -> Optional[float]:
     return last["close"] if last else None
 
 
-def plan(orders: List[Dict[str, Any]], recorded: Dict[tuple, Dict[str, Any]],
+def _held_for_exit(position: Optional[Dict[str, Any]], exit_side: str) -> float:
+    """Shares the broker holds that an exit of `exit_side` would close.
+
+    A sell flattens a long; a buy flattens a short. The opposite side, or no
+    position, is zero held — never treat that as a reason to open a short.
+    """
+    if not position:
+        return 0.0
+    side = (position.get("side") or "long").lower()
+    qty = float(position.get("qty") or 0)
+    if exit_side == "sell" and side == "long":
+        return qty
+    if exit_side == "buy" and side == "short":
+        return qty
+    return 0.0
+
+
+def _exit_filled_total(exits: List[Dict[str, Any]]) -> float:
+    """Shares already closed across every terminal exit attempt."""
+    total = 0.0
+    for row in exits:
+        if row["status"] in pit_store.FILL_TERMINAL:
+            total += float(row.get("filled_qty") or 0)
+    return total
+
+
+def plan(orders: List[Dict[str, Any]], fills: List[Dict[str, Any]],
          calendar: List[str], today: str, horizon_days: int,
          last_close: Callable[[str, str], Optional[float]] = _last_close
          ) -> Tuple[List[Dict[str, Any]], int]:
@@ -81,13 +115,30 @@ def plan(orders: List[Dict[str, Any]], recorded: Dict[tuple, Dict[str, Any]],
     the one the book scores. An exit is due `horizon_days` trading days after
     its entry filled; one sent late is still sent, to flatten the position, and
     is marked so it is not measured.
+
+    An exit that expired unfilled or part-filled still holds shares. The next
+    session sends the remainder (entry filled minus every exit fill so far),
+    as a new attempt marked late and not measured, until the sum of exit fills
+    equals the entry (issue #189).
     """
+    by_key: Dict[tuple, Dict[str, Any]] = {}
+    for row in fills:
+        slot = by_key.setdefault(
+            (row["order_as_of"], row["ticker"]),
+            {"entry": None, "exits": []})
+        if row["leg"] == "entry":
+            slot["entry"] = row
+        else:
+            slot["exits"].append(row)
+
     legs: List[Dict[str, Any]] = []
     missed = 0
     for order in orders:
         key = (order["as_of_date"], order["ticker"])
         side = order.get("side") or "long"
-        entry = recorded.get((*key, "entry"))
+        slot = by_key.get(key, {"entry": None, "exits": []})
+        entry = slot["entry"]
+        exits = slot["exits"]
 
         if entry is None:
             session = order.get("intended_session")
@@ -110,19 +161,26 @@ def plan(orders: List[Dict[str, Any]], recorded: Dict[tuple, Dict[str, Any]],
                           f"{price:,.2f}; the opening auction takes whole "
                           f"shares only")
             legs.append({"order_as_of": key[0], "ticker": key[1],
-                         "leg": "entry", "scheduled_session": today,
+                         "leg": "entry", "attempt": 1,
+                         "scheduled_session": today,
                          "session": today, "side": _ENTRY_SIDE[side],
                          "qty": qty, "reason": reason,
                          "client_order_id": client_order_id(*key, "entry")})
             continue
 
-        if recorded.get((*key, "exit")) is not None:
-            continue
         # Exited once the entry has its final answer and holds shares. An
         # auction order that part-filled and had the rest cancelled still
         # left a position, and a position nobody exits is a different book.
+        # A prior exit that expired the same way still holds a remainder, so
+        # the check is on shares closed, not on whether an exit row exists.
         if (entry["status"] not in pit_store.FILL_TERMINAL
                 or not entry.get("filled_qty")):
+            continue
+        if any(e["status"] not in pit_store.FILL_TERMINAL for e in exits):
+            continue
+        entry_qty = float(entry["filled_qty"])
+        remainder = int(entry_qty - _exit_filled_total(exits))
+        if remainder <= 0:
             continue
         if entry["session"] not in calendar or today not in calendar:
             continue
@@ -131,13 +189,20 @@ def plan(orders: List[Dict[str, Any]], recorded: Dict[tuple, Dict[str, Any]],
         if elapsed < horizon_days:
             continue
         late = elapsed - horizon_days
+        attempt = max((int(e.get("attempt") or 1) for e in exits), default=0) + 1
+        # First exit on the due session is on-time and measured; every later
+        # attempt, and any first exit after the due session, is a flatten.
+        reason = None
+        if late or attempt > 1:
+            reason = (f"sent {late} session(s) late to flatten the "
+                      f"position; not measured")
         legs.append({"order_as_of": key[0], "ticker": key[1], "leg": "exit",
+                     "attempt": attempt,
                      "scheduled_session": calendar[start + horizon_days],
                      "session": today, "side": _EXIT_SIDE[side],
-                     "qty": int(entry["filled_qty"]),
-                     "reason": (f"sent {late} session(s) late to flatten the "
-                                f"position; not measured" if late else None),
-                     "client_order_id": client_order_id(*key, "exit")})
+                     "qty": remainder, "reason": reason,
+                     "client_order_id": client_order_id(
+                         *key, "exit", attempt=attempt)})
     return legs, missed
 
 
@@ -150,11 +215,10 @@ async def submit(broker, today: Optional[str] = None,
            "rejected": 0, "missed": 0}
     try:
         orders = pit_store.paper_orders_as_of(today, accepted_only=True)
-        recorded = {(r["order_as_of"], r["ticker"], r["leg"]): r
-                    for r in pit_store.paper_fills_as_of(today)}
+        fills = pit_store.paper_fills_as_of(today)
         sessions = ([o["intended_session"] for o in orders
                      if o.get("intended_session")]
-                    + [r["session"] for r in recorded.values()])
+                    + [r["session"] for r in fills])
         if not orders:
             pit_store.finish_run(rows_written=0, status="ok",
                                  error="no filed orders", run_id=run_id)
@@ -169,7 +233,7 @@ async def submit(broker, today: Optional[str] = None,
                                  run_id=run_id)
             return out
 
-        legs, out["missed"] = plan(orders, recorded, calendar, today,
+        legs, out["missed"] = plan(orders, fills, calendar, today,
                                    horizon_days)
         for leg in legs:
             row = {**leg, "broker_order_id": None,
@@ -178,6 +242,27 @@ async def submit(broker, today: Optional[str] = None,
                 pit_store.record_fill_submission({**row, "status": "skipped"})
                 out["skipped"] += 1
                 continue
+            # A remainder exit must not sell shares another trade (or a
+            # leftover like the 2.5 F) is holding. Ask the broker first; a
+            # lookup error is a refusal, never a silent "not held".
+            if leg["leg"] == "exit" and int(leg.get("attempt") or 1) > 1:
+                try:
+                    position = await broker.get_open_position(leg["ticker"])
+                except AsyncBrokerError as exc:
+                    pit_store.record_fill_submission(
+                        {**row, "status": "rejected",
+                         "reason": str(exc)[:300]})
+                    out["rejected"] += 1
+                    continue
+                held = _held_for_exit(position, leg["side"])
+                if held < leg["qty"]:
+                    pit_store.record_fill_submission({
+                        **row, "status": "skipped",
+                        "reason": (f"broker holds {held:g} shares; need "
+                                   f"{leg['qty']} to flatten this trade "
+                                   f"without opening a short")})
+                    out["skipped"] += 1
+                    continue
             try:
                 sent = await broker.submit_market_order(
                     leg["ticker"], leg["qty"], leg["side"],

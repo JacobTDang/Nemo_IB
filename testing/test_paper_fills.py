@@ -51,16 +51,33 @@ CALENDAR = [d for d in SESSIONS if d != HOLIDAY]
 
 
 class FakeBroker:
-    """Alpaca's calendar, order and order-status calls, in memory."""
+    """Alpaca's calendar, order, position and order-status calls, in memory.
 
-    def __init__(self, calendar=CALENDAR, reject=()):
+    `positions` mirrors what `AsyncBroker.get_open_position` returns: a map of
+    symbol to `{qty, side}`, or omit the symbol for a 404. `position_error`
+    raises that exception instead, the way a broker outage does.
+    """
+
+    def __init__(self, calendar=CALENDAR, reject=(), positions=None,
+                 position_error=None):
         self.calendar = list(calendar)
         self.reject = set(reject)
+        self.positions = dict(positions or {})
+        self.position_error = position_error
         self.sent = []
         self.orders = {}
 
     async def get_calendar(self, start, end):
         return [d for d in self.calendar if start <= d <= end]
+
+    async def get_open_position(self, symbol):
+        if self.position_error is not None:
+            raise self.position_error
+        pos = self.positions.get(symbol.upper())
+        if pos is None:
+            return None
+        return {"symbol": symbol.upper(), "qty": float(pos["qty"]),
+                "side": pos.get("side", "long")}
 
     async def submit_market_order(self, symbol, qty, side, *,
                                   client_order_id, time_in_force="day"):
@@ -84,6 +101,14 @@ class FakeBroker:
         self.orders[f"b-{client_order_id}"].update({
             "status": "filled", "filled_qty": str(qty),
             "filled_avg_price": str(price), "filled_at": at})
+
+    def expire(self, client_order_id, filled_qty=0, price=None, at=None):
+        """An auction order that ended unfilled or part-filled, as paper does."""
+        update = {"status": "expired", "filled_qty": str(filled_qty)}
+        if filled_qty and price is not None:
+            update["filled_avg_price"] = str(price)
+            update["filled_at"] = at
+        self.orders[f"b-{client_order_id}"].update(update)
 
 
 def _bars(ticker, price_on, days=SESSIONS):
@@ -115,8 +140,23 @@ def _collect(broker, today):
     return asyncio.run(fills.collect(broker, today=today))
 
 
-def _cid(order_as_of, ticker, leg):
-    return fills.client_order_id(order_as_of, ticker, leg)
+def _cid(order_as_of, ticker, leg, attempt=1):
+    return fills.client_order_id(order_as_of, ticker, leg, attempt=attempt)
+
+
+def _enter_and_fill(ticker, qty=50, price=100.0, filed=None, session=None,
+                    horizon=5):
+    """File, send and fill an entry; return the broker holding that qty long."""
+    filed = filed or SESSIONS[3]
+    session = session or SESSIONS[4]
+    _bars(ticker, lambda d: price)
+    _order(ticker, filed=filed, session=session)
+    broker = FakeBroker(positions={ticker: {"qty": qty, "side": "long"}})
+    _submit(broker, today=session, horizon=horizon)
+    broker.fill(_cid(filed, ticker, "entry"), price=price, qty=qty,
+                at=f"{session}T13:30:01Z")
+    _collect(broker, today=session)
+    return broker, filed, session
 
 
 # --- what gets sent, and when ------------------------------------------------
@@ -333,6 +373,207 @@ def test_a_late_exit_flattens_the_position_and_is_not_measured(store):
                                                       "exit")
     assert "late" in exit_row["reason"]
     assert pit_store.measured_round_trips(SESSIONS[11]) == []
+
+
+# --- exit retries when the auction leaves shares held (issue #189) -----------
+
+def test_a_zero_fill_exit_is_resent_next_session_for_the_full_remainder(store):
+    """An opening-auction exit that expires with nothing filled still holds
+    the entry; the next session must send the same qty again."""
+    broker, filed, _ = _enter_and_fill("AAA", qty=50)
+    _submit(broker, today=SESSIONS[9])
+    broker.expire(_cid(filed, "AAA", "exit"), filled_qty=0)
+    _collect(broker, today=SESSIONS[9])
+
+    _submit(broker, today=SESSIONS[11])
+
+    assert broker.sent[-1] == {
+        "symbol": "AAA", "qty": 50, "side": "sell",
+        "client_order_id": _cid(filed, "AAA", "exit", attempt=2),
+        "time_in_force": "opg"}
+
+
+def test_a_part_filled_exit_is_resent_for_the_rest(store):
+    """Paper injects partial fills on auction orders; the unfilled remainder
+    expires and must go out again for only what is still held."""
+    broker, filed, _ = _enter_and_fill("AAA", qty=50)
+    _submit(broker, today=SESSIONS[9])
+    broker.expire(_cid(filed, "AAA", "exit"), filled_qty=20, price=101.0,
+                  at=f"{SESSIONS[9]}T13:30:01Z")
+    _collect(broker, today=SESSIONS[9])
+    broker.positions["AAA"] = {"qty": 30, "side": "long"}
+
+    _submit(broker, today=SESSIONS[11])
+
+    assert broker.sent[-1]["qty"] == 30
+    assert broker.sent[-1]["client_order_id"] == _cid(
+        filed, "AAA", "exit", attempt=2)
+
+
+def test_no_exit_is_resent_once_the_position_is_flat(store):
+    """When exit fills have summed to the entry, there is nothing left to
+    send — a second morning must not invent another sell."""
+    broker, filed, _ = _enter_and_fill("AAA", qty=50)
+    _submit(broker, today=SESSIONS[9])
+    broker.fill(_cid(filed, "AAA", "exit"), price=101.0, qty=50,
+                at=f"{SESSIONS[9]}T13:30:01Z")
+    _collect(broker, today=SESSIONS[9])
+    before = len(broker.sent)
+
+    _submit(broker, today=SESSIONS[11])
+
+    assert len(broker.sent) == before
+
+
+def test_exit_resends_are_marked_late_and_not_measured(store):
+    """A remainder exit is a flatten, not the trade the book scores: late
+    reason, and measured_round_trips ignores every attempt after the first."""
+    broker, filed, _ = _enter_and_fill("AAA", qty=50)
+    _submit(broker, today=SESSIONS[9])
+    broker.expire(_cid(filed, "AAA", "exit"), filled_qty=0)
+    _collect(broker, today=SESSIONS[9])
+
+    _submit(broker, today=SESSIONS[11])
+    broker.fill(_cid(filed, "AAA", "exit", attempt=2), price=101.0, qty=50,
+                at=f"{SESSIONS[11]}T13:30:01Z")
+    _collect(broker, today=SESSIONS[11])
+
+    retry = [r for r in pit_store.paper_fills_as_of(SESSIONS[11])
+             if r["leg"] == "exit" and r.get("attempt", 1) == 2][0]
+    assert "late" in (retry["reason"] or "")
+    assert pit_store.measured_round_trips(SESSIONS[11]) == []
+
+
+def _store_before_attempts():
+    """A paper_fill table as deployed before #189, holding one filled entry."""
+    import sqlite3
+
+    with sqlite3.connect(pit_store.db_path()) as conn:
+        conn.execute("DROP TABLE IF EXISTS paper_fill")
+        conn.execute("""
+            CREATE TABLE paper_fill (
+                order_as_of TEXT NOT NULL, ticker TEXT NOT NULL,
+                leg TEXT NOT NULL, scheduled_session TEXT NOT NULL,
+                session TEXT NOT NULL, side TEXT NOT NULL, qty INTEGER NOT NULL,
+                client_order_id TEXT NOT NULL UNIQUE, broker_order_id TEXT,
+                status TEXT NOT NULL, reason TEXT, filled_qty REAL,
+                filled_price REAL, filled_at TEXT, submitted_at TEXT NOT NULL,
+                PRIMARY KEY (order_as_of, ticker, leg)
+            )""")
+        conn.execute(
+            """INSERT INTO paper_fill
+               (order_as_of, ticker, leg, scheduled_session, session, side,
+                qty, client_order_id, broker_order_id, status, reason,
+                filled_qty, filled_price, filled_at, submitted_at)
+               VALUES ('2026-06-04','AAA','entry','2026-06-05','2026-06-05',
+                       'buy',50,'cid-old',NULL,'filled',NULL,50,100.0,
+                       '2026-06-05T13:30:01Z','2026-06-05T13:15:00Z')""")
+
+
+def test_paper_fill_migration_keeps_existing_rows_and_is_safe_to_run_twice(store):
+    """A store created before attempt existed must keep every row as attempt
+    1, and a second migrate must not duplicate or drop them."""
+    _store_before_attempts()
+
+    pit_store.init_schema()
+    pit_store.init_schema()
+
+    rows = pit_store.paper_fills_as_of("2026-06-05")
+    assert len(rows) == 1
+    assert rows[0]["client_order_id"] == "cid-old"
+    assert rows[0]["attempt"] == 1
+    assert rows[0]["filled_qty"] == pytest.approx(50)
+
+
+def test_a_paper_fill_migration_that_fails_midway_changes_nothing(
+        store, monkeypatch):
+    """The rebuild is one transaction. CREATE TABLE commits on its own in
+    sqlite3's default mode, so a failure after it used to leave a half-built
+    paper_fill__attempt behind, and every later init_schema then died on
+    "table already exists" while the store kept its old key."""
+    import sqlite3
+
+    _store_before_attempts()
+    real_connect = pit_store.connect
+
+    class _FailsOnDrop:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+        def __enter__(self):
+            self._conn.__enter__()
+            return self
+
+        def __exit__(self, *exc):
+            return self._conn.__exit__(*exc)
+
+        def execute(self, sql, *args):
+            if sql.strip().startswith("DROP TABLE paper_fill"):
+                raise sqlite3.OperationalError("disk I/O error")
+            return self._conn.execute(sql, *args)
+
+    monkeypatch.setattr(pit_store, "connect",
+                        lambda: _FailsOnDrop(real_connect()))
+    with pytest.raises(sqlite3.OperationalError):
+        pit_store.init_schema()
+    monkeypatch.setattr(pit_store, "connect", real_connect)
+
+    with sqlite3.connect(pit_store.db_path()) as conn:
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(paper_fill)")}
+        held = conn.execute("SELECT client_order_id FROM paper_fill").fetchall()
+    assert "paper_fill__attempt" not in tables
+    assert "attempt" not in columns
+    assert held == [("cid-old",)]
+
+    pit_store.init_schema()
+    assert pit_store.paper_fills_as_of("2026-06-05")[0]["attempt"] == 1
+
+
+def test_a_remainder_larger_than_the_broker_position_is_skipped_naming_held_qty(
+        store):
+    """Never sell shares the account does not hold: a remainder of 50 against
+    a broker long of 10 is skipped, and the reason names the 10."""
+    broker, filed, _ = _enter_and_fill("AAA", qty=50)
+    _submit(broker, today=SESSIONS[9])
+    broker.expire(_cid(filed, "AAA", "exit"), filled_qty=0)
+    _collect(broker, today=SESSIONS[9])
+    broker.positions["AAA"] = {"qty": 10, "side": "long"}
+    before = len(broker.sent)
+
+    out = _submit(broker, today=SESSIONS[11])
+
+    assert len(broker.sent) == before
+    retry = [r for r in pit_store.paper_fills_as_of(SESSIONS[11])
+             if r["leg"] == "exit" and r.get("attempt", 1) == 2][0]
+    assert retry["status"] == "skipped"
+    assert "10" in (retry["reason"] or "")
+    assert out["skipped"] == 1
+
+
+def test_a_broker_position_lookup_error_is_recorded_as_rejected(store):
+    """A broker error on the position check is a refusal with that error as
+    the reason — never a silent 'not held'."""
+    broker, filed, _ = _enter_and_fill("AAA", qty=50)
+    _submit(broker, today=SESSIONS[9])
+    broker.expire(_cid(filed, "AAA", "exit"), filled_qty=0)
+    _collect(broker, today=SESSIONS[9])
+    broker.position_error = AsyncBrokerError("HTTP 503: broker unavailable")
+    before = len(broker.sent)
+
+    out = _submit(broker, today=SESSIONS[11])
+
+    assert len(broker.sent) == before
+    retry = [r for r in pit_store.paper_fills_as_of(SESSIONS[11])
+             if r["leg"] == "exit" and r.get("attempt", 1) == 2][0]
+    assert retry["status"] == "rejected"
+    assert "503" in (retry["reason"] or "")
+    assert "not held" not in (retry["reason"] or "").lower()
+    assert out["rejected"] == 1
 
 
 def test_the_store_will_not_restate_a_fill(store):
