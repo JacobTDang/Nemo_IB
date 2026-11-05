@@ -229,6 +229,24 @@ def test_a_copy_book_failure_does_not_stop_earnings_legs(store, monkeypatch):
     assert out["submitted"] >= 1
 
 
+def test_an_unreadable_copy_setting_does_not_stop_earnings_legs(store, monkeypatch):
+    """A typo in a copy setting fails the copy book, by name, and nothing else.
+    Read before either book's own try, it stopped the earnings orders too."""
+    _bars("EARN", lambda d: 100.0)
+    _bars("COPY", lambda d: 100.0)
+    _sue_order("EARN", filed=SESSIONS[3], session=SESSIONS[4])
+    _copy_order("COPY", filed=SESSIONS[3], session=SESSIONS[4])
+    monkeypatch.setenv("NEMO_COPY_HOLD_DAYS", "twenty")
+    broker = FakeBroker()
+
+    out = _submit(broker, today=SESSIONS[4])
+
+    assert [s["symbol"] for s in broker.sent] == ["EARN"]
+    assert out["status"] == "partial"
+    assert out["copy"]["status"] == "failed"
+    assert "NEMO_COPY_HOLD_DAYS" in out["copy"]["error"]
+
+
 def test_submit_and_collect_report_copy_counts_apart_from_earnings(store):
     """The result names each book's counts so a quiet copy book cannot hide
     inside the earnings totals."""

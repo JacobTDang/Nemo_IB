@@ -320,11 +320,22 @@ async def submit(broker, today: Optional[str] = None,
     try:
         earn_orders = pit_store.paper_orders_as_of(today, accepted_only=True)
         earn_fills = pit_store.paper_fills_as_of(today)
-        copy_settings = CopySettings.from_env()
-        copy_fills = pit_store.fills_as_of(today, table="copy_fill")
-        copy_orders = _copy_orders_for_submit(today, copy_fills, copy_settings)
+        # The copy book's inputs are read inside its own guard and raised again
+        # in the copy section below: a typo in a copy setting fails that book by
+        # name, and must not stop the earnings legs.
+        copy_load_error: Optional[Exception] = None
+        copy_settings: Optional[CopySettings] = None
+        copy_fills: List[Dict[str, Any]] = []
+        copy_orders: List[Dict[str, Any]] = []
+        try:
+            copy_settings = CopySettings.from_env()
+            copy_fills = pit_store.fills_as_of(today, table="copy_fill")
+            copy_orders = _copy_orders_for_submit(today, copy_fills,
+                                                  copy_settings)
+        except Exception as exc:  # noqa: BLE001 - re-raised in the copy section
+            copy_load_error = exc
 
-        if not earn_orders and not copy_orders:
+        if not earn_orders and not copy_orders and copy_load_error is None:
             pit_store.finish_run(rows_written=0, status="ok",
                                  error="no filed orders", run_id=run_id)
             return out
@@ -364,6 +375,8 @@ async def submit(broker, today: Optional[str] = None,
             out["error"] = msg
 
         try:
+            if copy_load_error is not None:
+                raise copy_load_error
             copy_legs, copy_missed = plan(
                 copy_orders, copy_fills, calendar, today,
                 copy_settings.hold_days, book="copy")
