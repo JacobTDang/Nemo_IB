@@ -57,7 +57,7 @@ def test_the_report_names_a_job_that_has_never_run(store):
     rows, and so does a job that ran and found nothing."""
     report = status.collect()
 
-    never = [j for j in report["jobs"] if j["last_run"] is None]
+    never = [j for j in report["jobs"] if j["last_run"] is None and j["state"] != "off"]
     assert never, "a fresh store should report every job as never run"
     assert all(j["state"] == "never" for j in never)
 
@@ -535,3 +535,39 @@ def _job(report, name):
     match = [j for j in report["jobs"] if j["job"] == name]
     assert match, f"{name} not in the report"
     return match[0]
+
+
+def test_copy_job_off_does_not_raise_old_failure(store, monkeypatch):
+    monkeypatch.setenv('NEMO_COPY_TRADING', 'off')
+    store.start_run('congress_copy', as_of_date='2026-03-01')
+    store.finish_run(status='failed', error='stale House sync')
+    report = status.collect(as_of='2026-03-05')
+    assert _job(report, 'congress_copy')['state'] == 'off'
+    assert not any('congress_copy' in a for a in report['attention'])
+    line = next(s for s in status._render(report).splitlines() if 'congress_copy' in s)
+    assert line.startswith('  ')
+
+
+def test_enabled_copy_job_is_required_weekday_job(store, monkeypatch):
+    monkeypatch.setenv('NEMO_COPY_TRADING', 'on')
+    report = status.collect(as_of='2026-03-05')
+    row = _job(report, 'congress_copy')
+    assert row['every'] == 'weekday'
+    assert row['max_run_seconds'] == 600
+    assert not row['optional']
+    assert any('congress_copy' in a for a in report['attention'])
+
+
+def test_enabled_copy_job_reports_failed_run(store, monkeypatch):
+    monkeypatch.setenv('NEMO_COPY_TRADING', 'on')
+    store.start_run('congress_copy', as_of_date='2026-03-05')
+    store.finish_run(status='failed', error='stale House sync')
+    report = status.collect(as_of='2026-03-05')
+    assert _job(report, 'congress_copy')['state'] == 'failed'
+    assert any('stale House sync' in a for a in report['attention'])
+
+
+def test_status_refuses_unknown_copy_flag(store, monkeypatch):
+    monkeypatch.setenv('NEMO_COPY_TRADING', 'maybe')
+    with pytest.raises(ValueError, match='NEMO_COPY_TRADING'):
+        status.collect()

@@ -53,6 +53,15 @@ def _write_everything_late(store):
         [{"ticker": "AAA", "fiscal_period": "2026Q1", "side": "long",
           "sue": 2.0, "target_dollars": 100.0,
           "intended_session": "2026-03-03"}], recorded_at=LATER)
+    store.record_copy_orders([{
+        "txn_id": "copy-late", "as_of_date": "2026-03-02", "decided_at": LATER,
+        "learned_at": "2026-03-02T06:00:00Z", "filing_id": "filing-late",
+        "member_id": "member-late", "member": "Jane Smith", "chamber": "house",
+        "owner": "self", "source_ticker": "AAA", "ticker": "AAA", "cik": "1",
+        "amount_min": 15001, "amount_max": 50000,
+        "transaction_date": "2026-03-01", "filed_date": "2026-03-02",
+        "accepted": True, "reason": None, "side": "long",
+        "target_dollars": 5000, "intended_session": "2026-03-02"}])
     store.record_activist_filings([{
         "accession": "0001-25-000001", "subject_ticker": "AAA",
         "filer": "Someone LP", "form": "SC 13D",
@@ -100,6 +109,7 @@ def _write_everything_late(store):
     ("universe_as_of", lambda: pit_store.universe_as_of(PAST)),
     ("announcements_as_of", lambda: pit_store.announcements_as_of("AAA", PAST)),
     ("paper_orders_as_of", lambda: pit_store.paper_orders_as_of(PAST)),
+    ("copy_orders_as_of", lambda: pit_store.copy_orders_as_of(PAST)),
     ("activist_filings_as_of",
      lambda: pit_store.activist_filings_as_of(PAST)),
     ("reporters_since",
@@ -143,6 +153,7 @@ def test_the_same_readers_do_see_it_afterwards(store):
     assert pit_store.corporate_actions_as_of("AAA", later)
     assert pit_store.universe_as_of(later)
     assert pit_store.announcements_as_of("AAA", later)
+    assert pit_store.copy_orders_as_of(later)
     assert pit_store.paper_orders_as_of(later)
     assert pit_store.activist_filings_as_of(later)
     assert pit_store.consensus_as_of("AAA", "2026Q1", later)
@@ -163,7 +174,7 @@ def test_every_as_of_reader_in_the_store_is_covered_here():
         "activist_filings_as_of", "consensus_as_of", "actual_as_of",
         "reporters_since", "filed_periods", "filed_issuer_periods",
         "has_consensus_history", "borrow_rate_as_of", "book_equity_as_of",
-        "paper_fills_as_of", "measured_round_trips",
+        "paper_fills_as_of", "measured_round_trips", "copy_orders_as_of",
         # Reads the run log, which records what the process did rather than
         # what the market did; see the test below for why it is keyed on the
         # date a run was FOR rather than on when it finished.

@@ -332,7 +332,7 @@ safe to cron; nothing already parsed is fetched twice.
 
 ## The scheduled jobs
 
-Eight services in the compose file are not servers. They bind no port, serve
+The scheduled services in the compose file are not servers. They bind no port, serve
 nothing, and finish — so they sit under the `sync` profile and `docker compose
 up` never starts them. A `restart: unless-stopped` batch job is a loop.
 
@@ -351,6 +351,7 @@ Cron lines, in the order they should run:
 ```cron
 MAILTO=you@example.com
 CRON_TZ=UTC
+30 12 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-copy.lock docker compose --env-file ../.env run --rm research-copy; } >> /srv/nemo/logs/research-copy.log 2>&1 || tail -n 100 /srv/nemo/logs/research-copy.log
 30 22 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-daily.lock docker compose --env-file ../.env run --rm research-daily && flock -n /var/lock/nemo-research-scan.lock docker compose --env-file ../.env run --rm research-scan; } >> /srv/nemo/logs/research-daily.log 2>&1 || tail -n 100 /srv/nemo/logs/research-daily.log
 */20 13-23 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-watch.lock docker compose --env-file ../.env run --rm research-watch; } >> /srv/nemo/logs/research-watch.log 2>&1 || tail -n 100 /srv/nemo/logs/research-watch.log
  0  7 * * 6 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-score.lock docker compose --env-file ../.env run --rm research-score; } >> /srv/nemo/logs/research-score.log 2>&1 || tail -n 100 /srv/nemo/logs/research-score.log
@@ -361,6 +362,42 @@ CRON_TZ=UTC
  0  4 * * * cd /srv/nemo/deploy && { date -u; docker container prune -f --filter until=24h --filter label=com.docker.compose.project=deploy; } >> /srv/nemo/logs/docker-prune.log 2>&1 || tail -n 100 /srv/nemo/logs/docker-prune.log
 0 12 * * 1-5 cd /srv/nemo/deploy && { date -u; docker compose --env-file ../.env run --rm research-status; } >> /srv/nemo/logs/research-status.log 2>&1 || tail -n 100 /srv/nemo/logs/research-status.log
 ```
+
+### Congressional purchase decisions
+
+The `research-copy` service runs at 12:30 UTC each weekday, after the
+06:00 congress sync and before the 13:15 fills job. It records decisions
+only and sends no order.
+
+The service mounts `research-data` at `/app/data` and sets `NEMO_PIT_DB`
+to `/app/data/pit.db`. It mounts `congress-data` at `/app/congress` and sets
+`NEMO_CONGRESS_DB` to `/app/congress/congress.db`. The job opens the congress
+database read-only. It does not create or migrate it. The mount is writable,
+because SQLite must write the shared-memory file of a WAL database to read it.
+
+Set these values in `/srv/nemo/.env`:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `NEMO_COPY_TRADING` | `off` | Only `on` and `off` are permitted, in any letter case. Unset means `off`. |
+| `NEMO_COPY_MIN_AMOUNT` | `15001` | Minimum disclosed amount floor, in dollars. Nonnegative integer. |
+| `NEMO_COPY_DOLLARS` | `5000` | Dollar target for each purchase. Positive integer. |
+| `NEMO_COPY_HOLD_DAYS` | `20` | Sessions after the intended session before a book slot opens. Positive integer. |
+| `NEMO_COPY_MAX_OPEN` | `10` | Maximum open copy positions. Positive integer. |
+| `NEMO_COPY_MAX_TRADE_AGE_DAYS` | `45` | Maximum days from the transaction date to the UTC parse date. Nonnegative integer. |
+| `NEMO_COPY_MEMBERS` | empty | Comma-separated full names. Empty selects all members. Comparison ignores letter case. |
+
+Empty settings use the code defaults. Invalid settings stop the job and name
+the setting. The compose file passes these settings to `research-copy` and
+`research-status`. When the flag is off, the job writes nothing and the status
+screen shows `off`. When it is on, the status screen monitors a weekday job.
+
+The job reads filings from the last three days that Nemo parsed before the
+UTC decision time. It keeps accepted and rejected decisions in `copy_order`.
+Accepted decisions reserve book slots until the hold period ends.
+The scanner supplies the weekday calendar, which does not exclude holidays.
+A House sync older than three days fails the run. A current House sync with
+no new purchases records an `ok` run and writes no decisions.
 
 ### Where a cron line's output goes
 

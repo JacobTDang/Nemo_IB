@@ -456,11 +456,51 @@ services:
     environment:
       <<: *clock-env
       NEMO_PIT_DB: /app/data/pit.db
+      NEMO_COPY_TRADING: ${NEMO_COPY_TRADING:-}
+      NEMO_COPY_MIN_AMOUNT: ${NEMO_COPY_MIN_AMOUNT:-}
+      NEMO_COPY_DOLLARS: ${NEMO_COPY_DOLLARS:-}
+      NEMO_COPY_HOLD_DAYS: ${NEMO_COPY_HOLD_DAYS:-}
+      NEMO_COPY_MAX_OPEN: ${NEMO_COPY_MAX_OPEN:-}
+      NEMO_COPY_MAX_TRADE_AGE_DAYS: ${NEMO_COPY_MAX_TRADE_AGE_DAYS:-}
+      NEMO_COPY_MEMBERS: ${NEMO_COPY_MEMBERS:-}
     volumes:
       - research-data:/app/data
     # It writes nothing to either, and gets them anyway: the rule that every
     # batch service caps its writes is worth keeping absolute, so a service
     # that later grows a cache does not quietly land on the host disk.
+    tmpfs:
+      - /root/.edgar:rw,size=16m
+      - /app/db_cache:rw,size=16m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Congressional decisions, after the source sync and before fills submit.
+  #   30 12 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-copy.lock docker compose --env-file ../.env run --rm research-copy; } >> /srv/nemo/logs/research-copy.log 2>&1 || tail -n 100 /srv/nemo/logs/research-copy.log
+  research-copy:
+    image: ${NEMO_IMAGE:-nemo-data:local}
+    profiles: ["sync"]
+    restart: "no"
+    entrypoint: ["python", "-m", "research.congress_copy"]
+    environment:
+      <<: *clock-env
+      NEMO_PIT_DB: /app/data/pit.db
+      NEMO_CONGRESS_DB: /app/congress/congress.db
+      NEMO_COPY_TRADING: ${NEMO_COPY_TRADING:-}
+      NEMO_COPY_MIN_AMOUNT: ${NEMO_COPY_MIN_AMOUNT:-}
+      NEMO_COPY_DOLLARS: ${NEMO_COPY_DOLLARS:-}
+      NEMO_COPY_HOLD_DAYS: ${NEMO_COPY_HOLD_DAYS:-}
+      NEMO_COPY_MAX_OPEN: ${NEMO_COPY_MAX_OPEN:-}
+      NEMO_COPY_MAX_TRADE_AGE_DAYS: ${NEMO_COPY_MAX_TRADE_AGE_DAYS:-}
+      NEMO_COPY_MEMBERS: ${NEMO_COPY_MEMBERS:-}
+    volumes:
+      - research-data:/app/data
+      # Writable on purpose. The store is WAL, and SQLite keeps a reader's
+      # shared-memory file beside it, so a read-only mount fails even a mode=ro
+      # open. The reader's mode=ro URI is what keeps this job from writing.
+      - congress-data:/app/congress
     tmpfs:
       - /root/.edgar:rw,size=16m
       - /app/db_cache:rw,size=16m
