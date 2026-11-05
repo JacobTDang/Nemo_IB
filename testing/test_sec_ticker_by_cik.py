@@ -50,6 +50,7 @@ class _Schedule13:
     """A Schedule 13D in DMC's folder, filed by a holder about DMC."""
 
     def __init__(self, accession, filed):
+        self.form = "SC 13D"
         self.accession_number = accession
         self.filing_date = filed
         self.file_number = "005-56187"
