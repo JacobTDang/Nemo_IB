@@ -67,6 +67,29 @@ S\x00\x00\x00\x00\x00\x00\x00\x00\x00 O\x00\x00: SCH1
 Digitally Signed: Hon. Richard W. Allen , 01/16/2025
 """
 
+HOUSE_SPOUSE_DC = """Filing ID #20033695
+Name: Hon. Doris O. Matsui
+Status: Member
+State/District: CA07
+ID Owner Asset Transaction Date Notification Amount Cap.
+Type Date Gains >
+$200?
+SP U.S. Treasury Note due 2/28/2029 P 12/15/2025 12/16/2025 Spouse/DC Over
+[GS] $1,000,000
+F\x00\x00\x00\x00\x00 S\x00\x00\x00\x00\x00: New
+SP U.S. Treasury Note due 2/28/2030 P 12/15/2025 12/16/2025 Spouse/DC Over
+[GS] $1,000,000
+F\x00\x00\x00\x00\x00 S\x00\x00\x00\x00\x00: New
+SP U.S. Treasury Note due 8/31/2029 P 12/15/2025 12/16/2025 Spouse/DC Over
+[GS] $1,000,000
+F\x00\x00\x00\x00\x00 S\x00\x00\x00\x00\x00: New
+SP U.S. Treasury Note due 8/31/2030 P 12/15/2025 12/16/2025 Spouse/DC Over
+[GS] $1,000,000
+F\x00\x00\x00\x00\x00 S\x00\x00\x00\x00\x00: New
+* For the complete list of asset type abbreviations, please visit https://fd.house.gov/reference/asset-type-codes.aspx.
+Digitally Signed: Hon. Doris O. Matsui , 01/09/2026
+"""
+
 SENATE_HTML = """
 <html><body><h1>Periodic Transaction Report</h1>
 <table><thead><tr>
@@ -157,6 +180,38 @@ def test_house_owner_defaults_to_self_when_unmarked():
     bill = next(t for t in filing["transactions"]
                 if "TREASURY BILL" in t["asset_name"].upper())
     assert bill["owner"] == "self"
+
+
+def test_house_ptr_spouse_dc_over_million_gives_four_transactions():
+    filing = ct.parse_house_ptr(HOUSE_SPOUSE_DC)
+
+    assert filing["member"] == "Hon. Doris O. Matsui"
+    assert filing["doc_id"] == "20033695"
+    assert len(filing["transactions"]) == 4
+
+    for txn in filing["transactions"]:
+        assert txn["owner"] == "spouse"
+        assert txn["amount_min"] == 1000001
+        assert txn["amount_max"] is None
+        assert txn["asset_type_code"] == "GS"
+        assert "[GS]" not in txn["asset_name"]
+        assert "$1,000,000" not in txn["asset_name"]
+        assert txn["asset_name"].startswith("U.S. Treasury Note due")
+        assert txn["transaction_type"] == "purchase"
+        assert txn["transaction_date"] == "2025-12-15"
+        assert txn["notification_date"] == "2025-12-16"
+
+
+def test_parse_amount_range_spouse_dc_over_million():
+    """A floor and no ceiling, with or without the wrapped figure."""
+    assert ct.parse_amount_range("Spouse/DC Over $1,000,000") == (1000001, None)
+    assert ct.parse_amount_range("Spouse/DC Over [GS] $1,000,000") == (1000001, None)
+
+
+def test_a_band_keeps_its_ceiling_when_the_tail_mentions_spouse_dc():
+    """Only the amount's own start is the Spouse/DC box; the tail is not."""
+    assert ct.parse_amount_range(
+        "$1,001 - $15,000 D: Spouse/DC Over a trust") == (1001, 15000)
 
 
 # ----------------------------------------------------------------- Senate

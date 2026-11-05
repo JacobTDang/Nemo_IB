@@ -59,12 +59,14 @@ _SENATE_OWNER = {"self": "self", "spouse": "spouse", "joint": "joint",
                  "child": "dependent_child", "dependent child": "dependent_child"}
 
 # A transaction row is anchored by its type followed by two dates. Longest
-# alternative first, so "S (partial)" is not read as a bare "S".
+# alternative first, so "S (partial)" is not read as a bare "S". The amount is
+# a dollar band, or "Spouse/DC Over $1,000,000", whose figure often wraps to
+# the next line (see `parse_amount_range`).
 _TXN_ANCHOR = re.compile(
     r"\b(?P<type>P|S \(partial\)|S|E)\s+"
     r"(?P<txn_date>\d{2}/\d{2}/\d{4})\s+"
     r"(?P<notified>\d{2}/\d{2}/\d{4})\s+"
-    r"(?P<amount>\$[\d,]+(?:\s*-\s*\$[\d,]+)?\s*\+?)")
+    r"(?P<amount>(?:Spouse/DC\s+Over(?:\s*\$[\d,]+)?|\$[\d,]+(?:\s*-\s*\$[\d,]+)?\s*\+?))")
 
 # The PDF renders field labels in a decorative font whose interior letters
 # extract as NUL bytes: "Filing Status" arrives as
@@ -228,6 +230,13 @@ AMOUNT_BRACKETS: Tuple[Tuple[int, Optional[int]], ...] = (
 )
 _BRACKET_FLOORS = {low: high for low, high in AMOUNT_BRACKETS}
 
+# Above $1,000,000 the Act's bands apply to the filer's own and joint assets
+# only. A spouse's or dependent child's asset goes in one box, "Spouse/DC Over
+# $1,000,000", so the filing states a floor and no ceiling. Matched only where
+# the amount begins: the rest of the text is the row's tail.
+_SPOUSE_DC_OVER = re.compile(r"\s*Spouse/DC\s+Over\b")
+SPOUSE_DC_FLOOR = 1000001
+
 
 # The PTR's table header, repeated at the top of each page. When an entry
 # spans a page break the header is absorbed into the row -- 411 of 16,518
@@ -267,6 +276,8 @@ def parse_amount_range(text: str) -> Tuple[Optional[int], Optional[int]]:
     """
     if not text:
         return (None, None)
+    if _SPOUSE_DC_OVER.match(text):
+        return (SPOUSE_DC_FLOOR, None)
     numbers = [int(n.replace(",", "")) for n in re.findall(r"\$([\d,]+)", text)]
     if not numbers:
         return (None, None)
