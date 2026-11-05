@@ -444,13 +444,11 @@ def test_exit_resends_are_marked_late_and_not_measured(store):
     assert pit_store.measured_round_trips(SESSIONS[11]) == []
 
 
-def test_paper_fill_migration_keeps_existing_rows_and_is_safe_to_run_twice(store):
-    """A store created before attempt existed must keep every row as attempt
-    1, and a second migrate must not duplicate or drop them."""
+def _store_before_attempts():
+    """A paper_fill table as deployed before #189, holding one filled entry."""
     import sqlite3
 
-    path = pit_store.db_path()
-    with sqlite3.connect(path) as conn:
+    with sqlite3.connect(pit_store.db_path()) as conn:
         conn.execute("DROP TABLE IF EXISTS paper_fill")
         conn.execute("""
             CREATE TABLE paper_fill (
@@ -471,6 +469,12 @@ def test_paper_fill_migration_keeps_existing_rows_and_is_safe_to_run_twice(store
                        'buy',50,'cid-old',NULL,'filled',NULL,50,100.0,
                        '2026-06-05T13:30:01Z','2026-06-05T13:15:00Z')""")
 
+
+def test_paper_fill_migration_keeps_existing_rows_and_is_safe_to_run_twice(store):
+    """A store created before attempt existed must keep every row as attempt
+    1, and a second migrate must not duplicate or drop them."""
+    _store_before_attempts()
+
     pit_store.init_schema()
     pit_store.init_schema()
 
@@ -479,6 +483,55 @@ def test_paper_fill_migration_keeps_existing_rows_and_is_safe_to_run_twice(store
     assert rows[0]["client_order_id"] == "cid-old"
     assert rows[0]["attempt"] == 1
     assert rows[0]["filled_qty"] == pytest.approx(50)
+
+
+def test_a_paper_fill_migration_that_fails_midway_changes_nothing(
+        store, monkeypatch):
+    """The rebuild is one transaction. CREATE TABLE commits on its own in
+    sqlite3's default mode, so a failure after it used to leave a half-built
+    paper_fill__attempt behind, and every later init_schema then died on
+    "table already exists" while the store kept its old key."""
+    import sqlite3
+
+    _store_before_attempts()
+    real_connect = pit_store.connect
+
+    class _FailsOnDrop:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+        def __enter__(self):
+            self._conn.__enter__()
+            return self
+
+        def __exit__(self, *exc):
+            return self._conn.__exit__(*exc)
+
+        def execute(self, sql, *args):
+            if sql.strip().startswith("DROP TABLE paper_fill"):
+                raise sqlite3.OperationalError("disk I/O error")
+            return self._conn.execute(sql, *args)
+
+    monkeypatch.setattr(pit_store, "connect",
+                        lambda: _FailsOnDrop(real_connect()))
+    with pytest.raises(sqlite3.OperationalError):
+        pit_store.init_schema()
+    monkeypatch.setattr(pit_store, "connect", real_connect)
+
+    with sqlite3.connect(pit_store.db_path()) as conn:
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(paper_fill)")}
+        held = conn.execute("SELECT client_order_id FROM paper_fill").fetchall()
+    assert "paper_fill__attempt" not in tables
+    assert "attempt" not in columns
+    assert held == [("cid-old",)]
+
+    pit_store.init_schema()
+    assert pit_store.paper_fills_as_of("2026-06-05")[0]["attempt"] == 1
 
 
 def test_a_remainder_larger_than_the_broker_position_is_skipped_naming_held_qty(

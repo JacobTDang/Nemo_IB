@@ -407,6 +407,11 @@ def _migrate_paper_fill_attempts(conn: sqlite3.Connection) -> None:
     present = {r[1] for r in conn.execute("PRAGMA table_info(paper_fill)")}
     if not present or "attempt" in present:
         return
+    # One transaction for the whole rebuild. sqlite3 commits a CREATE TABLE on
+    # its own unless a transaction is already open, so a failure after it left
+    # a half-built copy behind and every later start died on "table already
+    # exists". The caller's `with` commits this, or rolls it back on a raise.
+    conn.execute("BEGIN")
     conn.execute("""
         CREATE TABLE paper_fill__attempt (
             order_as_of       TEXT NOT NULL,
