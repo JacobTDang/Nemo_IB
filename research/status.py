@@ -10,7 +10,7 @@ found nothing** and **a job that did not run**. Both write zero rows. Most
 nights the first one is normal and the second one is an outage, and only the
 run log separates them -- so this reads the log rather than counting rows.
 
-Three states beyond the obvious, each of which looks like success to a reader
+Four states beyond the obvious, each of which looks like success to a reader
 counting rows:
 
   `never`   - the job has no run at all. On a fresh volume that is every job
@@ -18,8 +18,11 @@ counting rows:
               is the job's own tolerance, counted from the store's first run:
               a Saturday job is not due on a Tuesday. A store with no runs at
               all has nothing to count from, and is raised.
-  `crashed` - a run started and never finished. The process died, and
-              `missing_days` already refuses to count it as coverage.
+  `running` - a run started and has not finished, but is younger than the
+              longest that job's runs take. It is still working.
+  `crashed` - a run started, never finished, and is older than that. The
+              process died, and `missing_days` already refuses to count it
+              as coverage.
   `stale`   - the last success is further back than the job's own tolerance.
               The scanner refuses outright at five days, so the report has to
               say so before the refusal does.
@@ -41,6 +44,12 @@ from research import pit_store
 # room for one missed run, not round numbers. A job that runs only on weekdays
 # counts them in weekdays (see `_age`), so a weekend is not silence.
 #
+# `max_run_seconds` is how long an unfinished run is still `running`; older,
+# it is `crashed`. Without it every run in progress read as a crash (#179). At
+# least twice the longest run on the VM by 2026-11-05, and never under ten
+# minutes: seed 82.7 min, announce 67.6, daily_bars 3.6, every other nightly
+# stage and the fills under one. activist_watch stops itself at 600 s.
+#
 # `partial_is_normal` marks a job whose steady state is partial coverage.
 # `activist_watch` watches a time-bounded slice of the watchlist on purpose, so
 # every pass is honestly `partial` and every day is honestly a gap. Both are
@@ -52,42 +61,54 @@ from research import pit_store
 JOBS = (
     {"job": "daily_bars", "module": "research.daily_job",
      "every": "weeknight", "stale_after_days": 2,
+     "max_run_seconds": 600,
      "partial_is_normal": False},
     {"job": "newcomers", "module": "research.daily_job",
      "every": "weeknight", "stale_after_days": 2,
+     "max_run_seconds": 600,
      "partial_is_normal": False},
     {"job": "universe", "module": "research.daily_job",
      "every": "weeknight", "stale_after_days": 2,
+     "max_run_seconds": 600,
      "partial_is_normal": False},
     {"job": "consensus", "module": "research.daily_job",
      "every": "weeknight", "stale_after_days": 2,
+     "max_run_seconds": 600,
      "partial_is_normal": False},
     {"job": "scan", "module": "research.scanner",
      "every": "weeknight", "stale_after_days": 2,
+     "max_run_seconds": 600,
      "partial_is_normal": False},
     {"job": "activist_watch", "module": "research.activist_watch",
      "every": "20 minutes", "stale_after_days": 1,
      # Bounded by a clock, so one pass covers a slice and never the
      # whole watchlist. See `research.activist_watch`. One weekday with
-     # no finished pass is already dozens of missed runs.
+     # no finished pass is already dozens of missed runs. The clock is
+     # 600 s; five more minutes cover writing the pass out.
+     "max_run_seconds": 900,
      "partial_is_normal": True},
     {"job": "score", "module": "research.scoring",
      "every": "Saturday", "stale_after_days": 10,
+     "max_run_seconds": 600,
      "partial_is_normal": False},
     {"job": "announce", "module": "research.announcements",
      "every": "Saturday", "stale_after_days": 10,
+     "max_run_seconds": 8100,
      "partial_is_normal": False},
     {"job": "seed", "module": "research.seed_consensus",
      "every": "monthly", "stale_after_days": 40,
+     "max_run_seconds": 10800,
      "partial_is_normal": False},
     # Paper fills (issue #116). Optional: they run only once Alpaca paper keys
     # are in .env, so a job that has never run is shown, not raised. Once it
     # has run, a failure or a stall is raised like any other.
     {"job": "fill_submit", "module": "tools.alpaca.fills",
      "every": "weekday", "stale_after_days": 2,
+     "max_run_seconds": 600,
      "partial_is_normal": False, "optional": True},
     {"job": "fill_collect", "module": "tools.alpaca.fills",
      "every": "weekday", "stale_after_days": 2,
+     "max_run_seconds": 600,
      "partial_is_normal": False, "optional": True},
 )
 
@@ -164,6 +185,7 @@ def _job_state(spec: Dict[str, Any], as_of: str) -> Dict[str, Any]:
     job = spec["job"]
     out = {"job": job, "module": spec["module"], "every": spec["every"],
            "stale_after_days": spec["stale_after_days"],
+           "max_run_seconds": spec["max_run_seconds"],
            "partial_is_normal": spec["partial_is_normal"],
            "optional": spec.get("optional", False),
            "last_run": None, "last_success": None, "state": "never",
@@ -178,9 +200,13 @@ def _job_state(spec: Dict[str, Any], as_of: str) -> Dict[str, Any]:
                 "rows_written": row["rows_written"], "error": row["error"]})
 
     if not row["finished_at"]:
-        # `missing_days` already refuses to count this as coverage. Saying so
-        # here is what turns "no rows last night" into "the process died".
-        out["state"] = "crashed"
+        # Measured against the wall clock, not `as_of`: whether a process is
+        # still alive is a fact about now. `missing_days` refuses to count
+        # either as coverage; saying which one turns "no rows last night"
+        # into "the process died".
+        started = datetime.fromisoformat(row["started_at"].replace("Z", "+00:00"))
+        age = (datetime.now(timezone.utc) - started).total_seconds()
+        out["state"] = "running" if age <= spec["max_run_seconds"] else "crashed"
         return out
 
     # The run's own verdict stands. `last_successful_run` counts only 'ok'
@@ -221,7 +247,8 @@ def _job_state(spec: Dict[str, Any], as_of: str) -> Dict[str, Any]:
     if start > yesterday:
         out["gaps"] = 0
     else:
-        out["gaps"] = len(pit_store.missing_days(job, start, yesterday))
+        out["gaps"] = len(pit_store.missing_days(job, start, yesterday,
+                                                 every=spec["every"]))
     return out
 
 

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import pathlib
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -88,11 +88,57 @@ def test_a_run_that_never_finished_is_not_counted_as_a_run(store):
     """A crashed process leaves a started row with no finish. Reading that as
     coverage is how a job that dies every night looks healthy."""
     store.start_run("scan", as_of_date="2026-03-03")
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE run_log SET started_at = '2026-03-03T21:00:00Z' "
+            "WHERE job = 'scan'")
 
     row = _job(status.collect(as_of="2026-03-03"), "scan")
 
     assert row["state"] == "crashed", (
         "a started-and-unfinished run was reported as a completed one")
+
+
+def _started_minutes_ago(store, job, minutes, as_of_date="2026-10-27"):
+    """An unfinished run of `job` that started `minutes` before now."""
+    store.start_run(job, as_of_date=as_of_date)
+    started = (datetime.now(timezone.utc) - timedelta(minutes=minutes))
+    with store.connect() as conn:
+        conn.execute("UPDATE run_log SET started_at = ? WHERE job = ?",
+                     (started.strftime("%Y-%m-%dT%H:%M:%SZ"), job))
+
+
+def test_a_run_started_inside_its_bound_is_running_and_raises_nothing(store):
+    """A run in progress has no finish yet. Calling it a crash raised an alarm
+    for half of every afternoon while activist_watch worked (#179)."""
+    _started_minutes_ago(store, "activist_watch", 5)
+
+    report = status.collect(as_of="2026-10-27")
+
+    assert _job(report, "activist_watch")["state"] == "running"
+    assert not any("activist_watch" in a for a in report["attention"])
+
+
+@pytest.mark.parametrize("job, minutes", [
+    ("seed", 83), ("announce", 68), ("activist_watch", 10.5),
+    ("daily_bars", 4)])
+def test_a_run_as_long_as_the_longest_measured_is_still_running(store, job,
+                                                                minutes):
+    """The longest runs on the VM by 2026-11-05. A bound below one of them
+    reports a working job as dead every time it runs that long."""
+    _started_minutes_ago(store, job, minutes)
+
+    assert _job(status.collect(as_of="2026-10-27"), job)["state"] == "running"
+
+
+def test_a_run_started_past_its_bound_is_crashed_and_raises_attention(store):
+    _started_minutes_ago(store, "activist_watch", 30)
+
+    report = status.collect(as_of="2026-10-27")
+
+    assert _job(report, "activist_watch")["state"] == "crashed"
+    assert ("activist_watch started a run for 2026-10-27 and never finished it"
+            in report["attention"])
 
 
 # --- what needs attention ---------------------------------------------------
@@ -337,6 +383,52 @@ def test_weekday_really_missed_inside_window_is_still_counted_as_gap(store):
         store.finish_run(rows_written=10, status="ok")
 
     row = _job(status.collect(as_of="2026-10-22"), "scan")
+
+    assert row["gaps"] == 1
+
+
+def test_saturday_job_that_ran_both_saturdays_in_window_has_zero_gaps(store):
+    """Score runs on Saturday. Oct 24 and Oct 31 are the two Saturdays in the
+    14-day window ending before 2026-11-05. Running on both must report 0 gaps,
+    not count the intervening weekdays."""
+    store.start_run("score", as_of_date="2026-10-24")
+    store.finish_run(rows_written=10, status="ok")
+    store.start_run("score", as_of_date="2026-10-31")
+    store.finish_run(rows_written=10, status="ok")
+
+    row = _job(status.collect(as_of="2026-11-05"), "score")
+
+    assert row["gaps"] == 0
+
+
+def test_saturday_job_that_missed_one_saturday_has_one_gap(store):
+    """Missed Oct 31; must report exactly 1 gap."""
+    store.start_run("score", as_of_date="2026-10-24")
+    store.finish_run(rows_written=10, status="ok")
+
+    row = _job(status.collect(as_of="2026-11-05"), "score")
+
+    assert row["gaps"] == 1
+
+
+def test_monthly_job_that_ran_on_first_has_zero_gaps(store):
+    """Seed runs on the 1st of the month. A store with runs on 2026-10-01 and
+    2026-11-01 must report 0 gaps as of 2026-11-05, not count weekdays or Saturdays."""
+    store.start_run("seed", as_of_date="2026-10-01")
+    store.finish_run(rows_written=10, status="ok")
+    store.start_run("seed", as_of_date="2026-11-01")
+    store.finish_run(rows_written=10, status="ok")
+
+    row = _job(status.collect(as_of="2026-11-05"), "seed")
+
+    assert row["gaps"] == 0
+
+
+def test_monthly_job_that_missed_the_first_has_one_gap(store):
+    store.start_run("seed", as_of_date="2026-10-01")
+    store.finish_run(rows_written=10, status="ok")
+
+    row = _job(status.collect(as_of="2026-11-05"), "seed")
 
     assert row["gaps"] == 1
 
