@@ -389,15 +389,19 @@ Set these values in `/srv/nemo/.env`:
 
 Empty settings use the code defaults. Invalid settings stop the job and name
 the setting. The compose file passes these settings to `research-copy` and
-`research-status`. When the flag is off, the job writes nothing and the status
-screen shows `off`. When it is on, the status screen monitors a weekday job.
+`research-status`. It also passes `NEMO_COPY_TRADING` and `NEMO_COPY_HOLD_DAYS`
+to `research-fills`, which sends the copy book's accepted purchases to the
+paper account. When the flag is off, the decision job writes nothing and the
+status screen shows `off`. The fills job still exits copy positions already
+held. When the flag is on, the status screen monitors a weekday job.
 
 The job reads filings from the last three days that Nemo parsed before the
 UTC decision time. It keeps accepted and rejected decisions in `copy_order`.
 Accepted decisions reserve book slots until the hold period ends.
 The scanner supplies the weekday calendar, which does not exclude holidays.
 A House sync older than three days fails the run. A current House sync with
-no new purchases records an `ok` run and writes no decisions.
+no new purchases records an `ok` run and writes no decisions. The decision
+job itself still sends no order.
 
 ### Where a cron line's output goes
 
@@ -613,9 +617,13 @@ of basis points changes its sign. `research-fills` measures it (issue #116).
 Each weekday before the opening auction closes to new orders it sends the legs
 due that session to an Alpaca **paper** account as opening-auction market
 orders in whole shares: entries for orders the scan filed for today, exits for
-entries whose twenty sessions are up. After the open it collects what filled.
-`report` sets each fill against the open the scoring assumes, and the weekly
-score feeds round trips filled on schedule into the go/no-go gate above, which
+entries whose twenty sessions are up. The same run also sends the congressional
+copy book's accepted purchases, sized in whole shares from the last close, and
+exits them after `NEMO_COPY_HOLD_DAYS` sessions. Copy fills land in `copy_fill`
+and never enter the earnings gate or risk book. After the open it collects what
+filled for both books. `report` sets each earnings fill against the open the
+scoring assumes, and shows the copy book separately. The weekly score feeds
+earnings round trips filled on schedule into the go/no-go gate above, which
 cannot pass without them.
 
 It is its own image, because it is the one thing here that can place an order

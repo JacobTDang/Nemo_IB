@@ -667,6 +667,8 @@ services:
       NEMO_PIT_DB: /app/data/pit.db
       ALPACA_PAPER_KEY: ${ALPACA_PAPER_KEY:-}
       ALPACA_PAPER_SECRET: ${ALPACA_PAPER_SECRET:-}
+      NEMO_COPY_TRADING: ${NEMO_COPY_TRADING:-}
+      NEMO_COPY_HOLD_DAYS: ${NEMO_COPY_HOLD_DAYS:-}
     volumes:
       - research-data:/app/data
     tmpfs:

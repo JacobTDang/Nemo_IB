@@ -339,9 +339,13 @@ pass on modeled costs, so it reports "not passed" until measured fills exist.
 The `research-fills` job measures those fills with an Alpaca paper account. It
 sends each filed order to the opening auction of its session and records what
 filled. Its report compares each fill with the open that the scoring assumes.
-The job runs from its own image, because it can place orders. The data image
-cannot place orders. Paper fills show the quoted spread at the open. They do
-not show the price impact of the order.
+The same job also sends the congressional copy book's accepted purchases to
+the same paper account. Copy fills land in `copy_fill` and never enter the
+earnings gate or risk book. When `NEMO_COPY_TRADING` is off, the job sends no
+new copy entry, but it still exits copy positions already held. The job runs
+from its own image, because it can place orders. The data image cannot place
+orders. Paper fills show the quoted spread at the open. They do not show the
+price impact of the order.
 
 ### Congressional purchase decisions
 
@@ -371,7 +375,9 @@ A current sync without new purchases records an `ok` run.
 The intended session is the first session on or after the decision date.
 The scanner supplies the calendar. That calendar includes weekdays but does
 not exclude exchange holidays. The hold period uses the same calendar.
-The job records the dollar target. It sends no order.
+The job records the dollar target. It sends no order. The `research-fills`
+job sends the copy book's orders to the paper account and holds each entry
+for `NEMO_COPY_HOLD_DAYS` sessions.
 
 These settings go in the deployment environment file. Empty values use the
 code defaults. Invalid values stop the job and identify the setting.
@@ -410,7 +416,8 @@ activist_filing    13D events with four timestamps, latency derived at read
 book_equity        what the paper book was worth each night, and the limit
 risk_event         each time the drawdown switch tripped or a person reset it
 gate_check         the go/no-go gate as each weekly score found it
-paper_fill         each order sent to the paper broker, and what it filled
+paper_fill         each earnings-book order sent to the paper broker, and what it filled
+copy_fill          each copy-book order sent to the paper broker, and what it filled
 run_log            every run, so a day the job did not run is visible
 ```
 

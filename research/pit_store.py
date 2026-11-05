@@ -353,6 +353,28 @@ CREATE TABLE IF NOT EXISTS paper_fill (
     PRIMARY KEY (order_as_of, ticker, leg, attempt)
 );
 
+-- Congressional copy-book fills (issue #190). Same shape as paper_fill, and
+-- never mixed with it: the earnings gate and risk book read only paper_fill.
+CREATE TABLE IF NOT EXISTS copy_fill (
+    order_as_of       TEXT NOT NULL,
+    ticker            TEXT NOT NULL,
+    leg               TEXT NOT NULL CHECK (leg IN ('entry', 'exit')),
+    attempt           INTEGER NOT NULL DEFAULT 1,
+    scheduled_session TEXT NOT NULL,
+    session           TEXT NOT NULL,
+    side              TEXT NOT NULL,
+    qty               INTEGER NOT NULL,
+    client_order_id   TEXT NOT NULL UNIQUE,
+    broker_order_id   TEXT,
+    status            TEXT NOT NULL,
+    reason            TEXT,
+    filled_qty        REAL,
+    filled_price      REAL,
+    filled_at         TEXT,
+    submitted_at      TEXT NOT NULL,
+    PRIMARY KEY (order_as_of, ticker, leg, attempt)
+);
+
 CREATE TABLE IF NOT EXISTS run_log (
     run_id       INTEGER PRIMARY KEY AUTOINCREMENT,
     job          TEXT NOT NULL,
@@ -1588,17 +1610,27 @@ def latest_gate_check(as_of_date: str) -> Optional[Dict[str, Any]]:
 # ------------------------------------------------------------- paper fills
 #
 # Issue #116. Standard library only, like the rest of this module: the gate in
-# `scoring` reads measured round trips from here.
+# `scoring` reads measured round trips from here. Issue #190 adds `copy_fill`
+# with the same columns; both books share these writers by naming the table.
 
 FILL_TERMINAL = ("filled", "canceled", "expired", "rejected", "skipped")
+FILL_TABLES = frozenset({"paper_fill", "copy_fill"})
 
 
-def record_fill_submission(row: Dict[str, Any]) -> int:
+def _fill_table(table: str) -> str:
+    if table not in FILL_TABLES:
+        raise ValueError(f"unknown fill table: {table!r}")
+    return table
+
+
+def record_fill_submission(row: Dict[str, Any],
+                           table: str = "paper_fill") -> int:
     """One leg sent, skipped or refused. The first record of a key stands."""
+    table = _fill_table(table)
     attempt = int(row.get("attempt") or 1)
     with connect() as conn:
         cur = conn.execute(
-            """INSERT OR IGNORE INTO paper_fill
+            f"""INSERT OR IGNORE INTO {table}
                (order_as_of, ticker, leg, attempt, scheduled_session, session,
                 side, qty, client_order_id, broker_order_id, status, reason,
                 submitted_at)
@@ -1613,13 +1645,15 @@ def record_fill_submission(row: Dict[str, Any]) -> int:
 def update_paper_fill(client_order_id: str, status: str,
                       filled_qty: Optional[float],
                       filled_price: Optional[float],
-                      filled_at: Optional[str]) -> int:
+                      filled_at: Optional[str],
+                      table: str = "paper_fill") -> int:
     """What the broker says now. A leg already at a terminal answer is left
     alone: a fill price is a fact, and a later look must not restate it."""
+    table = _fill_table(table)
     placeholders = ",".join("?" * len(FILL_TERMINAL))
     with connect() as conn:
         cur = conn.execute(
-            f"""UPDATE paper_fill
+            f"""UPDATE {table}
                    SET status = ?, filled_qty = ?, filled_price = ?,
                        filled_at = ?
                  WHERE client_order_id = ?
@@ -1629,15 +1663,17 @@ def update_paper_fill(client_order_id: str, status: str,
         return cur.rowcount
 
 
-def paper_fills_as_of(as_of_date: str) -> List[Dict[str, Any]]:
+def fills_as_of(as_of_date: str, table: str = "paper_fill"
+                ) -> List[Dict[str, Any]]:
     """Every leg submitted on or before `as_of_date`, as it stood then.
 
     A fill that came after the date is shown as still pending: on that day
     nobody knew the price.
     """
+    table = _fill_table(table)
     with connect() as conn:
         rows = [dict(r) for r in conn.execute(
-            """SELECT * FROM paper_fill WHERE date(submitted_at) <= ?
+            f"""SELECT * FROM {table} WHERE date(submitted_at) <= ?
                 ORDER BY submitted_at, ticker, leg, attempt""",
             (as_of_date,))]
     for row in rows:
@@ -1647,13 +1683,18 @@ def paper_fills_as_of(as_of_date: str) -> List[Dict[str, Any]]:
     return rows
 
 
+def paper_fills_as_of(as_of_date: str) -> List[Dict[str, Any]]:
+    """Earnings-book fills as of `as_of_date`."""
+    return fills_as_of(as_of_date, table="paper_fill")
+
+
 def measured_round_trips(as_of_date: str) -> List[Dict[str, Any]]:
     """Orders whose entry and exit both filled on schedule by `as_of_date`.
 
     The measured counterpart of a scored trade: same order, same sessions,
     the broker's prices instead of the opens. Only exit attempt 1 counts, and
     only when it was on time — later remainder exits flatten the account and
-    are never measured (issue #189).
+    are never measured (issue #189). Reads `paper_fill` only.
     """
     orders = {(o["as_of_date"], o["ticker"]): o
               for o in paper_orders_as_of(as_of_date, accepted_only=True)}
@@ -1685,6 +1726,58 @@ def measured_round_trips(as_of_date: str) -> List[Dict[str, Any]]:
             "borrow_bps": order.get("borrow_bps"),
             "participation": order.get("participation")})
     return trips
+
+
+def copy_book_summary(as_of_date: str) -> Dict[str, Any]:
+    """Open and closed copy positions, and the share-weighted mean return.
+
+    Return is exit fill over entry fill, minus one, for a long. Exit fills
+    across attempts are quantity-weighted into one exit price. Positions that
+    still hold shares after every terminal exit are open.
+    """
+    fills = fills_as_of(as_of_date, table="copy_fill")
+    by_key: Dict[tuple, Dict[str, Any]] = {}
+    for row in fills:
+        slot = by_key.setdefault(
+            (row["order_as_of"], row["ticker"]),
+            {"entry": None, "exits": []})
+        if row["leg"] == "entry":
+            slot["entry"] = row
+        else:
+            slot["exits"].append(row)
+
+    open_n = closed_n = 0
+    weighted_return = 0.0
+    weight = 0.0
+    for slot in by_key.values():
+        entry = slot["entry"]
+        if (entry is None or entry["status"] not in FILL_TERMINAL
+                or not entry.get("filled_qty") or not entry.get("filled_price")):
+            continue
+        entry_qty = float(entry["filled_qty"])
+        exit_qty = 0.0
+        exit_value = 0.0
+        for exit_row in slot["exits"]:
+            if exit_row["status"] not in FILL_TERMINAL:
+                continue
+            qty = float(exit_row.get("filled_qty") or 0)
+            if qty <= 0 or not exit_row.get("filled_price"):
+                continue
+            exit_qty += qty
+            exit_value += qty * float(exit_row["filled_price"])
+        if exit_qty + 1e-9 < entry_qty:
+            open_n += 1
+            continue
+        closed_n += 1
+        exit_price = exit_value / exit_qty
+        ret = exit_price / float(entry["filled_price"]) - 1.0
+        weighted_return += entry_qty * ret
+        weight += entry_qty
+    return {
+        "open": open_n,
+        "closed": closed_n,
+        "mean_return": (weighted_return / weight) if weight else None,
+    }
 
 
 # ------------------------------------------------------------ copy decisions
