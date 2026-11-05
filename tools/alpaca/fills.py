@@ -13,6 +13,11 @@ market orders: entries for orders the scan filed for today, exits for entries
 the holding period has run out on. After the open it collects what filled. The
 report sets each fill against the open the scoring assumes.
 
+Issue #190 adds the congressional copy book beside the earnings book in the
+same run. Copy legs use their own client ids and land in `copy_fill`, so the
+earnings gate and risk book never see them. The decision job still sends no
+order; this job is what sends the copy book's legs.
+
 It runs from its own image (`docker build --target fills`). The data image
 serves market data and cannot place an order, and this module is not in it.
 It never constructs a live broker.
@@ -34,6 +39,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from research import pit_store, scoring
+from research.congress_copy import Settings as CopySettings
 from tools.alpaca.async_broker import AsyncBroker, AsyncBrokerError
 
 HORIZON_DAYS = scoring.DEFAULT_HORIZON_DAYS
@@ -49,14 +55,21 @@ NOTE = ("Paper fills are simulated from quotes: they measure the quoted spread "
 
 
 def client_order_id(order_as_of: str, ticker: str, leg: str,
-                    attempt: int = 1) -> str:
+                    attempt: int = 1, book: str = "earnings") -> str:
     """Deterministic per attempt, so a second run cannot send the same
     attempt twice: the store refuses the row and the broker refuses the id.
 
     Attempt 1 keeps the original id shape so rows already at the broker stay
     addressable; later remainder exits append the attempt number (issue #189).
+    The copy book's prefix is `nemo-copy-` so its ids can never collide with
+    the earnings book's `nemo-` ids (issue #190).
     """
-    base = f"nemo-{order_as_of}-{ticker}-{leg}"
+    if book == "copy":
+        base = f"nemo-copy-{order_as_of}-{ticker}-{leg}"
+    elif book == "earnings":
+        base = f"nemo-{order_as_of}-{ticker}-{leg}"
+    else:
+        raise ValueError(f"unknown fill book: {book!r}")
     if attempt <= 1:
         return base
     return f"{base}-{attempt}"
@@ -103,9 +116,15 @@ def _exit_filled_total(exits: List[Dict[str, Any]]) -> float:
     return total
 
 
+def _empty_book() -> Dict[str, Any]:
+    return {"status": "ok", "submitted": 0, "skipped": 0,
+            "rejected": 0, "missed": 0}
+
+
 def plan(orders: List[Dict[str, Any]], fills: List[Dict[str, Any]],
          calendar: List[str], today: str, horizon_days: int,
-         last_close: Callable[[str, str], Optional[float]] = _last_close
+         last_close: Callable[[str, str], Optional[float]] = _last_close,
+         book: str = "earnings"
          ) -> Tuple[List[Dict[str, Any]], int]:
     """The legs due at today's open, and how many entries were missed.
 
@@ -165,7 +184,8 @@ def plan(orders: List[Dict[str, Any]], fills: List[Dict[str, Any]],
                          "scheduled_session": today,
                          "session": today, "side": _ENTRY_SIDE[side],
                          "qty": qty, "reason": reason,
-                         "client_order_id": client_order_id(*key, "entry")})
+                         "client_order_id": client_order_id(
+                             *key, "entry", book=book)})
             continue
 
         # Exited once the entry has its final answer and holds shares. An
@@ -202,89 +222,174 @@ def plan(orders: List[Dict[str, Any]], fills: List[Dict[str, Any]],
                      "session": today, "side": _EXIT_SIDE[side],
                      "qty": remainder, "reason": reason,
                      "client_order_id": client_order_id(
-                         *key, "exit", attempt=attempt)})
+                         *key, "exit", attempt=attempt, book=book)})
     return legs, missed
+
+
+async def _submit_legs(broker, legs: List[Dict[str, Any]], today: str,
+                       table: str) -> Dict[str, Any]:
+    """Send one book's planned legs and record each one in `table`."""
+    out = _empty_book()
+    for leg in legs:
+        row = {**leg, "broker_order_id": None,
+               "submitted_at": _stamp(today)}
+        if leg["qty"] <= 0:
+            pit_store.record_fill_submission(
+                {**row, "status": "skipped"}, table=table)
+            out["skipped"] += 1
+            continue
+        # A remainder exit must not sell shares another trade (or a
+        # leftover like the 2.5 F) is holding. Ask the broker first; a
+        # lookup error is a refusal, never a silent "not held".
+        if leg["leg"] == "exit" and int(leg.get("attempt") or 1) > 1:
+            try:
+                position = await broker.get_open_position(leg["ticker"])
+            except AsyncBrokerError as exc:
+                pit_store.record_fill_submission(
+                    {**row, "status": "rejected",
+                     "reason": str(exc)[:300]}, table=table)
+                out["rejected"] += 1
+                continue
+            held = _held_for_exit(position, leg["side"])
+            if held < leg["qty"]:
+                pit_store.record_fill_submission({
+                    **row, "status": "skipped",
+                    "reason": (f"broker holds {held:g} shares; need "
+                               f"{leg['qty']} to flatten this trade "
+                               f"without opening a short")}, table=table)
+                out["skipped"] += 1
+                continue
+        try:
+            sent = await broker.submit_market_order(
+                leg["ticker"], leg["qty"], leg["side"],
+                client_order_id=leg["client_order_id"],
+                time_in_force="opg")
+        except AsyncBrokerError as exc:
+            pit_store.record_fill_submission(
+                {**row, "status": "rejected",
+                 "reason": str(exc)[:300]}, table=table)
+            out["rejected"] += 1
+            continue
+        pit_store.record_fill_submission(
+            {**row, "status": sent.get("status") or "submitted",
+             "broker_order_id": sent.get("id")}, table=table)
+        out["submitted"] += 1
+    out["status"] = "partial" if out["rejected"] else "ok"
+    return out
+
+
+async def _collect_legs(broker, today: str, table: str) -> Dict[str, Any]:
+    """Ask the broker about every open leg in `table`."""
+    open_legs = [r for r in pit_store.fills_as_of(today, table=table)
+                 if r["status"] not in pit_store.FILL_TERMINAL
+                 and r["broker_order_id"]]
+    updated = 0
+    for row in open_legs:
+        order = await broker.get_order_by_id(row["broker_order_id"])
+        price = order.get("filled_avg_price")
+        updated += pit_store.update_paper_fill(
+            row["client_order_id"], order.get("status") or "unknown",
+            float(order.get("filled_qty") or 0),
+            float(price) if price else None, order.get("filled_at"),
+            table=table)
+    return {"status": "ok", "asked": len(open_legs), "updated": updated}
+
+
+def _copy_orders_for_submit(today: str, fills: List[Dict[str, Any]],
+                            settings: CopySettings) -> List[Dict[str, Any]]:
+    """Accepted copy decisions due today. Off still exits held positions."""
+    orders = [o for o in pit_store.copy_orders_as_of(today) if o.get("accepted")]
+    if settings.enabled:
+        return orders
+    # Turning the flag off must never leave shares nobody exits: keep only
+    # orders that already have an entry leg on file, so plan can flatten them
+    # and cannot open a new name.
+    held = {(r["order_as_of"], r["ticker"]) for r in fills if r["leg"] == "entry"}
+    return [o for o in orders if (o["as_of_date"], o["ticker"]) in held]
 
 
 async def submit(broker, today: Optional[str] = None,
                  horizon_days: int = HORIZON_DAYS) -> Dict[str, Any]:
-    """Send today's due legs to the opening auction and record each one."""
+    """Send today's due legs for both books to the opening auction."""
     today = today or _today()
     run_id = pit_store.start_run(SUBMIT_JOB, as_of_date=today)
-    out = {"as_of": today, "status": "ok", "submitted": 0, "skipped": 0,
-           "rejected": 0, "missed": 0}
+    out: Dict[str, Any] = {
+        "as_of": today, "status": "ok", "submitted": 0, "skipped": 0,
+        "rejected": 0, "missed": 0, "copy": _empty_book()}
+    notes: List[str] = []
     try:
-        orders = pit_store.paper_orders_as_of(today, accepted_only=True)
-        fills = pit_store.paper_fills_as_of(today)
-        sessions = ([o["intended_session"] for o in orders
-                     if o.get("intended_session")]
-                    + [r["session"] for r in fills])
-        if not orders:
+        earn_orders = pit_store.paper_orders_as_of(today, accepted_only=True)
+        earn_fills = pit_store.paper_fills_as_of(today)
+        copy_settings = CopySettings.from_env()
+        copy_fills = pit_store.fills_as_of(today, table="copy_fill")
+        copy_orders = _copy_orders_for_submit(today, copy_fills, copy_settings)
+
+        if not earn_orders and not copy_orders:
             pit_store.finish_run(rows_written=0, status="ok",
                                  error="no filed orders", run_id=run_id)
             return out
 
+        sessions = ([o["intended_session"] for o in earn_orders + copy_orders
+                     if o.get("intended_session")]
+                    + [r["session"] for r in earn_fills + copy_fills])
         calendar = sorted(await broker.get_calendar(min(sessions + [today]),
                                                     today))
         if today not in calendar:
             out["status"] = "closed"
+            out["copy"]["status"] = "closed"
             pit_store.finish_run(rows_written=0, status="closed",
                                  error=f"the exchange is shut on {today}",
                                  run_id=run_id)
             return out
 
-        legs, out["missed"] = plan(orders, fills, calendar, today,
-                                   horizon_days)
-        for leg in legs:
-            row = {**leg, "broker_order_id": None,
-                   "submitted_at": _stamp(today)}
-            if leg["qty"] <= 0:
-                pit_store.record_fill_submission({**row, "status": "skipped"})
-                out["skipped"] += 1
-                continue
-            # A remainder exit must not sell shares another trade (or a
-            # leftover like the 2.5 F) is holding. Ask the broker first; a
-            # lookup error is a refusal, never a silent "not held".
-            if leg["leg"] == "exit" and int(leg.get("attempt") or 1) > 1:
-                try:
-                    position = await broker.get_open_position(leg["ticker"])
-                except AsyncBrokerError as exc:
-                    pit_store.record_fill_submission(
-                        {**row, "status": "rejected",
-                         "reason": str(exc)[:300]})
-                    out["rejected"] += 1
-                    continue
-                held = _held_for_exit(position, leg["side"])
-                if held < leg["qty"]:
-                    pit_store.record_fill_submission({
-                        **row, "status": "skipped",
-                        "reason": (f"broker holds {held:g} shares; need "
-                                   f"{leg['qty']} to flatten this trade "
-                                   f"without opening a short")})
-                    out["skipped"] += 1
-                    continue
-            try:
-                sent = await broker.submit_market_order(
-                    leg["ticker"], leg["qty"], leg["side"],
-                    client_order_id=leg["client_order_id"],
-                    time_in_force="opg")
-            except AsyncBrokerError as exc:
-                pit_store.record_fill_submission(
-                    {**row, "status": "rejected", "reason": str(exc)[:300]})
-                out["rejected"] += 1
-                continue
-            pit_store.record_fill_submission(
-                {**row, "status": sent.get("status") or "submitted",
-                 "broker_order_id": sent.get("id")})
-            out["submitted"] += 1
+        # Each book is its own try: a failure in one must still send the other
+        # book's legs, and the run names the failure rather than swallow it.
+        try:
+            legs, out["missed"] = plan(
+                earn_orders, earn_fills, calendar, today, horizon_days,
+                book="earnings")
+            earn = await _submit_legs(broker, legs, today, table="paper_fill")
+            for key in ("submitted", "skipped", "rejected", "status"):
+                out[key] = earn[key]
+            if earn["rejected"]:
+                notes.append(f"{earn['rejected']} rejected")
+            if earn["skipped"]:
+                notes.append(f"{earn['skipped']} skipped")
+            if out["missed"]:
+                notes.append(f"{out['missed']} missed")
+        except Exception as exc:
+            out["status"] = "partial"
+            msg = f"earnings: {type(exc).__name__}: {exc}"[:300]
+            notes.append(msg)
+            out["error"] = msg
 
-        out["status"] = "partial" if out["rejected"] else "ok"
-        notes = [f"{out[k]} {k}" for k in ("rejected", "skipped", "missed")
-                 if out[k]]
+        try:
+            copy_legs, copy_missed = plan(
+                copy_orders, copy_fills, calendar, today,
+                copy_settings.hold_days, book="copy")
+            copy = await _submit_legs(
+                broker, copy_legs, today, table="copy_fill")
+            copy["missed"] = copy_missed
+            out["copy"] = copy
+            copy_bits = [
+                f"{copy[k]} {k}" for k in
+                ("submitted", "rejected", "skipped", "missed") if copy.get(k)]
+            if copy_bits or copy["status"] != "ok":
+                notes.append("copy: " + ("; ".join(copy_bits) or copy["status"]))
+            if copy["status"] == "partial":
+                out["status"] = "partial"
+        except Exception as exc:
+            msg = f"{type(exc).__name__}: {exc}"[:300]
+            out["copy"] = {**_empty_book(), "status": "failed", "error": msg}
+            out["status"] = "partial"
+            notes.append(f"copy: {msg}")
+
+        rows = (out["submitted"] + out["skipped"] + out["rejected"]
+                + out["copy"]["submitted"] + out["copy"]["skipped"]
+                + out["copy"]["rejected"])
         pit_store.finish_run(
-            rows_written=out["submitted"] + out["skipped"] + out["rejected"],
-            status=out["status"], error="; ".join(notes) or None,
-            run_id=run_id)
+            rows_written=rows, status=out["status"],
+            error="; ".join(notes) or None, run_id=run_id)
         return out
     except Exception as exc:
         pit_store.finish_run(rows_written=0, status="failed",
@@ -297,23 +402,38 @@ async def collect(broker, today: Optional[str] = None) -> Dict[str, Any]:
     """Ask the broker about every leg not yet at a terminal answer."""
     today = today or _today()
     run_id = pit_store.start_run(COLLECT_JOB, as_of_date=today)
+    out: Dict[str, Any] = {
+        "as_of": today, "status": "ok", "asked": 0, "updated": 0,
+        "copy": {"status": "ok", "asked": 0, "updated": 0}}
+    notes: List[str] = []
     try:
-        open_legs = [r for r in pit_store.paper_fills_as_of(today)
-                     if r["status"] not in pit_store.FILL_TERMINAL
-                     and r["broker_order_id"]]
-        updated = 0
-        for row in open_legs:
-            order = await broker.get_order_by_id(row["broker_order_id"])
-            price = order.get("filled_avg_price")
-            updated += pit_store.update_paper_fill(
-                row["client_order_id"], order.get("status") or "unknown",
-                float(order.get("filled_qty") or 0),
-                float(price) if price else None, order.get("filled_at"))
-        pit_store.finish_run(rows_written=updated, status="ok",
-                             error=None if open_legs else "nothing open",
-                             run_id=run_id)
-        return {"as_of": today, "status": "ok", "asked": len(open_legs),
-                "updated": updated}
+        try:
+            earn = await _collect_legs(broker, today, table="paper_fill")
+            out["asked"] = earn["asked"]
+            out["updated"] = earn["updated"]
+        except Exception as exc:
+            msg = f"earnings: {type(exc).__name__}: {exc}"[:300]
+            out["status"] = "partial"
+            out["error"] = msg
+            notes.append(msg)
+
+        try:
+            copy = await _collect_legs(broker, today, table="copy_fill")
+            out["copy"] = copy
+        except Exception as exc:
+            msg = f"{type(exc).__name__}: {exc}"[:300]
+            out["copy"] = {"status": "failed", "asked": 0, "updated": 0,
+                           "error": msg}
+            out["status"] = "partial"
+            notes.append(f"copy: {msg}")
+
+        if out["status"] == "ok" and not out["asked"] and not out["copy"]["asked"]:
+            notes.append("nothing open")
+        pit_store.finish_run(
+            rows_written=out["updated"] + out["copy"]["updated"],
+            status=out["status"],
+            error="; ".join(notes) or None, run_id=run_id)
+        return out
     except Exception as exc:
         pit_store.finish_run(rows_written=0, status="failed",
                              error=f"{type(exc).__name__}: {exc}"[:300],
@@ -331,7 +451,8 @@ def report(as_of: Optional[str] = None) -> Dict[str, Any]:
     """Measured round-trip cost against the modeled one, per trade and overall.
 
     Cost is what the fills paid relative to the opens the scoring uses: bought
-    above the open or sold below it is a positive cost, on each leg.
+    above the open or sold below it is a positive cost, on each leg. The copy
+    book is reported beside that measurement and never mixed into it.
     """
     as_of = as_of or _today()
     trips, unpriced = [], 0
@@ -354,7 +475,8 @@ def report(as_of: Optional[str] = None) -> Dict[str, Any]:
            "unpriced": unpriced, "note": NOTE,
            "mean_measured_cost_bps": None, "mean_modeled_cost_bps": None,
            "mean_excess_bps": None, "median_excess_bps": None,
-           "trips": trips}
+           "trips": trips,
+           "copy": pit_store.copy_book_summary(as_of)}
     if trips:
         out.update({
             "mean_measured_cost_bps": statistics.fmean(

@@ -351,6 +351,7 @@ def collect(as_of: Optional[str] = None) -> Dict[str, Any]:
     return {"as_of": as_of, "jobs": jobs, "store": _store_summary(),
             "book": _book_summary(as_of), "risk": risk,
             "gate": pit_store.latest_gate_check(as_of),
+            "copy": pit_store.copy_book_summary(as_of),
             "attention": attention}
 
 
@@ -392,6 +393,7 @@ def _render(report: Dict[str, Any]) -> str:
                   f"{book['borrow_rates']} borrow rates on file"]
 
     lines += _risk_lines(report.get("risk"), report.get("gate"))
+    lines += _copy_lines(report.get("copy"))
 
     if report["attention"]:
         lines += ["", "  ATTENTION"]
@@ -428,6 +430,17 @@ def _risk_lines(risk: Optional[Dict[str, Any]],
             f"  GATE   {gate['measured_trades']} of {gate['min_trades']} trades "
             f"with measured fills; {verdict}: {gate['reason'][:110]}")
     return lines
+
+
+def _copy_lines(copy: Optional[Dict[str, Any]]) -> List[str]:
+    """Congressional copy book, kept off the GATE and RISK lines (#190)."""
+    if not copy:
+        return ["  COPY   no fills yet"]
+    mean = copy.get("mean_return")
+    mean_text = (f"; mean return {mean:+.1%}" if mean is not None
+                 else "; no closed return yet")
+    return [f"  COPY   {copy.get('open', 0)} open, "
+            f"{copy.get('closed', 0)} closed{mean_text}"]
 
 
 def main(argv: Optional[List[str]] = None) -> int:
