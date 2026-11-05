@@ -881,9 +881,12 @@ def _walk_concepts(cik: str, as_of: str, tried: List[str],
 def _forms_filed(facts_payload: Dict[str, Any]) -> set:
     """Every form this filer has tagged anything under.
 
-    Read across taxonomies in the facts payload so a filer that tags EPS
-    or other financial facts under us-gaap can still be identified as a 10-Q
-    filer even when dei shares facts are omitted in quarterly filings.
+    Read across all taxonomies in the companyfacts payload. Cover-page `dei`
+    numeric facts (such as EntityCommonStockSharesOutstanding or EntityPublicFloat)
+    are omitted in quarterly 10-Q filings by some real registrants -- verified
+    for WTTR, ONEW, and JOUT, whose `dei` facts include only 10-K filings while
+    their `us-gaap` facts include 10-Q. Reading only `dei` caused `_forms_filed`
+    to miss 10-Q for WTTR, ONEW, and JOUT, preventing fallback to per-class XBRL.
     """
     forms: set = set()
     for tax in (facts_payload.get("facts") or {}).values():
@@ -934,26 +937,18 @@ def _class_member(fact: Dict[str, Any]) -> Optional[str]:
     for k, v in fact.items():
         if k.startswith("dim_") and "StatementClassOfStockAxis" in k and v:
             return str(v)
-    if fact.get("dimension") and "StatementClassOfStockAxis" in fact["dimension"] and fact.get("member"):
-        return str(fact.get("member"))
     return None
 
 
 def _filing_fiscal_focus(x: Any) -> Tuple[Optional[int], Optional[str]]:
     """Fiscal year and period focus from cover-page dei facts."""
     fy, fp = None, None
-    try:
-        fy_facts = x.query().by_concept("DocumentFiscalYearFocus").execute()
-        if fy_facts and fy_facts[0].get("value"):
-            fy = int(str(fy_facts[0]["value"]).strip())
-    except Exception:
-        pass
-    try:
-        fp_facts = x.query().by_concept("DocumentFiscalPeriodFocus").execute()
-        if fp_facts and fp_facts[0].get("value"):
-            fp = str(fp_facts[0]["value"]).strip().upper()
-    except Exception:
-        pass
+    fy_facts = x.query().by_concept("DocumentFiscalYearFocus").execute()
+    if fy_facts and fy_facts[0].get("value"):
+        fy = int(str(fy_facts[0]["value"]).strip())
+    fp_facts = x.query().by_concept("DocumentFiscalPeriodFocus").execute()
+    if fp_facts and fp_facts[0].get("value"):
+        fp = str(fp_facts[0]["value"]).strip().upper()
     return fy, fp
 
 
@@ -965,23 +960,18 @@ def _eps_series_from_xbrl(ticker: str, cik: str, as_of: str, name: str,
     on StatementClassOfStockAxis appear empty or stale. This reads the facts
     directly from each filing's XBRL instance.
     """
-    import os
-    from research import registrant
+    from datetime import date, timedelta
+    from edgar import set_identity
+    from research import pit_store, registrant
 
-    email = os.environ.get("SEC_EMAIL", "").strip()
-    if email:
-        try:
-            from edgar import set_identity
-            set_identity(f"Nemo {email}")
-        except Exception:
-            pass
+    set_identity(_user_agent())
 
     try:
         comp = registrant.company(ticker, cik)
         filings_col = comp.get_filings(form=["10-Q", "10-K"])
+    except LookupError:
+        raise
     except Exception as exc:  # noqa: BLE001 - reported, never masked
-        if type(exc).__name__ in ("IdentityNotSetError", "LookupError") or isinstance(exc, LookupError):
-            return None
         result["error"] = (f"SEC filings lookup failed for {name}: "
                            f"{type(exc).__name__}: {exc}. This is an "
                            f"outage, not a fact about the filer.")
@@ -998,8 +988,107 @@ def _eps_series_from_xbrl(ticker: str, cik: str, as_of: str, name: str,
     if not eligible:
         return None
 
-    xbrls = []
-    for f in eligible:
+    # Stale check: if the filer's newest 10-Q/10-K on or before as_of is more
+    # than _STALE_DAYS old, refuse without reading any XBRL.
+    cutoff = (date.fromisoformat(as_of) - timedelta(days=_STALE_DAYS)).isoformat()
+    if str(eligible[0].filing_date) < cutoff:
+        return None
+
+    acc_list = [f.accession_no for f in eligible]
+    cached_rows = pit_store.xbrl_class_eps_as_of(as_of, accessions=acc_list)
+    cached_by_acc: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for r in cached_rows:
+        cached_by_acc[r["accession"]].append(r)
+
+    def _extract_filing_facts(filing, xbrl_inst, concept_name):
+        fy, fp = _filing_fiscal_focus(xbrl_inst)
+        sym_facts = xbrl_inst.query().by_concept("TradingSymbol").execute()
+        tag = concept_name.split(":", 1)[1] if ":" in concept_name else concept_name
+        raw = xbrl_inst.query().by_concept(tag).by_dimension("StatementClassOfStockAxis").execute() if concept_name else []
+        rows = []
+        for rf in raw:
+            mem = _class_member(rf)
+            p_start = rf.get("period_start")
+            p_end = rf.get("period_end")
+            if not mem or not p_start or not p_end:
+                continue
+            val = rf.get("numeric_value")
+            if val is None:
+                try:
+                    val = float(rf.get("value"))
+                except (TypeError, ValueError):
+                    continue
+            fact_fy = rf.get("fiscal_year") or fy
+            fact_fp = rf.get("fiscal_period") or fp
+            rows.append({
+                "accession": filing.accession_no,
+                "class_member": mem,
+                "period_start": p_start,
+                "period_end": p_end,
+                "form": filing.form,
+                "concept": concept_name,
+                "value": val,
+                "trading_symbols": sym_facts,
+                "fiscal_year": int(fact_fy) if fact_fy is not None else None,
+                "fiscal_period": str(fact_fp) if fact_fp is not None else None,
+                "filing_date": str(filing.filing_date),
+            })
+        if not rows:
+            rows.append({
+                "accession": filing.accession_no,
+                "class_member": "",
+                "period_start": "",
+                "period_end": "",
+                "form": filing.form,
+                "concept": "",
+                "value": None,
+                "trading_symbols": sym_facts,
+                "fiscal_year": int(fy) if fy is not None else None,
+                "fiscal_period": str(fp) if fp is not None else None,
+                "filing_date": str(filing.filing_date),
+            })
+        return rows
+
+    newest = eligible[0]
+    chosen_concept: Optional[str] = None
+    if newest.accession_no in cached_by_acc:
+        class_facts = [r for r in cached_by_acc[newest.accession_no] if r.get("class_member")]
+        if not class_facts:
+            return None
+        chosen_concept = class_facts[0].get("concept")
+    else:
+        try:
+            x0 = newest.xbrl()
+        except Exception as exc:  # noqa: BLE001 - an outage is not an answer
+            result["error"] = (
+                f"XBRL lookup failed for {name} ({newest.form} {newest.accession_no}): "
+                f"{type(exc).__name__}: {exc}. This is an outage, not a "
+                f"fact about the filer.")
+            result["fetch_failed"] = True
+            return result
+        if x0 is None:
+            return None
+
+        for c in US_GAAP_EPS_CONCEPTS:
+            tag = c.split(":", 1)[1] if ":" in c else c
+            facts = x0.query().by_concept(tag).by_dimension("StatementClassOfStockAxis").execute()
+            if any(_class_member(fact) for fact in facts):
+                chosen_concept = c
+                break
+
+        if not chosen_concept:
+            # Stop after 1 read and refuse; cache sentinel row
+            sentinel_rows = _extract_filing_facts(newest, x0, "")
+            pit_store.record_xbrl_class_eps(sentinel_rows)
+            return None
+
+        newest_rows = _extract_filing_facts(newest, x0, chosen_concept)
+        pit_store.record_xbrl_class_eps(newest_rows)
+        cached_by_acc[newest.accession_no] = newest_rows
+
+    for f in eligible[1:]:
+        if f.accession_no in cached_by_acc:
+            continue
         try:
             x = f.xbrl()
         except Exception as exc:  # noqa: BLE001 - an outage is not an answer
@@ -1010,74 +1099,44 @@ def _eps_series_from_xbrl(ticker: str, cik: str, as_of: str, name: str,
             result["fetch_failed"] = True
             return result
         if x is not None:
-            xbrls.append((f, x))
-
-    if not xbrls:
-        return None
+            f_rows = _extract_filing_facts(f, x, chosen_concept)
+            pit_store.record_xbrl_class_eps(f_rows)
+            cached_by_acc[f.accession_no] = f_rows
 
     target_sym = _norm_symbol(ticker)
     traded_class: Optional[str] = None
-    for f, x in xbrls:
-        try:
-            sym_facts = x.query().by_concept("TradingSymbol").execute()
-        except Exception:
-            sym_facts = []
-        for sf in sym_facts:
-            mem = _class_member(sf)
-            val = sf.get("value")
-            if mem and val and _norm_symbol(str(val)) == target_sym:
-                traded_class = mem
+    for f in eligible:
+        for r in cached_by_acc.get(f.accession_no, []):
+            sym_facts = r.get("trading_symbols")
+            if sym_facts and isinstance(sym_facts, list):
+                for sf in sym_facts:
+                    mem = _class_member(sf)
+                    val = sf.get("value")
+                    if mem and val and _norm_symbol(str(val)) == target_sym:
+                        traded_class = mem
+                        break
+            if traded_class:
                 break
         if traded_class:
             break
 
-    chosen_concept: Optional[str] = None
-    for c in US_GAAP_EPS_CONCEPTS:
-        tag = c.split(":", 1)[1] if ":" in c else c
-        found_any = False
-        for f, x in xbrls:
-            try:
-                facts = x.query().by_concept(tag).by_dimension("StatementClassOfStockAxis").execute()
-                if any(_class_member(fact) for fact in facts):
-                    found_any = True
-                    break
-            except Exception:
-                continue
-        if found_any:
-            chosen_concept = c
-            break
-
-    if not chosen_concept:
-        return None
-
-    tag = chosen_concept.split(":", 1)[1] if ":" in chosen_concept else chosen_concept
     all_facts: List[_Fact] = []
     classes_used: set = set()
     all_classes_seen: set = set()
     differing_classes_seen: set = set()
 
-    for f, x in xbrls:
-        try:
-            raw_facts = x.query().by_concept(tag).by_dimension("StatementClassOfStockAxis").execute()
-        except Exception:
-            continue
-
-        fy, fp = _filing_fiscal_focus(x)
+    for f in eligible:
+        facts_in_filing = [r for r in cached_by_acc.get(f.accession_no, [])
+                           if r.get("class_member") and r.get("value") is not None]
         by_period: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
-        for rf in raw_facts:
+        for rf in facts_in_filing:
             p_start = rf.get("period_start")
             p_end = rf.get("period_end")
-            mem = _class_member(rf)
+            mem = rf.get("class_member")
             if not p_start or not p_end or not mem:
                 continue
             all_classes_seen.add(mem)
-            num = rf.get("numeric_value")
-            if num is None:
-                try:
-                    num = float(rf.get("value"))
-                except (TypeError, ValueError):
-                    continue
-            by_period[(p_start, p_end)].append({**rf, "numeric_value": num, "member": mem})
+            by_period[(p_start, p_end)].append(rf)
 
         seen_periods_in_filing = set()
         for (p_start, p_end), period_facts in by_period.items():
@@ -1085,19 +1144,19 @@ def _eps_series_from_xbrl(ticker: str, cik: str, as_of: str, name: str,
                 continue
             seen_periods_in_filing.add((p_start, p_end))
 
-            fact_fy = period_facts[0].get("fiscal_year") or fy
-            fact_fp = period_facts[0].get("fiscal_period") or fp
+            fact_fy = period_facts[0].get("fiscal_year")
+            fact_fp = period_facts[0].get("fiscal_period")
             if fact_fy is None or fact_fp is None:
                 continue
 
             if traded_class:
-                matching = [pf for pf in period_facts if pf["member"] == traded_class]
-                if not matching:
+                matched = [pf for pf in period_facts if pf["class_member"] == traded_class]
+                if not matched:
                     continue
-                chosen = matching[0]
+                chosen = matched[0]
                 classes_used.add(traded_class)
             else:
-                val_by_class = {pf["member"]: pf["numeric_value"] for pf in period_facts}
+                val_by_class = {pf["class_member"]: pf["value"] for pf in period_facts}
                 if len(set(val_by_class.values())) == 1:
                     chosen = period_facts[0]
                     classes_used.update(val_by_class.keys())
@@ -1108,7 +1167,7 @@ def _eps_series_from_xbrl(ticker: str, cik: str, as_of: str, name: str,
             all_facts.append(_Fact(
                 start=p_start,
                 end=p_end,
-                value=float(chosen["numeric_value"]),
+                value=float(chosen["value"]),
                 accession=f.accession_no,
                 form=f.form,
                 fiscal_year=int(fact_fy),
@@ -1116,7 +1175,7 @@ def _eps_series_from_xbrl(ticker: str, cik: str, as_of: str, name: str,
                 filed=str(f.filing_date),
             ))
 
-    if not all_facts:
+    def _differing_classes_refusal() -> Optional[Dict[str, Any]]:
         if differing_classes_seen and not traded_class:
             diff_classes = sorted(differing_classes_seen)
             result["error"] = (
@@ -1126,16 +1185,12 @@ def _eps_series_from_xbrl(ticker: str, cik: str, as_of: str, name: str,
             return result
         return None
 
+    if not all_facts:
+        return _differing_classes_refusal()
+
     quarters, clusters, unresolved = _build_quarters(all_facts, chosen_concept)
     if not quarters:
-        if differing_classes_seen and not traded_class:
-            diff_classes = sorted(differing_classes_seen)
-            result["error"] = (
-                f"{name} tags diluted EPS per share class ({', '.join(diff_classes)}) "
-                f"with differing values, and no traded class could be identified from "
-                f"dei:TradingSymbol.")
-            return result
-        return None
+        return _differing_classes_refusal()
 
     candidate = {
         "concept": chosen_concept,
@@ -1146,14 +1201,7 @@ def _eps_series_from_xbrl(ticker: str, cik: str, as_of: str, name: str,
         "latest_known_at": max(q["known_at"] for q in quarters.values()),
     }
     if _is_stale(candidate, as_of):
-        if differing_classes_seen and not traded_class:
-            diff_classes = sorted(differing_classes_seen)
-            result["error"] = (
-                f"{name} tags diluted EPS per share class ({', '.join(diff_classes)}) "
-                f"with differing values, and no traded class could be identified from "
-                f"dei:TradingSymbol.")
-            return result
-        return None
+        return _differing_classes_refusal()
 
     class_str = traded_class or ", ".join(sorted(classes_used or all_classes_seen))
     result["success"] = True
@@ -1169,10 +1217,6 @@ def _eps_series_from_xbrl(ticker: str, cik: str, as_of: str, name: str,
                   f"{c['low']}; figures filed on or before {c['low']} are "
                   f"rebased onto the later basis")}
         for c in candidate["clusters"]]
-    result["quarters"] = [
-        {"fiscal_period": _period_key(fy, fq), "fiscal_year": fy,
-         "fiscal_quarter": fq, **entry}
-        for (fy, fq), entry in sorted(quarters.items())]
     result["quarters"] = [
         {"fiscal_period": _period_key(fy_k, fq_k), "fiscal_year": fy_k,
          "fiscal_quarter": fq_k, **entry}

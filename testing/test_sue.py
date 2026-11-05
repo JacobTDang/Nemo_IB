@@ -162,6 +162,7 @@ def filer(monkeypatch):
         state["calls"].append(f"{taxonomy}:{tag}")
         return state["payload"].get(f"{taxonomy}:{tag}")
 
+    monkeypatch.setenv("SEC_EMAIL", "test@example.com")
     monkeypatch.setattr(sue, "_fetch_cik_map", lambda: {"TEST": "0000000001"})
     monkeypatch.setattr(sue, "_fetch_company_concept", fetch)
     monkeypatch.setattr(sue, "_fetch_company_facts",
@@ -1293,7 +1294,11 @@ class _FakeCompany:
 
 
 def _install_xbrl_company(monkeypatch, ticker: str, xbrl_override=None,
-                          on_xbrl=None, duplicate_filings_to=None):
+                          on_xbrl=None, duplicate_filings_to=None,
+                          set_email=True):
+    import os
+    if set_email and not os.environ.get("SEC_EMAIL"):
+        monkeypatch.setenv("SEC_EMAIL", "test@example.com")
     fix = _load_xbrl_fixture(ticker)
     cik_str = str(fix["cik"]).zfill(10)
     filings = list(fix["filings"])
@@ -1362,7 +1367,7 @@ def test_per_class_xbrl_path_is_only_reached_when_companyfacts_has_no_current_ep
 
 
 def test_per_class_xbrl_reads_dimensioned_eps_facts_from_ten_q_and_ten_k(
-        filer, monkeypatch):
+        filer, store, monkeypatch):
     """Rule 2: reads StatementClassOfStockAxis facts from 10-Q and 10-K XBRL."""
     _install_xbrl_company(monkeypatch, "COKE")
     monkeypatch.setattr(sue, "_fetch_cik_map", lambda: {"COKE": "0000317540"})
@@ -1381,7 +1386,7 @@ def test_per_class_xbrl_reads_dimensioned_eps_facts_from_ten_q_and_ten_k(
 
 
 def test_traded_class_is_picked_from_trading_symbol_on_class_axis_with_separators_removed(
-        filer, monkeypatch):
+        filer, store, monkeypatch):
     """Rule 3: cover page dei:TradingSymbol tags the traded class on StatementClassOfStockAxis."""
     _install_xbrl_company(monkeypatch, "CRD-A")
     monkeypatch.setattr(sue, "_fetch_cik_map", lambda: {"CRD-A": "0000025475"})
@@ -1400,7 +1405,7 @@ def test_traded_class_is_picked_from_trading_symbol_on_class_axis_with_separator
 
 
 def test_equal_class_values_are_used_when_traded_class_has_no_symbol(
-        filer, monkeypatch):
+        filer, store, monkeypatch):
     """Rule 3: when every class reports the same value for a period, that value is used."""
     _install_xbrl_company(monkeypatch, "COKE")
     monkeypatch.setattr(sue, "_fetch_cik_map", lambda: {"COKE": "0000317540"})
@@ -1417,7 +1422,7 @@ def test_equal_class_values_are_used_when_traded_class_has_no_symbol(
 
 
 def test_differing_classes_without_traded_symbol_refuses_and_names_classes(
-        filer, monkeypatch):
+        filer, store, monkeypatch):
     """Rule 3: when classes differ and traded class cannot be identified, refuse and name classes."""
     _install_xbrl_company(monkeypatch, "RELL")
     monkeypatch.setattr(sue, "_fetch_cik_map", lambda: {"RELL": "0000355948"})
@@ -1435,7 +1440,7 @@ def test_differing_classes_without_traded_symbol_refuses_and_names_classes(
 
 
 def test_per_class_quarters_preserve_filing_date_and_fiscal_identity_and_split_handling(
-        filer, monkeypatch):
+        filer, store, monkeypatch):
     """Rule 4: known_at equals filing date, fiscal period identity is preserved, splits handled."""
     _install_xbrl_company(monkeypatch, "COKE")
     monkeypatch.setattr(sue, "_fetch_cik_map", lambda: {"COKE": "0000317540"})
@@ -1456,7 +1461,7 @@ def test_per_class_quarters_preserve_filing_date_and_fiscal_identity_and_split_h
 
 
 def test_result_marks_per_class_xbrl_source_and_class_used(
-        filer, monkeypatch):
+        filer, store, monkeypatch):
     """Rule 5: result source names the per-class XBRL path and the class used."""
     _install_xbrl_company(monkeypatch, "CRD-A")
     monkeypatch.setattr(sue, "_fetch_cik_map", lambda: {"CRD-A": "0000025475"})
@@ -1475,7 +1480,7 @@ def test_result_marks_per_class_xbrl_source_and_class_used(
 
 
 def test_per_class_path_caps_filings_read_to_sue_history_depth(
-        filer, monkeypatch):
+        filer, store, monkeypatch):
     """Rule 6: reads only up to the maximum filings depth needed for SUE."""
     read_accessions = []
     _install_xbrl_company(monkeypatch, "COKE", on_xbrl=lambda accn: read_accessions.append(accn),
@@ -1494,7 +1499,7 @@ def test_per_class_path_caps_filings_read_to_sue_history_depth(
 
 
 def test_failed_xbrl_fetch_is_failure_with_fetch_failed_not_silent_empty(
-        filer, monkeypatch):
+        filer, store, monkeypatch):
     """Rule: failed XBRL fetch raises/returns fetch_failed: True, not empty series."""
     _install_xbrl_company(monkeypatch, "COKE", xbrl_override=ConnectionError("SEC 503"))
     monkeypatch.setattr(sue, "_fetch_cik_map", lambda: {"COKE": "0000317540"})
@@ -1509,4 +1514,161 @@ def test_failed_xbrl_fetch_is_failure_with_fetch_failed_not_silent_empty(
     assert res["success"] is False
     assert res["fetch_failed"] is True
     assert "503" in res["error"]
+
+
+def test_forms_filed_reads_across_taxonomies_for_filers_omitting_dei_10q():
+    """Rule 4: _forms_filed reads all taxonomies; filers like WTTR/ONEW/JOUT omit dei 10-Q."""
+    payload = {
+        "facts": {
+            "dei": {
+                "EntityPublicFloat": {
+                    "units": {"USD": [{"form": "10-K", "val": 1000}]}
+                }
+            },
+            "us-gaap": {
+                "Revenues": {
+                    "units": {"USD": [{"form": "10-Q", "val": 500}]}
+                }
+            }
+        }
+    }
+    forms = sue._forms_filed(payload)
+    assert "10-Q" in forms
+    assert "10-K" in forms
+
+
+def test_stale_filings_refuses_early_without_reading_xbrl(filer, store, monkeypatch):
+    """Rule 5a / Mutation 5: when newest filing is >200 days old, refuse without reading XBRL."""
+    monkeypatch.setenv("SEC_EMAIL", "test@example.com")
+    read_accessions = []
+    # Make newest filing older than 200 days before 2026-11-05 (e.g. 2025-11-05 like HUBG)
+    fix = _load_xbrl_fixture("coke")
+    stale_filings = []
+    for f in fix["filings"]:
+        f_stale = dict(f)
+        f_stale["filing_date"] = "2025-11-05"
+        stale_filings.append(f_stale)
+    fake_comp = _FakeCompany("COKE", "0000317540", stale_filings,
+                             on_xbrl=lambda accn: read_accessions.append(accn))
+    monkeypatch.setattr(registrant, "company", lambda t, cik=None: fake_comp)
+    monkeypatch.setattr(sue, "_fetch_cik_map", lambda: {"COKE": "0000317540"})
+    filer.state["facts"] = {"facts": {
+        "dei": {"EntityCommonStockSharesOutstanding": {"units": {"shares": [
+            {"start": "2025-01-01", "end": "2025-03-31", "val": 1.0,
+             "accn": "a", "fy": 2025, "fp": "Q1", "form": "10-Q",
+             "filed": "2025-04-30"}]}}},
+        "us-gaap": {
+            "EarningsPerShareDiluted": {"units": {"USD/shares": [
+                {"start": "2025-07-01", "end": "2025-09-30", "val": 1.0,
+                 "accn": "a", "fy": 2025, "fp": "Q3", "form": "10-Q",
+                 "filed": "2025-11-05"}]}}
+        }}}
+
+    res = sue.eps_series("COKE", as_of="2026-11-05")
+    assert res["success"] is False
+    assert len(read_accessions) == 0, f"Expected 0 XBRL reads for stale filer, got {len(read_accessions)}"
+    assert "more than 200 days before 2026-11-05" in res["error"]
+
+
+def test_newest_filing_without_class_eps_stops_after_one_xbrl_read(filer, store, monkeypatch):
+    """Rule 5b / Mutation 6: if newest filing has no class EPS, stop after 1 read and refuse."""
+    monkeypatch.setenv("SEC_EMAIL", "test@example.com")
+    read_accessions = []
+    fix = _load_xbrl_fixture("coke")
+    # All filings have NO eps facts on StatementClassOfStockAxis (like CPER)
+    cper_filings = []
+    for f in fix["filings"]:
+        f_cper = dict(f)
+        f_cper["eps_facts"] = []
+        cper_filings.append(f_cper)
+    fake_comp = _FakeCompany("CPER", "0001104659", cper_filings,
+                             on_xbrl=lambda accn: read_accessions.append(accn))
+    monkeypatch.setattr(registrant, "company", lambda t, cik=None: fake_comp)
+    monkeypatch.setattr(sue, "_fetch_cik_map", lambda: {"CPER": "0001104659"})
+    filer.state["facts"] = {"facts": {
+        "dei": {"EntityCommonStockSharesOutstanding": {"units": {"shares": [
+            {"start": "2026-01-01", "end": "2026-03-31", "val": 1.0,
+             "accn": "a", "fy": 2026, "fp": "Q1", "form": "10-Q",
+             "filed": "2026-04-30"}]}}},
+        "us-gaap": {}}}
+
+    res = sue.eps_series("CPER", as_of="2026-11-05")
+    assert res["success"] is False
+    assert len(read_accessions) == 1, f"Expected exactly 1 XBRL read for CPER, got {len(read_accessions)}"
+
+
+def test_cached_accessions_are_not_refetched_from_xbrl(filer, store, monkeypatch):
+    """Rule 5c / Mutation 7: accessions recorded in pit_store are never re-fetched."""
+    read_accessions = []
+    _install_xbrl_company(monkeypatch, "COKE", on_xbrl=lambda accn: read_accessions.append(accn))
+    monkeypatch.setattr(sue, "_fetch_cik_map", lambda: {"COKE": "0000317540"})
+    filer.state["facts"] = {"facts": {
+        "dei": {"EntityCommonStockSharesOutstanding": {"units": {"shares": [
+            {"start": "2026-01-01", "end": "2026-03-31", "val": 1.0,
+             "accn": "a", "fy": 2026, "fp": "Q1", "form": "10-Q",
+             "filed": "2026-04-30"}]}}},
+        "us-gaap": {}}}
+
+    # First call: fetches and caches
+    res1 = sue.eps_series("COKE", as_of="2026-11-05")
+    assert res1["success"] is True
+    first_reads = len(read_accessions)
+    assert first_reads > 0
+
+    # Second call: must read 0 XBRL instances
+    read_accessions.clear()
+    res2 = sue.eps_series("COKE", as_of="2026-11-05")
+    assert res2["success"] is True
+    assert len(read_accessions) == 0, f"Expected 0 re-fetches on cached accessions, got {len(read_accessions)}"
+    assert res2["quarters"] == res1["quarters"]
+
+
+def test_cper_no_class_eps_costs_one_read_first_time_and_zero_second_time(filer, store, monkeypatch):
+    """Rule 5c: CPER costs 1 XBRL read on first call and 0 on second call."""
+    monkeypatch.setenv("SEC_EMAIL", "test@example.com")
+    read_accessions = []
+    fix = _load_xbrl_fixture("coke")
+    cper_filings = []
+    for f in fix["filings"]:
+        f_cper = dict(f)
+        f_cper["eps_facts"] = []
+        cper_filings.append(f_cper)
+    fake_comp = _FakeCompany("CPER", "0001104659", cper_filings,
+                             on_xbrl=lambda accn: read_accessions.append(accn))
+    monkeypatch.setattr(registrant, "company", lambda t, cik=None: fake_comp)
+    monkeypatch.setattr(sue, "_fetch_cik_map", lambda: {"CPER": "0001104659"})
+    filer.state["facts"] = {"facts": {
+        "dei": {"EntityCommonStockSharesOutstanding": {"units": {"shares": [
+            {"start": "2026-01-01", "end": "2026-03-31", "val": 1.0,
+             "accn": "a", "fy": 2026, "fp": "Q1", "form": "10-Q",
+             "filed": "2026-04-30"}]}}},
+        "us-gaap": {}}}
+
+    # First call: 1 read
+    res1 = sue.eps_series("CPER", as_of="2026-11-05")
+    assert res1["success"] is False
+    assert len(read_accessions) == 1
+
+    # Second call: 0 reads
+    read_accessions.clear()
+    res2 = sue.eps_series("CPER", as_of="2026-11-05")
+    assert res2["success"] is False
+    assert len(read_accessions) == 0
+
+
+def test_missing_sec_email_raises_value_error(filer, monkeypatch):
+    """Rule 1: missing SEC_EMAIL must raise ValueError, not return None or swallow."""
+    monkeypatch.delenv("SEC_EMAIL", raising=False)
+    _install_xbrl_company(monkeypatch, "COKE", set_email=False)
+    monkeypatch.setattr(sue, "_fetch_cik_map", lambda: {"COKE": "0000317540"})
+    filer.state["facts"] = {"facts": {
+        "dei": {"EntityCommonStockSharesOutstanding": {"units": {"shares": [
+            {"start": "2026-01-01", "end": "2026-03-31", "val": 1.0,
+             "accn": "a", "fy": 2026, "fp": "Q1", "form": "10-Q",
+             "filed": "2026-04-30"}]}}},
+        "us-gaap": {}}}
+
+    with pytest.raises(ValueError, match="SEC_EMAIL is not set"):
+        sue.eps_series("COKE", as_of="2026-11-05")
+
 

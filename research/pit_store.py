@@ -385,6 +385,24 @@ CREATE TABLE IF NOT EXISTS run_log (
     status       TEXT,
     error        TEXT
 );
+
+CREATE TABLE IF NOT EXISTS xbrl_class_eps (
+    accession       TEXT NOT NULL,
+    class_member    TEXT NOT NULL,
+    period_start    TEXT NOT NULL,
+    period_end      TEXT NOT NULL,
+    form            TEXT NOT NULL,
+    concept         TEXT NOT NULL,
+    value           REAL,
+    trading_symbols TEXT,
+    fiscal_year     INTEGER,
+    fiscal_period   TEXT,
+    filing_date     TEXT NOT NULL,
+    recorded_at     TEXT NOT NULL,
+    PRIMARY KEY (accession, class_member, period_start, period_end)
+);
+CREATE INDEX IF NOT EXISTS idx_xbrl_class_eps_acc
+    ON xbrl_class_eps(accession);
 """
 
 
@@ -1826,3 +1844,93 @@ def copy_orders_as_of(as_of: str) -> List[Dict[str, Any]]:
         if learned < decided <= bound:
             visible.append({**dict(row), "accepted": bool(row["accepted"])})
     return visible
+
+
+# ----------------------------------------------------------- xbrl class eps
+
+def record_xbrl_class_eps(rows: Iterable[Dict[str, Any]],
+                          recorded_at: Optional[str] = None) -> int:
+    """Store extracted per-class EPS facts, keyed by accession and period."""
+    import json
+    columns = ("accession", "class_member", "period_start", "period_end",
+               "form", "concept", "value", "trading_symbols", "fiscal_year",
+               "fiscal_period", "filing_date", "recorded_at")
+    stamp = recorded_at or _now()
+    written = 0
+    try:
+        with connect() as conn:
+            for row in rows:
+                cur = conn.execute(
+                    f"INSERT INTO xbrl_class_eps ({','.join(columns)}) VALUES "
+                    f"({','.join('?' for _ in columns)}) "
+                    "ON CONFLICT(accession, class_member, period_start, period_end) DO NOTHING",
+                    (row["accession"], row.get("class_member") or "",
+                     row.get("period_start") or "", row.get("period_end") or "",
+                     row["form"], row.get("concept") or "",
+                     float(row["value"]) if row.get("value") is not None else None,
+                     row.get("trading_symbols") if isinstance(row.get("trading_symbols"), str)
+                     else (json.dumps(row.get("trading_symbols")) if row.get("trading_symbols") is not None else None),
+                     row.get("fiscal_year"), row.get("fiscal_period"),
+                     row["filing_date"], stamp))
+                written += cur.rowcount
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc):
+            init_schema()
+            with connect() as conn:
+                for row in rows:
+                    cur = conn.execute(
+                        f"INSERT INTO xbrl_class_eps ({','.join(columns)}) VALUES "
+                        f"({','.join('?' for _ in columns)}) "
+                        "ON CONFLICT(accession, class_member, period_start, period_end) DO NOTHING",
+                        (row["accession"], row.get("class_member") or "",
+                         row.get("period_start") or "", row.get("period_end") or "",
+                         row["form"], row.get("concept") or "",
+                         float(row["value"]) if row.get("value") is not None else None,
+                         row.get("trading_symbols") if isinstance(row.get("trading_symbols"), str)
+                         else (json.dumps(row.get("trading_symbols")) if row.get("trading_symbols") is not None else None),
+                         row.get("fiscal_year"), row.get("fiscal_period"),
+                         row["filing_date"], stamp))
+                    written += cur.rowcount
+        else:
+            raise
+    return written
+
+
+def xbrl_class_eps_as_of(as_of: str,
+                         accessions: Optional[Iterable[str]] = None
+                         ) -> List[Dict[str, Any]]:
+    """Cached class EPS facts knowable by `as_of`.
+
+    `filing_date <= as_of` keeps out future filings; `date(recorded_at) <= as_of`
+    prevents lookahead on backfilled records.
+    """
+    import json
+    cutoff = as_of[:10]
+    sql = ("SELECT * FROM xbrl_class_eps "
+           "WHERE filing_date <= ? AND date(recorded_at) <= ?")
+    params: List[Any] = [cutoff, cutoff]
+    if accessions is not None:
+        acc_list = list(accessions)
+        if not acc_list:
+            return []
+        placeholders = ",".join("?" for _ in acc_list)
+        sql += f" AND accession IN ({placeholders})"
+        params.extend(acc_list)
+    sql += " ORDER BY filing_date DESC, accession"
+    try:
+        with connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc):
+            return []
+        raise
+    out = []
+    for r in rows:
+        d = dict(r)
+        if d.get("trading_symbols"):
+            try:
+                d["trading_symbols"] = json.loads(d["trading_symbols"])
+            except Exception:
+                pass
+        out.append(d)
+    return out
