@@ -138,6 +138,9 @@ def _quarters(ticker: str, as_of: Optional[str] = None) -> Dict[str, Dict]:
 
     series = sue.eps_series(ticker, as_of=as_of)
     if not series.get("success"):
+        if series.get("fetch_failed"):
+            # An outage at EDGAR must not read as a filer with no quarters.
+            raise RuntimeError(series["error"])
         return {}
     return {q["fiscal_period"]: {"period_end": q.get("period_end"),
                                  "known_at": (q.get("known_at") or "")[:10]}
@@ -248,6 +251,12 @@ def backfill(tickers: Optional[Sequence[str]] = None,
     written = 0
     covered = 0
     failed: List[str] = []
+    outcomes = {
+        "dated": 0,
+        "no_quarterly_eps": 0,
+        "no_release_in_window": 0,
+        "failed": 0,
+    }
 
     for ticker, cik in names:
         # Every 8-K read below is cached under /root/.edgar and nothing removes
@@ -260,12 +269,19 @@ def backfill(tickers: Optional[Sequence[str]] = None,
         # documents it already pulled counted against the cap.
         filing_cache.prune_if_due()
         try:
-            found = for_quarters(ticker, as_of=as_of, cik=cik)
+            known = _quarters(ticker, as_of=as_of)
+            found = for_quarters(ticker, as_of=as_of, quarters=known, cik=cik)
         except Exception as exc:  # noqa: BLE001 - counted and reported
             failed.append(f"{ticker}: {type(exc).__name__}: {exc}")
+            outcomes["failed"] += 1
             continue
+        covered += 1
         if found:
-            covered += 1
+            outcomes["dated"] += 1
+        elif not known:
+            outcomes["no_quarterly_eps"] += 1
+        else:
+            outcomes["no_release_in_window"] += 1
         for period, row in found.items():
             written += pit_store.record_announcement(
                 ticker.upper(), period, row["announced_date"],
@@ -273,16 +289,29 @@ def backfill(tickers: Optional[Sequence[str]] = None,
                 recorded_at=f"{row['announced_date']}T21:00:00Z")
 
     # The same three-state vocabulary the recorder uses, so `missing_days` and
-    # `coverage_status` read this job exactly like the others.
+    # `coverage_status` read this job exactly like the others. A name is
+    # covered once its lookup completed, dated or not: about a quarter of the
+    # universe (funds, foreign issuers, filers with no Item 2.02 8-K) can never
+    # be dated, and counting them as missed made every run `partial` (#186).
+    status = daily_job.coverage_status(covered, len(names))
+    error = (f"{len(failed)} of {len(names)} lookups failed: "
+             + "; ".join(failed[:5])) if failed else None
+
+    # A broken release reader must not look like a quiet week: if any lookup
+    # succeeded and not one name was dated, fail loudly.
+    if names and covered > 0 and outcomes["dated"] == 0:
+        status = "failed"
+        reason = f"{covered} names looked up and none was dated"
+        error = f"{reason}; {error}" if error else reason
+
     pit_store.finish_run(
         rows_written=written,
-        status=daily_job.coverage_status(covered, len(names)),
-        error=(f"{len(failed)} of {len(names)} lookups failed: "
-               + "; ".join(failed[:5])) if failed else None,
+        status=status,
+        error=error,
         run_id=run_id)
 
     return {"tickers": len(names), "covered": covered, "written": written,
-            "failed": failed}
+            "failed": failed, "outcomes": outcomes}
 
 
 # ------------------------------------------------------------- entry point
