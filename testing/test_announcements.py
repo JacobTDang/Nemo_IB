@@ -172,6 +172,8 @@ def test_a_name_edgar_refuses_is_reported_not_swallowed(store, monkeypatch):
     def boom(ticker, **kw):
         raise ConnectionError("EDGAR returned 503")
 
+    monkeypatch.setattr(announcements, "_quarters",
+                        lambda t, as_of=None: QUARTERS)
     monkeypatch.setattr(announcements, "_fetch_8k", boom)
     out = announcements.backfill(["AAA"], as_of="2026-03-20")
     assert out["written"] == 0
@@ -573,6 +575,8 @@ def test_a_name_that_failed_still_left_documents_in_the_cache(store,
     def boom(ticker, **kw):
         raise ConnectionError("EDGAR returned 503")
 
+    monkeypatch.setattr(announcements, "_quarters",
+                        lambda t, as_of=None: QUARTERS)
     monkeypatch.setattr(announcements, "_fetch_8k", boom)
     asked = []
     monkeypatch.setattr(filing_cache, "prune_if_due",
@@ -581,3 +585,186 @@ def test_a_name_that_failed_still_left_documents_in_the_cache(store,
     out = announcements.backfill(["AAA", "BBB"], as_of="2026-03-01")
     assert len(out["failed"]) == 2
     assert len(asked) == 2
+
+
+# --- coverage, outcomes, and fetch failures ---------------------------------
+
+def test_a_name_whose_eps_series_has_fetch_failed_is_in_failed_and_run_is_partial(
+        store, monkeypatch):
+    from research import sue
+
+    def fake_eps(ticker, as_of=None):
+        if ticker == "BROKEN":
+            return {
+                "success": False,
+                "error": "SEC companyfacts lookup failed for BROKEN: URLError: timed out",
+                "fetch_failed": True,
+                "quarters": [],
+            }
+        return {
+            "success": True,
+            "quarters": [
+                {"fiscal_period": "2026Q1", "period_end": "2026-01-31",
+                 "known_at": "2026-03-11"},
+            ],
+        }
+
+    monkeypatch.setattr(sue, "eps_series", fake_eps)
+    monkeypatch.setattr(announcements, "_fetch_8k", lambda t, **kw: [
+        Filing("2026-02-11", "2.02", "2026-02-11T21:05:00")])
+
+    out = announcements.backfill(["BROKEN", "GOOD"], as_of="2026-03-20")
+
+    assert len(out["failed"]) == 1
+    assert any("BROKEN" in f for f in out["failed"])
+    assert out["covered"] == 1
+    assert out["tickers"] == 2
+
+    with store.connect() as conn:
+        run = dict(conn.execute(
+            "SELECT * FROM run_log WHERE job = 'announce' ORDER BY run_id DESC LIMIT 1"
+        ).fetchone())
+    assert run["status"] == "partial"
+    assert "BROKEN" in (run["error"] or "")
+
+
+def test_a_name_refused_by_eps_series_without_fetch_failed_is_covered_and_run_is_ok(
+        store, monkeypatch):
+    from research import sue
+
+    def fake_eps(ticker, as_of=None):
+        if ticker == "REFUSED":
+            return {
+                "success": False,
+                "error": "REFUSED is a foreign private issuer",
+                "quarters": [],
+            }
+        return {
+            "success": True,
+            "quarters": [
+                {"fiscal_period": "2026Q1", "period_end": "2026-01-31",
+                 "known_at": "2026-03-11"},
+            ],
+        }
+
+    monkeypatch.setattr(sue, "eps_series", fake_eps)
+    monkeypatch.setattr(announcements, "_fetch_8k", lambda t, **kw: [
+        Filing("2026-02-11", "2.02", "2026-02-11T21:05:00")] if t == "DATED" else [])
+
+    out = announcements.backfill(["REFUSED", "DATED"], as_of="2026-03-20")
+
+    assert out["failed"] == []
+    assert out["covered"] == 2
+    assert out["tickers"] == 2
+
+    with store.connect() as conn:
+        run = dict(conn.execute(
+            "SELECT * FROM run_log WHERE job = 'announce' ORDER BY run_id DESC LIMIT 1"
+        ).fetchone())
+    assert run["status"] == "ok"
+    assert run["error"] is None
+
+
+def test_a_name_with_quarters_but_no_release_in_window_is_covered_under_no_release_in_window(
+        store, monkeypatch):
+    from research import sue
+
+    def fake_eps(ticker, as_of=None):
+        return {
+            "success": True,
+            "quarters": [
+                {"fiscal_period": "2026Q1", "period_end": "2026-01-31",
+                 "known_at": "2026-03-11"},
+            ],
+        }
+
+    monkeypatch.setattr(sue, "eps_series", fake_eps)
+    monkeypatch.setattr(announcements, "_fetch_8k", lambda t, **kw: [
+        Filing("2026-02-11", "2.02", "2026-02-11T21:05:00")] if t == "DATED" else [])
+
+    out = announcements.backfill(["QUIET", "DATED"], as_of="2026-03-20")
+
+    assert out["failed"] == []
+    assert out["covered"] == 2
+    assert out["outcomes"]["no_release_in_window"] == 1
+    assert out["outcomes"]["dated"] == 1
+
+
+def test_names_looked_up_with_none_dated_fails_the_run_with_the_reason(
+        store, monkeypatch):
+    from research import sue
+
+    def fake_eps(ticker, as_of=None):
+        if ticker == "REFUSED":
+            return {
+                "success": False,
+                "error": "REFUSED is a foreign private issuer",
+                "quarters": [],
+            }
+        return {
+            "success": True,
+            "quarters": [
+                {"fiscal_period": "2026Q1", "period_end": "2026-01-31",
+                 "known_at": "2026-03-11"},
+            ],
+        }
+
+    monkeypatch.setattr(sue, "eps_series", fake_eps)
+    monkeypatch.setattr(announcements, "_fetch_8k", lambda t, **kw: [])
+
+    out = announcements.backfill(["REFUSED", "QUIET"], as_of="2026-03-20")
+
+    assert out["covered"] == 2
+    assert out["outcomes"]["dated"] == 0
+
+    with store.connect() as conn:
+        run = dict(conn.execute(
+            "SELECT * FROM run_log WHERE job = 'announce' ORDER BY run_id DESC LIMIT 1"
+        ).fetchone())
+    assert run["status"] == "failed"
+    assert "2 names looked up and none was dated" in run["error"]
+
+
+def test_the_outcomes_counts(store, monkeypatch):
+    from research import sue
+
+    def fake_eps(ticker, as_of=None):
+        if ticker == "ERR":
+            return {
+                "success": False,
+                "error": "SEC companyfacts lookup failed for ERR: URLError: timed out",
+                "fetch_failed": True,
+                "quarters": [],
+            }
+        if ticker == "REFUSED":
+            return {
+                "success": False,
+                "error": "REFUSED is a foreign private issuer",
+                "quarters": [],
+            }
+        return {
+            "success": True,
+            "quarters": [
+                {"fiscal_period": "2026Q1", "period_end": "2026-01-31",
+                 "known_at": "2026-03-11"},
+            ],
+        }
+
+    monkeypatch.setattr(sue, "eps_series", fake_eps)
+    monkeypatch.setattr(announcements, "_fetch_8k", lambda t, **kw: [
+        Filing("2026-02-11", "2.02", "2026-02-11T21:05:00")] if t == "DATED" else [])
+
+    out = announcements.backfill(["DATED", "REFUSED", "QUIET", "ERR"],
+                                 as_of="2026-03-20")
+
+    assert out["outcomes"] == {
+        "dated": 1,
+        "no_quarterly_eps": 1,
+        "no_release_in_window": 1,
+        "failed": 1,
+    }
+    assert out["tickers"] == 4
+    assert out["covered"] == 3
+    assert len(out["failed"]) == 1
+    assert out["written"] == 1
+

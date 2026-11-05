@@ -142,6 +142,7 @@ def test_a_failed_run_is_recorded_as_failed_not_left_open(store, monkeypatch):
     def boom(*a, **kw):
         raise RuntimeError("EDGAR said no")
 
+    monkeypatch.setattr(announcements, "_quarters", lambda *a, **kw: {})
     monkeypatch.setattr(announcements, "for_quarters", boom)
 
     announcements.backfill(tickers=["AAA"], as_of="2026-03-03")
