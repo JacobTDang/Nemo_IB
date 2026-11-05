@@ -1359,8 +1359,9 @@ def first_run(job: str) -> Optional[str]:
     return row["first"] if row and row["first"] else None
 
 
-def missing_days(job: str, start: str, end: str) -> List[str]:
-    """Weekdays in the range with no successful run.
+def missing_days(job: str, start: str, end: str,
+                 every: Optional[str] = None) -> List[str]:
+    """Expected schedule dates in the range with no successful run.
 
     A gap you cannot see becomes a conclusion; a gap you can see becomes a
     caveat. Only a finished run counts -- a crashed process leaves a started
@@ -1370,6 +1371,11 @@ def missing_days(job: str, start: str, end: str) -> List[str]:
     'closed' counts alongside 'ok'. The exchange shuts about ten weekdays a
     year, and a holiday listed as a permanent hole is ten false alarms
     annually, which is how the one real gap stops being noticed.
+
+    `every` is the job's schedule as `research.status` names it. A Saturday
+    job is due on Saturdays and a monthly one on the 1st; anything else is
+    due on weekdays. Counted on weekdays, a weekly job had a gap every
+    weekday while it ran on time (#181).
     """
     from datetime import date, timedelta
 
@@ -1387,7 +1393,13 @@ def missing_days(job: str, start: str, end: str) -> List[str]:
     gaps: List[str] = []
     day = first
     while day <= last:
-        if day.weekday() < 5 and day.isoformat() not in covered:
+        if every == "Saturday":
+            due = day.weekday() == 5
+        elif every == "monthly":
+            due = day.day == 1
+        else:
+            due = day.weekday() < 5
+        if due and day.isoformat() not in covered:
             gaps.append(day.isoformat())
         day += timedelta(days=1)
     return gaps

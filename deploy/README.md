@@ -628,12 +628,13 @@ docker compose --env-file ../.env run --rm research-status --json   # for script
 
 It answers the question the row counts cannot: **a job that ran and found
 nothing writes no rows, and so does a job that did not run.** Only `run_log`
-separates them, so the report reads the log. Four states matter:
+separates them, so the report reads the log. Five states matter:
 
 | state | means |
 |---|---|
 | `never` | no run at all. Raised only when the store is older than that job's own tolerance. Until then the job is not due yet and shows `~`. A store with no runs is always raised |
-| `crashed` | a run started and never finished, so the process died |
+| `running` | a run started and is younger than that job's run limit. The process is still working |
+| `crashed` | a run started, did not finish, and is older than that job's run limit. The process died |
 | `stale` | the last finished run is older than that job's own tolerance. A job that runs on weekdays counts weekdays, so a weekend does not make it stale |
 | `failed` | the run finished and reported failure, with the reason |
 
