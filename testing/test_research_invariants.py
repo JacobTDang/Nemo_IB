@@ -107,6 +107,13 @@ def _write_everything_late(store):
         "mean_net_bps": 5.0, "t_stat": None, "t_threshold": 2.87,
         "comparisons": 6, "passed": False, "reason": "written later"},
         recorded_at=LATER)
+    store.record_xbrl_class_eps([{
+        "accession": "0001-25-000001", "class_member": "CommonClassAMember",
+        "period_start": "2026-01-01", "period_end": "2026-03-31",
+        "form": "10-Q", "concept": "EarningsPerShareDiluted", "value": 1.0,
+        "trading_symbols": [{"concept": "dei:TradingSymbol", "value": "AAA"}],
+        "fiscal_year": 2026, "fiscal_period": "Q1", "filing_date": "2026-03-02",
+    }], recorded_at=LATER)
 
 
 # --- nothing is visible before it was written -------------------------------
@@ -133,6 +140,7 @@ def _write_everything_late(store):
     ("fills_as_of",
      lambda: pit_store.fills_as_of(PAST, table="copy_fill")),
     ("measured_round_trips", lambda: pit_store.measured_round_trips(PAST)),
+    ("xbrl_class_eps_as_of", lambda: pit_store.xbrl_class_eps_as_of(PAST)),
 ])
 def test_no_reader_sees_a_row_written_after_its_date(store, name, call):
     _write_everything_late(store)
@@ -177,6 +185,7 @@ def test_the_same_readers_do_see_it_afterwards(store):
     assert pit_store.paper_fills_as_of(later)
     assert pit_store.fills_as_of(later, table="copy_fill")
     assert pit_store.measured_round_trips(later)
+    assert pit_store.xbrl_class_eps_as_of(later)
 
 
 def test_every_as_of_reader_in_the_store_is_covered_here():
@@ -188,7 +197,7 @@ def test_every_as_of_reader_in_the_store_is_covered_here():
         "reporters_since", "filed_periods", "filed_issuer_periods",
         "has_consensus_history", "borrow_rate_as_of", "book_equity_as_of",
         "paper_fills_as_of", "fills_as_of", "measured_round_trips",
-        "copy_orders_as_of",
+        "copy_orders_as_of", "xbrl_class_eps_as_of",
         # Reads the run log, which records what the process did rather than
         # what the market did; see the test below for why it is keyed on the
         # date a run was FOR rather than on when it finished.
