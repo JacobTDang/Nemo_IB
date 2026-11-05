@@ -166,6 +166,19 @@ def filer(monkeypatch):
     monkeypatch.setattr(sue, "_fetch_company_concept", fetch)
     monkeypatch.setattr(sue, "_fetch_company_facts",
                         lambda cik: state.get("facts"))
+
+    from research import registrant
+    real_company = registrant.company
+
+    def mock_comp(t, cik=None):
+        if str(t).upper() == "TEST" or cik in ("0000000001", "1", 1):
+            class _EmptyComp:
+                def get_filings(self, form=None):
+                    return []
+            return _EmptyComp()
+        return real_company(t, cik)
+
+    monkeypatch.setattr(registrant, "company", mock_comp)
     sue._reset_caches()
 
     def install(payload, concept="us-gaap:EarningsPerShareDiluted"):
@@ -1189,3 +1202,311 @@ def test_an_answer_from_only_recorded_quarters_says_so(filer, store):
 
     result = sue.sue_af("TEST", as_of="2026-01-01", fiscal_period="2025Q3")
     assert result["seeded_quarters"] == 0
+
+
+# --- per-class EPS via XBRL (issue #187) -----------------------------------
+
+import json
+import pathlib
+from research import registrant
+
+
+def _load_xbrl_fixture(ticker: str):
+    path = pathlib.Path(__file__).parent / "fixtures" / f"{ticker.lower().replace('-', '_')}_xbrl.json"
+    with open(path) as fp:
+        return json.load(fp)
+
+
+class _FakeXBRLQuery:
+    def __init__(self, facts, symbol_facts):
+        self._facts = facts
+        self._symbol_facts = symbol_facts
+        self._concept = None
+        self._dimension = None
+
+    def by_concept(self, concept):
+        self._concept = concept
+        return self
+
+    def by_dimension(self, dimension):
+        self._dimension = dimension
+        return self
+
+    def execute(self):
+        pool = list(self._facts) + list(self._symbol_facts)
+        if self._concept:
+            c = self._concept.lower()
+            pool = [f for f in pool if c in f.get("concept", "").lower()]
+        if self._dimension:
+            d = self._dimension
+            pool = [f for f in pool if any(d in k for k in f.keys())
+                    or (f.get("dimension") and d in f["dimension"])]
+        return pool
+
+
+class _FakeXBRL:
+    def __init__(self, eps_facts, trading_symbols):
+        self._eps_facts = eps_facts
+        self._trading_symbols = trading_symbols
+
+    def query(self):
+        return _FakeXBRLQuery(self._eps_facts, self._trading_symbols)
+
+
+class _FakeFiling:
+    def __init__(self, rec, xbrl_override=None, on_xbrl=None):
+        self.accession_no = rec["accession_no"]
+        self.form = rec["form"]
+        self.filing_date = rec["filing_date"]
+        self._rec = rec
+        self._xbrl_override = xbrl_override
+        self._on_xbrl = on_xbrl
+
+    def xbrl(self):
+        if self._on_xbrl:
+            self._on_xbrl(self.accession_no)
+        if self._xbrl_override is not None:
+            if isinstance(self._xbrl_override, Exception):
+                raise self._xbrl_override
+            return self._xbrl_override
+        return _FakeXBRL(self._rec["eps_facts"], self._rec["trading_symbols"])
+
+
+class _FakeCompany:
+    def __init__(self, ticker, cik, filings_data, xbrl_override=None, on_xbrl=None):
+        self.ticker = ticker
+        self.cik = cik
+        self.not_found = False
+        self._filings = [_FakeFiling(f, xbrl_override=xbrl_override, on_xbrl=on_xbrl)
+                         for f in filings_data]
+
+    def get_filings(self, form=None):
+        class _Filings(list):
+            def head(self, n):
+                return _Filings(self[:n])
+        if form:
+            forms = [form] if isinstance(form, str) else list(form)
+            filtered = [f for f in self._filings
+                        if any(f.form.split("/")[0] in forms for f in [f])]
+            return _Filings(filtered)
+        return _Filings(self._filings)
+
+
+def _install_xbrl_company(monkeypatch, ticker: str, xbrl_override=None,
+                          on_xbrl=None, duplicate_filings_to=None):
+    fix = _load_xbrl_fixture(ticker)
+    cik_str = str(fix["cik"]).zfill(10)
+    filings = list(fix["filings"])
+    if duplicate_filings_to and len(filings) < duplicate_filings_to:
+        base = filings[-1]
+        for i in range(len(filings), duplicate_filings_to):
+            filings.append({
+                "accession_no": f"extra-{i:03d}",
+                "form": "10-Q",
+                "filing_date": "2020-01-01",
+                "trading_symbols": [],
+                "eps_facts": [],
+            })
+    fake_comp = _FakeCompany(ticker, cik_str, filings,
+                             xbrl_override=xbrl_override, on_xbrl=on_xbrl)
+
+    real_company = registrant.company
+
+    def mock_company(req_ticker, req_cik=None):
+        if req_ticker.upper() == ticker.upper() or (req_cik and str(req_cik).zfill(10) == cik_str):
+            return fake_comp
+        return real_company(req_ticker, req_cik)
+
+    monkeypatch.setattr(registrant, "company", mock_company)
+    return fake_comp
+
+
+def test_per_class_xbrl_path_is_only_reached_when_companyfacts_has_no_current_eps_and_filer_files_ten_q(
+        filer, monkeypatch):
+    """Rule 1: companyfacts winner is untouched, foreign filers and funds are refused without reaching XBRL."""
+    asked = []
+    real_company = registrant.company
+    monkeypatch.setattr(registrant, "company",
+                        lambda t, cik=None: asked.append(t) or real_company(t, cik))
+
+    # A name with current companyfacts EPS stays on that path
+    filer(concept_payload(STEADY))
+    res = sue.eps_series("TEST", as_of="2026-01-01")
+    assert res["success"] is True
+    assert res["source"] in ("companyconcept", "companyfacts")
+    assert not asked, "XBRL was fetched despite valid companyfacts series"
+
+    # A foreign private issuer (files 20-F) refuses without reaching XBRL
+    filer.state["payload"] = {}
+    filer.state["facts"] = {"facts": {
+        "dei": {"EntityCommonStockSharesOutstanding": {"units": {"shares": [
+            {"start": "2025-01-01", "end": "2025-12-31", "val": 1.0,
+             "accn": "a", "fy": 2025, "fp": "FY", "form": "20-F",
+             "filed": "2026-04-30"}]}}},
+        "us-gaap": {}}}
+    res_fpi = sue.eps_series("TEST", as_of="2026-06-01")
+    assert res_fpi["success"] is False
+    assert "foreign private issuer" in res_fpi["error"]
+    assert not asked, "XBRL was fetched for a foreign private issuer"
+
+    # A fund (e.g. N-CSR only) refuses without reaching XBRL
+    filer.state["facts"] = {"facts": {
+        "dei": {"EntityCommonStockSharesOutstanding": {"units": {"shares": [
+            {"start": "2025-01-01", "end": "2025-12-31", "val": 1.0,
+             "accn": "a", "fy": 2025, "fp": "FY", "form": "N-CSR",
+             "filed": "2026-04-30"}]}}},
+        "us-gaap": {}}}
+    res_fund = sue.eps_series("TEST", as_of="2026-06-01")
+    assert res_fund["success"] is False
+    assert not asked, "XBRL was fetched for a fund"
+
+
+def test_per_class_xbrl_reads_dimensioned_eps_facts_from_ten_q_and_ten_k(
+        filer, monkeypatch):
+    """Rule 2: reads StatementClassOfStockAxis facts from 10-Q and 10-K XBRL."""
+    _install_xbrl_company(monkeypatch, "COKE")
+    monkeypatch.setattr(sue, "_fetch_cik_map", lambda: {"COKE": "0000317540"})
+    filer.state["facts"] = {"facts": {
+        "dei": {"EntityCommonStockSharesOutstanding": {"units": {"shares": [
+            {"start": "2026-01-01", "end": "2026-03-31", "val": 1.0,
+             "accn": "a", "fy": 2026, "fp": "Q1", "form": "10-Q",
+             "filed": "2026-04-30"}]}}},
+        "us-gaap": {}}}
+
+    res = sue.eps_series("COKE", as_of="2026-11-05")
+    assert res["success"] is True, res.get("error")
+    assert len(res["quarters"]) >= 6
+    assert res["quarters"][-1]["fiscal_period"] == "2026Q3"
+    assert res["quarters"][-1]["eps"] == 2.64
+
+
+def test_traded_class_is_picked_from_trading_symbol_on_class_axis_with_separators_removed(
+        filer, monkeypatch):
+    """Rule 3: cover page dei:TradingSymbol tags the traded class on StatementClassOfStockAxis."""
+    _install_xbrl_company(monkeypatch, "CRD-A")
+    monkeypatch.setattr(sue, "_fetch_cik_map", lambda: {"CRD-A": "0000025475"})
+    filer.state["facts"] = {"facts": {
+        "dei": {"EntityCommonStockSharesOutstanding": {"units": {"shares": [
+            {"start": "2026-01-01", "end": "2026-03-31", "val": 1.0,
+             "accn": "a", "fy": 2026, "fp": "Q1", "form": "10-Q",
+             "filed": "2026-04-30"}]}}},
+        "us-gaap": {}}}
+
+    res = sue.eps_series("CRD-A", as_of="2026-11-05")
+    assert res["success"] is True, res.get("error")
+    assert res["class"] == "us-gaap:CommonClassAMember"
+    assert "us-gaap:CommonClassAMember" in res["source"]
+    assert res["quarters"][-1]["eps"] == 0.31
+
+
+def test_equal_class_values_are_used_when_traded_class_has_no_symbol(
+        filer, monkeypatch):
+    """Rule 3: when every class reports the same value for a period, that value is used."""
+    _install_xbrl_company(monkeypatch, "COKE")
+    monkeypatch.setattr(sue, "_fetch_cik_map", lambda: {"COKE": "0000317540"})
+    filer.state["facts"] = {"facts": {
+        "dei": {"EntityCommonStockSharesOutstanding": {"units": {"shares": [
+            {"start": "2026-01-01", "end": "2026-03-31", "val": 1.0,
+             "accn": "a", "fy": 2026, "fp": "Q1", "form": "10-Q",
+             "filed": "2026-04-30"}]}}},
+        "us-gaap": {}}}
+
+    res = sue.eps_series("COKE", as_of="2026-11-05")
+    assert res["success"] is True, res.get("error")
+    assert res["quarters"][-1]["eps"] == 2.64
+
+
+def test_differing_classes_without_traded_symbol_refuses_and_names_classes(
+        filer, monkeypatch):
+    """Rule 3: when classes differ and traded class cannot be identified, refuse and name classes."""
+    _install_xbrl_company(monkeypatch, "RELL")
+    monkeypatch.setattr(sue, "_fetch_cik_map", lambda: {"RELL": "0000355948"})
+    filer.state["facts"] = {"facts": {
+        "dei": {"EntityCommonStockSharesOutstanding": {"units": {"shares": [
+            {"start": "2026-01-01", "end": "2026-03-31", "val": 1.0,
+             "accn": "a", "fy": 2026, "fp": "Q1", "form": "10-Q",
+             "filed": "2026-04-30"}]}}},
+        "us-gaap": {}}}
+
+    res = sue.eps_series("RELL", as_of="2026-11-05")
+    assert res["success"] is False
+    assert "CommonClassAMember" in res["error"]
+    assert "CommonClassBMember" in res["error"]
+
+
+def test_per_class_quarters_preserve_filing_date_and_fiscal_identity_and_split_handling(
+        filer, monkeypatch):
+    """Rule 4: known_at equals filing date, fiscal period identity is preserved, splits handled."""
+    _install_xbrl_company(monkeypatch, "COKE")
+    monkeypatch.setattr(sue, "_fetch_cik_map", lambda: {"COKE": "0000317540"})
+    filer.state["facts"] = {"facts": {
+        "dei": {"EntityCommonStockSharesOutstanding": {"units": {"shares": [
+            {"start": "2026-01-01", "end": "2026-03-31", "val": 1.0,
+             "accn": "a", "fy": 2026, "fp": "Q1", "form": "10-Q",
+             "filed": "2026-04-30"}]}}},
+        "us-gaap": {}}}
+
+    res = sue.eps_series("COKE", as_of="2026-11-05")
+    assert res["success"] is True, res.get("error")
+    latest_q = res["quarters"][-1]
+    assert latest_q["known_at"] == "2026-11-04"
+    assert latest_q["fiscal_period"] == "2026Q3"
+    assert latest_q["period_end"] == "2026-10-02"
+    assert isinstance(res["basis_changes"], list)
+
+
+def test_result_marks_per_class_xbrl_source_and_class_used(
+        filer, monkeypatch):
+    """Rule 5: result source names the per-class XBRL path and the class used."""
+    _install_xbrl_company(monkeypatch, "CRD-A")
+    monkeypatch.setattr(sue, "_fetch_cik_map", lambda: {"CRD-A": "0000025475"})
+    filer.state["facts"] = {"facts": {
+        "dei": {"EntityCommonStockSharesOutstanding": {"units": {"shares": [
+            {"start": "2026-01-01", "end": "2026-03-31", "val": 1.0,
+             "accn": "a", "fy": 2026, "fp": "Q1", "form": "10-Q",
+             "filed": "2026-04-30"}]}}},
+        "us-gaap": {}}}
+
+    res = sue.eps_series("CRD-A", as_of="2026-11-05")
+    assert res["success"] is True
+    assert res["source"].startswith("xbrl:")
+    assert "CommonClassAMember" in res["source"]
+    assert res["class"] == "us-gaap:CommonClassAMember"
+
+
+def test_per_class_path_caps_filings_read_to_sue_history_depth(
+        filer, monkeypatch):
+    """Rule 6: reads only up to the maximum filings depth needed for SUE."""
+    read_accessions = []
+    _install_xbrl_company(monkeypatch, "COKE", on_xbrl=lambda accn: read_accessions.append(accn),
+                          duplicate_filings_to=30)
+    monkeypatch.setattr(sue, "_fetch_cik_map", lambda: {"COKE": "0000317540"})
+    filer.state["facts"] = {"facts": {
+        "dei": {"EntityCommonStockSharesOutstanding": {"units": {"shares": [
+            {"start": "2026-01-01", "end": "2026-03-31", "val": 1.0,
+             "accn": "a", "fy": 2026, "fp": "Q1", "form": "10-Q",
+             "filed": "2026-04-30"}]}}},
+        "us-gaap": {}}}
+
+    res = sue.eps_series("COKE", as_of="2026-11-05")
+    assert res["success"] is True
+    assert len(read_accessions) <= 16
+
+
+def test_failed_xbrl_fetch_is_failure_with_fetch_failed_not_silent_empty(
+        filer, monkeypatch):
+    """Rule: failed XBRL fetch raises/returns fetch_failed: True, not empty series."""
+    _install_xbrl_company(monkeypatch, "COKE", xbrl_override=ConnectionError("SEC 503"))
+    monkeypatch.setattr(sue, "_fetch_cik_map", lambda: {"COKE": "0000317540"})
+    filer.state["facts"] = {"facts": {
+        "dei": {"EntityCommonStockSharesOutstanding": {"units": {"shares": [
+            {"start": "2026-01-01", "end": "2026-03-31", "val": 1.0,
+             "accn": "a", "fy": 2026, "fp": "Q1", "form": "10-Q",
+             "filed": "2026-04-30"}]}}},
+        "us-gaap": {}}}
+
+    res = sue.eps_series("COKE", as_of="2026-11-05")
+    assert res["success"] is False
+    assert res["fetch_failed"] is True
+    assert "503" in res["error"]
+

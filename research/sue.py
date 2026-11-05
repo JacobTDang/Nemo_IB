@@ -93,11 +93,14 @@ splicing them puts a step change where the filer changed its tagging. The chain
 is ranked on currency before depth -- Ford's continuing-operations tag has more
 quarters than its diluted one and stops in 2011.
 
-**Some filers have no consolidated EPS at all.** Visa and Berkshire tag
-earnings per share against each share class, and SEC's company APIs return only
-undimensioned facts, so the concept is absent rather than partial. That is a
-refusal naming the cause, never a series built from whichever class happened to
-be readable.
+**Some filers have no consolidated EPS at all.** Filers with several share
+classes often tag earnings per share only on `us-gaap:StatementClassOfStockAxis`,
+leaving SEC's company APIs empty. When companyfacts has no current quarterly
+series and the filer files 10-Q, the 10-Q and 10-K XBRL instances are read
+directly. The class the ticker trades is selected via `dei:TradingSymbol` on the
+same axis, or used when all classes report identical values. Where classes
+differ and no traded class can be identified, it is refused naming the classes,
+never built from whichever class happened to be readable.
 
 **A foreign private issuer has no quarterly EPS either.** It files 20-F or 40-F
 annually and 6-K for interims, and 6-K exhibits carry no XBRL -- verified for
@@ -806,7 +809,7 @@ def _build_quarters(facts: List[_Fact], concept: str
 def _series_shell(ticker: str, as_of: str) -> Dict[str, Any]:
     return {"ticker": ticker.upper(), "success": False, "error": None,
             "as_of": as_of, "cik": None, "source": None, "concept": None,
-            "unit": None, "quarters": [], "basis_changes": [],
+            "class": None, "unit": None, "quarters": [], "basis_changes": [],
             "basis_unresolved": [], "concepts_tried": []}
 
 
@@ -878,17 +881,18 @@ def _walk_concepts(cik: str, as_of: str, tried: List[str],
 def _forms_filed(facts_payload: Dict[str, Any]) -> set:
     """Every form this filer has tagged anything under.
 
-    Read from the cover-page `dei` facts, which exist in every filing, so a
-    filer that tags no EPS at all can still be told apart from one that files
-    nothing quarterly.
+    Read across taxonomies in the facts payload so a filer that tags EPS
+    or other financial facts under us-gaap can still be identified as a 10-Q
+    filer even when dei shares facts are omitted in quarterly filings.
     """
     forms: set = set()
-    for body in (facts_payload.get("facts") or {}).get("dei", {}).values():
-        for rows in (body.get("units") or {}).values():
-            for row in rows:
-                form = str(row.get("form") or "")
-                if form:
-                    forms.add(form)
+    for tax in (facts_payload.get("facts") or {}).values():
+        for body in tax.values():
+            for rows in (body.get("units") or {}).values():
+                for row in rows:
+                    form = str(row.get("form") or "")
+                    if form:
+                        forms.add(form)
     return forms
 
 
@@ -904,18 +908,276 @@ def _no_series_reason(ticker: str, cik: str, as_of: str, forms: set,
                 f"not from the annual figures.")
     if "10-Q" in forms:
         return (f"{ticker} files 10-Q but tags no consolidated EPS under any "
-                f"of {', '.join(tried)}. SEC's company APIs return only "
-                f"undimensioned facts, and a filer with several share classes "
-                f"tags earnings per share against each class instead -- Visa "
-                f"and Berkshire both do -- so the concept is absent here "
-                f"rather than partial. This is a gap in what is readable, not "
-                f"a company without earnings.")
+                f"of {', '.join(tried)} and no usable per-class EPS series could "
+                f"be identified from its 10-Q/10-K XBRL instances. SEC's company "
+                f"APIs return only undimensioned facts, and per-class EPS requires "
+                f"either a traded class tagged on dei:TradingSymbol or identical "
+                f"values across classes.")
     if forms:
         return (f"{ticker} tags EPS but no quarterly period could be "
                 f"identified in the forms seen ({', '.join(sorted(forms))}). "
                 f"No time-series SUE can be built from that.")
     return (f"{ticker} (CIK {cik}) tags none of the EPS concepts tried "
             f"({', '.join(tried)}) in any filing on or before {as_of}.")
+
+
+# ----------------------------------------------------------- per-class XBRL
+
+def _norm_symbol(s: str) -> str:
+    """Trading symbol with separators removed, e.g. CRD-A or CRD.A -> CRDA."""
+    import re
+    return re.sub(r"[-./_ ]", "", s).upper()
+
+
+def _class_member(fact: Dict[str, Any]) -> Optional[str]:
+    """The share class member on StatementClassOfStockAxis, if present."""
+    for k, v in fact.items():
+        if k.startswith("dim_") and "StatementClassOfStockAxis" in k and v:
+            return str(v)
+    if fact.get("dimension") and "StatementClassOfStockAxis" in fact["dimension"] and fact.get("member"):
+        return str(fact.get("member"))
+    return None
+
+
+def _filing_fiscal_focus(x: Any) -> Tuple[Optional[int], Optional[str]]:
+    """Fiscal year and period focus from cover-page dei facts."""
+    fy, fp = None, None
+    try:
+        fy_facts = x.query().by_concept("DocumentFiscalYearFocus").execute()
+        if fy_facts and fy_facts[0].get("value"):
+            fy = int(str(fy_facts[0]["value"]).strip())
+    except Exception:
+        pass
+    try:
+        fp_facts = x.query().by_concept("DocumentFiscalPeriodFocus").execute()
+        if fp_facts and fp_facts[0].get("value"):
+            fp = str(fp_facts[0]["value"]).strip().upper()
+    except Exception:
+        pass
+    return fy, fp
+
+
+def _eps_series_from_xbrl(ticker: str, cik: str, as_of: str, name: str,
+                          result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Quarterly EPS from 10-Q and 10-K XBRL for filers that tag only per class.
+
+    SEC companyfacts carries only undimensioned facts, so filers that tag EPS
+    on StatementClassOfStockAxis appear empty or stale. This reads the facts
+    directly from each filing's XBRL instance.
+    """
+    import os
+    from research import registrant
+
+    email = os.environ.get("SEC_EMAIL", "").strip()
+    if email:
+        try:
+            from edgar import set_identity
+            set_identity(f"Nemo {email}")
+        except Exception:
+            pass
+
+    try:
+        comp = registrant.company(ticker, cik)
+        filings_col = comp.get_filings(form=["10-Q", "10-K"])
+    except Exception as exc:  # noqa: BLE001 - reported, never masked
+        if type(exc).__name__ in ("IdentityNotSetError", "LookupError") or isinstance(exc, LookupError):
+            return None
+        result["error"] = (f"SEC filings lookup failed for {name}: "
+                           f"{type(exc).__name__}: {exc}. This is an "
+                           f"outage, not a fact about the filer.")
+        result["fetch_failed"] = True
+        return result
+
+    if not filings_col:
+        return None
+
+    # SUE uses at most SIGMA_QUARTERS + 5 = 13 quarters; 16 filings (four
+    # years of 10-Q / 10-K) is the ceiling needed to supply them.
+    max_filings = 16
+    eligible = [f for f in filings_col if str(f.filing_date) <= as_of][:max_filings]
+    if not eligible:
+        return None
+
+    xbrls = []
+    for f in eligible:
+        try:
+            x = f.xbrl()
+        except Exception as exc:  # noqa: BLE001 - an outage is not an answer
+            result["error"] = (
+                f"XBRL lookup failed for {name} ({f.form} {f.accession_no}): "
+                f"{type(exc).__name__}: {exc}. This is an outage, not a "
+                f"fact about the filer.")
+            result["fetch_failed"] = True
+            return result
+        if x is not None:
+            xbrls.append((f, x))
+
+    if not xbrls:
+        return None
+
+    target_sym = _norm_symbol(ticker)
+    traded_class: Optional[str] = None
+    for f, x in xbrls:
+        try:
+            sym_facts = x.query().by_concept("TradingSymbol").execute()
+        except Exception:
+            sym_facts = []
+        for sf in sym_facts:
+            mem = _class_member(sf)
+            val = sf.get("value")
+            if mem and val and _norm_symbol(str(val)) == target_sym:
+                traded_class = mem
+                break
+        if traded_class:
+            break
+
+    chosen_concept: Optional[str] = None
+    for c in US_GAAP_EPS_CONCEPTS:
+        tag = c.split(":", 1)[1] if ":" in c else c
+        found_any = False
+        for f, x in xbrls:
+            try:
+                facts = x.query().by_concept(tag).by_dimension("StatementClassOfStockAxis").execute()
+                if any(_class_member(fact) for fact in facts):
+                    found_any = True
+                    break
+            except Exception:
+                continue
+        if found_any:
+            chosen_concept = c
+            break
+
+    if not chosen_concept:
+        return None
+
+    tag = chosen_concept.split(":", 1)[1] if ":" in chosen_concept else chosen_concept
+    all_facts: List[_Fact] = []
+    classes_used: set = set()
+    all_classes_seen: set = set()
+    differing_classes_seen: set = set()
+
+    for f, x in xbrls:
+        try:
+            raw_facts = x.query().by_concept(tag).by_dimension("StatementClassOfStockAxis").execute()
+        except Exception:
+            continue
+
+        fy, fp = _filing_fiscal_focus(x)
+        by_period: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+        for rf in raw_facts:
+            p_start = rf.get("period_start")
+            p_end = rf.get("period_end")
+            mem = _class_member(rf)
+            if not p_start or not p_end or not mem:
+                continue
+            all_classes_seen.add(mem)
+            num = rf.get("numeric_value")
+            if num is None:
+                try:
+                    num = float(rf.get("value"))
+                except (TypeError, ValueError):
+                    continue
+            by_period[(p_start, p_end)].append({**rf, "numeric_value": num, "member": mem})
+
+        seen_periods_in_filing = set()
+        for (p_start, p_end), period_facts in by_period.items():
+            if (p_start, p_end) in seen_periods_in_filing:
+                continue
+            seen_periods_in_filing.add((p_start, p_end))
+
+            fact_fy = period_facts[0].get("fiscal_year") or fy
+            fact_fp = period_facts[0].get("fiscal_period") or fp
+            if fact_fy is None or fact_fp is None:
+                continue
+
+            if traded_class:
+                matching = [pf for pf in period_facts if pf["member"] == traded_class]
+                if not matching:
+                    continue
+                chosen = matching[0]
+                classes_used.add(traded_class)
+            else:
+                val_by_class = {pf["member"]: pf["numeric_value"] for pf in period_facts}
+                if len(set(val_by_class.values())) == 1:
+                    chosen = period_facts[0]
+                    classes_used.update(val_by_class.keys())
+                else:
+                    differing_classes_seen.update(val_by_class.keys())
+                    continue
+
+            all_facts.append(_Fact(
+                start=p_start,
+                end=p_end,
+                value=float(chosen["numeric_value"]),
+                accession=f.accession_no,
+                form=f.form,
+                fiscal_year=int(fact_fy),
+                fiscal_period=str(fact_fp),
+                filed=str(f.filing_date),
+            ))
+
+    if not all_facts:
+        if differing_classes_seen and not traded_class:
+            diff_classes = sorted(differing_classes_seen)
+            result["error"] = (
+                f"{name} tags diluted EPS per share class ({', '.join(diff_classes)}) "
+                f"with differing values, and no traded class could be identified from "
+                f"dei:TradingSymbol.")
+            return result
+        return None
+
+    quarters, clusters, unresolved = _build_quarters(all_facts, chosen_concept)
+    if not quarters:
+        if differing_classes_seen and not traded_class:
+            diff_classes = sorted(differing_classes_seen)
+            result["error"] = (
+                f"{name} tags diluted EPS per share class ({', '.join(diff_classes)}) "
+                f"with differing values, and no traded class could be identified from "
+                f"dei:TradingSymbol.")
+            return result
+        return None
+
+    candidate = {
+        "concept": chosen_concept,
+        "unit": "USD/shares",
+        "quarters": quarters,
+        "clusters": clusters,
+        "unresolved": unresolved,
+        "latest_known_at": max(q["known_at"] for q in quarters.values()),
+    }
+    if _is_stale(candidate, as_of):
+        if differing_classes_seen and not traded_class:
+            diff_classes = sorted(differing_classes_seen)
+            result["error"] = (
+                f"{name} tags diluted EPS per share class ({', '.join(diff_classes)}) "
+                f"with differing values, and no traded class could be identified from "
+                f"dei:TradingSymbol.")
+            return result
+        return None
+
+    class_str = traded_class or ", ".join(sorted(classes_used or all_classes_seen))
+    result["success"] = True
+    result["source"] = f"xbrl:{class_str}"
+    result["class"] = class_str
+    result["concept"] = candidate["concept"]
+    result["unit"] = candidate["unit"]
+    result["basis_unresolved"] = candidate["unresolved"]
+    result["basis_changes"] = [
+        {"between": [c["low"], c["high"]], "ratio": c["ratio"],
+         "note": (f"the same fiscal period is reported {c['ratio']:.4f} times "
+                  f"larger after {c['high']} than it was on or before "
+                  f"{c['low']}; figures filed on or before {c['low']} are "
+                  f"rebased onto the later basis")}
+        for c in candidate["clusters"]]
+    result["quarters"] = [
+        {"fiscal_period": _period_key(fy, fq), "fiscal_year": fy,
+         "fiscal_quarter": fq, **entry}
+        for (fy, fq), entry in sorted(quarters.items())]
+    result["quarters"] = [
+        {"fiscal_period": _period_key(fy_k, fq_k), "fiscal_year": fy_k,
+         "fiscal_quarter": fq_k, **entry}
+        for (fy_k, fq_k), entry in sorted(candidate["quarters"].items())]
+    return result
 
 
 def eps_series(ticker: str, as_of: Optional[str] = None) -> Dict[str, Any]:
@@ -978,6 +1240,12 @@ def eps_series(ticker: str, as_of: Optional[str] = None) -> Dict[str, Any]:
                                          or _rank(fallback) > _rank(best)):
                 best, source = fallback, "companyfacts"
 
+    if best is None or _is_stale(best, as_of):
+        if "10-Q" in forms_seen and not any(f in FOREIGN_ANNUAL_FORMS for f in forms_seen):
+            xbrl_res = _eps_series_from_xbrl(ticker, cik, as_of, name, result)
+            if xbrl_res is not None:
+                return xbrl_res
+
     if best is None:
         result["error"] = _no_series_reason(name, cik, as_of, forms_seen,
                                             result["concepts_tried"])
@@ -994,8 +1262,8 @@ def eps_series(ticker: str, as_of: Optional[str] = None) -> Dict[str, Any]:
             f"is more than {_STALE_DAYS} days before {as_of}. A filer still "
             f"reporting is never that quiet, so this is a registrant that has "
             f"stopped filing, or one whose EPS moved to a tagging this cannot "
-            f"read -- Berkshire's went to per-share-class facts in 2014, and "
-            f"SEC's company APIs return only undimensioned ones.")
+            f"read -- Berkshire's went to per-share-class facts in 2014, whose "
+            f"classes differ with no dei:TradingSymbol identifying the traded class.")
         return result
 
     result["success"] = True
