@@ -60,8 +60,9 @@ JOB = "activist_watch"
 # was built, a 13D/A says something about a stake already disclosed -- an
 # increase, a partial sale, a settlement, sometimes an exit. The expected
 # reaction differs in sign, so collapsing them is a coin flip wearing a signal's
-# clothes.
-WATCHED_FORMS = ("SC 13D", "SC 13D/A")
+# clothes. Both EDGAR names of each, as in `sec_utils.SCHEDULE13D_FORMS`,
+# which this module does not import at load time.
+WATCHED_FORMS = ("SC 13D", "SC 13D/A", "SCHEDULE 13D", "SCHEDULE 13D/A")
 
 # Between SEC calls. SEC's published ceiling is 10 requests/second and it
 # enforces it hard; this project has been throttled repeatedly. Sequential and

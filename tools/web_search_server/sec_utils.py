@@ -1730,6 +1730,19 @@ def _schedule13_party(filing, attribute: str):
   return (None, None)
 
 
+# Schedules 13D and 13G have been structured filings since late 2024, and
+# EDGAR files them as `SCHEDULE 13D` and `SCHEDULE 13G`. The `SC` names are
+# the older filings and the few filers still amending under them. Asking only
+# for `SC` read every company as having had no 13D since early 2025 (#180).
+SCHEDULE13D_FORMS = ('SC 13D', 'SC 13D/A', 'SCHEDULE 13D', 'SCHEDULE 13D/A')
+SCHEDULE13G_FORMS = ('SC 13G', 'SC 13G/A', 'SCHEDULE 13G', 'SCHEDULE 13G/A')
+
+
+def is_schedule13d(form: str) -> bool:
+  """A 13D, initial or amended, under either name: the activist schedule."""
+  return form.startswith(('SC 13D', 'SCHEDULE 13D'))
+
+
 def schedule13_file_number_is_subject_side(filing) -> bool:
   """The free half of the subject/filer split, straight from the index.
 
@@ -1786,11 +1799,12 @@ def classify_schedule13(filing, company_cik: str) -> Dict[str, Any]:
 
 def get_schedule_13d_filings(ticker: str, limit: int = 15,
                              include_passive: bool = True) -> Dict[str, Any]:
-  """Return SC 13D (activist) and SC 13G (passive) filings naming the
+  """Return Schedule 13D (activist) and Schedule 13G (passive) filings naming the
   target ticker as subject company.
 
-  SC 13D = institutional holder with >5% stake AND intent to influence
-  management (activist). SC 13G = >5% stake, passive (index funds,
+  Schedule 13D (legacy SC 13D, structured SCHEDULE 13D) = institutional holder
+  with >5% stake AND intent to influence management (activist). Schedule 13G
+  (legacy SC 13G, structured SCHEDULE 13G) = >5% stake, passive (index funds,
   long-only). 13D/A and 13G/A are amendments.
 
   Activist 13D filings are highly informative for thesis-building —
@@ -1812,9 +1826,9 @@ def get_schedule_13d_filings(ticker: str, limit: int = 15,
 
   company_cik = str(int(company.cik))
 
-  forms_to_pull = ['SC 13D', 'SC 13D/A']
+  forms_to_pull = list(SCHEDULE13D_FORMS)
   if include_passive:
-    forms_to_pull.extend(['SC 13G', 'SC 13G/A'])
+    forms_to_pull.extend(SCHEDULE13G_FORMS)
 
   rows: list = []
   whole_set: dict = {}       # accession -> is_activist, subject-side only
@@ -1853,7 +1867,7 @@ def get_schedule_13d_filings(ticker: str, limit: int = 15,
       if not schedule13_file_number_is_subject_side(f):
         filed_by_company.add(accession)
         continue
-      whole_set.setdefault(accession, form.startswith('SC 13D'))
+      whole_set.setdefault(accession, is_schedule13d(f.form))
       subject_side.append(f)
 
     # Page the subject-side filings, not the raw folder. Slicing first meant
@@ -1884,7 +1898,7 @@ def get_schedule_13d_filings(ticker: str, limit: int = 15,
         continue
       if is_subject and f.accession_number not in whole_set:
         heuristic_disagreements.append(f.accession_number)
-        whole_set.setdefault(f.accession_number, form.startswith('SC 13D'))
+        whole_set.setdefault(f.accession_number, is_schedule13d(f.form))
         filed_by_company.discard(f.accession_number)
 
       # Try to extract stake percentage from filing body
@@ -1903,8 +1917,11 @@ def get_schedule_13d_filings(ticker: str, limit: int = 15,
       except Exception:
         pass
 
+      # The filing's own form, not the one asked for: edgartools answers a
+      # query for `SCHEDULE 13D` with the amendments too, and labelled by the
+      # query GNK's fourteen amendments read as fourteen new stakes.
       rows.append({
-        'form':             form,
+        'form':             f.form,
         'filing_date':      str(f.filing_date),
         'accession':        f.accession_number,
         'filer_name':       filer_name,
@@ -1918,8 +1935,8 @@ def get_schedule_13d_filings(ticker: str, limit: int = 15,
         'subject_verified': subject_verified,
         'stake_pct':        stake_pct,
         'url':              getattr(f, 'filing_url', None),
-        'is_amendment':     form.endswith('/A'),
-        'is_activist':      form.startswith('SC 13D'),
+        'is_amendment':     f.form.endswith('/A'),
+        'is_activist':      is_schedule13d(f.form),
       })
 
   if not rows:

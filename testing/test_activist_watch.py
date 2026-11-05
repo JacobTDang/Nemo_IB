@@ -1110,3 +1110,57 @@ def test_a_name_that_failed_still_left_documents_in_the_cache(store,
     out = activist_watch.watch_pass(["AAA", "BBB"], as_of="2026-08-26")
     assert out["status"] == "failed"
     assert len(asked) == 2
+
+
+# --- structured Schedule 13D/A form names (issue #180) ---------------------
+
+def test_watcher_records_folder_with_only_new_schedule_13d_names(store,
+                                                                 monkeypatch):
+    """EDGAR files Schedules 13D/13G under SCHEDULE 13D and SCHEDULE 13D/A since
+    late 2024. A folder containing only those forms must record both the initial
+    stake and the amendment."""
+    monkeypatch.setenv("SEC_EMAIL", "test@example.invalid")
+    initial = _Filing("s1", "SCHEDULE 13D", "2026-08-26", "005-19567",
+                      subject=INTC, filer=ICAHN,
+                      acceptance_datetime="2026-08-26T18:00:00Z")
+    amendment = _Filing("s2", "SCHEDULE 13D/A", "2026-08-26", "005-19567",
+                        subject=INTC, filer=ICAHN,
+                        acceptance_datetime="2026-08-26T19:00:00Z")
+
+    class _Company:
+        cik = int(INTC_CIK)
+
+        # As edgartools answers: the initial form's query brings the
+        # amendments too.
+        def get_filings(self, form=None):
+            if form == "SCHEDULE 13D":
+                return [initial, amendment]
+            if form == "SCHEDULE 13D/A":
+                return [amendment]
+            return []
+
+    monkeypatch.setattr(activist_watch.registrant, "company",
+                        lambda ticker, cik=None: _Company())
+
+    result = activist_watch.watch_pass(["INTC"], as_of="2026-08-26",
+                              detected_at="2026-08-26T20:33:45Z")
+
+    assert result["status"] == "ok"
+    assert result["new_events"] == 2
+
+    filings = {f["accession"]: f for f in
+               store.activist_filings_as_of("2026-08-26", ticker="INTC")}
+    assert "s1" in filings
+    assert "s2" in filings
+    assert filings["s1"]["form"] == "SCHEDULE 13D"
+    assert filings["s1"]["is_amendment"] is False
+    assert filings["s2"]["form"] == "SCHEDULE 13D/A"
+    assert filings["s2"]["is_amendment"] is True
+
+
+def test_the_watcher_asks_for_the_same_13d_forms_as_the_sec_tool():
+    """Two copies, because the watcher does not import `sec_utils` at load
+    time. A name added to one and not the other is a reader that goes blind."""
+    from tools.web_search_server import sec_utils
+
+    assert activist_watch.WATCHED_FORMS == sec_utils.SCHEDULE13D_FORMS

@@ -306,13 +306,13 @@ def _build_all_tools() -> List[Tool]:
         ),
         Tool(
           name="get_schedule_13d_filings",
-          description="Return SC 13D (activist) and SC 13G (passive) filings naming the target ticker as subject. 13D = institutional holder with >5% stake AND intent to influence (activist); 13G = passive (index funds, long-only). Returns filer name, CIK, stake percentage (where parseable), filing date, and URL. Knowing Ackman/Loeb/Icahn has built a position is decisive context; rising 13D activity = activist setup brewing.",
+          description="Return Schedule 13D (activist) and Schedule 13G (passive) filings naming the target ticker as subject. 13D = institutional holder with >5% stake AND intent to influence (activist); 13G = passive (index funds, long-only). Returns filer name, CIK, stake percentage (where parseable), filing date, and URL. Knowing Ackman/Loeb/Icahn has built a position is decisive context; rising 13D activity = activist setup brewing.",
           inputSchema={
             "type": "object",
             "properties": {
               "ticker": {"type": "string", "description": "Stock symbol"},
               "limit": {"type": "integer", "description": "Max filings to return", "default": 15},
-              "include_passive": {"type": "boolean", "description": "Include SC 13G (passive) filings; if false only returns 13D activists", "default": True}
+              "include_passive": {"type": "boolean", "description": "Include Schedule 13G (passive) filings; if false only returns 13D activists", "default": True}
             },
             "required": ["ticker"]
           }
