@@ -195,6 +195,33 @@ CREATE TABLE IF NOT EXISTS borrow_rate (
 CREATE INDEX IF NOT EXISTS idx_borrow_ticker
     ON borrow_rate(ticker, as_of_date);
 
+CREATE TABLE IF NOT EXISTS copy_order (
+    txn_id           TEXT PRIMARY KEY NOT NULL,
+    as_of_date       TEXT NOT NULL,
+    decided_at       TEXT NOT NULL,
+    learned_at       TEXT NOT NULL,
+    filing_id        TEXT NOT NULL,
+    member_id        TEXT,
+    member           TEXT,
+    chamber          TEXT NOT NULL,
+    owner            TEXT,
+    source_ticker    TEXT,
+    ticker           TEXT,
+    cik              TEXT,
+    amount_min       INTEGER,
+    amount_max       INTEGER,
+    transaction_date TEXT,
+    filed_date       TEXT NOT NULL,
+    accepted         INTEGER NOT NULL CHECK (accepted IN (0, 1)),
+    reason           TEXT,
+    side             TEXT,
+    target_dollars   REAL,
+    intended_session TEXT,
+    CHECK ((accepted = 0 AND reason IS NOT NULL) OR
+           (accepted = 1 AND reason IS NULL AND side = 'long'
+            AND target_dollars > 0 AND intended_session IS NOT NULL))
+);
+
 CREATE TABLE IF NOT EXISTS paper_order (
     as_of_date       TEXT NOT NULL,
     ticker           TEXT NOT NULL,
@@ -1658,3 +1685,51 @@ def measured_round_trips(as_of_date: str) -> List[Dict[str, Any]]:
             "borrow_bps": order.get("borrow_bps"),
             "participation": order.get("participation")})
     return trips
+
+
+# ------------------------------------------------------------ copy decisions
+
+def record_copy_orders(rows: Iterable[Dict[str, Any]]) -> int:
+    """Keep the first decision for each source transaction, including refusals."""
+    columns = ("txn_id", "as_of_date", "decided_at", "learned_at", "filing_id",
+               "member_id", "member", "chamber", "owner", "source_ticker",
+               "ticker", "cik", "amount_min", "amount_max", "transaction_date",
+               "filed_date", "accepted", "reason", "side", "target_dollars",
+               "intended_session")
+    written = 0
+    with connect() as conn:
+        for row in rows:
+            cur = conn.execute(
+                f"INSERT INTO copy_order ({','.join(columns)}) VALUES "
+                f"({','.join('?' for _ in columns)}) "
+                "ON CONFLICT(txn_id) DO NOTHING",
+                tuple(row[column] for column in columns))
+            written += cur.rowcount
+    return written
+
+
+def copy_orders_as_of(as_of: str) -> List[Dict[str, Any]]:
+    """Decisions known by a UTC instant (or the end of a UTC date).
+
+    Both the decision date and its timestamp constrain the read. The source
+    must also have been learned strictly before its decision.
+    """
+    cutoff = as_of if len(as_of) > 10 else as_of + "T23:59:59.999999+00:00"
+    bound = datetime.fromisoformat(cutoff.replace("Z", "+00:00"))
+    if bound.tzinfo is None:
+        raise ValueError("copy order cutoff must have a UTC offset")
+    bound = bound.astimezone(timezone.utc)
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT * FROM copy_order WHERE as_of_date <= ?
+                 ORDER BY decided_at, txn_id""",
+            (bound.date().isoformat(),)).fetchall()
+    # SQLite's date functions round fractional seconds. Compare instants in
+    # Python so a decision just after the cutoff cannot enter the earlier book.
+    visible = []
+    for row in rows:
+        decided = datetime.fromisoformat(row["decided_at"].replace("Z", "+00:00"))
+        learned = datetime.fromisoformat(row["learned_at"].replace("Z", "+00:00"))
+        if learned < decided <= bound:
+            visible.append({**dict(row), "accepted": bool(row["accepted"])})
+    return visible

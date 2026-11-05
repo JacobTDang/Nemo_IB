@@ -218,6 +218,7 @@ docker compose --env-file ../.env run --rm research-daily               # every 
 |---|---|---|
 | `research-daily` | one session of prices per name, screens the universe, snapshots consensus | `30 22 * * 1-5` |
 | `research-scan` | ranks candidates net of trading cost and borrow, files the intended orders | `0 23 * * 1-5` |
+| `research-copy` | records decisions for congressional stock purchases when the settings flag is on | `30 12 * * 1-5` |
 | `research-watch` | sweeps EDGAR for Schedule 13D stakes taken in a company | `*/20 13-23 * * 1-5` |
 | `research-score` | scores filed orders whose holding period has closed | `0 7 * * 6` |
 | `research-announce` | earnings dates and the hour they landed, from Item 2.02 filings | `0 9 * * 6` |
@@ -342,6 +343,49 @@ The job runs from its own image, because it can place orders. The data image
 cannot place orders. Paper fills show the quoted spread at the open. They do
 not show the price impact of the order.
 
+### Congressional purchase decisions
+
+The `research-copy` job records a separate paper book. The job is off by
+default. When it is off, it writes no run row. The status screen shows `off`
+and raises no alert for this job.
+
+When it is on, the job reads stock purchases from filings dated within the
+last three days. It includes all members of the household. The job uses only
+filings that Nemo parsed before the decision time. Each transaction gets one
+`copy_order` row. The row keeps the disclosed amount band, source dates,
+parse time, decision time, and acceptance or rejection reason. All times are UTC.
+
+The eligible universe supplies the issuer CIK. The job removes ticker
+separators before comparison. Thus `BRK.B` can match `BRK-B`. The job permits
+one open position per issuer. It rejects another purchase of that issuer in
+the same run. An accepted decision uses one book slot until its hold period
+ends, even before a fill exists.
+
+The job rejects a purchase without a ticker, below the amount floor, or from
+a member outside the list. It also rejects an old trade, an ineligible ticker,
+an issuer already held, a duplicate issuer, or a purchase when the book is full.
+The job measures trade age from the transaction date to the UTC parse date.
+A missing House sync or a House sync older than three days fails the run.
+A current sync without new purchases records an `ok` run.
+
+The intended session is the first session on or after the decision date.
+The scanner supplies the calendar. That calendar includes weekdays but does
+not exclude exchange holidays. The hold period uses the same calendar.
+The job records the dollar target. It sends no order.
+
+These settings go in the deployment environment file. Empty values use the
+code defaults. Invalid values stop the job and identify the setting.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `NEMO_COPY_TRADING` | `off` | Accepts only `on` or `off`, in any letter case. An unset value means `off`. |
+| `NEMO_COPY_MIN_AMOUNT` | `15001` | Minimum disclosed amount floor in dollars. Accepts a nonnegative integer. |
+| `NEMO_COPY_DOLLARS` | `5000` | Dollar target per trade. Accepts a positive integer. |
+| `NEMO_COPY_HOLD_DAYS` | `20` | Sessions after the intended session before the position releases its book slot. Accepts a positive integer. |
+| `NEMO_COPY_MAX_OPEN` | `10` | Maximum open copy positions. Accepts a positive integer. |
+| `NEMO_COPY_MAX_TRADE_AGE_DAYS` | `45` | Maximum calendar days from the trade to the parse date. Accepts a nonnegative integer. |
+| `NEMO_COPY_MEMBERS` | empty | Comma-separated full member names. Comparison ignores letter case. Empty means all members. |
+
 ### The record
 
 `research-daily` writes one SQLite file on the `research-data` volume. Money
@@ -361,6 +405,7 @@ announcement       fiscal identity, the date the market learned, and whether it
                    landed before the open or after the close
 borrow_rate        what it cost to be short, per name, as somebody quoted it
 paper_order        decisions, with the session they were for and no fill price
+copy_order         congressional purchase decisions, including rejection reasons
 activist_filing    13D events with four timestamps, latency derived at read
 book_equity        what the paper book was worth each night, and the limit
 risk_event         each time the drawdown switch tripped or a person reset it

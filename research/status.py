@@ -59,6 +59,9 @@ from research import pit_store
 # `testing/test_status.py` checks this list against the compose file, because a
 # report that quietly omits a job is worse than no report.
 JOBS = (
+    {"job": "congress_copy", "module": "research.congress_copy",
+     "every": "weekday", "stale_after_days": 2,
+     "max_run_seconds": 600, "partial_is_normal": False},
     {"job": "daily_bars", "module": "research.daily_job",
      "every": "weeknight", "stale_after_days": 2,
      "max_run_seconds": 600,
@@ -191,6 +194,12 @@ def _job_state(spec: Dict[str, Any], as_of: str) -> Dict[str, Any]:
            "last_run": None, "last_success": None, "state": "never",
            "status": None, "rows_written": None, "error": None,
            "age_days": None, "gaps": None}
+
+    if job == "congress_copy":
+        from research.congress_copy import enabled
+        if not enabled():
+            out["state"] = "off"
+            return out
 
     row = _last_run(job)
     if row is None:
@@ -356,7 +365,7 @@ def _render(report: Dict[str, Any]) -> str:
         # `!` means exactly "named in ATTENTION below". A marker that draws
         # the eye and then offers nothing to do is worse than no marker.
         raised = any(a.startswith(job["job"] + " ") for a in report["attention"])
-        mark = "!" if raised else ("~" if job["state"] not in ("ok", "closed")
+        mark = "!" if raised else ("~" if job["state"] not in ("ok", "closed", "off")
                                    else " ")
         rows = "-" if job["rows_written"] is None else f"{job['rows_written']:,}"
         # A gap count is meaningless for a job that covers a slice per pass.
