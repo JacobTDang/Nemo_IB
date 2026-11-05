@@ -12,6 +12,7 @@ named rather than left out of the list.
 """
 from __future__ import annotations
 
+import asyncio
 import socket
 import threading
 import time
@@ -39,14 +40,17 @@ def _text(result: types.CallToolResult) -> str:
 class FakeBackend:
     """A data server as the gateway sees it: a name, its tools, and calls."""
 
-    def __init__(self, name, tools, answer=None, down=False):
+    def __init__(self, name, tools, answer=None, down=False, delay=0.0):
         self.name = name
         self.tools = [_tool(t) for t in tools]
         self.answer = answer
         self.down = down
+        self.delay = delay
         self.calls = []
 
     async def list_tools(self):
+        if self.delay:
+            await asyncio.sleep(self.delay)
         if self.down:
             raise ConnectionError("connection refused")
         return self.tools
@@ -80,6 +84,44 @@ async def test_every_tool_of_every_backend_is_listed_once():
     server = gateway.build_server([FakeBackend("sec", ["a", "b"]),
                                    FakeBackend("fred", ["c"])])
     assert sorted(await _list(server)) == ["a", "b", "c"]
+
+
+async def test_concurrent_tools_list_each_return_every_tool_once():
+    sec = FakeBackend("sec", ["a", "b"], delay=0.01)
+    fred = FakeBackend("fred", ["c"], delay=0.01)
+    server = gateway.build_server([sec, fred])
+
+    first, second, third = await asyncio.gather(
+        _list(server), _list(server), _list(server))
+
+    assert sorted(first) == ["a", "b", "c"]
+    assert sorted(second) == ["a", "b", "c"]
+    assert sorted(third) == ["a", "b", "c"]
+    assert sorted(await _list(server)) == ["a", "b", "c"]
+
+
+async def test_concurrent_tools_call_and_list_yields_one_copy():
+    sec = FakeBackend("sec", ["a", "b"], delay=0.01)
+    fred = FakeBackend("fred", ["c"], delay=0.01)
+    server = gateway.build_server([sec, fred])
+
+    call_result, list_result = await asyncio.gather(
+        _call(server, "a"), _list(server))
+
+    assert not call_result.isError
+    assert _text(call_result) == "sec:a"
+    assert sorted(list_result) == ["a", "b", "c"]
+    assert sorted(await _list(server)) == ["a", "b", "c"]
+
+
+async def test_first_read_that_fails_caches_nothing_and_later_read_succeeds():
+    sec = FakeBackend("sec", ["a"], down=True, delay=0.01)
+    server = gateway.build_server([sec, FakeBackend("fred", ["c"], delay=0.01)])
+    with pytest.raises(RuntimeError, match=r"sec"):
+        await _list(server)
+
+    sec.down = False
+    assert sorted(await _list(server)) == ["a", "c"]
 
 
 async def test_two_backends_serving_one_name_refuse_to_list():
