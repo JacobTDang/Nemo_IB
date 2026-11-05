@@ -19,6 +19,7 @@ Run with `python -m tools.gateway http`.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import pathlib
 import sys
@@ -118,31 +119,38 @@ def build_server(backends: Sequence[Any]) -> Server:
     server = Server("nemo")
     owners: Dict[str, Any] = {}
     listed: List[types.Tool] = []
+    # Several clients connect at once after a restart. Without the lock each
+    # first request found the list empty, read every backend and appended its
+    # own copy: 288 entries for 96 tools (#177).
+    lock = asyncio.Lock()
 
     async def catalogue() -> List[types.Tool]:
         if listed:
             return listed
-        tools: List[types.Tool] = []
-        owner_of: Dict[str, Any] = {}
-        for backend in backends:
-            try:
-                served = await backend.list_tools()
-            except Exception as exc:  # noqa: BLE001 - named and re-raised
-                raise RuntimeError(
-                    f"the {backend.name} server did not list its tools "
-                    f"({type(exc).__name__}: {exc}), so the gateway lists "
-                    f"nothing rather than a list without them") from exc
-            for tool in served:
-                if tool.name in owner_of:
+        async with lock:
+            if listed:
+                return listed
+            tools: List[types.Tool] = []
+            owner_of: Dict[str, Any] = {}
+            for backend in backends:
+                try:
+                    served = await backend.list_tools()
+                except Exception as exc:  # noqa: BLE001 - named and re-raised
                     raise RuntimeError(
-                        f"{tool.name} is served by both "
-                        f"{owner_of[tool.name].name} and {backend.name}; one "
-                        f"of them would silently answer every call")
-                owner_of[tool.name] = backend
-                tools.append(tool)
-        owners.update(owner_of)
-        listed.extend(tools)
-        return listed
+                        f"the {backend.name} server did not list its tools "
+                        f"({type(exc).__name__}: {exc}), so the gateway lists "
+                        f"nothing rather than a list without them") from exc
+                for tool in served:
+                    if tool.name in owner_of:
+                        raise RuntimeError(
+                            f"{tool.name} is served by both "
+                            f"{owner_of[tool.name].name} and {backend.name}; one "
+                            f"of them would silently answer every call")
+                    owner_of[tool.name] = backend
+                    tools.append(tool)
+            owners.update(owner_of)
+            listed.extend(tools)
+            return listed
 
     @server.list_tools()
     async def list_tools() -> List[types.Tool]:
