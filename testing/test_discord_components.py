@@ -141,8 +141,8 @@ def test_the_webhook_query_keeps_existing_parameters(webhooks):
     post.deliver("ops", [post.ops_message(
         "research-seed", "1 row recorded", ok=True, quiet=True, when=WHEN)],
         transport=transport,
-        url_for=lambda channel: OPS + "?wait=true")
-    assert seen["url"] == OPS + "?wait=true&with_components=true"
+        url_for=lambda channel: OPS + "?thread_id=9")
+    assert seen["url"] == OPS + "?thread_id=9&with_components=true&wait=true"
     assert seen["body"]["flags"] & post.IS_COMPONENTS_V2
 
 
@@ -284,7 +284,7 @@ def test_preview_accepts_every_message_type():
     examples.extend(post.brief_messages(
         "## Pre-market\n\nAAA is unchanged.", when=WHEN))
     import time
-    endpoint = post.with_components(url)
+    endpoint = post.webhook_endpoint(url)
     with httpx.Client(timeout=30) as client:
         for payload in examples:
             response = None

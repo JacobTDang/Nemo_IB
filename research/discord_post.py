@@ -31,6 +31,12 @@ COMPONENT_LIMIT = 40
 LABEL_LIMIT = 80
 URL_LIMIT = 512
 
+# A 429 waits out Discord's retry_after, up to this many seconds, and the post
+# is tried again. After SEND_ATTEMPTS answers the 429 is a failed post.
+RETRY_AFTER_CAP = 10.0
+SEND_ATTEMPTS = 3
+ERROR_DETAIL_LIMIT = 300
+
 OPS_SETTING = "NEMO_DISCORD_OPS_WEBHOOK_URL"
 SIGNALS_SETTING = "NEMO_DISCORD_SIGNALS_WEBHOOK_URL"
 _SETTINGS = {"ops": OPS_SETTING, "signals": SIGNALS_SETTING}
@@ -117,11 +123,17 @@ def webhook_url(channel: str) -> str:
     return value
 
 
-def with_components(url: str) -> str:
+def webhook_endpoint(url: str) -> str:
+    """The URL to POST to: the webhook plus ``with_components=true&wait=true``.
+
+    ``wait=true`` makes Discord answer with the saved message. Without it a
+    message that Discord does not save returns no error. Other query
+    parameters stay.
+    """
     parts = urlsplit(url)
     query = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True)
-             if key != "with_components"]
-    query.append(("with_components", "true"))
+             if key not in ("with_components", "wait")]
+    query.extend([("with_components", "true"), ("wait", "true")])
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
 
 
@@ -536,18 +548,24 @@ def _daily(result, failed, seconds, when, error):
 def deliver(channel: str, payloads: Sequence[dict], *,
             transport: Optional[Callable[[str, dict], Any]] = None,
             url_for: Optional[Callable[[str], str]] = None) -> None:
-    """POST each payload. ``transport`` is the test seam. It receives the URL."""
+    """POST each payload. ``transport`` is the test seam. It receives the URL.
+
+    Every payload is checked against the limits before the first one is sent,
+    so a long digest never posts half.
+    """
     url = (url_for or webhook_url)(channel)
-    endpoint = with_components(url)
+    endpoint = webhook_endpoint(url)
     send = transport or _http_send
     for payload in payloads:
         _check(payload)
+    for payload in payloads:
         try:
             send(endpoint, payload)
         except DiscordError:
             raise
-        except Exception:
-            raise DiscordError("Discord post failed") from None
+        except Exception as exc:
+            raise DiscordError(
+                f"Discord post failed: {type(exc).__name__}") from None
 
 
 def finish(job: str, code: int, result: Optional[dict] = None, *,
@@ -569,15 +587,67 @@ def finish(job: str, code: int, result: Optional[dict] = None, *,
     return code
 
 
+def _retry_after(response) -> Optional[float]:
+    try:
+        value = response.json().get("retry_after")
+    except (ValueError, AttributeError):
+        value = None
+    if value is None:
+        value = response.headers.get("retry-after")
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _discord_detail(response) -> str:
+    """Discord's JSON ``code`` and ``message``. The body holds no secret."""
+    try:
+        body = response.json()
+    except ValueError:
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    bits = []
+    if body.get("code") is not None:
+        bits.append(f"code {body['code']}")
+    if body.get("message"):
+        bits.append(str(body["message"]))
+    return redact(": ".join(bits))[:ERROR_DETAIL_LIMIT]
+
+
+def _refusal(response) -> DiscordError:
+    detail = _discord_detail(response)
+    suffix = f": {detail}" if detail else ""
+    return DiscordError(f"Discord post returned {response.status_code}{suffix}")
+
+
 def _http_send(url: str, body: dict) -> None:
     import httpx
 
-    try:
-        response = httpx.post(url, json=body, timeout=30)
-    except Exception:
-        raise DiscordError("Discord post failed") from None
-    if response.status_code >= 300:
-        raise DiscordError(f"Discord post returned {response.status_code}")
+    for attempt in range(1, SEND_ATTEMPTS + 1):
+        try:
+            response = httpx.post(url, json=body, timeout=30)
+        except Exception as exc:
+            raise DiscordError(
+                f"Discord post failed: {type(exc).__name__}") from None
+        if response.status_code == 429 and attempt < SEND_ATTEMPTS:
+            wait = _retry_after(response)
+            if wait is None:
+                raise _refusal(response)
+            time.sleep(min(wait, RETRY_AFTER_CAP))
+            continue
+        if response.status_code >= 300:
+            raise _refusal(response)
+        try:
+            saved = response.json()
+        except ValueError:
+            saved = None
+        if not isinstance(saved, dict) or not saved.get("id"):
+            raise DiscordError(
+                f"Discord answered {response.status_code} without a message id; "
+                f"the message may not be saved")
+        return
 
 
 def log_tail(path: str, lines: int = 100) -> str:
