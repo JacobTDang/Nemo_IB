@@ -154,8 +154,22 @@ def _module_file(module: str) -> pathlib.Path | None:
     return package if package.exists() else None
 
 
+def _string_constants(tree: ast.AST) -> dict:
+    """Module-level `NAME = "text"`, so `os.environ.get(NAME)` can be read."""
+    found: dict = {}
+    for node in getattr(tree, "body", ()):
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)):
+            found[node.targets[0].id] = node.value.value
+    return found
+
+
 def _reads_in(tree: ast.AST) -> set:
-    """`os.environ.get("X")`, `os.getenv("X")` and `os.environ["X"]`."""
+    """`os.environ.get("X")`, `os.getenv("X")` and `os.environ["X"]`, where X
+    is a literal or a module-level constant that holds one."""
+    constants = _string_constants(tree)
     names: set = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and node.args:
@@ -172,6 +186,8 @@ def _reads_in(tree: ast.AST) -> set:
                 )
             )
             first = node.args[0]
+            if isinstance(first, ast.Name) and first.id in constants:
+                first = ast.Constant(constants[first.id])
             if looks_like_a_read and isinstance(first, ast.Constant) \
                     and isinstance(first.value, str):
                 names.add(first.value)
@@ -269,6 +285,38 @@ def test_a_service_declares_only_keys_its_own_code_reads(name, services):
         f"a container does not need is one any traceback in it can print.")
 
 
+def test_the_scanner_for_reads_follows_a_module_constant():
+    """`os.environ.get(NAME)` reads the key `NAME = "..."` holds. The Discord
+    sender names its settings once, as constants, and the walk has to see them."""
+    tree = ast.parse(
+        'import os\n'
+        'SETTING = "NEMO_SOMETHING"\n'
+        'def read():\n'
+        '    return os.environ.get(SETTING, "")\n'
+        'def other(name):\n'
+        '    return os.environ.get(name)\n')
+    assert _reads_in(tree) == {"NEMO_SOMETHING"}
+
+
+def test_each_service_gets_the_webhooks_of_the_channels_its_job_posts_to(services):
+    """The import walk above cannot tell the two webhooks apart: every job
+    imports the one module that reads both. `JOB_CHANNELS` says which channels
+    a job posts to, and a service holds exactly those webhooks. A service that
+    posts nothing holds neither."""
+    from research.discord_post import (
+        JOB_CHANNELS, OPS_SETTING, SIGNALS_SETTING)
+
+    setting = {"ops": OPS_SETTING, "signals": SIGNALS_SETTING}
+    # research-notify posts a cron failure for any job, to #ops.
+    channels = {**JOB_CHANNELS, "research-notify": ("ops",)}
+    for name, service in services.items():
+        held = _declared(service) & set(setting.values())
+        expected = {setting[channel] for channel in channels.get(name, ())}
+        assert held == expected, (
+            f"`{name}` is handed {sorted(held)}; the channels it posts to "
+            f"need {sorted(expected)}")
+
+
 def test_research_score_holds_no_broker_or_model_credential(services):
     """The measured case, named so a regression says which keys came back.
 
@@ -276,6 +324,8 @@ def test_research_score_holds_no_broker_or_model_credential(services):
     It has no upstream, places no order and calls no model.
     """
     declared = _declared(services["research-score"])
+    # DISCORD_WEBHOOK_URL is the old single webhook. The job now holds the two
+    # NEMO_DISCORD_* webhooks, which the test above matches to its channels.
     forbidden = {"ALPACA_LIVE_KEY", "ALPACA_LIVE_SECRET", "ALPACA_PAPER_KEY",
                  "ALPACA_PAPER_SECRET", "OPENROUTER_API_KEY", "OPENROUTER_GLM",
                  "OPENROUTER_NEMOTRON", "GROQ_API_KEY", "DISCORD_WEBHOOK_URL"}

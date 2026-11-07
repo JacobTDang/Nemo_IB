@@ -324,6 +324,8 @@ def sync_senate_ptrs(days: int = 90, max_filings: Optional[int] = None,
 # ---------------------------------------------------------------------- CLI
 
 def main(argv: Optional[List[str]] = None) -> int:
+    from research import discord_post
+    elapsed = discord_post.stopwatch()
     parser = argparse.ArgumentParser(
         description="Ingest congressional STOCK Act disclosures into the "
                     "local store. Safe to re-run: nothing already parsed is "
@@ -398,12 +400,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         _log(f"[repair] requeued {requeued} transaction report(s) recorded as "
              f"parsed with no transactions in them")
 
-    failures = blocked = 0
+    failures = blocked = parsed_this_run = 0
     for year in args.house or []:
         try:
             result = sync_house_ptrs(year, max_filings=args.max_filings,
                                      recheck_days=args.recheck_days)
             blocked += bool(result["blocked"])
+            parsed_this_run += result["filings_parsed"]
         except DisclosureUnavailable as exc:
             print(f"[house {year}] FAILED: {exc}", file=sys.stderr)
             failures += 1
@@ -414,6 +417,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                                       max_filings=args.max_filings,
                                       recheck_days=args.recheck_days)
             blocked += bool(result["blocked"])
+            parsed_this_run += result["filings_parsed"]
         except DisclosureUnavailable as exc:
             print(f"[senate] FAILED: {exc}", file=sys.stderr)
             failures += 1
@@ -424,6 +428,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                                          max_filings=args.max_filings,
                                          recheck_days=args.recheck_days)
             blocked += bool(result["blocked"])
+            parsed_this_run += result["filings_parsed"]
         except DisclosureUnavailable as exc:
             print(f"[senate annual] FAILED: {exc}", file=sys.stderr)
             failures += 1
@@ -447,7 +452,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     # A blocked source is a non-zero exit too: the run did not cover what it
     # was asked to cover, and a caller reading only the status code would
     # otherwise treat a refusal as a completed backfill.
-    return 1 if failures or blocked else 0
+    code = 1 if failures or blocked else 0
+    error = ""
+    if failures or blocked:
+        error = f"{failures} sources failed, {blocked} blocked"
+    return discord_post.finish("congress-sync", code, {
+        "parsed": parsed_this_run,
+        "failures": failures,
+        "error": error,
+    }, seconds=elapsed())
 
 
 

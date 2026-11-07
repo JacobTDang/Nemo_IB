@@ -1392,6 +1392,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "than the first night the recorder ran)")
     args = parser.parse_args(argv)
 
+    from research import discord_post
+    elapsed = discord_post.stopwatch()
+
     # Nothing else does. The container entry point every batch service
     # overrides initialises a different database, so the first run on a fresh
     # volume died on "no such table: run_log" before it fetched anything --
@@ -1404,8 +1407,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(json.dumps(filled, indent=2, default=str))
         # One bad night in the list is a night still missing, and the operator
         # who ran this is the one person who will act on knowing that.
-        return 1 if any(_any_stage_failed(day)
+        code = 1 if any(_any_stage_failed(day)
                         for day in filled["days"].values()) else 0
+        return discord_post.finish(
+            "research-daily", code, filled, seconds=elapsed())
 
     kwargs: Dict[str, Any] = {"as_of": args.as_of}
     if args.bootstrap:
@@ -1413,7 +1418,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     result = run_all(**kwargs)
     print(json.dumps(result, indent=2, default=str))
 
-    return 1 if _any_stage_failed(result) else 0
+    code = 1 if _any_stage_failed(result) else 0
+    return discord_post.finish(
+        "research-daily", code, result, seconds=elapsed())
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised via main()
