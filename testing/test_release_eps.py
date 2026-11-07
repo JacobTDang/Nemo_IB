@@ -30,9 +30,17 @@ measured accuracy; disagreement refuses the row rather than guessing.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from research import release_eps, scoring
+
+_FIXTURES = Path(__file__).parent / "release_excerpts"
+
+
+def _fixture(name: str) -> str:
+    return (_FIXTURES / name).read_text()
 
 APPLE = ("Company gross margin was 50.1 percent, including a favorable impact "
          "of approximately 2 percentage points from tariff refunds. Diluted "
@@ -467,6 +475,50 @@ def test_every_ex99_exhibit_is_tried_until_one_yields_a_figure(monkeypatch):
     assert out["eps"] == pytest.approx(2.02)
 
 
+def test_exhibit_ranked_by_declared_document_type_first():
+    """First Horizon and Home BancShares declare document_type `EX-99.1` while
+    naming the file `a1q2023earningsrelease.htm` or `exh_991.htm`. Ranking by
+    declared type first gives EX-99.1 rank 0, any other EX-99.N rank 1, and
+    non-exhibits None, falling back to name/description only when absent."""
+    from edgar.attachments import Attachment
+
+    rel = Attachment(sequence_number="1", description="4Q2020 EARNINGS RELEASE",
+                     document="a1q2023earningsrelease.htm", ixbrl=False,
+                     path="...", document_type="EX-99.1", size=None)
+    deck = Attachment(sequence_number="2", description="4Q2020 EARNINGS DECK",
+                      document="a4q20earningsdeckvf.htm", ixbrl=False,
+                      path="...", document_type="EX-99.2", size=None)
+    cover = Attachment(sequence_number="3", description="8-K",
+                       document="fhn-20210122.htm", ixbrl=False,
+                       path="...", document_type="8-K", size=None)
+    graphic = Attachment(sequence_number="4", description="GRAPHIC",
+                         document="logo.jpg", ixbrl=False,
+                         path="...", document_type="GRAPHIC", size=None)
+
+    assert release_eps._exhibit_rank(rel) == 0
+    assert release_eps._exhibit_rank(deck) == 1
+    assert release_eps._exhibit_rank(cover) is None
+    assert release_eps._exhibit_rank(graphic) is None
+
+    filing = _Filing("acc", [deck, rel, cover, graphic])
+    exhibits = release_eps._exhibits("FHN", "acc", filings=[filing])
+    assert exhibits == [rel, deck]
+
+    # When the type is absent or carries no number, keep the name/description rule
+    named_rel = Attachment(sequence_number="5", description="",
+                           document="exhibit991narrative.htm", ixbrl=False,
+                           path="...", document_type=None, size=None)
+    named_deck = Attachment(sequence_number="6", description="",
+                            document="ex992supplement.htm", ixbrl=False,
+                            path="...", document_type="", size=None)
+    homb_rel = Attachment(sequence_number="7", description="PRESS RELEASE",
+                          document="exh_991.htm", ixbrl=False,
+                          path="...", document_type="EX-99.1", size=None)
+    assert release_eps._exhibit_rank(named_rel) == 0
+    assert release_eps._exhibit_rank(named_deck) == 1
+    assert release_eps._exhibit_rank(homb_rel) == 0
+
+
 def test_a_read_timeout_is_retried_once(monkeypatch):
     calls = {"n": 0}
 
@@ -543,6 +595,53 @@ def test_an_adjusted_figure_qualified_after_the_number_loses_to_the_gaap_one():
     out = release_eps.extract_diluted_eps(APPLE_FY24_Q4)
 
     assert out["eps"] == pytest.approx(0.97)
+
+
+def test_flattened_statement_with_cut_short_labels_is_excluded_from_prose():
+    """0000036966-21-000003. Flattened statements whose labels are cut short
+    ('Inco… 2019 Stat… 2020 2019 $/bp % ── Net inte… $ 1,662 …') must not be
+    read by prose. If the release text states the quarter's figure it is read;
+    if not, it is refused with a specific reason."""
+    excerpt = _fixture("0000036966-21-000003_truncated_statement.txt")
+    out = release_eps.extract_diluted_eps(excerpt)
+
+    assert out["eps"] is None
+    assert out["reason"] == "no diluted per-share figure named in the release"
+
+    # When the text states the quarter's figure, prose reads it
+    stated = (
+        "Fourth quarter net income available to common shareholders was "
+        "$175 million or earnings per share of $0.31, compared with third "
+        "quarter 2023 NIAC of $129 million or earnings per share of $0.23. "
+        + excerpt
+    )
+    out_stated = release_eps.extract_diluted_eps(stated)
+    assert out_stated["eps"] == pytest.approx(0.31)
+
+
+def test_adjusted_basis_qualifier_after_figure_is_not_read_as_gaap():
+    """0000036966-21-000041. 'We delivered EPS of $0.50 and ROTCE of over 18%
+    on an adjusted basis…' qualifies its figure as adjusted/non-GAAP and must
+    not be read as GAAP EPS."""
+    excerpt = _fixture("0000036966-21-000041_adjusted_basis.txt")
+    out = release_eps.extract_diluted_eps(excerpt)
+
+    assert out["eps"] is None
+    assert out["reason"] == (
+        "every diluted per-share figure is qualified as non-GAAP or adjusted; "
+        "there is no GAAP figure to read"
+    )
+
+
+def test_a_gaap_clause_before_an_adjusted_one_is_still_read():
+    """0000036966-25-000035. First Horizon's headline carries both figures in
+    one sentence: "with an EPS of $0.41, ...; $217 Million or $0.42 on an
+    Adjusted Basis". The qualifier belongs to the clause after the semicolon,
+    so the GAAP $0.41 is read and the adjusted $0.42 is not."""
+    out = release_eps.extract_diluted_eps(
+        _fixture("0000036966-25-000035_gaap_clause_before_adjusted.txt"))
+
+    assert out["eps"] == pytest.approx(0.41)
 
 
 def test_a_flattened_bullet_list_is_split_at_the_bullets():
