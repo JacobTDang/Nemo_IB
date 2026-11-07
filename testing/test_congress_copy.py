@@ -174,17 +174,57 @@ def test_senate_stock_can_be_copied(book):
     assert decisions()[0]['accepted'] == 1
 
 
-@pytest.mark.parametrize('filed', ['2026-11-01', '2026-11-06'])
-def test_filings_outside_three_day_window_are_not_candidates(book, filed):
-    transaction(filed_date=filed)
+@pytest.mark.parametrize('stamp', ['2026-10-29T12:29:59Z', '2026-10-28T12:30:00Z'])
+def test_filings_outside_seven_day_window_are_not_candidates(book, stamp):
+    transaction(parsed_at=stamp)
     book.run()
     assert decisions() == []
 
 
-def test_three_day_boundary_is_included(book):
-    transaction(filed_date='2026-11-02')
+def test_seven_day_boundary_is_included(book):
+    transaction(parsed_at='2026-10-29T12:30:00Z')
     book.run()
     assert decisions()[0]['accepted'] == 1
+
+
+def test_filing_parsed_on_weekend_after_late_post_is_decided_on_monday(book, monkeypatch):
+    monday = datetime(2026, 11, 9, 12, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(book.datetime, 'now', classmethod(lambda cls, tz=None: monday))
+    with congress_store.connect() as conn:
+        conn.execute("UPDATE sync_state SET last_synced_at='2026-11-09T06:00:00+00:00'")
+    transaction(filed_date='2026-11-05', parsed_at='2026-11-07T06:00:00+00:00',
+                transaction_date='2026-10-25')
+    assert book.run()['status'] == 'ok'
+    order = decisions()[0]
+    assert order['accepted'] == 1 and order['reason'] is None
+    assert order['filed_date'] == '2026-11-05'
+    assert order['learned_at'] == '2026-11-07T06:00:00+00:00'
+
+
+def test_old_filed_date_with_recent_parse_is_decided_and_rejected_when_trade_too_old(book):
+    transaction(filed_date='2026-09-01',
+                parsed_at='2026-11-05T06:00:00+00:00',
+                transaction_date='2026-08-01')
+    book.run()
+    assert len(decisions()) == 1
+    assert decisions()[0]['accepted'] == 0
+    assert decisions()[0]['reason'] == 'trade_too_old'
+
+
+def test_transaction_decided_on_earlier_run_is_not_decided_again_on_later_run(book, monkeypatch):
+    transaction('t1')
+    assert book.run()['rows_written'] == 1
+    assert len(decisions()) == 1
+
+    friday = datetime(2026, 11, 6, 12, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(book.datetime, 'now', classmethod(lambda cls, tz=None: friday))
+    with congress_store.connect() as conn:
+        conn.execute("UPDATE sync_state SET last_synced_at='2026-11-06T06:00:00+00:00'")
+
+    settings = book.Settings.from_env()
+    assert book._decisions(friday, settings) == []
+    assert book.run()['rows_written'] == 0
+    assert len(decisions()) == 1
 
 
 @pytest.mark.parametrize('stamp', ['2026-11-05T12:30:01Z',

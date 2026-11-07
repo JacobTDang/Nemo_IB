@@ -395,7 +395,7 @@ paper account. When the flag is off, the decision job writes nothing and the
 status screen shows `off`. The fills job still exits copy positions already
 held. When the flag is on, the status screen monitors a weekday job.
 
-The job reads filings from the last three days that Nemo parsed before the
+The job reads the stock purchases that Nemo parsed in the 7 days before the
 UTC decision time. It keeps accepted and rejected decisions in `copy_order`.
 Accepted decisions reserve book slots until the hold period ends.
 The scanner supplies the weekday calendar, which does not exclude holidays.
