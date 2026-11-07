@@ -275,6 +275,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     import argparse
     import json
 
+    from research import discord_post
+    elapsed = discord_post.stopwatch()
+
     # Nothing else does, and the ordering that hides it is not enforced
     # anywhere: the recorder normally runs first and creates the store, so the
     # first command against a fresh volume dies on "no such table" instead.
@@ -294,9 +297,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     # No names, or `--tickers` with none after it, is the eligible universe.
     result = seed(args.tickers or None)
     print(json.dumps(result, indent=2, default=str))
-    from research import discord_post
     code = 1 if result["failed"] and not result["written"] else 0
-    return discord_post.finish("research-seed", code, result)
+    return discord_post.finish(
+        "research-seed", code, result, seconds=elapsed())
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised via main()

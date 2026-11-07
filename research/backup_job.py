@@ -2,8 +2,7 @@
 
 Refuses to replace yesterday's copy with an empty file. A mistyped volume
 gives an empty source path, and a backup whose failure looks like a valid
-database is worse than no backup. The file name uses the container clock,
-which the compose file pins to UTC.
+database is worse than no backup. The file name carries the UTC date.
 """
 from __future__ import annotations
 
@@ -15,23 +14,28 @@ import sys
 from research import discord_post
 
 
+SOURCE = pathlib.Path("/app/data/pit.db")
+BACKUPS = pathlib.Path("/backups")
+
+
 def main() -> int:
-    source_path = pathlib.Path("/app/data/pit.db")
-    out = pathlib.Path("/backups")
-    if not source_path.exists():
-        message = f"{source_path} is not there -- check the volume mount"
+    elapsed = discord_post.stopwatch()
+    if not SOURCE.exists():
+        message = f"{SOURCE} is not there -- check the volume mount"
         print(message, file=sys.stderr)
         return discord_post.finish(
-            "research-backup", 1, {"bytes": 0, "removed": 0, "error": message})
-    out.mkdir(parents=True, exist_ok=True)
-    dest = out / f"pit-{datetime.date.today().isoformat()}.db"
-    source, target = sqlite3.connect(source_path), sqlite3.connect(dest)
+            "research-backup", 1, {"bytes": 0, "removed": 0, "error": message},
+            seconds=elapsed())
+    BACKUPS.mkdir(parents=True, exist_ok=True)
+    today = datetime.datetime.now(datetime.timezone.utc).date()
+    dest = BACKUPS / f"pit-{today.isoformat()}.db"
+    source, target = sqlite3.connect(SOURCE), sqlite3.connect(dest)
     try:
         source.backup(target)
     finally:
         target.close()
         source.close()
-    stale = sorted(out.glob("pit-*.db"))[:-14]
+    stale = sorted(BACKUPS.glob("pit-*.db"))[:-14]
     for path in stale:
         path.unlink()
     print(f"wrote {dest} ({dest.stat().st_size} bytes), "
@@ -39,7 +43,7 @@ def main() -> int:
     return discord_post.finish("research-backup", 0, {
         "bytes": dest.stat().st_size,
         "removed": len(stale),
-    })
+    }, seconds=elapsed())
 
 
 if __name__ == "__main__":

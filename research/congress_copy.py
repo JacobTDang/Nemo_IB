@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sqlite3
+import traceback
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -210,19 +211,22 @@ def run() -> dict:
 
 def main() -> int:
     from research import discord_post
+    elapsed = discord_post.stopwatch()
     try:
         if enabled():
             pit_store.init_schema()
         result = run()
     except Exception as exc:  # noqa: BLE001 - recorded data stays; the exit reports it
         error = f'{type(exc).__name__}: {exc}'
+        traceback.print_exc()
         print(json.dumps({'status': 'failed', 'error': error, 'rows_written': 0}))
         return discord_post.finish(
             'research-copy', 1,
-            {'status': 'failed', 'error': error, 'rows_written': 0})
+            {'status': 'failed', 'error': error, 'rows_written': 0},
+            seconds=elapsed())
     print(json.dumps(result, indent=2))
     code = 1 if result['status'] == 'failed' else 0
-    return discord_post.finish('research-copy', code, result)
+    return discord_post.finish('research-copy', code, result, seconds=elapsed())
 
 
 if __name__ == '__main__':

@@ -509,6 +509,9 @@ def main(argv=None) -> int:
     import argparse
     import json
 
+    from research import discord_post
+    elapsed = discord_post.stopwatch()
+
     pit_store.init_schema()
     parser = argparse.ArgumentParser(
         prog="fills", description="Paper fills against the filed book.")
@@ -531,7 +534,6 @@ def main(argv=None) -> int:
                 return await submit(broker, args.as_of, args.horizon_days)
             return await collect(broker, args.as_of)
 
-    from research import discord_post
     try:
         result = asyncio.run(run())
     except Exception as exc:  # noqa: BLE001 - reported, then non-zero
@@ -540,11 +542,13 @@ def main(argv=None) -> int:
                           "error": error}, indent=2))
         return discord_post.finish(
             "research-fills", 1,
-            {"action": args.action, "status": "failed", "error": error})
+            {"action": args.action, "status": "failed", "error": error},
+            seconds=elapsed())
     print(json.dumps(result, indent=2, default=str))
     code = 0 if result["status"] in ("ok", "closed") else 1
     return discord_post.finish(
-        "research-fills", code, {**result, "action": args.action})
+        "research-fills", code, {**result, "action": args.action},
+        seconds=elapsed())
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised via main()

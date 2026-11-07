@@ -448,6 +448,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     import argparse
     import json
 
+    from research import discord_post
+    elapsed = discord_post.stopwatch()
+
     parser = argparse.ArgumentParser(
         prog="status",
         description="What the automation did, and what needs attention.")
@@ -469,9 +472,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     report = collect(as_of=args.as_of)
     print(json.dumps(report, indent=2, default=str) if args.json
           else _render(report))
-    from research import discord_post
     code = 1 if report["attention"] else 0
-    return discord_post.finish("research-status", code, report)
+    return discord_post.finish(
+        "research-status", code, report, seconds=elapsed())
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised via main()

@@ -879,6 +879,12 @@ def deliver(channel: str, payloads: Sequence[dict], *,
                 f"Discord post failed: {type(exc).__name__}") from None
 
 
+def stopwatch() -> Callable[[], float]:
+    """Start timing now. Call the result for the seconds since."""
+    started = time.monotonic()
+    return lambda: time.monotonic() - started
+
+
 def finish(job: str, code: int, result: Optional[dict] = None, *,
            seconds: Optional[float] = None,
            transport: Optional[Callable[[str, dict], Any]] = None,
