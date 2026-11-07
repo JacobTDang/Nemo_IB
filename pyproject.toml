@@ -206,6 +206,7 @@ asyncio_mode = "auto"
 markers = [
     "slow: long-running tests excluded from quick runs via -m 'not slow'",
     "network: live-network tests skippable via SKIP_NETWORK_TESTS=1",
+    "live_discord: posts example messages to the preview Discord webhook",
 ]
 
 [tool.uv]

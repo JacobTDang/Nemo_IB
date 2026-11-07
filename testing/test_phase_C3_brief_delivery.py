@@ -53,7 +53,7 @@ def test_build_brief_chunks_long_brief_paginates():
   chunks = build_brief_chunks(LONG_BRIEF)
   assert len(chunks) > 1, f"long brief should paginate, got {len(chunks)} chunks"
   for i, c in enumerate(chunks):
-    assert len(c) <= 2000, f"chunk {i} exceeds Discord 2000-char limit: {len(c)}"
+    assert len(c) <= 4000, f"chunk {i} exceeds a text display: {len(c)}"
   # Round-trip: concatenated chunks should contain all original section markers
   joined = '\n'.join(chunks)
   for marker in ('Section A', 'Section B', 'Section C'):
@@ -73,73 +73,71 @@ def test_build_brief_chunks_prefers_section_boundaries():
   print(f"PASS: pagination respects section boundaries")
 
 
-def test_send_brief_no_webhook_returns_false():
+def test_send_brief_no_webhook_names_the_setting(monkeypatch):
   from agent.Pre_Market_Briefer import send_brief
-  with patch.dict(os.environ, {'DISCORD_WEBHOOK_URL': ''}, clear=False):
-    # Ensure DISCORD_WEBHOOK_URL is empty even after load_dotenv
-    with patch('alerts.discord.load_dotenv', lambda: None):
-      result = send_brief(SHORT_BRIEF, webhook_url=None)
-  assert result is False, "missing webhook should return False, not raise"
-  print(f"PASS: missing webhook returns False without raising")
+  from research.discord_post import DiscordError
+  monkeypatch.delenv('NEMO_DISCORD_SIGNALS_WEBHOOK_URL', raising=False)
+  try:
+    send_brief(SHORT_BRIEF, webhook_url=None)
+  except DiscordError as exc:
+    assert 'NEMO_DISCORD_SIGNALS_WEBHOOK_URL' in str(exc)
+    assert 'http' not in str(exc)
+  else:
+    raise AssertionError('missing webhook returned instead of failing')
 
 
-def test_send_brief_posts_each_chunk():
-  """Mock DiscordWebhook so we capture every execute() call."""
+def test_send_brief_posts_each_chunk(monkeypatch):
   posted = []
-  class FakeResp:
-    status_code = 204
-  class FakeHook:
-    def __init__(self, *a, **kw):
-      self.content = kw.get('content', '')
-    def execute(self):
-      posted.append(self.content)
-      return FakeResp()
-    def set_content(self, c):
-      self.content = c
 
-  _install_fake_discord_module(FakeHook)
+  def transport(url, body):
+    posted.append(body)
+    assert 'with_components=true' in url
+    assert 'discord.example' in url
+
+  monkeypatch.setattr('research.discord_post._http_send', transport)
   from agent.Pre_Market_Briefer import send_brief
   result = send_brief(LONG_BRIEF, webhook_url='https://discord.example/webhook/test')
-  assert result is True, f"send_brief returned False: {result}"
+  assert result is True
   assert len(posted) >= 2, f"long brief should post >= 2 messages, got {len(posted)}"
-  joined = '\n'.join(posted)
+  joined = str(posted)
   for marker in ('Section A', 'Section B', 'Section C'):
     assert marker in joined
-  print(f"PASS: long brief posted as {len(posted)} discord messages")
+  assert '(1/' in joined
 
 
-def test_send_brief_failure_returns_false():
-  class FakeResp:
-    status_code = 500
-  class FakeHook:
-    def __init__(self, *a, **kw):
-      self.content = kw.get('content', '')
-    def execute(self):
-      return FakeResp()
-    def set_content(self, c):
-      self.content = c
+def test_send_brief_failure_raises(monkeypatch):
+  def transport(url, body):
+    raise RuntimeError(f'post failed {url}')
 
-  _install_fake_discord_module(FakeHook)
+  monkeypatch.setattr('research.discord_post._http_send', transport)
   from agent.Pre_Market_Briefer import send_brief
-  result = send_brief(SHORT_BRIEF, webhook_url='https://discord.example/webhook/test')
-  assert result is False, "non-2xx response should yield False"
-  print(f"PASS: send failure surfaced as False")
+  from research.discord_post import DiscordError
+  try:
+    send_brief(SHORT_BRIEF, webhook_url='https://discord.example/webhook/secret-token')
+  except DiscordError as exc:
+    assert 'secret-token' not in str(exc)
+    assert 'http' not in str(exc)
+  else:
+    raise AssertionError('a failed post returned instead of failing')
 
 
 def test_send_brief_handles_empty_string():
   from agent.Pre_Market_Briefer import send_brief
-  result = send_brief("", webhook_url='https://x.example')
-  # Empty input -> nothing to send -> False (or True with no posts)
-  assert result is False
-  print(f"PASS: empty brief returns False without crashing")
+  from research.discord_post import DiscordError
+  try:
+    send_brief('', webhook_url='https://hooks.example/brief')
+  except DiscordError as exc:
+    assert 'empty' in str(exc)
+  else:
+    raise AssertionError('an empty brief was sent')
 
 
 if __name__ == "__main__":
   test_build_brief_chunks_short_brief_single_message()
   test_build_brief_chunks_long_brief_paginates()
   test_build_brief_chunks_prefers_section_boundaries()
-  test_send_brief_no_webhook_returns_false()
+  test_send_brief_no_webhook_names_the_setting()
   test_send_brief_posts_each_chunk()
-  test_send_brief_failure_returns_false()
+  test_send_brief_failure_raises()
   test_send_brief_handles_empty_string()
   print("\nAll Phase C3 brief delivery tests passed.")

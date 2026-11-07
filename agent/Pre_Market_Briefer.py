@@ -15,7 +15,7 @@ from state.theses import latest_thesis
 
 
 DISCORD_MESSAGE_LIMIT = 2000
-SAFE_CHUNK_BUDGET = 1900  # leave headroom under Discord's 2000-char message cap
+SAFE_CHUNK_BUDGET = 3500  # one text display holds 4000, with room for the headline and footer
 
 
 def assemble_brief_inputs(
@@ -147,45 +147,17 @@ def _paragraph_split(piece: str, max_chars: int) -> List[str]:
 
 
 def send_brief(brief_md: str, webhook_url: Optional[str] = None) -> bool:
-  """Deliver the brief to Discord, paginating into ~1900-char chunks.
+  """Deliver the brief as Components V2 containers on the signals channel.
 
-  Returns True only if every chunk posts successfully. Missing webhook,
-  empty brief, or import errors return False without raising.
+  A long brief is several messages. Each headline carries ``(1/3)``.
+  A missing webhook or a failed post raises ``DiscordError``. The URL is
+  not included in the error.
   """
-  if not brief_md or not brief_md.strip():
-    print("[brief] empty brief; nothing to send", file=sys.stderr, flush=True)
-    return False
-  if not webhook_url:
-    from alerts.discord import _webhook_url
-    webhook_url = _webhook_url()
-  if not webhook_url:
-    print("[brief] DISCORD_WEBHOOK_URL not set; brief NOT delivered",
-          file=sys.stderr, flush=True)
-    return False
-  try:
-    from discord_webhook import DiscordWebhook
-  except ImportError as e:
-    print(f"[brief] discord_webhook not installed: {e}", file=sys.stderr, flush=True)
-    return False
+  from research.discord_post import brief_messages, deliver
 
-  chunks = build_brief_chunks(brief_md)
-  if not chunks:
-    return False
-
-  all_ok = True
-  for chunk in chunks:
-    try:
-      hook = DiscordWebhook(url=webhook_url, content=chunk, rate_limit_retry=True)
-      resp = hook.execute()
-      if isinstance(resp, list):
-        ok = all(getattr(r, 'status_code', 500) < 300 for r in resp)
-      else:
-        ok = getattr(resp, 'status_code', 500) < 300
-      if not ok:
-        print(f"[brief] chunk send returned non-2xx: {resp}",
-              file=sys.stderr, flush=True)
-      all_ok = all_ok and ok
-    except Exception as e:
-      print(f"[brief] chunk send raised: {e}", file=sys.stderr, flush=True)
-      all_ok = False
-  return all_ok
+  pages = brief_messages(brief_md)
+  if webhook_url:
+    deliver('signals', pages, url_for=lambda channel: webhook_url)
+  else:
+    deliver('signals', pages)
+  return True
