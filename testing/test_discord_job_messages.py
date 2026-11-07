@@ -645,3 +645,31 @@ def test_a_fenced_block_longer_than_a_page_is_closed_and_reopened():
         detail = "\n".join(texts(payload)[1:-1])
         assert detail.count("```") % 2 == 0
     assert "x = 899" in body(pages[-1])
+
+
+def test_a_repeated_watch_failure_posts_nothing_and_still_marks_itself_reported(
+        tmp_path, capsys):
+    path = tmp_path / "watch.json"
+    post.save_watch_state(path, {"failing_since": WHEN - 600, "failed_passes": 1})
+    sent = []
+    code = post.finish("research-watch", 1, FAILED_PASS,
+                       transport=lambda url, payload: sent.append(payload),
+                       state_path=path)
+    assert code == 1 and sent == []
+    assert post.REPORTED in capsys.readouterr().err
+    assert post.load_watch_state(path)["failed_passes"] == 2
+
+
+def test_a_run_that_exits_zero_does_not_print_the_reported_marker(capsys):
+    sent = []
+    code = post.finish("research-seed", 0, {"written": 3, "failed": []},
+                       transport=lambda url, payload: sent.append(payload))
+    assert code == 0 and len(sent) == 1
+    assert post.REPORTED not in capsys.readouterr().err
+
+
+def test_the_prune_message_never_blames_the_prune_for_a_post_failure():
+    messages = post.messages_for("docker-prune", 0, {"ok": True}, when=WHEN)
+    assert "container prune failed" not in body(messages[0][1])
+    failed = post.messages_for("docker-prune", 1, {"error": "x"}, when=WHEN)
+    assert "container prune failed" not in body(failed[0][1])
