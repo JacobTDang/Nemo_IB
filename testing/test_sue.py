@@ -1609,6 +1609,9 @@ def test_cached_accessions_are_not_refetched_from_xbrl(filer, store, monkeypatch
              "filed": "2026-04-30"}]}}},
         "us-gaap": {}}}
 
+    # The cache is read as of 2026-11-05, so its rows are stamped that day.
+    monkeypatch.setattr(pit_store, "_now", lambda: "2026-11-05T22:00:00Z")
+
     # First call: fetches and caches
     res1 = sue.eps_series("COKE", as_of="2026-11-05")
     assert res1["success"] is True
@@ -1643,6 +1646,9 @@ def test_cper_no_class_eps_costs_one_read_first_time_and_zero_second_time(filer,
              "accn": "a", "fy": 2026, "fp": "Q1", "form": "10-Q",
              "filed": "2026-04-30"}]}}},
         "us-gaap": {}}}
+
+    # The cache is read as of 2026-11-05, so its rows are stamped that day.
+    monkeypatch.setattr(pit_store, "_now", lambda: "2026-11-05T22:00:00Z")
 
     # First call: 1 read
     res1 = sue.eps_series("CPER", as_of="2026-11-05")
