@@ -10,15 +10,17 @@ from research.discord_post import (
     format_money, signal_message,
 )
 
-# Kept so a caller can still tell the severities apart by colour.
-SEVERITY_COLORS = {
-    'broken': RED,
-    'weakened': YELLOW,
-    'intact': GREEN,
-    'info': BLURPLE,
-    'order': BLURPLE,
-    'error': RED,
+# The colour and the emoji of each severity. A severity that is not here is a
+# caller's mistake, and the message says so instead of choosing a colour.
+_SEVERITIES = {
+    'broken': (RED, '❌'),
+    'weakened': (YELLOW, '⚠️'),
+    'intact': (GREEN, '✅'),
+    'info': (BLURPLE, '📋'),
+    'order': (BLURPLE, '📋'),
+    'error': (RED, '❌'),
 }
+SEVERITY_COLORS = {name: color for name, (color, _) in _SEVERITIES.items()}
 
 
 def build_thesis_payload(
@@ -26,8 +28,10 @@ def build_thesis_payload(
     thesis_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """The Components V2 message a thesis change would send."""
-    color = SEVERITY_COLORS.get(severity, SEVERITY_COLORS['info'])
-    emoji = {'broken': '❌', 'weakened': '⚠️', 'intact': '✅'}.get(severity, '📋')
+    if severity not in _SEVERITIES:
+        raise DiscordError(
+            f"unknown severity {severity!r}; use one of {', '.join(_SEVERITIES)}")
+    color, emoji = _SEVERITIES[severity]
     lines = [
         f"**{escape_text(ticker)}** {escape_text(severity)}",
         escape_text(headline or '')[:300],

@@ -64,10 +64,20 @@ def test_payload_omits_thesis_when_no_id():
   print("PASS: Thesis line omitted when thesis_id=None")
 
 
-def test_unknown_severity_falls_back_to_info():
-  p = build_thesis_payload("X", "FROBNICATED", "h", "r", "a")
-  assert p['components'][0]['accent_color'] == SEVERITY_COLORS['info']
-  print("PASS: unknown severity falls back to info color")
+def test_unknown_severity_raises_instead_of_guessing_a_color():
+  import pytest
+  from research.discord_post import DiscordError
+  with pytest.raises(DiscordError) as caught:
+    build_thesis_payload("X", "FROBNICATED", "h", "r", "a")
+  assert 'FROBNICATED' in str(caught.value)
+  print("PASS: unknown severity raises")
+
+
+def test_every_known_severity_has_its_own_emoji_and_color():
+  for severity in SEVERITY_COLORS:
+    p = build_thesis_payload("X", severity, "h", "r", "a")
+    assert p['components'][0]['accent_color'] == SEVERITY_COLORS[severity]
+  assert '❌' in _body(build_thesis_payload("X", "error", "h", "r", "a"))
 
 
 def test_send_thesis_alert_unset_webhook_names_the_setting(monkeypatch):
