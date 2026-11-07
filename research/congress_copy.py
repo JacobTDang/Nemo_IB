@@ -14,6 +14,8 @@ from research import daily_job, pit_store, scanner
 from tools.altdata_server import congress_store
 
 JOB = 'congress_copy'
+# Weekday cron plus a House posting lag of up to 4 days measured.
+LOOKBACK_DAYS = 7
 
 
 def enabled() -> bool:
@@ -100,7 +102,7 @@ def _source_rows(now: datetime) -> list[dict]:
         if now - _instant(last, 'House last_synced_at') > timedelta(
                 days=congress_store.CONGRESS_SYNC_STALE_DAYS):
             raise RuntimeError(f'House sync is stale: last success {last}')
-        since = (now.date() - timedelta(days=3)).isoformat()
+        since = now - timedelta(days=LOOKBACK_DAYS)
         return [dict(row) for row in conn.execute(
             """SELECT t.*, f.chamber, f.filed_date, f.parsed_at,
                       m.full_name AS member
@@ -108,9 +110,8 @@ def _source_rows(now: datetime) -> list[dict]:
                  LEFT JOIN members m ON m.member_id=t.member_id
                 WHERE t.transaction_type='purchase'
                   AND t.asset_type_code IN ('ST', 'Stock')
-                  AND f.filed_date BETWEEN ? AND ?
-                ORDER BY f.filed_date, f.filing_id, t.row_index, t.txn_id""",
-            (since, now.date().isoformat()))]
+                ORDER BY f.filed_date, f.filing_id, t.row_index, t.txn_id""")
+            if _instant(row['parsed_at'], 'parsed_at') >= since]
 
 
 def _decisions(now: datetime, settings: Settings) -> list[dict]:

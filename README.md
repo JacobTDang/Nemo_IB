@@ -353,11 +353,12 @@ The `research-copy` job records a separate paper book. The job is off by
 default. When it is off, it writes no run row. The status screen shows `off`
 and raises no alert for this job.
 
-When it is on, the job reads stock purchases from filings dated within the
-last three days. It includes all members of the household. The job uses only
-filings that Nemo parsed before the decision time. Each transaction gets one
-`copy_order` row. The row keeps the disclosed amount band, source dates,
-parse time, decision time, and acceptance or rejection reason. All times are UTC.
+When it is on, the job reads the stock purchases that Nemo parsed in the last
+7 days. It includes all members of the household. The job uses only filings
+that Nemo parsed before the decision time. Each transaction gets one
+`copy_order` row.
+The row keeps the disclosed amount band, source dates, parse time, decision
+time, and acceptance or rejection reason. All times are UTC.
 
 The eligible universe supplies the issuer CIK. The job removes ticker
 separators before comparison. Thus `BRK.B` can match `BRK-B`. The job permits
