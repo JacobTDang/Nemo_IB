@@ -69,14 +69,17 @@ FETCH_RETRY_BACKOFF = 3.0
 # "fully" sits between "per" and "diluted" in a bank headline ("$1.83 per
 # fully diluted common share"). "per basic and diluted share" is one figure
 # for both bases, which is not a basic figure. "(diluted)" after "per common
-# share" is the same label written the other way around.
+# share" is the same label written the other way around. Citizens & Northern's
+# "per basic and diluted common share" and Prelude's "per share of common
+# stock, basic and diluted" are the one-figure label too.
 _DILUTED = re.compile(
     r"(?:per\s+(?:fully\s+)?diluted\s+(?:common\s+)?share"
     r"|diluted\s+(?:net\s+)?(?:earnings|income|loss|eps)(?:\s+per\s+(?:common\s+)?share)?"
     r"|(?:earnings|income|loss)\s+per\s+diluted\s+(?:common\s+)?share"
     r"|diluted\s+eps"
-    r"|per\s+basic\s+and\s+diluted\s+share"
-    r"|per\s+(?:common\s+)?share\s*\(\s*diluted\s*\))", re.I)
+    r"|per\s+basic\s+and\s+diluted\s+(?:common\s+)?share"
+    r"|per\s+(?:common\s+)?share\s*\(\s*diluted\s*\)"
+    r"|per\s+(?:share\s+of\s+common\s+stock|common\s+share|share),?\s+basic\s+and\s+diluted)", re.I)
 
 # The unqualified form banks use: "$7.70 per share", "EPS of $7.70". Accepted
 # only in a sentence that is about earnings and not about a distribution.
@@ -158,9 +161,15 @@ _MONEY_BEFORE = re.compile(
 # ...or through a growth verb and a percentage: "EPS grew 18% to $0.91",
 # "increased 12% to $2.02", "rose to $1.10". Coca-Cola writes every headline
 # that way, and an adjacency rule without it refused all 23 of its releases.
+# The quarter may sit between the phrase and the verb: Glacier writes "Diluted
+# earnings per share for the current quarter was $0.69". Third Coast writes
+# "diluted earnings per share were each $0.32".
 _MONEY_AFTER = re.compile(
     r"^\s*(?::\s*EPS)?\s*"
-    r"(?:was|were|of|totaled|totalled|came\s+in\s+at|reached|at|:|,|\(|"
+    r"(?:for\s+(?:the\s+)?(?:current\s+|first\s+|second\s+|third\s+|fourth\s+"
+    r"|1st\s+|2nd\s+|3rd\s+|4th\s+)?quarter"
+    r"(?:\s+ended\s+[A-Za-z]+\s+\d{1,2},?\s+\d{4})?\s+)?"
+    r"(?:was|were(?:\s+each)?|of|totaled|totalled|came\s+in\s+at|reached|at|:|,|\(|"
     r"(?:grew|increased|rose|climbed|improved|expanded|declined|decreased|fell|"
     r"dropped|was\s+up|was\s+down)(?:\s+\d+(?:\.\d+)?\s*%)?\s+(?:to|at))?"
     r"\s*(?:(?:-\s?\$|\(\s?\$|\$\s?\(|\$)\s?-?(\d*\.\d{2})\)?"
@@ -268,7 +277,11 @@ def _from_prose(text: str) -> Dict[str, Any]:
     candidates: List[tuple] = []
     saw_phrase = saw_gaap = False
     for index, sentence in enumerate(_SENTENCE.split(text)):
-        if _STATEMENT.search(sentence) or _GUIDANCE.search(sentence):
+        # A statement row is the table reader's. "Net loss per share, basic
+        # and diluted $ (0.90) $ (1.77)" carries the diluted phrase, and prose
+        # would read whichever column comes first.
+        if _STATEMENT.search(sentence) or _GUIDANCE.search(sentence) \
+                or _ROW.search(sentence):
             continue
         match = _DILUTED.search(sentence)
         basis = "gaap"
