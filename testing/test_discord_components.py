@@ -177,7 +177,7 @@ def test_finish_keeps_a_successful_exit_only_when_the_post_works(webhooks):
         raise RuntimeError("nope")
 
     assert post.finish("research-seed", 0, {"written": 4, "failed": []},
-                       transport=boom) == 1
+                       transport=boom) == post.POST_FAILED == 75
 
 
 def test_each_job_renders_a_phone_message(webhooks):
@@ -219,14 +219,6 @@ def test_each_job_renders_a_phone_message(webhooks):
             assert payload["flags"] & post.IS_COMPONENTS_V2
             assert _count(payload) <= 40
             assert sum(len(item) for item in _texts(payload)) <= 4000
-
-
-def test_a_quiet_watch_does_not_ping_signals(webhooks):
-    messages = post.messages_for(
-        "research-watch", 0, {"status": "ok", "new_events": 0, "events": []},
-        when=WHEN)
-    assert [channel for channel, _ in messages] == ["ops"]
-    assert messages[0][1]["flags"] & post.SUPPRESS_NOTIFICATIONS
 
 
 def test_a_long_brief_splits_into_numbered_containers():

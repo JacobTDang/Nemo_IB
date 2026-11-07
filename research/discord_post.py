@@ -3,13 +3,22 @@
 One container per message. A plain webhook can send this layout when the
 request sets ``with_components=true`` and the message flag ``1 << 15``.
 The webhook URL is never put in an exception, a log line, or a payload.
+
+A run that found nothing and did not fail posts nothing. Each job's own
+process posts its result through ``finish``. After a non-zero exit that it
+reported, the process prints ``REPORTED`` as its last line, so the cron
+failure branch (``research.notify``) does not post the same failure again.
 """
 from __future__ import annotations
 
+import collections
+import json
 import os
 import re
+import sys
 import time
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 IS_COMPONENTS_V2 = 1 << 15
@@ -37,14 +46,51 @@ RETRY_AFTER_CAP = 10.0
 SEND_ATTEMPTS = 3
 ERROR_DETAIL_LIMIT = 300
 
+# Exit codes the cron lines read. A job that ran and could not post exits 75
+# (EX_TEMPFAIL), and the chain still goes on to the scan. `flock -n -E` exits
+# 99 when the lock is held.
+POST_FAILED = 75
+LOCK_HELD = 99
+
+# The last line a process prints after a non-zero exit that it already
+# reported to Discord, or deliberately did not repeat.
+REPORTED = "nemo-discord: failure reported"
+
 OPS_SETTING = "NEMO_DISCORD_OPS_WEBHOOK_URL"
 SIGNALS_SETTING = "NEMO_DISCORD_SIGNALS_WEBHOOK_URL"
 _SETTINGS = {"ops": OPS_SETTING, "signals": SIGNALS_SETTING}
+
+# The channels each job posts to. The compose file gives each service exactly
+# the webhook settings for these channels, and `messages_for` refuses a
+# message to any other channel.
+JOB_CHANNELS: Dict[str, Tuple[str, ...]] = {
+    "research-copy": ("ops", "signals"),
+    "research-scan": ("ops", "signals"),
+    "research-watch": ("ops", "signals"),
+    "research-score": ("ops", "signals"),
+    "research-announce": ("ops", "signals"),
+    "research-fills": ("ops", "signals"),
+    "research-daily": ("ops",),
+    "research-seed": ("ops",),
+    "congress-sync": ("ops",),
+    "research-backup": ("ops",),
+    "research-status": ("ops",),
+    "docker-prune": ("ops",),
+}
+
+WATCH_EVENTS_SHOWN = 8
+BUTTONS_PER_ROW = 5
+FAILURES_SHOWN = 10
+CUT_MARK = "[earlier lines cut]"
+ZERO_WIDTH_SPACE = "​"
 
 _WEBHOOK_URL = re.compile(
     r"https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/\S+",
     re.I)
 _MARKDOWN = re.compile(r"([\\*_`~|>\[\]])")
+_FENCE = re.compile(r"^\s*```")
+_HEADER = re.compile(r"^#{1,3} ")
+_RUN_OF_BACKTICKS = re.compile(r"`(?=``)")
 
 
 class DiscordError(Exception):
@@ -85,6 +131,13 @@ def format_gib(nbytes: float) -> str:
     return f"{nbytes / (1024 ** 3):.1f} GiB"
 
 
+def _fixed(value: Any, places: int) -> str:
+    try:
+        return f"{float(value):.{places}f}"
+    except (TypeError, ValueError):
+        return escape_text(str(value))
+
+
 def mask_link(label: str, url: str) -> str:
     parts = urlsplit(url)
     if parts.scheme not in ("http", "https") or not parts.hostname:
@@ -97,27 +150,11 @@ def mask_link(label: str, url: str) -> str:
     return f"[{escape_text(label)}](<{safe}>)"
 
 
-def _ops_webhook() -> str:
-    return os.environ.get("NEMO_DISCORD_OPS_WEBHOOK_URL", "").strip()
-
-
-def _signals_webhook() -> str:
-    return os.environ.get("NEMO_DISCORD_SIGNALS_WEBHOOK_URL", "").strip()
-
-
-def missing_settings() -> List[str]:
-    """Settings a job needs and does not have. Empty when both webhooks are set."""
-    missing = []
-    if not _signals_webhook():
-        missing.append(f"{SIGNALS_SETTING} is not set")
-    if not _ops_webhook():
-        missing.append(f"{OPS_SETTING} is not set")
-    return missing
-
-
 def webhook_url(channel: str) -> str:
-    value = _signals_webhook() if channel == "signals" else _ops_webhook()
+    if channel not in _SETTINGS:
+        raise DiscordError(f"{channel!r} is not a Discord channel this project posts to")
     name = _SETTINGS[channel]
+    value = os.environ.get(name, "").strip()
     if not value:
         raise DiscordError(f"{name} is not set")
     return value
@@ -186,13 +223,41 @@ def _footer(source: str, when: int) -> str:
     return f"-# {source} · <t:{when}:f> (<t:{when}:R>)"
 
 
+def _break_fences(text: str) -> str:
+    """Stop a run of backticks in log text from closing the code block."""
+    return _RUN_OF_BACKTICKS.sub("`" + ZERO_WIDTH_SPACE, text)
+
+
 def _fit_error(error: str, budget: int) -> str:
-    body = redact(error).strip()
+    """The end of ``error`` in a code block of at most ``budget`` characters.
+
+    The last lines of a log hold the cause, so the head is the part that goes.
+    The cut falls on a line boundary unless the last line alone is too long.
+    """
+    body = _break_fences(redact(error)).strip()
     fence = f"```\n{body}\n```"
     if len(fence) <= budget:
         return fence
-    keep = max(0, budget - len("```\n\n```"))
-    return f"```\n{body[:keep]}\n```"
+    keep = max(0, budget - len("```\n\n```") - len(CUT_MARK) - 1)
+    tail = body[len(body) - keep:] if keep else ""
+    if tail and body[len(body) - keep - 1] != "\n" and "\n" in tail:
+        tail = tail.split("\n", 1)[1]
+    return f"```\n{CUT_MARK}\n{tail}\n```"
+
+
+def _link_button(label: Any, url: Any) -> dict:
+    if not isinstance(label, str) or not label:
+        raise DiscordError("a link button needs a label")
+    if len(label) > LABEL_LIMIT:
+        raise DiscordError(f"a button label is {len(label)} characters; the limit is {LABEL_LIMIT}")
+    if not isinstance(url, str) or not url:
+        raise DiscordError(f"the link button {label!r} has no URL")
+    if len(url) > URL_LIMIT:
+        raise DiscordError(f"the link button {label!r} has a URL of {len(url)} characters; the limit is {URL_LIMIT}")
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise DiscordError(f"the link button {label!r} needs an http(s) URL with a host")
+    return {"type": BUTTON, "style": 5, "label": label, "url": url}
 
 
 def _assemble(*, emoji: str, headline: str, color: int, facts: str, detail: str,
@@ -209,20 +274,13 @@ def _assemble(*, emoji: str, headline: str, color: int, facts: str, detail: str,
     if error:
         used = _text_length(children) + _text_length(extras) + len(_footer(source, when))
         extras.append({"type": TEXT, "content": _fit_error(error, TEXT_LIMIT - used - 1)})
-    buttons = []
-    for label, url in links:
-        if len(label) > LABEL_LIMIT or len(url) > URL_LIMIT:
-            raise DiscordError("a link button exceeds Discord's label or URL limit")
-        parts = urlsplit(url)
-        if parts.scheme not in ("http", "https") or not parts.hostname:
-            continue
-        buttons.append({"type": BUTTON, "style": 5, "label": label, "url": url})
+    buttons = [_link_button(label, url) for label, url in links]
     if extras or buttons:
         children.append({"type": SEPARATOR, "divider": True, "spacing": 1})
         children.extend(extras)
     while buttons:
-        children.append({"type": ACTION_ROW, "components": buttons[:5]})
-        buttons = buttons[5:]
+        children.append({"type": ACTION_ROW, "components": buttons[:BUTTONS_PER_ROW]})
+        buttons = buttons[BUTTONS_PER_ROW:]
     children.append({"type": TEXT, "content": _footer(source, when)})
     payload = {
         "flags": IS_COMPONENTS_V2 | (SUPPRESS_NOTIFICATIONS if suppress else 0),
@@ -245,7 +303,8 @@ def _bold_first_number(summary: str) -> str:
 
 def ops_message(job: str, summary: str, *, ok: bool, quiet: bool = False,
                 seconds: Optional[float] = None, error: str = "",
-                when: Optional[int] = None, warning: bool = False) -> dict:
+                when: Optional[int] = None, warning: bool = False,
+                detail: str = "") -> dict:
     when = int(time.time()) if when is None else int(when)
     if not ok:
         emoji, color, suppress = "❌", RED, False
@@ -259,7 +318,7 @@ def ops_message(job: str, summary: str, *, ok: bool, quiet: bool = False,
     if seconds is not None:
         facts = f"{facts}\n**Duration** **{format_duration(seconds)}**"
     return _assemble(
-        emoji=emoji, headline=job, color=color, facts=facts, detail="",
+        emoji=emoji, headline=job, color=color, facts=facts, detail=detail,
         error=error, links=(), source=f"nemo {job}", when=when, suppress=suppress)
 
 
@@ -297,22 +356,80 @@ def brief_messages(brief_md: str, *, when: Optional[int] = None) -> List[dict]:
     return built
 
 
+def _blocks(text: str) -> List[str]:
+    """Paragraphs, with a header starting a new one. A fenced block is one block."""
+    blocks: List[str] = []
+    current: List[str] = []
+
+    def close() -> None:
+        if current:
+            blocks.append("\n".join(current))
+            current.clear()
+
+    fenced = False
+    for line in text.splitlines():
+        if fenced:
+            current.append(line)
+            if _FENCE.match(line):
+                fenced = False
+                close()
+        elif _FENCE.match(line):
+            close()
+            current.append(line)
+            fenced = True
+        elif not line.strip():
+            close()
+        elif _HEADER.match(line):
+            close()
+            current.append(line)
+        else:
+            current.append(line)
+    close()
+    return blocks
+
+
+def _chunk_lines(lines: Sequence[str], limit: int) -> List[List[str]]:
+    chunks: List[List[str]] = []
+    current: List[str] = []
+    size = 0
+    for line in lines:
+        pieces = [line[i:i + limit] for i in range(0, len(line), limit)] or [""]
+        for piece in pieces:
+            added = len(piece) + (1 if current else 0)
+            if current and size + added > limit:
+                chunks.append(current)
+                current, size, added = [], 0, len(piece)
+            current.append(piece)
+            size += added
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _split_block(block: str, budget: int) -> List[str]:
+    """Cut one block that is longer than a page. A fenced block is closed at the
+    end of each piece and opened again at the start of the next."""
+    lines = block.splitlines()
+    if _FENCE.match(lines[0]):
+        opener = lines[0].strip()
+        inner = lines[1:]
+        if inner and _FENCE.match(inner[-1]):
+            inner = inner[:-1]
+        room = budget - len(opener) - len("```") - 2
+        return [f"{opener}\n" + "\n".join(chunk) + "\n```"
+                for chunk in _chunk_lines(inner, room)]
+    return ["\n".join(chunk) for chunk in _chunk_lines(lines, budget)]
+
+
 def _pages(text: str, budget: int) -> List[str]:
     if len(text) <= budget:
         return [text]
+    pieces: List[str] = []
+    for block in _blocks(text):
+        pieces.extend(_split_block(block, budget) if len(block) > budget else [block])
     pages: List[str] = []
     current = ""
-    for block in re.split(r"(?=\n## |\n### )", text):
-        piece = block.lstrip("\n")
-        if not piece:
-            continue
-        if len(piece) > budget:
-            if current:
-                pages.append(current)
-                current = ""
-            for start in range(0, len(piece), budget):
-                pages.append(piece[start:start + budget])
-            continue
+    for piece in pieces:
         candidate = f"{current}\n\n{piece}" if current else piece
         if len(candidate) <= budget:
             current = candidate
@@ -321,87 +438,92 @@ def _pages(text: str, budget: int) -> List[str]:
             current = piece
     if current:
         pages.append(current)
-    return pages or [text[:budget]]
+    return pages
+
+
+# ------------------------------------------------------------ what each job says
+
+def _failure_lines(failed: Sequence[Any], limit: int = FAILURES_SHOWN) -> str:
+    items = [str(item) for item in failed]
+    shown = items[:limit]
+    if len(items) > limit:
+        shown.append(f"and {len(items) - limit} more")
+    return "\n".join(shown)
+
+
+def _guard(job: str, messages: List[Tuple[str, dict]]) -> List[Tuple[str, dict]]:
+    allowed = JOB_CHANNELS[job]
+    for channel, _ in messages:
+        if channel not in allowed:
+            raise DiscordError(f"{job} cannot post to the {channel} channel")
+    return messages
 
 
 def messages_for(job: str, code: int, result: Optional[dict], *,
-                 seconds: Optional[float] = None, when: Optional[int] = None
-                 ) -> List[Tuple[str, dict]]:
-    """The messages one job run should post. ``code`` is the job's own exit code."""
+                 seconds: Optional[float] = None, when: Optional[int] = None,
+                 watch_state: Optional[dict] = None) -> List[Tuple[str, dict]]:
+    """The messages one job run should post. ``code`` is the job's own exit code.
+
+    A run that found nothing and did not fail returns no messages.
+    """
+    if job not in JOB_CHANNELS:
+        raise DiscordError(f"no Discord message is defined for the job {job!r}")
+    if job == "research-watch":
+        return watch_messages(
+            code, result, watch_state or {}, seconds=seconds, when=when)[0]
     result = result or {}
     when = int(time.time()) if when is None else int(when)
-    error = str(result.get("error") or "")
     failed = code != 0 or result.get("status") == "failed"
+    error = str(result.get("error") or "") if failed else ""
 
-    if job == "research-copy":
-        return _copy(result, failed, seconds, when, error)
-    if job == "research-scan":
-        return _scan(result, failed, seconds, when, error)
-    if job == "research-watch":
-        return _watch(result, failed, seconds, when, error)
-    if job == "research-score":
-        return _score(result, failed, seconds, when, error)
-    if job == "research-announce":
-        return _announce(result, failed, seconds, when, error)
     if job == "research-fills":
-        return _fills(result, failed, seconds, when, error)
-    if job == "research-daily":
-        return _daily(result, failed, seconds, when, error)
-    if job == "research-seed":
-        written = int(result.get("written") or 0)
-        quiet = written == 0
-        return [("ops", ops_message(
-            job, f"**{written:,}** quarters recorded", ok=not failed, quiet=quiet,
-            seconds=seconds, error=error, when=when))]
-    if job == "congress-sync":
-        parsed = int(result.get("parsed") or 0)
-        return [("ops", ops_message(
-            job, f"**{parsed:,}** filings parsed", ok=not failed, quiet=False,
-            seconds=seconds, error=error, when=when))]
-    if job == "research-backup":
-        removed = int(result.get("removed") or 0)
-        size = format_gib(float(result.get("bytes") or 0))
-        return [("ops", ops_message(
-            job, f"**{size}** written, **{removed}** older copies removed",
-            ok=not failed, quiet=False, seconds=seconds, error=error, when=when))]
-    if job == "research-status":
-        attention = [str(item) for item in result.get("attention") or []]
-        if attention:
-            return [("ops", ops_message(
-                job, f"**{len(attention)}** items need attention", ok=True,
-                warning=True, seconds=seconds,
-                error="\n".join(attention), when=when))]
-        return [("ops", ops_message(
-            job, "**0** items need attention", ok=True, quiet=True,
-            seconds=seconds, when=when))]
-    if job == "docker-prune":
-        ok = bool(result.get("ok", code == 0)) and not failed
-        return [("ops", ops_message(
-            job, "containers older than 24h pruned" if ok else "container prune failed",
-            ok=ok, quiet=ok, seconds=seconds, error=error, when=when))]
-    summary = f"**{code}** exit"
-    return [("ops", ops_message(
-        job, summary, ok=not failed, quiet=not failed, seconds=seconds,
-        error=error, when=when))]
+        messages = _fills(result, seconds, when)
+    elif job == "research-copy":
+        messages = _copy(result, failed, seconds, when, error)
+    elif job == "research-scan":
+        messages = _scan(result, failed, seconds, when, error)
+    elif job == "research-score":
+        messages = _score(result, failed, seconds, when, error)
+    elif job == "research-announce":
+        messages = _announce(result, failed, seconds, when, error)
+    elif job == "research-daily":
+        messages = _daily(result, failed, seconds, when, error)
+    elif job == "research-seed":
+        messages = _seed(result, failed, seconds, when, error)
+    elif job == "congress-sync":
+        messages = _sync(result, failed, seconds, when, error)
+    elif job == "research-backup":
+        messages = _backup(result, failed, seconds, when, error)
+    elif job == "research-status":
+        messages = _status(result, seconds, when)
+    else:
+        messages = [("ops", ops_message(
+            job,
+            "containers older than 24h pruned" if not failed
+            else f"exited with code **{code}**",
+            ok=not failed, quiet=not failed, seconds=seconds, error=error,
+            when=when))]
+    return _guard(job, messages)
 
 
 def _copy(result, failed, seconds, when, error):
     rows = int(result.get("rows_written") or 0)
-    if result.get("status") == "off":
-        return [("ops", ops_message(
-            "research-copy", "copy trading is **off**", ok=True, quiet=True,
-            seconds=seconds, when=when))]
+    if not failed and (result.get("status") == "off" or rows == 0):
+        return []
     messages = [("ops", ops_message(
         "research-copy", f"**{rows:,}** decisions recorded",
-        ok=not failed, quiet=rows == 0, seconds=seconds, error=error, when=when))]
+        ok=not failed, seconds=seconds, error=error, when=when))]
     preview = result.get("preview") or []
     if preview and not failed:
         lines = []
-        for item in preview[:8]:
+        for item in preview[:WATCH_EVENTS_SHOWN]:
             lines.append(
                 f"**{escape_text(str(item.get('ticker') or ''))}** "
                 f"{escape_text(str(item.get('member') or ''))} · "
                 f"**{format_money(float(item.get('dollars') or 0))}**")
+        accepted = int(result.get("accepted") or len(preview))
+        if accepted > len(lines):
+            lines.append(f"and **{accepted - len(lines)}** more")
         messages.append(("signals", signal_message(
             "Congressional copy", lines, emoji="🛒", color=GREEN,
             source="nemo research-copy", when=when)))
@@ -410,65 +532,114 @@ def _copy(result, failed, seconds, when, error):
 
 def _scan(result, failed, seconds, when, error):
     candidates = result.get("candidates") or []
-    written = int(result.get("written") or len(candidates) or 0)
+    superseded = result.get("superseded") or {}
+    dropped = set(superseded.get("dropped") or [])
+    filed = [row for row in candidates if row.get("ticker") not in dropped]
+    if not failed and not filed and not superseded:
+        return []
+    warning = bool(superseded) and not failed
+    note = (f"⚠️ {escape_text(str(superseded.get('note') or 'an earlier decision stands'))}"
+            if superseded else "")
     messages = [("ops", ops_message(
-        "research-scan", f"**{written:,}** orders filed",
-        ok=not failed, quiet=written == 0 and not failed,
-        seconds=seconds, error=error, when=when))]
-    if candidates and not failed:
+        "research-scan", f"**{len(filed):,}** orders filed",
+        ok=not failed, warning=warning, seconds=seconds, error=error,
+        detail=note, when=when))]
+    if filed and not failed:
         lines = []
-        for row in candidates[:8]:
+        for row in filed[:WATCH_EVENTS_SHOWN]:
             lines.append(
                 f"**{escape_text(str(row.get('ticker') or ''))}** "
                 f"{escape_text(str(row.get('side') or ''))} · "
-                f"SUE **{row.get('sue')}**")
+                f"SUE **{_fixed(row.get('sue'), 2)}**")
+        if len(filed) > len(lines):
+            lines.append(f"and **{len(filed) - len(lines)}** more")
+        if note:
+            lines.append(note)
         messages.append(("signals", signal_message(
-            "Scanner book", lines, emoji="📋", color=BLURPLE,
+            "Scanner book", lines, emoji="⚠️" if warning else "📋",
+            color=YELLOW if warning else BLURPLE,
             source="nemo research-scan", when=when)))
     return messages
 
 
-def _watch(result, failed, seconds, when, error):
+def _events_message(events: Sequence[Any], count: int, when: int) -> dict:
+    lines = []
+    links = []
+    shown = events[:WATCH_EVENTS_SHOWN]
+    for event in shown:
+        if isinstance(event, dict):
+            ticker = str(event.get("subject_ticker") or "")
+            form = str(event.get("form") or "13D")
+            lines.append(
+                f"**{escape_text(ticker)}** {escape_text(form)} · "
+                f"{escape_text(str(event.get('filer_name') or ''))}")
+            links.append((f"{ticker} {form}"[:LABEL_LIMIT], event.get("url")))
+        else:
+            lines.append(escape_text(str(event)))
+    total = max(count, len(events))
+    if total > len(shown):
+        lines.append(f"and **{total - len(shown)}** more")
+    return signal_message(
+        "Activist filing", lines or [f"**{count}** new filings"],
+        emoji="📋", color=BLURPLE, source="nemo research-watch",
+        links=links, when=when)
+
+
+def watch_messages(code: int, result: Optional[dict], state: dict, *,
+                   seconds: Optional[float] = None, when: Optional[int] = None
+                   ) -> Tuple[List[Tuple[str, dict]], dict]:
+    """The messages for one research-watch pass, and the alert state after it.
+
+    #ops hears about a change of state only. The first failed pass notifies,
+    later failed passes in a row post nothing, and the first good pass after a
+    failure posts one silent line. The pass itself is `partial` in the steady
+    state, so a coverage note is never a reason to post.
+    """
+    result = result or {}
+    when = int(time.time()) if when is None else int(when)
+    failing_since = int(state.get("failing_since") or 0)
+    passes = int(state.get("failed_passes") or 0)
+    failed = code != 0 or result.get("status") == "failed"
+    messages: List[Tuple[str, dict]] = []
+    if failed:
+        if not failing_since:
+            messages.append(("ops", ops_message(
+                "research-watch", "the pass failed", ok=False, seconds=seconds,
+                error=str(result.get("error") or ""), when=when)))
+        new_state = {"failing_since": failing_since or when,
+                     "failed_passes": passes + 1}
+        return _guard("research-watch", messages), new_state
+    if failing_since:
+        messages.append(("ops", ops_message(
+            "research-watch",
+            f"recovered after **{passes}** failed passes, "
+            f"failing since <t:{failing_since}:R>",
+            ok=True, seconds=seconds, when=when)))
     events = result.get("events") or []
-    count = int(result.get("new_events") if result.get("new_events") is not None else len(events))
-    messages = [("ops", ops_message(
-        "research-watch", f"**{count:,}** new 13D filings",
-        ok=not failed, quiet=count == 0 and not failed,
-        seconds=seconds, error=error, when=when))]
-    if count and not failed:
-        lines = []
-        links = []
-        for event in events[:8]:
-            if isinstance(event, dict):
-                lines.append(
-                    f"**{escape_text(str(event.get('subject_ticker') or ''))}** "
-                    f"{escape_text(str(event.get('form') or '13D'))} · "
-                    f"{escape_text(str(event.get('filer_name') or ''))}")
-                url = event.get("url") or ""
-                if url and not links:
-                    links.append(("Filing", str(url)))
-            else:
-                lines.append(escape_text(str(event)))
-        messages.append(("signals", signal_message(
-            "Activist filing", lines or [f"**{count}** new filings"],
-            emoji="📋", color=BLURPLE, source="nemo research-watch",
-            links=links, when=when)))
-    return messages
+    count = int(result["new_events"] if result.get("new_events") is not None
+                else len(events))
+    if count:
+        messages.append(("signals", _events_message(events, count, when)))
+    return _guard("research-watch", messages), {}
 
 
 def _score(result, failed, seconds, when, error):
     sample = int(result.get("sample") or 0)
-    usable = bool(result.get("coefficient_usable"))
-    drift = result.get("drift_bps_per_sue")
-    if drift is None:
-        drift = result.get("drift_bps_per_tail")
-    drift_text = "no coefficient" if drift is None else f"**{float(drift):.1f} bp** per SUE"
-    hit = result.get("hit_rate")
-    hit_text = "" if hit is None else f" · hit rate **{format_percent(float(hit))}**"
+    if not failed and sample == 0:
+        return []
     messages = [("ops", ops_message(
         "research-score", f"**{sample:,}** trades scored",
-        ok=not failed, quiet=not failed, seconds=seconds, error=error, when=when))]
+        ok=not failed, seconds=seconds, error=error, when=when))]
     if not failed:
+        usable = bool(result.get("coefficient_usable"))
+        if result.get("drift_bps_per_sue") is not None:
+            drift_text = f"**{float(result['drift_bps_per_sue']):.1f} bp** per SUE"
+        elif result.get("drift_bps_per_tail") is not None:
+            drift_text = f"**{float(result['drift_bps_per_tail']):.1f} bp** per tail"
+        else:
+            drift_text = "no coefficient"
+        hit = result.get("hit_rate")
+        hit_text = "" if hit is None else f" · hit rate **{format_percent(float(hit))}**"
         messages.append(("signals", signal_message(
             "Score",
             [f"{drift_text}{hit_text}",
@@ -481,11 +652,21 @@ def _score(result, failed, seconds, when, error):
 
 def _announce(result, failed, seconds, when, error):
     written = int(result.get("written") or 0)
+    failures = [str(item) for item in result.get("failed") or []]
+    if failed:
+        return [("ops", ops_message(
+            "research-announce", f"**{written:,}** announcement dates recorded",
+            ok=False, seconds=seconds, error=error or _failure_lines(failures),
+            when=when))]
+    if written == 0 and not failures:
+        return []
+    warning = bool(failures)
     messages = [("ops", ops_message(
         "research-announce", f"**{written:,}** announcement dates recorded",
-        ok=not failed, quiet=written == 0 and not failed,
-        seconds=seconds, error=error, when=when))]
-    if written and not failed:
+        ok=True, warning=warning, seconds=seconds,
+        detail=f"⚠️ **{len(failures)}** lookups failed" if warning else "",
+        error=_failure_lines(failures), when=when))]
+    if written:
         messages.append(("signals", signal_message(
             "Earnings dates",
             [f"**{written:,}** dates recorded from Item 2.02"],
@@ -493,24 +674,96 @@ def _announce(result, failed, seconds, when, error):
     return messages
 
 
-def _fills(result, failed, seconds, when, error):
-    submitted = int(result.get("submitted") or 0)
-    rejected = int(result.get("rejected") or 0)
-    updated = int(result.get("updated") or 0)
-    action = str(result.get("action") or "fills")
-    count = submitted or updated
-    warning = rejected > 0 and not failed
+def _seed(result, failed, seconds, when, error):
+    written = int(result.get("written") or 0)
+    failures = [str(item) for item in result.get("failed") or []]
+    summary = f"**{written:,}** quarters recorded"
+    if failed:
+        return [("ops", ops_message(
+            "research-seed", summary, ok=False, seconds=seconds,
+            error=error or _failure_lines(failures), when=when))]
+    if failures:
+        return [("ops", ops_message(
+            "research-seed", summary, ok=True, warning=True, seconds=seconds,
+            detail=f"⚠️ **{len(failures)}** names failed",
+            error=_failure_lines(failures), when=when))]
+    if written == 0:
+        return []
+    return [("ops", ops_message(
+        "research-seed", summary, ok=True, seconds=seconds, when=when))]
+
+
+def _sync(result, failed, seconds, when, error):
+    parsed = int(result.get("parsed") or 0)
+    if not failed and parsed == 0:
+        return []
+    return [("ops", ops_message(
+        "congress-sync", f"**{parsed:,}** filings parsed", ok=not failed,
+        seconds=seconds, error=error, when=when))]
+
+
+def _backup(result, failed, seconds, when, error):
+    removed = int(result.get("removed") or 0)
+    size = format_gib(float(result.get("bytes") or 0))
+    return [("ops", ops_message(
+        "research-backup",
+        f"**{size}** written, **{removed}** older copies removed",
+        ok=not failed, seconds=seconds, error=error, when=when))]
+
+
+def _status(result, seconds, when):
+    """The one heartbeat. It always posts, silent when nothing needs attention."""
+    attention = [str(item) for item in result.get("attention") or []]
+    if attention:
+        return [("ops", ops_message(
+            "research-status", f"**{len(attention)}** items need attention",
+            ok=True, warning=True, seconds=seconds,
+            error="\n".join(attention), when=when))]
+    return [("ops", ops_message(
+        "research-status", "**All clear**: nothing needs attention", ok=True,
+        seconds=seconds, when=when))]
+
+
+def _fills(result, seconds, when):
+    """Both books summed. A rejection is a warning, not a failed run."""
+    status = result.get("status")
+    if status not in ("ok", "closed", "partial"):
+        return [("ops", ops_message(
+            "research-fills", "the run failed", ok=False, seconds=seconds,
+            error=str(result.get("error") or f"unexpected status {status!r}"),
+            when=when))]
+    action = result.get("action")
+    if action not in ("submit", "collect"):
+        raise DiscordError(f"research-fills posts submit or collect, not {action!r}")
+    copy = result.get("copy") or {}
+    key, verb = ("submitted", "submitted") if action == "submit" else ("updated", "updated")
+    earnings = int(result.get(key) or 0)
+    copy_count = int(copy.get(key) or 0)
+    count = earnings + copy_count
+    rejected = int(result.get("rejected") or 0) + int(copy.get("rejected") or 0)
+    skipped = int(result.get("skipped") or 0) + int(copy.get("skipped") or 0)
+    missed = int(result.get("missed") or 0) + int(copy.get("missed") or 0)
+    warning = status == "partial" or rejected > 0 or missed > 0
+    if not warning and count == 0:
+        return []
+    lines = [f"**{count:,}** orders {verb}"]
+    if copy_count:
+        lines.append(f"Earnings **{earnings:,}** · Copy **{copy_count:,}**")
+    if skipped:
+        lines.append(f"**{skipped:,}** skipped")
+    if rejected:
+        lines.append(f"⚠️ **{rejected:,}** rejected")
+    if missed:
+        lines.append(f"⚠️ **{missed:,}** missed")
+    notes = [str(note) for note in result.get("notes") or []]
+    if not notes:
+        notes = [str(text) for text in (result.get("error"), copy.get("error")) if text]
     messages = [("ops", ops_message(
-        "research-fills",
-        f"**{count:,}** paper {action}s, **{rejected:,}** rejected",
-        ok=not failed, quiet=count == 0 and not warning and not failed,
-        warning=warning, seconds=seconds, error=error, when=when))]
-    if count and not failed:
+        "research-fills", "\n".join(lines), ok=True, warning=warning,
+        seconds=seconds, error="\n".join(notes) if warning else "", when=when))]
+    if count:
         messages.append(("signals", signal_message(
-            "Paper fills",
-            [f"**{count:,}** {escape_text(action)}",
-             f"**{rejected:,}** rejected" if rejected else "**0** rejected"],
-            emoji="🧪" if warning else "🛒",
+            "Paper fills", lines, emoji="⚠️" if warning else "🛒",
             color=YELLOW if warning else GREEN,
             source="nemo research-fills", when=when)))
     return messages
@@ -545,6 +798,64 @@ def _daily(result, failed, seconds, when, error):
         quiet=False, seconds=seconds, error=detail_error, when=when))]
 
 
+def cron_message(job: str, code: int, tail: str, *,
+                 when: Optional[int] = None) -> dict:
+    """What the cron failure branch posts for a job that did not post itself."""
+    if code == LOCK_HELD:
+        return ops_message(
+            job, "skipped: the previous run still holds the lock", ok=True,
+            warning=True, when=when)
+    if code == POST_FAILED:
+        return ops_message(
+            job, "ran, but its Discord post failed", ok=True, warning=True,
+            error=tail, when=when)
+    return ops_message(
+        job, f"exited with code **{code}**", ok=False, error=tail, when=when)
+
+
+# --------------------------------------------------------- alert state, watch only
+
+def watch_state_path() -> Path:
+    """Beside the store, on the volume that outlives a run."""
+    from research import pit_store
+
+    return Path(pit_store.db_path()).with_name("discord_watch_state.json")
+
+
+def load_watch_state(path) -> dict:
+    path = Path(path)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise DiscordError(f"{path} cannot be read: {exc.strerror or exc}") from None
+    try:
+        state = json.loads(raw)
+    except ValueError:
+        state = None
+    if not isinstance(state, dict):
+        raise DiscordError(
+            f"{path} is not a JSON object; delete it to reset the "
+            f"research-watch alert state")
+    return state
+
+
+def save_watch_state(path, state: dict) -> None:
+    path = Path(path)
+    try:
+        if not state:
+            path.unlink(missing_ok=True)
+            return
+        scratch = path.with_name(path.name + ".tmp")
+        scratch.write_text(json.dumps(state), encoding="utf-8")
+        os.replace(scratch, path)
+    except OSError as exc:
+        raise DiscordError(f"{path} cannot be written: {exc.strerror or exc}") from None
+
+
+# ------------------------------------------------------------------ posting
+
 def deliver(channel: str, payloads: Sequence[dict], *,
             transport: Optional[Callable[[str, dict], Any]] = None,
             url_for: Optional[Callable[[str], str]] = None) -> None:
@@ -570,20 +881,36 @@ def deliver(channel: str, payloads: Sequence[dict], *,
 
 def finish(job: str, code: int, result: Optional[dict] = None, *,
            seconds: Optional[float] = None,
-           transport: Optional[Callable[[str, dict], Any]] = None) -> int:
-    """Post after the job has recorded its data. A failed post returns 1.
+           transport: Optional[Callable[[str, dict], Any]] = None,
+           state_path=None) -> int:
+    """Post after the job has recorded its data, and return the exit code.
 
-    The recorded rows stay. This function only changes the exit code.
+    The recorded rows stay. This function only changes the exit code: a job
+    that succeeded and could not post exits ``POST_FAILED``. After a non-zero
+    exit that it posted (or chose not to repeat), the process prints
+    ``REPORTED`` last, so the cron failure branch posts nothing more.
     """
+    when = int(time.time())
     try:
+        new_state = None
+        if job == "research-watch":
+            path = state_path or watch_state_path()
+            messages, new_state = watch_messages(
+                code, result, load_watch_state(path), seconds=seconds, when=when)
+        else:
+            messages = messages_for(job, code, result, seconds=seconds, when=when)
         grouped: Dict[str, List[dict]] = {}
-        for channel, payload in messages_for(job, code, result, seconds=seconds):
+        for channel, payload in messages:
             grouped.setdefault(channel, []).append(payload)
         for channel, payloads in grouped.items():
             deliver(channel, payloads, transport=transport)
+        if new_state is not None:
+            save_watch_state(path, new_state)
     except DiscordError as exc:
-        print(redact(str(exc)), flush=True)
-        return 1 if code == 0 else code
+        print(f"{job}: {redact(str(exc))}", file=sys.stderr, flush=True)
+        return code if code != 0 else POST_FAILED
+    if code != 0:
+        print(REPORTED, file=sys.stderr, flush=True)
     return code
 
 
@@ -650,10 +977,26 @@ def _http_send(url: str, body: dict) -> None:
         return
 
 
+# ------------------------------------------------------------------- the log
+
+def _log_lines(path: str, lines: int) -> List[str]:
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        return list(collections.deque(handle, maxlen=lines))
+
+
 def log_tail(path: str, lines: int = 100) -> str:
     try:
-        with open(path, encoding="utf-8", errors="replace") as handle:
-            content = handle.readlines()
+        content = _log_lines(path, lines)
     except OSError as exc:
         return f"{path} cannot be read: {exc.strerror or exc}"
-    return redact("".join(content[-lines:]))
+    return redact("".join(content))
+
+
+def already_reported(path: str) -> bool:
+    """Whether the last run in the log ended by reporting its own failure."""
+    try:
+        content = _log_lines(path, 5)
+    except OSError:
+        return False
+    last = [line.strip() for line in content if line.strip()]
+    return bool(last) and last[-1] == REPORTED

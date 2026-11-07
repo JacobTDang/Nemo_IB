@@ -316,7 +316,9 @@ async def submit(broker, today: Optional[str] = None,
     out: Dict[str, Any] = {
         "as_of": today, "status": "ok", "submitted": 0, "skipped": 0,
         "rejected": 0, "missed": 0, "copy": _empty_book()}
+    # The same notes the run log keeps, so Discord can say what went wrong.
     notes: List[str] = []
+    out["notes"] = notes
     try:
         earn_orders = pit_store.paper_orders_as_of(today, accepted_only=True)
         earn_fills = pit_store.paper_fills_as_of(today)
@@ -419,6 +421,7 @@ async def collect(broker, today: Optional[str] = None) -> Dict[str, Any]:
         "as_of": today, "status": "ok", "asked": 0, "updated": 0,
         "copy": {"status": "ok", "asked": 0, "updated": 0}}
     notes: List[str] = []
+    out["notes"] = notes
     try:
         try:
             earn = await _collect_legs(broker, today, table="paper_fill")

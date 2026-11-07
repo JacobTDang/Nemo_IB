@@ -478,10 +478,7 @@ def test_failed_job_exits_nonzero(book, capsys):
     assert 'House' in capsys.readouterr().out
 
 
-def test_successful_empty_job_exits_zero(book, monkeypatch):
-    monkeypatch.setattr(
-        'research.discord_post.finish',
-        lambda job, code, result=None, **kwargs: code)
+def test_successful_empty_job_exits_zero(book):
     assert book.main() == 0
 
 
@@ -513,7 +510,4 @@ def test_copy_reader_keeps_parse_just_before_decision(book):
 def test_off_entrypoint_does_not_create_store(book, monkeypatch):
     monkeypatch.setenv('NEMO_COPY_TRADING', 'off')
     monkeypatch.setattr(pit_store, 'init_schema', lambda: pytest.fail('opened PIT store'))
-    monkeypatch.setattr(
-        'research.discord_post.finish',
-        lambda job, code, result=None, **kwargs: code)
     assert book.main() == 0

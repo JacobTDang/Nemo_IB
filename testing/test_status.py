@@ -18,20 +18,6 @@ from datetime import date, datetime, timedelta, timezone
 import pytest
 
 
-@pytest.fixture(autouse=True)
-def discord_webhooks_are_set(monkeypatch):
-    """The status screen treats a missing webhook as attention.
-
-    These tests are about the store. They set both webhooks so a clean store
-    stays clean, and they do not post.
-    """
-    monkeypatch.setenv("NEMO_DISCORD_OPS_WEBHOOK_URL", "https://hooks.example/ops")
-    monkeypatch.setenv(
-        "NEMO_DISCORD_SIGNALS_WEBHOOK_URL", "https://hooks.example/signals")
-    monkeypatch.setattr(
-        "research.discord_post.finish",
-        lambda job, code, result=None, **kwargs: code)
-
 from research import pit_store, scanner, status
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -585,12 +571,13 @@ def test_enabled_copy_job_reports_failed_run(store, monkeypatch):
     assert any('stale House sync' in a for a in report['attention'])
 
 
-def test_a_missing_discord_webhook_needs_attention(store, monkeypatch):
+def test_the_status_screen_does_not_read_discord_settings(store, monkeypatch):
+    """`nemo status` runs on the host, where no webhook is set. Only a service
+    that posts needs its webhook, and its own post names the missing setting."""
     monkeypatch.delenv("NEMO_DISCORD_OPS_WEBHOOK_URL", raising=False)
     monkeypatch.delenv("NEMO_DISCORD_SIGNALS_WEBHOOK_URL", raising=False)
     attention = status.collect()["attention"]
-    assert any("NEMO_DISCORD_OPS_WEBHOOK_URL is not set" in item for item in attention)
-    assert any("NEMO_DISCORD_SIGNALS_WEBHOOK_URL is not set" in item for item in attention)
+    assert not any("DISCORD" in item for item in attention)
 
 
 def test_status_refuses_unknown_copy_flag(store, monkeypatch):
