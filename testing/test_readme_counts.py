@@ -323,8 +323,9 @@ def _cron_lines(page):
 
 
 def test_the_scan_is_chained_behind_the_recorder_not_timed_after_it(deploy_doc):
-    """One line, `&&`, so the scan cannot start until the recorder has
-    finished -- and does not start at all if the recorder failed."""
+    """One line, so the scan cannot start until the recorder has finished --
+    and does not start at all if the recorder failed. How the line gates the
+    scan is run, not read, in the tests that follow the log section."""
     scan_lines = [(schedule, command) for schedule, command in
                   _cron_lines(deploy_doc) if "research-scan" in command]
     assert scan_lines, "nothing on the page schedules research-scan"
@@ -334,9 +335,6 @@ def test_the_scan_is_chained_behind_the_recorder_not_timed_after_it(deploy_doc):
             f"'{schedule} {command}' runs {services}; the scan has to be "
             f"chained behind the recorder in one line")
         assert set(services[2:]) <= {"research-notify"}, services
-        assert " && " in command.split("research-daily", 1)[1], (
-            "the two commands are not joined by `&&`, so the scan runs "
-            "whatever the recorder did")
 
 
 def test_nothing_schedules_the_recorder_and_the_scan_at_two_clock_times(
@@ -376,19 +374,27 @@ LOG_REDIRECT = re.compile(r">> (/srv/nemo/logs/[\w.-]+\.log) 2>&1")
 # the tests.
 _HOST_PATHS = ("/srv/nemo/deploy", LOGS, "/var/lock")
 
-# `docker` prints on both streams, and fails when told to: for every call, or
-# for a call naming one service. `flock` runs its command, or does what
-# util-linux `flock -n` does on a held lock: exit 1 and print nothing.
+# `docker` prints on both streams, and fails when told to: for every call, for
+# a call naming one service, or with the exit code EXITS gives a service
+# ("research-daily=75 research-scan=1"). `flock` runs its command, or does what
+# util-linux `flock -n` does on a held lock: print nothing and exit 1, or the
+# `-E` code when the line gives one.
 _DOCKER_STUB = """#!/bin/sh
 echo "stdout of docker $*"
 echo "stderr of docker $*" >&2
 [ "$FAIL" = every ] && exit 1
 case " $* " in *" $FAIL "*) [ -n "$FAIL" ] && exit 1 ;; esac
+for pair in $EXITS; do
+  case " $* " in *" run --rm ${pair%%=*} "*) exit "${pair#*=}" ;; esac
+done
 exit 0
 """
 _FLOCK_STUB = """#!/bin/sh
-[ -n "$LOCK_HELD" ] && exit 1
-shift 2
+shift
+conflict=1
+if [ "$1" = -E ]; then conflict=$2; shift 2; fi
+[ -n "$LOCK_HELD" ] && exit "$conflict"
+shift
 exec "$@"
 """
 
@@ -496,6 +502,98 @@ def test_a_failed_recorder_still_stops_the_scan_inside_the_logged_line(
             f"'{command}' ran the scan after the recorder failed")
         assert "run --rm research-daily" in mailed, (
             f"'{command}': the recorder failed and nothing was printed")
+
+
+def _notified(mailed):
+    """The research-notify call the failure branch made, or None. The branch
+    is the call that names a log: the prune line's `--ok` call is in the log
+    that the branch prints, and names none."""
+    calls = [line for line in mailed.splitlines()
+             if line.startswith("stdout of docker") and "research-notify" in line
+             and "--log " in line]
+    assert len(calls) <= 1, calls
+    return calls[0] if calls else None
+
+
+def test_a_lock_held_by_the_previous_run_is_reported_as_a_skip(
+        deploy_doc, compose, tmp_path):
+    """`flock -E 99` gives a held lock its own exit code, and the failure
+    branch hands that code to research-notify, which posts a skip instead of
+    a failure with a stale log tail."""
+    locked = [(schedule, command) for schedule, command in
+              _every_cron_line(deploy_doc, compose) if "flock -n" in command]
+    assert locked, "no cron line takes a lock"
+    for n, (schedule, command) in enumerate(locked):
+        assert "flock -n -E 99 " in command, (
+            f"'{command}' leaves a held lock at flock's default exit code 1, "
+            f"the same code a failed job has")
+        mailed, _ = _run_as_cron(command, tmp_path / f"line{n}", LOCK_HELD="1")
+        call = _notified(mailed)
+        assert call and "--code 99" in call, (schedule, mailed)
+
+
+def test_a_failed_line_hands_the_exit_code_to_research_notify(
+        deploy_doc, compose, tmp_path):
+    for n, (schedule, command) in enumerate(
+            _every_cron_line(deploy_doc, compose)):
+        mailed, _ = _run_as_cron(command, tmp_path / f"line{n}", FAIL="every")
+        call = _notified(mailed)
+        assert call and "--code 1" in call and "--log " in call, (schedule, mailed)
+
+
+def test_a_line_that_succeeds_posts_nothing_from_the_failure_branch(
+        deploy_doc, compose, tmp_path):
+    for n, (schedule, command) in enumerate(
+            _every_cron_line(deploy_doc, compose)):
+        mailed, _ = _run_as_cron(command, tmp_path / f"line{n}")
+        assert _notified(mailed) is None, (schedule, mailed)
+
+
+def _chained(deploy_doc, compose):
+    chained = [command for _, command in _every_cron_line(deploy_doc, compose)
+               if "research-scan" in command]
+    assert chained, "nothing schedules research-scan"
+    return chained
+
+
+@pytest.mark.parametrize("exits, ran_scan, job, code", [
+    ("", True, None, None),
+    ("research-daily=75", True, "research-daily", "75"),
+    ("research-daily=1", False, "research-daily", "1"),
+    ("research-daily=99", False, "research-daily", "99"),
+    ("research-scan=1", True, "research-scan", "1"),
+    ("research-daily=75 research-scan=1", True, "research-scan", "1"),
+])
+def test_the_chain_runs_the_scan_after_a_recorder_that_exits_0_or_75(
+        deploy_doc, compose, tmp_path, exits, ran_scan, job, code):
+    """A recorder whose Discord post failed (75) recorded its rows, so the scan
+    goes on. A failed recorder (1) or a held lock (99) stops it. A scan that
+    fails is named research-scan, not research-daily."""
+    for n, command in enumerate(_chained(deploy_doc, compose)):
+        mailed, log = _run_as_cron(command, tmp_path / f"line{n}", EXITS=exits)
+        assert ("run --rm research-scan" in log) is ran_scan, (exits, log)
+        call = _notified(mailed)
+        if job is None:
+            assert call is None and mailed == "", (exits, mailed)
+        else:
+            assert call and f"--job {job} " in call and f"--code {code}" in call, (
+                exits, call)
+
+
+def test_a_container_prune_that_fails_and_a_prune_post_that_fails_are_told_apart(
+        deploy_doc, compose, tmp_path):
+    prune = [command for _, command in _every_cron_line(deploy_doc, compose)
+             if "docker container prune" in command]
+    assert prune, "no cron line prunes containers"
+    for n, command in enumerate(prune):
+        mailed, _ = _run_as_cron(command, tmp_path / f"a{n}", FAIL="prune")
+        call = _notified(mailed)
+        assert "--job docker-prune " in call and "--code 1" in call
+        assert "--ok" not in call
+        mailed, _ = _run_as_cron(
+            command, tmp_path / f"b{n}", EXITS="research-notify=75")
+        call = _notified(mailed)
+        assert "--job docker-prune " in call and "--code 75" in call
 
 
 def test_the_cron_block_names_where_a_failure_is_mailed(deploy_doc):

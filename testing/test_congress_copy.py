@@ -488,7 +488,7 @@ def test_cron_runs_copy_at_1230_with_lock_and_log():
     line = next(line for line in doc.splitlines()
                 if line.startswith('30 12 * * 1-5 '))
     assert 'date -u;' in line
-    assert 'flock -n /var/lock/nemo-research-copy.lock' in line
+    assert 'flock -n -E 99 /var/lock/nemo-research-copy.lock' in line
     assert 'run --rm research-copy;' in line
     assert '>> /srv/nemo/logs/research-copy.log 2>&1' in line
 

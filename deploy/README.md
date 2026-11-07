@@ -351,16 +351,16 @@ Cron lines, in the order they should run:
 ```cron
 MAILTO=you@example.com
 CRON_TZ=UTC
-30 12 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-copy.lock docker compose --env-file ../.env run --rm research-copy; } >> /srv/nemo/logs/research-copy.log 2>&1 || { tail -n 100 /srv/nemo/logs/research-copy.log; docker compose --env-file ../.env run --rm research-notify --job research-copy --log /srv/nemo/logs/research-copy.log; }
-30 22 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-daily.lock docker compose --env-file ../.env run --rm research-daily && flock -n /var/lock/nemo-research-scan.lock docker compose --env-file ../.env run --rm research-scan; } >> /srv/nemo/logs/research-daily.log 2>&1 || { tail -n 100 /srv/nemo/logs/research-daily.log; docker compose --env-file ../.env run --rm research-notify --job research-daily --log /srv/nemo/logs/research-daily.log; }
-*/20 13-23 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-watch.lock docker compose --env-file ../.env run --rm research-watch; } >> /srv/nemo/logs/research-watch.log 2>&1 || { tail -n 100 /srv/nemo/logs/research-watch.log; docker compose --env-file ../.env run --rm research-notify --job research-watch --log /srv/nemo/logs/research-watch.log; }
- 0  7 * * 6 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-score.lock docker compose --env-file ../.env run --rm research-score; } >> /srv/nemo/logs/research-score.log 2>&1 || { tail -n 100 /srv/nemo/logs/research-score.log; docker compose --env-file ../.env run --rm research-notify --job research-score --log /srv/nemo/logs/research-score.log; }
- 0  9 * * 6 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-announce.lock docker compose --env-file ../.env run --rm research-announce; } >> /srv/nemo/logs/research-announce.log 2>&1 || { tail -n 100 /srv/nemo/logs/research-announce.log; docker compose --env-file ../.env run --rm research-notify --job research-announce --log /srv/nemo/logs/research-announce.log; }
- 0  8 1 * * cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-seed.lock docker compose --env-file ../.env run --rm research-seed; } >> /srv/nemo/logs/research-seed.log 2>&1 || { tail -n 100 /srv/nemo/logs/research-seed.log; docker compose --env-file ../.env run --rm research-notify --job research-seed --log /srv/nemo/logs/research-seed.log; }
- 0  6 * * * cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-congress-sync.lock docker compose --env-file ../.env run --rm congress-sync; } >> /srv/nemo/logs/congress-sync.log 2>&1 || { tail -n 100 /srv/nemo/logs/congress-sync.log; docker compose --env-file ../.env run --rm research-notify --job congress-sync --log /srv/nemo/logs/congress-sync.log; }
-15  3 * * * cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-backup.lock docker compose --env-file ../.env run --rm research-backup; } >> /srv/nemo/logs/research-backup.log 2>&1 || { tail -n 100 /srv/nemo/logs/research-backup.log; docker compose --env-file ../.env run --rm research-notify --job research-backup --log /srv/nemo/logs/research-backup.log; }
- 0  4 * * * cd /srv/nemo/deploy && { date -u; docker container prune -f --filter until=24h --filter label=com.docker.compose.project=deploy && docker compose --env-file ../.env run --rm research-notify --job docker-prune --ok; } >> /srv/nemo/logs/docker-prune.log 2>&1 || { tail -n 100 /srv/nemo/logs/docker-prune.log; docker compose --env-file ../.env run --rm research-notify --job docker-prune --log /srv/nemo/logs/docker-prune.log; }
-0 12 * * 1-5 cd /srv/nemo/deploy && { date -u; docker compose --env-file ../.env run --rm research-status; } >> /srv/nemo/logs/research-status.log 2>&1 || { tail -n 100 /srv/nemo/logs/research-status.log; docker compose --env-file ../.env run --rm research-notify --job research-status --log /srv/nemo/logs/research-status.log; }
+30 12 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n -E 99 /var/lock/nemo-research-copy.lock docker compose --env-file ../.env run --rm research-copy; } >> /srv/nemo/logs/research-copy.log 2>&1 || { rc=$?; tail -n 100 /srv/nemo/logs/research-copy.log; docker compose --env-file ../.env run --rm research-notify --job research-copy --log /srv/nemo/logs/research-copy.log --code $rc; }
+30 22 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n -E 99 /var/lock/nemo-research-daily.lock docker compose --env-file ../.env run --rm research-daily; rc=$?; job=research-daily; if [ $rc -eq 0 ] || [ $rc -eq 75 ]; then flock -n -E 99 /var/lock/nemo-research-scan.lock docker compose --env-file ../.env run --rm research-scan; last=$?; if [ $last -ne 0 ]; then rc=$last; job=research-scan; fi; fi; [ $rc -eq 0 ]; } >> /srv/nemo/logs/research-daily.log 2>&1 || { tail -n 100 /srv/nemo/logs/research-daily.log; docker compose --env-file ../.env run --rm research-notify --job ${job:-research-daily} --log /srv/nemo/logs/research-daily.log --code ${rc:-1}; }
+*/20 13-23 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n -E 99 /var/lock/nemo-research-watch.lock docker compose --env-file ../.env run --rm research-watch; } >> /srv/nemo/logs/research-watch.log 2>&1 || { rc=$?; tail -n 100 /srv/nemo/logs/research-watch.log; docker compose --env-file ../.env run --rm research-notify --job research-watch --log /srv/nemo/logs/research-watch.log --code $rc; }
+ 0  7 * * 6 cd /srv/nemo/deploy && { date -u; flock -n -E 99 /var/lock/nemo-research-score.lock docker compose --env-file ../.env run --rm research-score; } >> /srv/nemo/logs/research-score.log 2>&1 || { rc=$?; tail -n 100 /srv/nemo/logs/research-score.log; docker compose --env-file ../.env run --rm research-notify --job research-score --log /srv/nemo/logs/research-score.log --code $rc; }
+ 0  9 * * 6 cd /srv/nemo/deploy && { date -u; flock -n -E 99 /var/lock/nemo-research-announce.lock docker compose --env-file ../.env run --rm research-announce; } >> /srv/nemo/logs/research-announce.log 2>&1 || { rc=$?; tail -n 100 /srv/nemo/logs/research-announce.log; docker compose --env-file ../.env run --rm research-notify --job research-announce --log /srv/nemo/logs/research-announce.log --code $rc; }
+ 0  8 1 * * cd /srv/nemo/deploy && { date -u; flock -n -E 99 /var/lock/nemo-research-seed.lock docker compose --env-file ../.env run --rm research-seed; } >> /srv/nemo/logs/research-seed.log 2>&1 || { rc=$?; tail -n 100 /srv/nemo/logs/research-seed.log; docker compose --env-file ../.env run --rm research-notify --job research-seed --log /srv/nemo/logs/research-seed.log --code $rc; }
+ 0  6 * * * cd /srv/nemo/deploy && { date -u; flock -n -E 99 /var/lock/nemo-congress-sync.lock docker compose --env-file ../.env run --rm congress-sync; } >> /srv/nemo/logs/congress-sync.log 2>&1 || { rc=$?; tail -n 100 /srv/nemo/logs/congress-sync.log; docker compose --env-file ../.env run --rm research-notify --job congress-sync --log /srv/nemo/logs/congress-sync.log --code $rc; }
+15  3 * * * cd /srv/nemo/deploy && { date -u; flock -n -E 99 /var/lock/nemo-research-backup.lock docker compose --env-file ../.env run --rm research-backup; } >> /srv/nemo/logs/research-backup.log 2>&1 || { rc=$?; tail -n 100 /srv/nemo/logs/research-backup.log; docker compose --env-file ../.env run --rm research-notify --job research-backup --log /srv/nemo/logs/research-backup.log --code $rc; }
+ 0  4 * * * cd /srv/nemo/deploy && { date -u; docker container prune -f --filter until=24h --filter label=com.docker.compose.project=deploy && docker compose --env-file ../.env run --rm research-notify --job docker-prune --ok; } >> /srv/nemo/logs/docker-prune.log 2>&1 || { rc=$?; tail -n 100 /srv/nemo/logs/docker-prune.log; docker compose --env-file ../.env run --rm research-notify --job docker-prune --log /srv/nemo/logs/docker-prune.log --code $rc; }
+0 12 * * 1-5 cd /srv/nemo/deploy && { date -u; docker compose --env-file ../.env run --rm research-status; } >> /srv/nemo/logs/research-status.log 2>&1 || { rc=$?; tail -n 100 /srv/nemo/logs/research-status.log; docker compose --env-file ../.env run --rm research-notify --job research-status --log /srv/nemo/logs/research-status.log --code $rc; }
 ```
 
 ### Congressional purchase decisions
@@ -419,23 +419,43 @@ Each line in the block above does two things:
   `/srv/nemo/logs`. A host with no mail still keeps the output.
 - When the line fails, it prints the last 100 lines of that log. Cron mails
   only what a line prints, so cron mails only a failure. The same branch runs
-  `research-notify`, which posts that tail to #ops. A successful job posts
-  from inside its own process. The container prune has no process, so its
-  line posts a success from `research-notify` and a failure from the same
-  branch.
+  `research-notify` with the exit code of the line.
+
+A job posts its own result to Discord from inside its process, after it
+records its rows. A run that finds nothing and does not fail posts nothing.
+`research-status` is the one daily check. It posts to #ops at 12:00 UTC on
+weekdays, and it posts silently when nothing needs attention. A missing post
+at that time means that cron did not run.
+
+When a job exits with a non-zero code, it has already posted the failure and
+printed `nemo-discord: failure reported` as the last line of its output.
+`research-notify` reads that line and posts nothing. It posts the log tail
+only when the line is not there: the process crashed before its post, the
+kernel killed it, or Docker failed. `research-watch` posts only when its state
+changes. The first failed pass notifies. A later failed pass in a row posts
+nothing. The first good pass after a failure posts one silent line.
+
+Two exit codes have a fixed meaning:
+
+- 75: the job ran and recorded its rows, but its Discord post failed.
+- 99: `flock` found the lock held, so the job did not start. `research-notify`
+  posts one yellow warning, not a failure.
 
 Set `NEMO_DISCORD_SIGNALS_WEBHOOK_URL` and `NEMO_DISCORD_OPS_WEBHOOK_URL` in
 `/srv/nemo/.env`. A service receives only the channel its code posts to. A
-missing value fails that run and names the setting. Rows already recorded
-stay recorded.
+missing value fails that run with exit code 75 and names the setting. Rows
+already recorded stay recorded.
 
 Each run writes the date as its first line. The lines after the last date line
 come from the run that failed. If no line follows the date, the job printed
 nothing: `flock` found the lock held. The mail shows only the end of the
 output. The log keeps all of it.
 
-The braces do not change the `&&` chain. The scan starts only after the
-recorder exits with zero. Each job keeps its own `flock`.
+The braces do not change the chain. The scan starts after the recorder exits
+with 0 or 75. A recorder that exits with 75 recorded its rows, and only its
+post failed. Any other code stops the chain, and the failure branch names
+`research-daily`. When the scan fails, the failure branch names
+`research-scan`. Each job keeps its own `flock`.
 
 Do these steps once, as the user that owns the crontab, before you install the
 lines.
@@ -649,8 +669,8 @@ them. The job never builds a live broker. Then add two lines to the same
 crontab, under its `CRON_TZ=UTC` line:
 
 ```cron
-15 13 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-fills.lock docker compose --env-file ../.env run --rm research-fills submit; } >> /srv/nemo/logs/research-fills.log 2>&1 || { tail -n 100 /srv/nemo/logs/research-fills.log; docker compose --env-file ../.env run --rm research-notify --job research-fills --log /srv/nemo/logs/research-fills.log; }
-45 14 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-fills.lock docker compose --env-file ../.env run --rm research-fills collect; } >> /srv/nemo/logs/research-fills.log 2>&1 || { tail -n 100 /srv/nemo/logs/research-fills.log; docker compose --env-file ../.env run --rm research-notify --job research-fills --log /srv/nemo/logs/research-fills.log; }
+15 13 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n -E 99 /var/lock/nemo-research-fills.lock docker compose --env-file ../.env run --rm research-fills submit; } >> /srv/nemo/logs/research-fills.log 2>&1 || { rc=$?; tail -n 100 /srv/nemo/logs/research-fills.log; docker compose --env-file ../.env run --rm research-notify --job research-fills --log /srv/nemo/logs/research-fills.log --code $rc; }
+45 14 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n -E 99 /var/lock/nemo-research-fills.lock docker compose --env-file ../.env run --rm research-fills collect; } >> /srv/nemo/logs/research-fills.log 2>&1 || { rc=$?; tail -n 100 /srv/nemo/logs/research-fills.log; docker compose --env-file ../.env run --rm research-notify --job research-fills --log /srv/nemo/logs/research-fills.log --code $rc; }
 ```
 
 13:15 UTC is before the auction's 09:28 ET cutoff in summer and winter time,
