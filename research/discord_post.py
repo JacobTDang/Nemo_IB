@@ -58,7 +58,6 @@ REPORTED = "nemo-discord: failure reported"
 
 OPS_SETTING = "NEMO_DISCORD_OPS_WEBHOOK_URL"
 SIGNALS_SETTING = "NEMO_DISCORD_SIGNALS_WEBHOOK_URL"
-_SETTINGS = {"ops": OPS_SETTING, "signals": SIGNALS_SETTING}
 
 # The channels each job posts to. The compose file gives each service exactly
 # the webhook settings for these channels, and `messages_for` refuses a
@@ -151,13 +150,15 @@ def mask_link(label: str, url: str) -> str:
 
 
 def webhook_url(channel: str) -> str:
-    if channel not in _SETTINGS:
+    if channel == "ops":
+        name, value = OPS_SETTING, os.environ.get(OPS_SETTING, "")
+    elif channel == "signals":
+        name, value = SIGNALS_SETTING, os.environ.get(SIGNALS_SETTING, "")
+    else:
         raise DiscordError(f"{channel!r} is not a Discord channel this project posts to")
-    name = _SETTINGS[channel]
-    value = os.environ.get(name, "").strip()
-    if not value:
+    if not value.strip():
         raise DiscordError(f"{name} is not set")
-    return value
+    return value.strip()
 
 
 def webhook_endpoint(url: str) -> str:

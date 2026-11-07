@@ -28,9 +28,10 @@
 # cannot be filtered -- it hands the container every line in the file -- so
 # research-score, a weekly job that opens pit.db and nothing else, received
 # ALPACA_LIVE_KEY, ALPACA_LIVE_SECRET, both paper keys, three OpenRouter
-# variables, GROQ_API_KEY and DISCORD_WEBHOOK_URL. Eighteen keys where it needs
-# one. A key that reaches a container it does not need is a key any traceback
-# in that container can print, and one more copy in `docker inspect`.
+# variables, GROQ_API_KEY and the old single Discord webhook. Eighteen keys
+# where it needs one. A key that reaches a container it does not need is a key
+# any traceback in that container can print, and one more copy in
+# `docker inspect`.
 #
 # So each service now names what it gets, and the values are interpolated. That
 # is the part that needs the flag: compose reads `${VAR}` from the shell and
@@ -468,7 +469,6 @@ services:
       NEMO_COPY_MAX_TRADE_AGE_DAYS: ${NEMO_COPY_MAX_TRADE_AGE_DAYS:-}
       NEMO_COPY_MEMBERS: ${NEMO_COPY_MEMBERS:-}
       NEMO_DISCORD_OPS_WEBHOOK_URL: ${NEMO_DISCORD_OPS_WEBHOOK_URL:-}
-      NEMO_DISCORD_SIGNALS_WEBHOOK_URL: ${NEMO_DISCORD_SIGNALS_WEBHOOK_URL:-}
     volumes:
       - research-data:/app/data
     # It writes nothing to either, and gets them anyway: the rule that every

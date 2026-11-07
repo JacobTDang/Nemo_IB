@@ -1,25 +1,11 @@
 """Phase C3: send_brief delivers paginated markdown to Discord.
 
-Mocks the discord_webhook layer so the test makes no network call.
+The HTTP call is replaced, so the test makes no network call.
 """
 import os
 import sys
-import types
-from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-
-def _install_fake_discord_module(hook_cls):
-  """Ensure `import discord_webhook` works in send_brief, with our fake class."""
-  mod = types.ModuleType('discord_webhook')
-  mod.DiscordWebhook = hook_cls
-  class _DummyEmbed:
-    def __init__(self, *a, **kw): pass
-    def add_embed_field(self, **kw): pass
-  mod.DiscordEmbed = _DummyEmbed
-  sys.modules['discord_webhook'] = mod
-  return mod
 
 
 SHORT_BRIEF = """## Pre-Market Brief - 2026-05-20
@@ -40,37 +26,41 @@ LONG_BRIEF = ("## Pre-Market Brief - 2026-05-20\n\n"
               + "### Section C\n" + ("Sed do eiusmod tempor. " * 80))
 
 
-def test_build_brief_chunks_short_brief_single_message():
-  from agent.Pre_Market_Briefer import build_brief_chunks
-  chunks = build_brief_chunks(SHORT_BRIEF)
-  assert len(chunks) == 1, f"short brief should fit in 1 chunk, got {len(chunks)}"
-  assert 'AAPL' in chunks[0] and 'NVDA' in chunks[0]
-  print(f"PASS: short brief -> 1 chunk ({len(chunks[0])} chars)")
+def _details(pages):
+  """The brief text of each page: the text displays between headline and footer."""
+  out = []
+  for payload in pages:
+    texts = [n['content'] for n in payload['components'][0]['components']
+             if n.get('type') == 10]
+    out.append('\n'.join(texts[1:-1]))
+  return out
 
 
-def test_build_brief_chunks_long_brief_paginates():
-  from agent.Pre_Market_Briefer import build_brief_chunks
-  chunks = build_brief_chunks(LONG_BRIEF)
-  assert len(chunks) > 1, f"long brief should paginate, got {len(chunks)} chunks"
-  for i, c in enumerate(chunks):
-    assert len(c) <= 4000, f"chunk {i} exceeds a text display: {len(c)}"
-  # Round-trip: concatenated chunks should contain all original section markers
-  joined = '\n'.join(chunks)
+def test_short_brief_is_a_single_message():
+  from research.discord_post import brief_messages
+  pages = brief_messages(SHORT_BRIEF)
+  assert len(pages) == 1, f"short brief should fit in 1 message, got {len(pages)}"
+  detail = _details(pages)[0]
+  assert 'AAPL' in detail and 'NVDA' in detail
+  assert '(1/' not in str(pages)
+
+
+def test_long_brief_paginates_and_every_page_fits_a_text_display():
+  from research.discord_post import brief_messages
+  pages = brief_messages(LONG_BRIEF)
+  assert len(pages) > 1, f"long brief should paginate, got {len(pages)} messages"
+  for i, detail in enumerate(_details(pages)):
+    assert len(detail) <= 4000, f"page {i} exceeds a text display: {len(detail)}"
+  joined = '\n'.join(_details(pages))
   for marker in ('Section A', 'Section B', 'Section C'):
     assert marker in joined, f"section {marker} lost in pagination"
-  print(f"PASS: long brief -> {len(chunks)} chunks, each <=2000 chars")
 
 
-def test_build_brief_chunks_prefers_section_boundaries():
-  from agent.Pre_Market_Briefer import build_brief_chunks
-  chunks = build_brief_chunks(LONG_BRIEF)
-  # If we have multiple chunks, each chunk after the first should start with
-  # a "###" or "##" header — meaning we split on section, not mid-paragraph
-  for c in chunks[1:]:
-    stripped = c.lstrip()
-    starts_with_header = stripped.startswith('##') or stripped.startswith('###')
-    assert starts_with_header, f"chunk does not start on a header: {stripped[:60]!r}"
-  print(f"PASS: pagination respects section boundaries")
+def test_pagination_prefers_section_boundaries():
+  from research.discord_post import brief_messages
+  for detail in _details(brief_messages(LONG_BRIEF))[1:]:
+    assert detail.lstrip().startswith('##'), (
+      f"page does not start on a header: {detail.lstrip()[:60]!r}")
 
 
 def test_send_brief_no_webhook_names_the_setting(monkeypatch):
@@ -133,9 +123,9 @@ def test_send_brief_handles_empty_string():
 
 
 if __name__ == "__main__":
-  test_build_brief_chunks_short_brief_single_message()
-  test_build_brief_chunks_long_brief_paginates()
-  test_build_brief_chunks_prefers_section_boundaries()
+  test_short_brief_is_a_single_message()
+  test_long_brief_paginates_and_every_page_fits_a_text_display()
+  test_pagination_prefers_section_boundaries()
   test_send_brief_no_webhook_names_the_setting()
   test_send_brief_posts_each_chunk()
   test_send_brief_failure_raises()
