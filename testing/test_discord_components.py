@@ -233,15 +233,11 @@ def test_a_long_brief_splits_into_numbered_containers():
         assert payload["components"][0]["type"] == post.CONTAINER
 
 
-@pytest.mark.network
-@pytest.mark.live_discord
-@pytest.mark.skipif(not os.environ.get("DISCORD_PREVIEW_WEBHOOK_URL"),
-                    reason="DISCORD_PREVIEW_WEBHOOK_URL is not set")
-def test_preview_accepts_every_message_type():
-    """One example of every message, to the preview webhook only."""
-    import httpx
+REAL_SEND = post._http_send  # the conftest fixture replaces the module attribute
 
-    url = os.environ["DISCORD_PREVIEW_WEBHOOK_URL"]
+
+def _examples():
+    """One of every message type, built from fixtures, for the preview webhook."""
     examples = []
     examples.append(post.ops_message(
         "research-seed", "4 rows recorded", ok=True, quiet=True,
@@ -249,45 +245,82 @@ def test_preview_accepts_every_message_type():
     examples.append(post.ops_message(
         "research-daily", "1 stage failed", ok=False, seconds=12,
         error="consensus: HTTP 503", when=WHEN))
-    examples.extend(payload for _, payload in post.messages_for(
-        "research-copy", 0, {
-            "status": "ok", "rows_written": 1, "accepted": 1,
-            "preview": [{"ticker": "AAA", "member": "Ada Lovelace",
-                         "dollars": 5000}]}, when=WHEN))
-    examples.extend(payload for _, payload in post.messages_for(
-        "research-scan", 0, {"written": 1, "candidates": [
-            {"ticker": "AAA", "side": "long", "sue": 1.2}]}, when=WHEN))
-    examples.extend(payload for _, payload in post.messages_for(
-        "research-watch", 0, {"status": "ok", "new_events": 1, "events": [{
-            "subject_ticker": "INTC", "filer_name": "Example LP",
-            "form": "SC 13D",
-            "url": "https://www.sec.gov/Archives/edgar/data/1/x.htm"}]},
-        when=WHEN))
-    examples.extend(payload for _, payload in post.messages_for(
-        "research-score", 0, {"sample": 40, "hit_rate": 0.55,
-                              "coefficient_usable": True,
-                              "drift_bps_per_sue": 12.0}, when=WHEN))
-    examples.extend(payload for _, payload in post.messages_for(
-        "research-fills", 0, {"status": "ok", "submitted": 1, "rejected": 0,
-                              "action": "submit"}, when=WHEN))
-    examples.extend(payload for _, payload in post.messages_for(
-        "research-status", 1, {"attention": ["score has no usable coefficient"]},
-        when=WHEN))
-    examples.extend(post.brief_messages(
-        "## Pre-market\n\nAAA is unchanged.", when=WHEN))
+
+    def messages(job, code, result, **kwargs):
+        return [payload for _, payload in post.messages_for(
+            job, code, result, when=WHEN, **kwargs)]
+
+    watch_events = [{
+        "subject_ticker": f"T{i}", "filer_name": "Example LP", "form": "SC 13D",
+        "url": f"https://www.sec.gov/Archives/edgar/data/{i}/x.htm"}
+        for i in range(9)]
+    examples += messages("research-copy", 0, {
+        "status": "ok", "rows_written": 1, "accepted": 1,
+        "preview": [{"ticker": "AAA", "member": "Ada Lovelace",
+                     "dollars": 5000}]})
+    examples += messages("research-scan", 0, {"written": 1, "candidates": [
+        {"ticker": "AAA", "side": "long", "sue": 1.2}]})
+    examples += messages("research-scan", 0, {
+        "written": 2, "rejected": [],
+        "candidates": [{"ticker": "AAA", "side": "long", "sue": 1.2},
+                       {"ticker": "BBB", "side": "short", "sue": -1.1}],
+        "superseded": {"dropped": ["BBB"],
+                       "note": "2026-11-06 already holds a row for BBB"}})
+    examples += messages("research-watch", 0, {
+        "status": "partial", "new_events": 9, "events": watch_events})
+    def watch(code, result, state):
+        return [payload for _, payload in post.watch_messages(
+            code, result, state, when=WHEN)[0]]
+
+    examples += watch(1, {"status": "failed", "error": "EDGAR returned 503"}, {})
+    examples += watch(0, {"status": "partial", "new_events": 0, "events": []},
+                      {"failing_since": WHEN - 3600, "failed_passes": 3})
+    examples += messages("research-score", 0, {
+        "sample": 40, "hit_rate": 0.55, "coefficient_usable": True,
+        "drift_bps_per_sue": 12.0})
+    examples += messages("research-announce", 0, {
+        "written": 3, "tickers": 5, "covered": 4,
+        "failed": ["AAA: ReadTimeout: slow"], "outcomes": {}})
+    examples += messages("research-fills", 1, {
+        "action": "submit", "status": "partial", "submitted": 2, "skipped": 0,
+        "rejected": 1, "missed": 0, "notes": ["1 rejected", "copy: 1 submitted"],
+        "copy": {"status": "ok", "submitted": 1, "skipped": 0, "rejected": 0,
+                 "missed": 0}})
+    examples += messages("congress-sync", 0, {"parsed": 12, "failures": 0})
+    examples += messages("research-backup", 0, {"bytes": 2_200_000_000,
+                                                "removed": 1})
+    examples += messages("research-status", 1, {
+        "attention": ["score has no usable coefficient"]})
+    examples += messages("research-status", 0, {"attention": []})
+    examples.append(post.cron_message(
+        "research-watch", post.LOCK_HELD, "", when=WHEN))
+    examples.append(post.cron_message(
+        "research-copy", 137, "Killed\nexit 137", when=WHEN))
+    brief = ("## Pre-market\n\nAAA is unchanged.\n\n```python\n"
+             + "\n".join(f"x = {i}" for i in range(700)) + "\n```")
+    examples.extend(post.brief_messages(brief, when=WHEN))
+    return examples
+
+
+def test_every_example_message_fits_the_limits():
+    examples = _examples()
+    assert len(examples) >= 20
+    for payload in examples:
+        assert payload["flags"] & post.IS_COMPONENTS_V2
+        assert _count(payload) <= post.COMPONENT_LIMIT
+        assert sum(len(item) for item in _texts(payload)) <= post.TEXT_LIMIT
+
+
+@pytest.mark.network
+@pytest.mark.live_discord
+@pytest.mark.skipif(not os.environ.get("DISCORD_PREVIEW_WEBHOOK_URL"),
+                    reason="DISCORD_PREVIEW_WEBHOOK_URL is not set")
+def test_preview_accepts_every_message_type():
+    """One example of every message, to the preview webhook only, through the
+    real transport: wait=true, a message id in every answer, 429 retried."""
     import time
-    endpoint = post.webhook_endpoint(url)
-    with httpx.Client(timeout=30) as client:
-        for payload in examples:
-            response = None
-            for _attempt in range(4):
-                try:
-                    response = client.post(endpoint, json=payload)
-                except Exception:
-                    raise AssertionError("preview post failed") from None
-                if response.status_code != 429:
-                    break
-                time.sleep(1)
-            assert response is not None and 200 <= response.status_code < 300, (
-                response.status_code if response is not None else "no response")
-            time.sleep(0.4)
+
+    endpoint = post.webhook_endpoint(os.environ["DISCORD_PREVIEW_WEBHOOK_URL"])
+    for payload in _examples():
+        REAL_SEND(endpoint, payload)
+        time.sleep(0.4)

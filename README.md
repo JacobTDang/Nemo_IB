@@ -56,7 +56,8 @@ the problems that a passing test suite does not find.
 The scheduled jobs post to Discord. `NEMO_DISCORD_SIGNALS_WEBHOOK_URL` is the
 #signals channel. `NEMO_DISCORD_OPS_WEBHOOK_URL` is the #ops channel. Put both
 values in the repository `.env`. The compose file passes each service only the
-channel that service posts to. A missing value is a failed run. It names the
+channel that service posts to. A run that finds nothing and does not fail
+posts nothing. A missing value is a failed run with exit code 75. It names the
 setting. The job still keeps the rows it already recorded.
 
 ### Registering with an MCP client
