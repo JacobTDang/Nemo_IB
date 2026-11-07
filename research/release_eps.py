@@ -101,6 +101,14 @@ _NON_GAAP = re.compile(
     r"|\bA?FFO\b|comprehensive\s+income|operating\s+earnings|economic\s+return",
     re.I)
 
+# A sentence that ends "on an adjusted basis", or a similar phrase, qualifies
+# its figure as non-GAAP even when the words follow the number. A trailing
+# "when excluding ..." demerits the sentence so a clean GAAP one beats it, but
+# does not disqualify it on its own.
+_AFTER_QUALIFIER = re.compile(
+    r"\bon\s+(?:an?\s+)?(?:[a-z-]+\s+)?(?:adjusted|non[-\s]?gaap|pro\s*forma|normali[sz]ed)(?:\s+[a-z-]+)?\s+basis\b",
+    re.I)
+
 # A component of earnings is not the earnings. Aflac's quarter-naming sentence
 # was "included pretax net realized investment losses of $322 million, or
 # $0.42 per diluted share", and it outranked the headline. Demoted, not
@@ -149,9 +157,12 @@ _ANNUAL = re.compile(
 #
 # Only the markers that never occur in prose. "Three months ended June 27,
 # 2025" is how a headline paragraph names its own quarter, and a guard on it
-# refused all 23 of Coca-Cola's releases.
+# refused all 23 of Coca-Cola's releases. First Horizon's statements are
+# flattened with their labels cut short ("Inco… 2019 Stat… 2020"), and that
+# header is a statement marker too.
 _STATEMENT = re.compile(
-    r"\(in\s+(?:millions|thousands|billions)|except\s+per[-\s]+share", re.I)
+    r"\(in\s+(?:millions|thousands|billions)|except\s+per[-\s]+share"
+    r"|Inco…\s+\d{4}\s+Stat…", re.I)
 
 # A dollar figure, with the three ways a loss is written: $(0.12), ($0.12),
 # -$0.12, and a table's bare "$ -0.33".
@@ -265,6 +276,19 @@ def _figure_beside(sentence: str, match: "re.Match"):
     return None
 
 
+def _clause_of(sentence: str, match: re.Match) -> str:
+    """The clause holding the match, between semicolons or the sentence ends.
+
+    First Horizon's headline is one sentence with two clauses: "with an EPS of
+    $0.41, ...; $217 Million or $0.42 on an Adjusted Basis". The qualifier is
+    the second clause's, not the first's."""
+    start = sentence.rfind(";", 0, match.start())
+    start = 0 if start == -1 else start + 1
+    end = sentence.find(";", match.end())
+    end = len(sentence) if end == -1 else end
+    return sentence[start:end]
+
+
 def _from_prose(text: str) -> Dict[str, Any]:
     """Sentence by sentence, in document order, ranked.
 
@@ -293,7 +317,8 @@ def _from_prose(text: str) -> Dict[str, Any]:
                 continue
             basis = "per_share"
         saw_phrase = True
-        if _NON_GAAP.search(sentence[:match.start()]):
+        clause = _clause_of(sentence, match)
+        if _NON_GAAP.search(sentence[:match.start()]) or _AFTER_QUALIFIER.search(clause):
             continue
         saw_gaap = True
         value = _figure_beside(sentence, match)
@@ -510,11 +535,17 @@ def _company(ticker: str, cik: Optional[str] = None):
 def _exhibit_rank(attachment) -> Optional[int]:
     """0 for EX-99.1, 1 for any other EX-99.x, None for not an exhibit 99.
 
-    Matched on the document name and the description together, because
-    JPMorgan's are `exhibit991narrative` and `ex992supplement`: a substring
-    check on `ex99` alone matched the supplement -- tables only -- and never
-    read the narrative press release.
+    Ranked by the attachment's declared `document_type` first: EX-99.1 gives
+    rank 0, and any other EX-99.N gives rank 1. When the type is absent or
+    carries no number, falling back to matching on the document name and
+    description together (JPMorgan's are `exhibit991narrative` and
+    `ex992supplement`).
     """
+    dtype = (getattr(attachment, "document_type", "") or "").strip()
+    m = re.match(r"^EX(?:HIBIT)?[-_ ]?99\.(\d+)$", dtype, re.I)
+    if m:
+        return 0 if m.group(1) == "1" else 1
+
     doc = (getattr(attachment, "document", "") or "").lower()
     descr = (getattr(attachment, "description", "") or "").lower()
     if not re.search(r"ex(?:hibit)?[-_ ]?99", doc + " " + descr):
