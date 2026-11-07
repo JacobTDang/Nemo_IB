@@ -130,6 +130,14 @@ def format_gib(nbytes: float) -> str:
     return f"{nbytes / (1024 ** 3):.1f} GiB"
 
 
+def _count(n: int, singular: str, plural: Optional[str] = None, *,
+           bold: bool = True) -> str:
+    """``**1** order`` or ``**1,200** orders``: the noun agrees with the count."""
+    noun = singular if n == 1 else (plural or f"{singular}s")
+    number = f"{n:,}"
+    return f"**{number}** {noun}" if bold else f"{number} {noun}"
+
+
 def _fixed(value: Any, places: int) -> str:
     try:
         return f"{float(value):.{places}f}"
@@ -512,7 +520,7 @@ def _copy(result, failed, seconds, when, error):
     if not failed and (result.get("status") == "off" or rows == 0):
         return []
     messages = [("ops", ops_message(
-        "research-copy", f"**{rows:,}** decisions recorded",
+        "research-copy", f"{_count(rows, 'decision')} recorded",
         ok=not failed, seconds=seconds, error=error, when=when))]
     preview = result.get("preview") or []
     if preview and not failed:
@@ -542,7 +550,7 @@ def _scan(result, failed, seconds, when, error):
     note = (f"⚠️ {escape_text(str(superseded.get('note') or 'an earlier decision stands'))}"
             if superseded else "")
     messages = [("ops", ops_message(
-        "research-scan", f"**{len(filed):,}** orders filed",
+        "research-scan", f"{_count(len(filed), 'order')} filed",
         ok=not failed, warning=warning, seconds=seconds, error=error,
         detail=note, when=when))]
     if filed and not failed:
@@ -578,10 +586,10 @@ def _events_message(events: Sequence[Any], count: int, when: int) -> dict:
         else:
             lines.append(escape_text(str(event)))
     total = max(count, len(events))
-    if total > len(shown):
+    if shown and total > len(shown):
         lines.append(f"and **{total - len(shown)}** more")
     return signal_message(
-        "Activist filing", lines or [f"**{count}** new filings"],
+        "Activist filing", lines or [_count(count, "new filing")],
         emoji="📋", color=BLURPLE, source="nemo research-watch",
         links=links, when=when)
 
@@ -613,7 +621,7 @@ def watch_messages(code: int, result: Optional[dict], state: dict, *,
     if failing_since:
         messages.append(("ops", ops_message(
             "research-watch",
-            f"recovered after **{passes}** failed passes, "
+            f"recovered after {_count(passes, 'failed pass')}, "
             f"failing since <t:{failing_since}:R>",
             ok=True, seconds=seconds, when=when)))
     events = result.get("events") or []
@@ -629,7 +637,7 @@ def _score(result, failed, seconds, when, error):
     if not failed and sample == 0:
         return []
     messages = [("ops", ops_message(
-        "research-score", f"**{sample:,}** trades scored",
+        "research-score", f"{_count(sample, 'trade')} scored",
         ok=not failed, seconds=seconds, error=error, when=when))]
     if not failed:
         usable = bool(result.get("coefficient_usable"))
@@ -656,21 +664,21 @@ def _announce(result, failed, seconds, when, error):
     failures = [str(item) for item in result.get("failed") or []]
     if failed:
         return [("ops", ops_message(
-            "research-announce", f"**{written:,}** announcement dates recorded",
+            "research-announce", f"{_count(written, 'announcement date')} recorded",
             ok=False, seconds=seconds, error=error or _failure_lines(failures),
             when=when))]
     if written == 0 and not failures:
         return []
     warning = bool(failures)
     messages = [("ops", ops_message(
-        "research-announce", f"**{written:,}** announcement dates recorded",
+        "research-announce", f"{_count(written, 'announcement date')} recorded",
         ok=True, warning=warning, seconds=seconds,
-        detail=f"⚠️ **{len(failures)}** lookups failed" if warning else "",
+        detail=f"⚠️ {_count(len(failures), 'lookup')} failed" if warning else "",
         error=_failure_lines(failures), when=when))]
     if written:
         messages.append(("signals", signal_message(
             "Earnings dates",
-            [f"**{written:,}** dates recorded from Item 2.02"],
+            [f"{_count(written, 'date')} recorded from Item 2.02"],
             emoji="📋", color=BLURPLE, source="nemo research-announce", when=when)))
     return messages
 
@@ -678,7 +686,7 @@ def _announce(result, failed, seconds, when, error):
 def _seed(result, failed, seconds, when, error):
     written = int(result.get("written") or 0)
     failures = [str(item) for item in result.get("failed") or []]
-    summary = f"**{written:,}** quarters recorded"
+    summary = f"{_count(written, 'quarter')} recorded"
     if failed:
         return [("ops", ops_message(
             "research-seed", summary, ok=False, seconds=seconds,
@@ -686,7 +694,7 @@ def _seed(result, failed, seconds, when, error):
     if failures:
         return [("ops", ops_message(
             "research-seed", summary, ok=True, warning=True, seconds=seconds,
-            detail=f"⚠️ **{len(failures)}** names failed",
+            detail=f"⚠️ {_count(len(failures), 'name')} failed",
             error=_failure_lines(failures), when=when))]
     if written == 0:
         return []
@@ -699,7 +707,7 @@ def _sync(result, failed, seconds, when, error):
     if not failed and parsed == 0:
         return []
     return [("ops", ops_message(
-        "congress-sync", f"**{parsed:,}** filings parsed", ok=not failed,
+        "congress-sync", f"{_count(parsed, 'filing')} parsed", ok=not failed,
         seconds=seconds, error=error, when=when))]
 
 
@@ -708,7 +716,8 @@ def _backup(result, failed, seconds, when, error):
     size = format_gib(float(result.get("bytes") or 0))
     return [("ops", ops_message(
         "research-backup",
-        f"**{size}** written, **{removed}** older copies removed",
+        f"**{size}** written, "
+        f"{_count(removed, 'older copy', 'older copies')} removed",
         ok=not failed, seconds=seconds, error=error, when=when))]
 
 
@@ -717,7 +726,9 @@ def _status(result, seconds, when):
     attention = [str(item) for item in result.get("attention") or []]
     if attention:
         return [("ops", ops_message(
-            "research-status", f"**{len(attention)}** items need attention",
+            "research-status",
+            f"{_count(len(attention), 'item')} "
+            f"{'needs' if len(attention) == 1 else 'need'} attention",
             ok=True, warning=True, seconds=seconds,
             error="\n".join(attention), when=when))]
     return [("ops", ops_message(
@@ -747,7 +758,7 @@ def _fills(result, seconds, when):
     warning = status == "partial" or rejected > 0 or missed > 0
     if not warning and count == 0:
         return []
-    lines = [f"**{count:,}** orders {verb}"]
+    lines = [f"{_count(count, 'order')} {verb}"]
     if copy_count:
         lines.append(f"Earnings **{earnings:,}** · Copy **{copy_count:,}**")
     if skipped:
@@ -774,16 +785,16 @@ def _daily(result, failed, seconds, when, error):
     if "days" in result and isinstance(result["days"], dict):
         days = result["days"]
         return [("ops", ops_message(
-            "research-daily", f"**{len(days):,}** backfill days",
+            "research-daily", f"{_count(len(days), 'backfill day')}",
             ok=not failed, quiet=False, seconds=seconds, error=error, when=when))]
     stages = {key: value for key, value in result.items()
               if isinstance(value, dict) and "status" in value}
     written = sum(int(value.get("written") or 0) for value in stages.values())
     failed_names = [name for name, value in stages.items() if value.get("status") == "failed"]
     gaps = result.get("gaps") or []
-    summary = f"**{written:,}** rows recorded"
+    summary = f"{_count(written, 'row')} recorded"
     if failed_names:
-        summary += f", **{len(failed_names)}** stages failed"
+        summary += f", {_count(len(failed_names), 'stage')} failed"
     detail_error = error
     if failed_names and not detail_error:
         bits = []
@@ -793,7 +804,7 @@ def _daily(result, failed, seconds, when, error):
         detail_error = "\n".join(bits)
     if gaps:
         detail_error = (detail_error + "\n" if detail_error else "") + (
-            f"{len(gaps)} coverage gaps")
+            f"{_count(len(gaps), 'coverage gap', bold=False)}")
     return [("ops", ops_message(
         "research-daily", summary, ok=not failed_names and not failed,
         quiet=False, seconds=seconds, error=detail_error, when=when))]

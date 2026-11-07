@@ -396,7 +396,7 @@ def test_a_copy_only_run_is_not_reported_as_nothing(book):
     result = _submit(FakeBroker())
     assert result["submitted"] == 0 and result["copy"]["submitted"] == 1
     messages = _fills_message(result, "submit", 0)
-    assert "**1** orders submitted" in body(message_to(messages, "signals"))
+    assert "**1** order submitted" in body(message_to(messages, "signals"))
 
 
 def test_a_rejection_is_a_yellow_warning_with_the_exit_code_kept(book):
@@ -493,7 +493,7 @@ def test_a_superseded_book_is_not_reported_as_filed():
                                "nothing was filed for it"}}
     messages = post.messages_for("research-scan", 0, result, when=WHEN)
     ops = message_to(messages, "ops")
-    assert "**1** orders filed" in body(ops)
+    assert "**1** order filed" in body(ops)
     assert "⚠️" in body(ops) and "already holds a row for BBB" in body(ops)
     assert ops["components"][0]["accent_color"] == post.YELLOW
     assert not silent(ops)
