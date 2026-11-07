@@ -778,7 +778,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     result = score_orders(as_of=args.as_of, horizon_days=args.horizon_days,
                           comparisons=args.comparisons)
     print(json.dumps(result, indent=2, default=str))
-    return 0
+    from research import discord_post
+    return discord_post.finish("research-score", 0, result)
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised via main()

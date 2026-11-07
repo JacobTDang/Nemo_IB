@@ -929,15 +929,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "reported as borrow_unpriced")
     args = parser.parse_args(argv)
 
+    from research import discord_post
     try:
         result = record_scan(as_of=args.as_of, borrow_rate=args.borrow_rate)
     except Exception as exc:  # noqa: BLE001 - reported, then non-zero
+        error = f"{type(exc).__name__}: {exc}"
         print(json.dumps({"as_of": args.as_of, "status": "failed",
-                          "error": f"{type(exc).__name__}: {exc}"}, indent=2))
-        return 1
+                          "error": error}, indent=2))
+        return discord_post.finish(
+            "research-scan", 1, {"status": "failed", "error": error, "written": 0})
 
     print(json.dumps(result, indent=2, default=str))
-    return 0
+    return discord_post.finish("research-scan", 0, result)
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised via main()

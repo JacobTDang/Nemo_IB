@@ -294,7 +294,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     # No names, or `--tickers` with none after it, is the eligible universe.
     result = seed(args.tickers or None)
     print(json.dumps(result, indent=2, default=str))
-    return 1 if result["failed"] and not result["written"] else 0
+    from research import discord_post
+    code = 1 if result["failed"] and not result["written"] else 0
+    return discord_post.finish("research-seed", code, result)
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised via main()

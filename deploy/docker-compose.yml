@@ -322,12 +322,12 @@ services:
   # So: sweep them. The label is what keeps this off every other project's
   # exited containers on the same host, and its value is this directory's name,
   # which is where compose gets the project name from -- hence the cd.
-  #   0 4 * * * cd /srv/nemo/deploy && { date -u; docker container prune -f --filter until=24h --filter label=com.docker.compose.project=deploy; } >> /srv/nemo/logs/docker-prune.log 2>&1 || tail -n 100 /srv/nemo/logs/docker-prune.log
+  #   0 4 * * * cd /srv/nemo/deploy && { date -u; docker container prune -f --filter until=24h --filter label=com.docker.compose.project=deploy && docker compose --env-file ../.env run --rm research-notify --job docker-prune --ok; } >> /srv/nemo/logs/docker-prune.log 2>&1 || { tail -n 100 /srv/nemo/logs/docker-prune.log; docker compose --env-file ../.env run --rm research-notify --job docker-prune --log /srv/nemo/logs/docker-prune.log; }
   #
   # And the healthcheck, which exits non-zero when a job has stopped
   # running. Midday on a weekday, so a night that failed is seen the
   # same day rather than the next time somebody looks:
-  #   0 12 * * 1-5 cd /srv/nemo/deploy && { date -u; docker compose --env-file ../.env run --rm research-status; } >> /srv/nemo/logs/research-status.log 2>&1 || tail -n 100 /srv/nemo/logs/research-status.log
+  #   0 12 * * 1-5 cd /srv/nemo/deploy && { date -u; docker compose --env-file ../.env run --rm research-status; } >> /srv/nemo/logs/research-status.log 2>&1 || { tail -n 100 /srv/nemo/logs/research-status.log; docker compose --env-file ../.env run --rm research-notify --job research-status --log /srv/nemo/logs/research-status.log; }
   #
   # A reboot mid-job does NOT block the next run, and that part is well built:
   # start_run (research/pit_store.py) only INSERTs, and missing_days counts a
@@ -345,7 +345,7 @@ services:
   #
   # Safe to re-run and safe to cron: filings already parsed are never
   # refetched, so a nightly run costs one index fetch plus whatever is new.
-  #   0 6 * * * cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-congress-sync.lock docker compose --env-file ../.env run --rm congress-sync; } >> /srv/nemo/logs/congress-sync.log 2>&1 || tail -n 100 /srv/nemo/logs/congress-sync.log
+  #   0 6 * * * cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-congress-sync.lock docker compose --env-file ../.env run --rm congress-sync; } >> /srv/nemo/logs/congress-sync.log 2>&1 || { tail -n 100 /srv/nemo/logs/congress-sync.log; docker compose --env-file ../.env run --rm research-notify --job congress-sync --log /srv/nemo/logs/congress-sync.log; }
   #
   # Deliberately NOT built from the *server anchor. That anchor requires
   # NEMO_MCP_TOKEN, and compose interpolates the whole file before merging, so
@@ -374,6 +374,7 @@ services:
       <<: [*filing-cache-env, *clock-env]
       NEMO_CONGRESS_DB: /app/data/congress.db
       SEC_EMAIL: ${SEC_EMAIL:-}
+      NEMO_DISCORD_OPS_WEBHOOK_URL: ${NEMO_DISCORD_OPS_WEBHOOK_URL:-}
     volumes:
       - congress-data:/app/data
     tmpfs:
@@ -408,7 +409,7 @@ services:
   #
   # After the close, allowing for late consolidated prints -- with the scan
   # chained onto the same line rather than given a clock time of its own:
-  #   30 22 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-daily.lock docker compose --env-file ../.env run --rm research-daily && flock -n /var/lock/nemo-research-scan.lock docker compose --env-file ../.env run --rm research-scan; } >> /srv/nemo/logs/research-daily.log 2>&1 || tail -n 100 /srv/nemo/logs/research-daily.log
+  #   30 22 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-daily.lock docker compose --env-file ../.env run --rm research-daily && flock -n /var/lock/nemo-research-scan.lock docker compose --env-file ../.env run --rm research-scan; } >> /srv/nemo/logs/research-daily.log 2>&1 || { tail -n 100 /srv/nemo/logs/research-daily.log; docker compose --env-file ../.env run --rm research-notify --job research-daily --log /srv/nemo/logs/research-daily.log; }
   #
   # This was two lines thirty minutes apart, which is a guess rather than a
   # dependency. The recorder does 15+ yfinance batches with retries, screens
@@ -429,6 +430,7 @@ services:
       NEMO_PIT_DB: /app/data/pit.db
       SEC_EMAIL: ${SEC_EMAIL:-}
       FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
+      NEMO_DISCORD_OPS_WEBHOOK_URL: ${NEMO_DISCORD_OPS_WEBHOOK_URL:-}
     volumes:
       - research-data:/app/data
     tmpfs:
@@ -463,6 +465,8 @@ services:
       NEMO_COPY_MAX_OPEN: ${NEMO_COPY_MAX_OPEN:-}
       NEMO_COPY_MAX_TRADE_AGE_DAYS: ${NEMO_COPY_MAX_TRADE_AGE_DAYS:-}
       NEMO_COPY_MEMBERS: ${NEMO_COPY_MEMBERS:-}
+      NEMO_DISCORD_OPS_WEBHOOK_URL: ${NEMO_DISCORD_OPS_WEBHOOK_URL:-}
+      NEMO_DISCORD_SIGNALS_WEBHOOK_URL: ${NEMO_DISCORD_SIGNALS_WEBHOOK_URL:-}
     volumes:
       - research-data:/app/data
     # It writes nothing to either, and gets them anyway: the rule that every
@@ -478,7 +482,7 @@ services:
         max-file: "3"
 
   # Congressional decisions, after the source sync and before fills submit.
-  #   30 12 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-copy.lock docker compose --env-file ../.env run --rm research-copy; } >> /srv/nemo/logs/research-copy.log 2>&1 || tail -n 100 /srv/nemo/logs/research-copy.log
+  #   30 12 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-copy.lock docker compose --env-file ../.env run --rm research-copy; } >> /srv/nemo/logs/research-copy.log 2>&1 || { tail -n 100 /srv/nemo/logs/research-copy.log; docker compose --env-file ../.env run --rm research-notify --job research-copy --log /srv/nemo/logs/research-copy.log; }
   research-copy:
     image: ${NEMO_IMAGE:-nemo-data:local}
     profiles: ["sync"]
@@ -495,6 +499,8 @@ services:
       NEMO_COPY_MAX_OPEN: ${NEMO_COPY_MAX_OPEN:-}
       NEMO_COPY_MAX_TRADE_AGE_DAYS: ${NEMO_COPY_MAX_TRADE_AGE_DAYS:-}
       NEMO_COPY_MEMBERS: ${NEMO_COPY_MEMBERS:-}
+      NEMO_DISCORD_OPS_WEBHOOK_URL: ${NEMO_DISCORD_OPS_WEBHOOK_URL:-}
+      NEMO_DISCORD_SIGNALS_WEBHOOK_URL: ${NEMO_DISCORD_SIGNALS_WEBHOOK_URL:-}
     volumes:
       - research-data:/app/data
       # Writable on purpose. The store is WAL, and SQLite keeps a reader's
@@ -537,6 +543,8 @@ services:
       <<: [*filing-cache-env, *clock-env]
       NEMO_PIT_DB: /app/data/pit.db
       SEC_EMAIL: ${SEC_EMAIL:-}
+      NEMO_DISCORD_OPS_WEBHOOK_URL: ${NEMO_DISCORD_OPS_WEBHOOK_URL:-}
+      NEMO_DISCORD_SIGNALS_WEBHOOK_URL: ${NEMO_DISCORD_SIGNALS_WEBHOOK_URL:-}
     volumes:
       - research-data:/app/data
     tmpfs:
@@ -559,7 +567,7 @@ services:
   #
   # Every twenty minutes through the session and a little past the close,
   # which is when 13Ds actually appear:
-  #   */20 13-23 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-watch.lock docker compose --env-file ../.env run --rm research-watch; } >> /srv/nemo/logs/research-watch.log 2>&1 || tail -n 100 /srv/nemo/logs/research-watch.log
+  #   */20 13-23 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-watch.lock docker compose --env-file ../.env run --rm research-watch; } >> /srv/nemo/logs/research-watch.log 2>&1 || { tail -n 100 /srv/nemo/logs/research-watch.log; docker compose --env-file ../.env run --rm research-notify --job research-watch --log /srv/nemo/logs/research-watch.log; }
   research-watch:
     image: ${NEMO_IMAGE:-nemo-data:local}
     profiles: ["sync"]
@@ -589,6 +597,8 @@ services:
       SEC_EMAIL: ${SEC_EMAIL:-}
       NAME: ${NAME:-}
       FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
+      NEMO_DISCORD_OPS_WEBHOOK_URL: ${NEMO_DISCORD_OPS_WEBHOOK_URL:-}
+      NEMO_DISCORD_SIGNALS_WEBHOOK_URL: ${NEMO_DISCORD_SIGNALS_WEBHOOK_URL:-}
     volumes:
       - research-data:/app/data
     tmpfs:
@@ -611,7 +621,7 @@ services:
   #   docker compose --env-file ../.env run --rm research-score
   #   docker compose --env-file ../.env run --rm research-score --horizon-days 40
   #
-  #   0 7 * * 6 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-score.lock docker compose --env-file ../.env run --rm research-score; } >> /srv/nemo/logs/research-score.log 2>&1 || tail -n 100 /srv/nemo/logs/research-score.log
+  #   0 7 * * 6 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-score.lock docker compose --env-file ../.env run --rm research-score; } >> /srv/nemo/logs/research-score.log 2>&1 || { tail -n 100 /srv/nemo/logs/research-score.log; docker compose --env-file ../.env run --rm research-notify --job research-score --log /srv/nemo/logs/research-score.log; }
   research-score:
     image: ${NEMO_IMAGE:-nemo-data:local}
     profiles: ["sync"]
@@ -620,6 +630,8 @@ services:
     environment:
       <<: *clock-env
       NEMO_PIT_DB: /app/data/pit.db
+      NEMO_DISCORD_OPS_WEBHOOK_URL: ${NEMO_DISCORD_OPS_WEBHOOK_URL:-}
+      NEMO_DISCORD_SIGNALS_WEBHOOK_URL: ${NEMO_DISCORD_SIGNALS_WEBHOOK_URL:-}
     volumes:
       - research-data:/app/data
     # This was the one batch service with no tmpfs, so /app/db_cache and
@@ -655,8 +667,8 @@ services:
   #
   # Submitted before the opening auction's 09:28 ET cutoff in both EDT and EST,
   # collected after the 09:30 open in both:
-  #   15 13 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-fills.lock docker compose --env-file ../.env run --rm research-fills submit; } >> /srv/nemo/logs/research-fills.log 2>&1 || tail -n 100 /srv/nemo/logs/research-fills.log
-  #   45 14 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-fills.lock docker compose --env-file ../.env run --rm research-fills collect; } >> /srv/nemo/logs/research-fills.log 2>&1 || tail -n 100 /srv/nemo/logs/research-fills.log
+  #   15 13 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-fills.lock docker compose --env-file ../.env run --rm research-fills submit; } >> /srv/nemo/logs/research-fills.log 2>&1 || { tail -n 100 /srv/nemo/logs/research-fills.log; docker compose --env-file ../.env run --rm research-notify --job research-fills --log /srv/nemo/logs/research-fills.log; }
+  #   45 14 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-fills.lock docker compose --env-file ../.env run --rm research-fills collect; } >> /srv/nemo/logs/research-fills.log 2>&1 || { tail -n 100 /srv/nemo/logs/research-fills.log; docker compose --env-file ../.env run --rm research-notify --job research-fills --log /srv/nemo/logs/research-fills.log; }
   research-fills:
     image: ${NEMO_FILLS_IMAGE:-nemo-fills:local}
     profiles: ["sync"]
@@ -669,6 +681,8 @@ services:
       ALPACA_PAPER_SECRET: ${ALPACA_PAPER_SECRET:-}
       NEMO_COPY_TRADING: ${NEMO_COPY_TRADING:-}
       NEMO_COPY_HOLD_DAYS: ${NEMO_COPY_HOLD_DAYS:-}
+      NEMO_DISCORD_OPS_WEBHOOK_URL: ${NEMO_DISCORD_OPS_WEBHOOK_URL:-}
+      NEMO_DISCORD_SIGNALS_WEBHOOK_URL: ${NEMO_DISCORD_SIGNALS_WEBHOOK_URL:-}
     volumes:
       - research-data:/app/data
     tmpfs:
@@ -695,7 +709,7 @@ services:
   # Safe to re-run: a quarter already in the record is never overwritten,
   # because a real observation outranks a reconstruction of it. Monthly is
   # plenty -- it only picks up names newly in the universe.
-  #   0 8 1 * * cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-seed.lock docker compose --env-file ../.env run --rm research-seed; } >> /srv/nemo/logs/research-seed.log 2>&1 || tail -n 100 /srv/nemo/logs/research-seed.log
+  #   0 8 1 * * cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-seed.lock docker compose --env-file ../.env run --rm research-seed; } >> /srv/nemo/logs/research-seed.log 2>&1 || { tail -n 100 /srv/nemo/logs/research-seed.log; docker compose --env-file ../.env run --rm research-notify --job research-seed --log /srv/nemo/logs/research-seed.log; }
   research-seed:
     image: ${NEMO_IMAGE:-nemo-data:local}
     profiles: ["sync"]
@@ -706,6 +720,7 @@ services:
       NEMO_PIT_DB: /app/data/pit.db
       SEC_EMAIL: ${SEC_EMAIL:-}
       FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
+      NEMO_DISCORD_OPS_WEBHOOK_URL: ${NEMO_DISCORD_OPS_WEBHOOK_URL:-}
     volumes:
       - research-data:/app/data
     tmpfs:
@@ -727,7 +742,7 @@ services:
   #   docker compose --env-file ../.env run --rm research-announce --tickers JPM WMT TGT
   #
   # Safe to re-run and cheap after the first pass. Weekly is plenty:
-  #   0 9 * * 6 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-announce.lock docker compose --env-file ../.env run --rm research-announce; } >> /srv/nemo/logs/research-announce.log 2>&1 || tail -n 100 /srv/nemo/logs/research-announce.log
+  #   0 9 * * 6 cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-announce.lock docker compose --env-file ../.env run --rm research-announce; } >> /srv/nemo/logs/research-announce.log 2>&1 || { tail -n 100 /srv/nemo/logs/research-announce.log; docker compose --env-file ../.env run --rm research-notify --job research-announce --log /srv/nemo/logs/research-announce.log; }
   research-announce:
     image: ${NEMO_IMAGE:-nemo-data:local}
     profiles: ["sync"]
@@ -738,6 +753,8 @@ services:
       NEMO_PIT_DB: /app/data/pit.db
       SEC_EMAIL: ${SEC_EMAIL:-}
       FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
+      NEMO_DISCORD_OPS_WEBHOOK_URL: ${NEMO_DISCORD_OPS_WEBHOOK_URL:-}
+      NEMO_DISCORD_SIGNALS_WEBHOOK_URL: ${NEMO_DISCORD_SIGNALS_WEBHOOK_URL:-}
     volumes:
       - research-data:/app/data
     tmpfs:
@@ -765,46 +782,49 @@ services:
   # off the host as well -- a backup on the machine that dies is not a backup.
   #
   #   docker compose --env-file ../.env run --rm research-backup
-  #   15 3 * * * cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-backup.lock docker compose --env-file ../.env run --rm research-backup; } >> /srv/nemo/logs/research-backup.log 2>&1 || tail -n 100 /srv/nemo/logs/research-backup.log
+  #   15 3 * * * cd /srv/nemo/deploy && { date -u; flock -n /var/lock/nemo-research-backup.lock docker compose --env-file ../.env run --rm research-backup; } >> /srv/nemo/logs/research-backup.log 2>&1 || { tail -n 100 /srv/nemo/logs/research-backup.log; docker compose --env-file ../.env run --rm research-notify --job research-backup --log /srv/nemo/logs/research-backup.log; }
   research-backup:
     image: ${NEMO_IMAGE:-nemo-data:local}
     profiles: ["sync"]
     restart: "no"
-    entrypoint:
-      - python
-      - -c
-      - |
-        import datetime, pathlib, sqlite3, sys
-        source_path = pathlib.Path("/app/data/pit.db")
-        out = pathlib.Path("/backups")
-        # Refuse rather than write an empty file over yesterday's good copy:
-        # a mistyped volume gives an empty /app/data, and a backup job whose
-        # failure mode is a valid-looking 0-row database is worse than none.
-        if not source_path.exists():
-            sys.exit(f"{source_path} is not there -- check the volume mount")
-        out.mkdir(parents=True, exist_ok=True)
-        dest = out / f"pit-{datetime.date.today().isoformat()}.db"
-        source, target = sqlite3.connect(source_path), sqlite3.connect(dest)
-        try:
-            source.backup(target)
-        finally:
-            target.close()
-            source.close()
-        # Host disk, so it needs a bound of its own. Fourteen dailies.
-        stale = sorted(out.glob("pit-*.db"))[:-14]
-        for path in stale:
-            path.unlink()
-        print(f"wrote {dest} ({dest.stat().st_size} bytes), "
-              f"removed {len(stale)} older than the last 14")
-    # The only key it gets, and the only one it reads: the backup file is named
-    # `pit-<date>.db` off `datetime.date.today()`, which is local time. On a
-    # container an hour the other side of midnight that is a name for a day
-    # nobody backed up, and the fourteen-file window then keeps the wrong ones.
+    entrypoint: ["python", "-m", "research.backup_job"]
+    # The backup file is named `pit-<date>.db` off `datetime.date.today()`,
+    # which is local time. On a container an hour the other side of midnight
+    # that is a name for a day nobody backed up, and the fourteen-file window
+    # then keeps the wrong ones. TZ is pinned so today() is the UTC date.
+    # The ops webhook is the only other key. The job posts one line after the
+    # copy is on disk. A failed post does not delete the copy.
     environment:
       <<: *clock-env
+      NEMO_DISCORD_OPS_WEBHOOK_URL: ${NEMO_DISCORD_OPS_WEBHOOK_URL:-}
     volumes:
       - research-data:/app/data
       - ${NEMO_BACKUP_DIR:-/srv/nemo/backups}:/backups
+    tmpfs:
+      - /root/.edgar:rw,size=16m
+      - /app/db_cache:rw,size=16m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # The cron failure branch. A job that dies before it can post, and the
+  # container prune, reach #ops through this service. It reads one log file
+  # and one webhook. It holds no store and no broker key.
+  research-notify:
+    image: ${NEMO_IMAGE:-nemo-data:local}
+    profiles: ["sync"]
+    restart: "no"
+    entrypoint: ["python", "-m", "research.notify"]
+    environment:
+      <<: *clock-env
+      NEMO_DISCORD_OPS_WEBHOOK_URL: ${NEMO_DISCORD_OPS_WEBHOOK_URL:-}
+    volumes:
+      - /srv/nemo/logs:/srv/nemo/logs:ro
+    tmpfs:
+      - /root/.edgar:rw,size=16m
+      - /app/db_cache:rw,size=16m
     logging:
       driver: json-file
       options:

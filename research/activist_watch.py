@@ -467,7 +467,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     result["latency"] = latency_report(as_of=args.as_of)
 
     print(json.dumps(result, indent=2, default=str))
-    return 1 if result.get("status") == "failed" else 0
+    from research import discord_post
+    code = 1 if result.get("status") == "failed" else 0
+    return discord_post.finish("research-watch", code, result)
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised via main()

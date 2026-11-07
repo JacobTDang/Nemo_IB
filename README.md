@@ -53,6 +53,12 @@ servers. [`deploy/README.md`](deploy/README.md) gives the measurements behind
 those numbers. It also covers what persists, log retention, authentication, and
 the problems that a passing test suite does not find.
 
+The scheduled jobs post to Discord. `NEMO_DISCORD_SIGNALS_WEBHOOK_URL` is the
+#signals channel. `NEMO_DISCORD_OPS_WEBHOOK_URL` is the #ops channel. Put both
+values in the repository `.env`. The compose file passes each service only the
+channel that service posts to. A missing value is a failed run. It names the
+setting. The job still keeps the rows it already recorded.
+
 ### Registering with an MCP client
 
 The servers use streamable HTTP with a bearer token. Register one entry, for the

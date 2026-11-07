@@ -198,15 +198,31 @@ def run() -> dict:
         pit_store.finish_run(status='failed', error=error, run_id=run_id)
         return {'status': 'failed', 'as_of': as_of, 'error': error, 'rows_written': 0}
     pit_store.finish_run(rows_written=written, status='ok', run_id=run_id)
-    return {'status': 'ok', 'as_of': as_of, 'rows_written': written}
+    accepted_rows = [row for row in decisions if row.get('accepted')]
+    return {
+        'status': 'ok', 'as_of': as_of, 'rows_written': written,
+        'accepted': len(accepted_rows),
+        'preview': [{'ticker': row.get('ticker'), 'member': row.get('member'),
+                     'dollars': row.get('target_dollars')}
+                    for row in accepted_rows[:8]],
+    }
 
 
 def main() -> int:
-    if enabled():
-        pit_store.init_schema()
-    result = run()
+    from research import discord_post
+    try:
+        if enabled():
+            pit_store.init_schema()
+        result = run()
+    except Exception as exc:  # noqa: BLE001 - recorded data stays; the exit reports it
+        error = f'{type(exc).__name__}: {exc}'
+        print(json.dumps({'status': 'failed', 'error': error, 'rows_written': 0}))
+        return discord_post.finish(
+            'research-copy', 1,
+            {'status': 'failed', 'error': error, 'rows_written': 0})
     print(json.dumps(result, indent=2))
-    return 1 if result['status'] == 'failed' else 0
+    code = 1 if result['status'] == 'failed' else 0
+    return discord_post.finish('research-copy', code, result)
 
 
 if __name__ == '__main__':

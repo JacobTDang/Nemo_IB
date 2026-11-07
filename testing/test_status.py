@@ -17,6 +17,21 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def discord_webhooks_are_set(monkeypatch):
+    """The status screen treats a missing webhook as attention.
+
+    These tests are about the store. They set both webhooks so a clean store
+    stays clean, and they do not post.
+    """
+    monkeypatch.setenv("NEMO_DISCORD_OPS_WEBHOOK_URL", "https://hooks.example/ops")
+    monkeypatch.setenv(
+        "NEMO_DISCORD_SIGNALS_WEBHOOK_URL", "https://hooks.example/signals")
+    monkeypatch.setattr(
+        "research.discord_post.finish",
+        lambda job, code, result=None, **kwargs: code)
+
 from research import pit_store, scanner, status
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -43,7 +58,10 @@ def test_every_scheduled_job_is_one_this_report_knows_about():
         entrypoint = service.get("entrypoint") or []
         if isinstance(entrypoint, list) and "-m" in entrypoint:
             module = entrypoint[entrypoint.index("-m") + 1]
-            if module.startswith("research.") and module != "research.status":
+            # status reads the log. notify and backup do not write a run row:
+            # notify is the cron failure branch, and backup copies the file.
+            if module.startswith("research.") and module not in {
+                    "research.status", "research.notify", "research.backup_job"}:
                 modules.add(module)
 
     covered = {j["module"] for j in status.JOBS}
@@ -565,6 +583,14 @@ def test_enabled_copy_job_reports_failed_run(store, monkeypatch):
     report = status.collect(as_of='2026-03-05')
     assert _job(report, 'congress_copy')['state'] == 'failed'
     assert any('stale House sync' in a for a in report['attention'])
+
+
+def test_a_missing_discord_webhook_needs_attention(store, monkeypatch):
+    monkeypatch.delenv("NEMO_DISCORD_OPS_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("NEMO_DISCORD_SIGNALS_WEBHOOK_URL", raising=False)
+    attention = status.collect()["attention"]
+    assert any("NEMO_DISCORD_OPS_WEBHOOK_URL is not set" in item for item in attention)
+    assert any("NEMO_DISCORD_SIGNALS_WEBHOOK_URL is not set" in item for item in attention)
 
 
 def test_status_refuses_unknown_copy_flag(store, monkeypatch):

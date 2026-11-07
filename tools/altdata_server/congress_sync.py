@@ -447,7 +447,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     # A blocked source is a non-zero exit too: the run did not cover what it
     # was asked to cover, and a caller reading only the status code would
     # otherwise treat a refusal as a completed backfill.
-    return 1 if failures or blocked else 0
+    from research import discord_post
+    code = 1 if failures or blocked else 0
+    overall = store.coverage()
+    error = ""
+    if failures or blocked:
+        error = f"{failures} sources failed, {blocked} blocked"
+    return discord_post.finish("congress-sync", code, {
+        "parsed": overall.get("parsed") or 0,
+        "failures": failures,
+        "error": error,
+    })
 
 
 

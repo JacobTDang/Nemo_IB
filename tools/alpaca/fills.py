@@ -528,14 +528,20 @@ def main(argv=None) -> int:
                 return await submit(broker, args.as_of, args.horizon_days)
             return await collect(broker, args.as_of)
 
+    from research import discord_post
     try:
         result = asyncio.run(run())
     except Exception as exc:  # noqa: BLE001 - reported, then non-zero
+        error = f"{type(exc).__name__}: {exc}"
         print(json.dumps({"action": args.action, "status": "failed",
-                          "error": f"{type(exc).__name__}: {exc}"}, indent=2))
-        return 1
+                          "error": error}, indent=2))
+        return discord_post.finish(
+            "research-fills", 1,
+            {"action": args.action, "status": "failed", "error": error})
     print(json.dumps(result, indent=2, default=str))
-    return 0 if result["status"] in ("ok", "closed") else 1
+    code = 0 if result["status"] in ("ok", "closed") else 1
+    return discord_post.finish(
+        "research-fills", code, {**result, "action": args.action})
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised via main()

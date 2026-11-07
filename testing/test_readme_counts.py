@@ -330,9 +330,10 @@ def test_the_scan_is_chained_behind_the_recorder_not_timed_after_it(deploy_doc):
     assert scan_lines, "nothing on the page schedules research-scan"
     for schedule, command in scan_lines:
         services = RUNS.findall(command)
-        assert services == ["research-daily", "research-scan"], (
+        assert services[:2] == ["research-daily", "research-scan"], (
             f"'{schedule} {command}' runs {services}; the scan has to be "
             f"chained behind the recorder in one line")
+        assert set(services[2:]) <= {"research-notify"}, services
         assert " && " in command.split("research-daily", 1)[1], (
             "the two commands are not joined by `&&`, so the scan runs "
             "whatever the recorder did")

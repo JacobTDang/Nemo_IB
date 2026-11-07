@@ -348,6 +348,9 @@ def collect(as_of: Optional[str] = None) -> Dict[str, Any]:
             f"risk switch tripped on {risk['tripped']['as_of_date']}; the scan "
             f"files no orders until it is reset with a reason")
 
+    from research.discord_post import missing_settings
+    attention.extend(missing_settings())
+
     return {"as_of": as_of, "jobs": jobs, "store": _store_summary(),
             "book": _book_summary(as_of), "risk": risk,
             "gate": pit_store.latest_gate_check(as_of),
@@ -469,7 +472,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     report = collect(as_of=args.as_of)
     print(json.dumps(report, indent=2, default=str) if args.json
           else _render(report))
-    return 1 if report["attention"] else 0
+    from research import discord_post
+    code = 1 if report["attention"] else 0
+    return discord_post.finish("research-status", code, report)
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised via main()
