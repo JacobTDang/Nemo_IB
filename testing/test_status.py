@@ -17,6 +17,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
+
 from research import pit_store, scanner, status
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -43,7 +44,10 @@ def test_every_scheduled_job_is_one_this_report_knows_about():
         entrypoint = service.get("entrypoint") or []
         if isinstance(entrypoint, list) and "-m" in entrypoint:
             module = entrypoint[entrypoint.index("-m") + 1]
-            if module.startswith("research.") and module != "research.status":
+            # status reads the log. notify and backup do not write a run row:
+            # notify is the cron failure branch, and backup copies the file.
+            if module.startswith("research.") and module not in {
+                    "research.status", "research.notify", "research.backup_job"}:
                 modules.add(module)
 
     covered = {j["module"] for j in status.JOBS}
@@ -565,6 +569,15 @@ def test_enabled_copy_job_reports_failed_run(store, monkeypatch):
     report = status.collect(as_of='2026-03-05')
     assert _job(report, 'congress_copy')['state'] == 'failed'
     assert any('stale House sync' in a for a in report['attention'])
+
+
+def test_the_status_screen_does_not_read_discord_settings(store, monkeypatch):
+    """`nemo status` runs on the host, where no webhook is set. Only a service
+    that posts needs its webhook, and its own post names the missing setting."""
+    monkeypatch.delenv("NEMO_DISCORD_OPS_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("NEMO_DISCORD_SIGNALS_WEBHOOK_URL", raising=False)
+    attention = status.collect()["attention"]
+    assert not any("DISCORD" in item for item in attention)
 
 
 def test_status_refuses_unknown_copy_flag(store, monkeypatch):

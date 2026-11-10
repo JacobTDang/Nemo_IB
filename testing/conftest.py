@@ -41,6 +41,21 @@ def pytest_sessionstart(session):
     load_dotenv(dotenv_path, override=False)
 
 
+@pytest.fixture(autouse=True)
+def discord_posts_stay_in_process(monkeypatch):
+    """Job entry points post to Discord after they record.
+
+    The suite sets both webhooks and drops the HTTP call. A test that wants
+    the missing-webhook failure deletes the variables itself. The live preview
+    test posts with its own client and does not use this stub.
+    """
+    monkeypatch.setenv("NEMO_DISCORD_OPS_WEBHOOK_URL", "https://hooks.example/ops")
+    monkeypatch.setenv(
+        "NEMO_DISCORD_SIGNALS_WEBHOOK_URL", "https://hooks.example/signals")
+    monkeypatch.setattr(
+        "research.discord_post._http_send", lambda url, body: None)
+
+
 @pytest.fixture(autouse=True, scope="module")
 def isolated_process_caches():
     """Clear in-process caches between test modules.

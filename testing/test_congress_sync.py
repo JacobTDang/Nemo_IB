@@ -449,13 +449,13 @@ def years_asked_for(monkeypatch):
 
     def sync_house(year, **kwargs):
         asked.append(year)
-        return {"blocked": False}
+        return {"blocked": False, "filings_parsed": 0}
 
     monkeypatch.setattr(sync, "sync_house_ptrs", sync_house)
     monkeypatch.setattr(sync, "sync_senate_ptrs",
-                        lambda **kwargs: {"blocked": False})
+                        lambda **kwargs: {"blocked": False, "filings_parsed": 0})
     monkeypatch.setattr(sync, "sync_senate_annuals",
-                        lambda **kwargs: {"blocked": False})
+                        lambda **kwargs: {"blocked": False, "filings_parsed": 0})
     return asked
 
 

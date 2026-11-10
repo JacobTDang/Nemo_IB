@@ -42,7 +42,9 @@ def _scheduled_research_modules():
     and recording its own runs would put a row in the log for every time
     somebody looked at the log.
     """
-    reporters = {"research.status"}
+    # notify posts a cron failure. backup copies the database file. Neither
+    # writes run_log. The status report documents that gap on purpose.
+    reporters = {"research.status", "research.notify", "research.backup_job"}
     import yaml
 
     services = yaml.safe_load(COMPOSE.read_text())["services"]

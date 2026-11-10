@@ -316,7 +316,9 @@ async def submit(broker, today: Optional[str] = None,
     out: Dict[str, Any] = {
         "as_of": today, "status": "ok", "submitted": 0, "skipped": 0,
         "rejected": 0, "missed": 0, "copy": _empty_book()}
+    # The same notes the run log keeps, so Discord can say what went wrong.
     notes: List[str] = []
+    out["notes"] = notes
     try:
         earn_orders = pit_store.paper_orders_as_of(today, accepted_only=True)
         earn_fills = pit_store.paper_fills_as_of(today)
@@ -419,6 +421,7 @@ async def collect(broker, today: Optional[str] = None) -> Dict[str, Any]:
         "as_of": today, "status": "ok", "asked": 0, "updated": 0,
         "copy": {"status": "ok", "asked": 0, "updated": 0}}
     notes: List[str] = []
+    out["notes"] = notes
     try:
         try:
             earn = await _collect_legs(broker, today, table="paper_fill")
@@ -506,6 +509,9 @@ def main(argv=None) -> int:
     import argparse
     import json
 
+    from research import discord_post
+    elapsed = discord_post.stopwatch()
+
     pit_store.init_schema()
     parser = argparse.ArgumentParser(
         prog="fills", description="Paper fills against the filed book.")
@@ -531,11 +537,18 @@ def main(argv=None) -> int:
     try:
         result = asyncio.run(run())
     except Exception as exc:  # noqa: BLE001 - reported, then non-zero
+        error = f"{type(exc).__name__}: {exc}"
         print(json.dumps({"action": args.action, "status": "failed",
-                          "error": f"{type(exc).__name__}: {exc}"}, indent=2))
-        return 1
+                          "error": error}, indent=2))
+        return discord_post.finish(
+            "research-fills", 1,
+            {"action": args.action, "status": "failed", "error": error},
+            seconds=elapsed())
     print(json.dumps(result, indent=2, default=str))
-    return 0 if result["status"] in ("ok", "closed") else 1
+    code = 0 if result["status"] in ("ok", "closed") else 1
+    return discord_post.finish(
+        "research-fills", code, {**result, "action": args.action},
+        seconds=elapsed())
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised via main()
