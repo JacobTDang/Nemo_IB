@@ -73,13 +73,15 @@ FETCH_RETRY_BACKOFF = 3.0
 # "per basic and diluted common share" and Prelude's "per share of common
 # stock, basic and diluted" are the one-figure label too.
 _DILUTED = re.compile(
-    r"(?:per\s+(?:fully\s+)?diluted\s+(?:common\s+)?share"
-    r"|diluted\s+(?:net\s+)?(?:earnings|income|loss|eps)(?:\s+per\s+(?:common\s+)?share)?"
+    r"(?:"
+    r"per\s+(?:fully\s+)?diluted\s+(?:common\s+)?share"
+    r"|diluted\s+(?:net\s+)?(?:earnings|income|loss(?:\s+in\s+earnings)?|eps)(?:\s+per\s+(?:common\s+)?share)?"
     r"|(?:earnings|income|loss)\s+per\s+diluted\s+(?:common\s+)?share"
     r"|diluted\s+eps"
     r"|per\s+basic\s+and\s+diluted\s+(?:common\s+)?share"
     r"|per\s+(?:common\s+)?share\s*\(\s*diluted\s*\)"
-    r"|per\s+(?:share\s+of\s+common\s+stock|common\s+share|share),?\s+basic\s+and\s+diluted)", re.I)
+    r"|per\s+(?:share\s+of\s+common\s+stock|common\s+share|share),?\s+basic\s+and\s+diluted"
+    r")(?:\s*\(\s*[\"']?[A-Za-z-]+[\"']?\s*\))?", re.I)
 
 # The unqualified form banks use: "$7.70 per share", "EPS of $7.70". Accepted
 # only in a sentence that is about earnings and not about a distribution.
@@ -93,7 +95,7 @@ _NOT_EARNINGS = re.compile(
 
 # Qualifiers that make a figure something other than the GAAP one.
 _NON_GAAP = re.compile(
-    r"non[-\s]?gaap|adjusted|pro\s*forma|normali[sz]ed|core\s+(?:eps|earnings)"
+    r"non[-\s]?gaap|adjusted|pro\s*forma|normali[sz]ed|\bcore(?!\s+(?:business|banking|deposits?|operating))\b"
     r"|excluding|ex[-\s]items|significant\s+items|\bcomparable\b"
     # A REIT's or an insurer's headline metric, which is non-GAAP by another
     # name: AGNC's "net spread and dollar roll income per common share".
@@ -114,8 +116,11 @@ _AFTER_QUALIFIER = re.compile(
 # $0.42 per diluted share", and it outranked the headline. Demoted, not
 # skipped: some headlines say "included" too.
 _COMPONENT = re.compile(
-    r"\b(?:included|includes|including|impact\s+of|benefit\s+of|charges?\s+of"
-    r"|gains?\s+of|losses\s+of|expense\s+of|related\s+to"
+    r"\b(?:included|includes|include|including|impact\s+of|benefit\s+of|charges?\s+of"
+    r"|gains?\s+of|losses\s+of|expense\s+of|related\s+to|merger[-\s]related"
+    r"|provision\s+for|reduction\s+to|reduced\s+(?:after-tax\s+)?net\s+income|charges?\s+to\s+(?:net\s+)?earnings"
+    r"|(?:losses?|gains?)\s+on\s+(?:the\s+)?sales?|securities\s+losses?"
+    r"|increased\s+\$[\d.]+\s*(?:million|billion)?,\s*or\s+\$[\d.]+\s+per\s+diluted\s+share"
     # AGNC: "a net loss of $(433) million in other gain (loss), net, or
     # $(0.39) per common share" -- the amount is a line item.
     r"|\bin\s+other\b|\bin\s+[a-z\s()]{3,40},\s*net\b)", re.I)
@@ -124,8 +129,10 @@ _COMPONENT = re.compile(
 # $1.94 per diluted share in the fourth quarter of 2025" names a quarter --
 # the prior one -- and beat the headline that named none.
 _COMPARATIVE = re.compile(
-    r"\b(?:this|that|which)\s+compares\b|^\s*compared\s+(?:with|to)"
-    r"|^\s*(?:versus|vs\.?)\s", re.I)
+    r"\b(?:this|that|which)\s+compares\b|^\s*(?:\([0-9]+\)\s*)?(?:this|that|which)\s+compares\b"
+    r"|^\s*compared\s+(?:with|to)"
+    r"|^\s*(?:versus|vs\.?)\s"
+    r"|\bprior\s+year\s+(?:earnings|net\s+income|loss|results)\b", re.I)
 
 # XBRL's diluted EPS is the total. Continuing operations is a different basis
 # when there were discontinued ones -- demoted, and accepted when it is all
@@ -143,12 +150,12 @@ _NET_INCOME = re.compile(r"\bnet\s+(?:income|earnings)\b", re.I)
 # and the year comes first.
 _QUARTER = re.compile(
     r"(?:first|second|third|fourth)[-\s]quarter|\bQ[1-4]\b|\d[qQ]\d{2}\b"
-    r"|three\s+months|\bquarterly\b", re.I)
+    r"|three\s+(?:and\s+(?:six|nine)\s+)?months|\bquarterly\b", re.I)
 _ANNUAL = re.compile(
-    r"fiscal\s+(?:year|20\d\d)|full[-\s]year|twelve\s+months|year\s+ended"
+    r"\bannual\b|fiscal\s+(?:year|20\d\d)|full[-\s]year|twelve\s+months|year\s+ended"
     r"|\bfor\s+(?:the\s+year|20\d\d)\b|\bin\s+20\d\d\b"
     # Year-to-date is not the quarter either.
-    r"|(?:six|nine)\s+months|year[-\s]to[-\s]date|first\s+half", re.I)
+    r"|(?:six|nine)\s+months|six[-\s]month\s+period|nine[-\s]month\s+period|year[-\s]to[-\s]date|first\s+half", re.I)
 
 # A flattened financial statement is not prose. Its header interleaves column
 # labels -- "(In millions except per Three June share Months 27, June 28, ...
@@ -162,7 +169,9 @@ _ANNUAL = re.compile(
 # header is a statement marker too.
 _STATEMENT = re.compile(
     r"\(in\s+(?:millions|thousands|billions)|except\s+per[-\s]+share"
-    r"|Inco…\s+\d{4}\s+Stat…", re.I)
+    r"|Inco…\s+\d{4}\s+Stat…"
+    r"|Consolidated\s+Statements\s+of\s+(?:Income|Operations|Earnings)"
+    r"", re.I)
 
 # A dollar figure, with the three ways a loss is written: $(0.12), ($0.12),
 # -$0.12, and a table's bare "$ -0.33".
@@ -195,7 +204,7 @@ _MONEY_AFTER = re.compile(
 # A sub-bullet is a boundary too, and it may open with a figure: AGNC's
 # highlights are "◦ $0.52 net income per common share ◦ $0.00 other ...".
 _SENTENCE = re.compile(
-    r"(?<=[.!?])\s+(?=[A-Z“\"(])|\s*[•·▪■]\s*(?=[A-Z“\"])|\s*[◦○●‣]\s*(?=[A-Z“\"$(])")
+    r"(?<=[.!?])\s+(?=[A-Z“\"(]|\b20\d\d\b)|\s*[•·▪■]\s*(?=[A-Z“\"])|\s*[◦○●‣]\s*(?=[A-Z“\"$(])")
 
 # Forward-looking. A guidance sentence names the next quarter before its
 # figure and would outrank the reported one; it is never the reported one.
@@ -259,6 +268,11 @@ def _figure_beside(sentence: str, match: "re.Match"):
     """The first figure adjacent to a phrase: immediately before it ("$0.49
     per diluted share", "32 cents per share") or within a few words after it
     ("was $2.02")."""
+    resp = re.search(
+        r"basic\b.*?\band\s+diluted\b.*?were\s+(?:-\s?\$|\(\s?\$|\$\s?\(|\$)?(\d*\.\d{2})\)?\s*(?:per\s+share)?\s+and\s+(?:-\s?\$|\(\s?\$|\$\s?\(|\$)?(\d*\.\d{2})\)?\s*(?:per\s+share)?,\s*respectively",
+        sentence, re.I)
+    if resp:
+        return float(resp.group(2))
     before = sentence[:match.start()]
     tail = _MONEY_BEFORE.search(before) or _MONEY_THEN_NOUN.search(before)
     if tail:
@@ -329,8 +343,10 @@ def _from_prose(text: str) -> Dict[str, Any]:
         # the fourth quarter of 2025".
         figure_at = _figure_position(sentence, match)
         head = sentence[:figure_at]
+        is_annual_clause = bool(_ANNUAL.search(clause)) and not bool(_QUARTER.search(sentence))
         rank = 0 if _QUARTER.search(head) else (
-            2 if _ANNUAL.search(sentence) else 1)
+            2 if (_ANNUAL.search(head) or is_annual_clause) else (
+            2 if (_ANNUAL.search(sentence) and not _QUARTER.search(sentence)) else 1))
         # The wrong number beats the wrong period. A component of earnings
         # ("included ... losses of $322 million, or $0.42 per diluted share")
         # and a continuing-operations basis are wrong figures whatever quarter
@@ -339,8 +355,9 @@ def _from_prose(text: str) -> Dict[str, Any]:
         # excluding the one-time charge" comes after the figure, so it is not
         # a reason to skip, only to lose to a clean sentence -- then a
         # diluted phrase over an unqualified one, then document order.
-        key = (bool(_COMPONENT.search(sentence[:match.start()]))
-               or bool(_COMPARATIVE.search(sentence)),
+        is_component = bool(_COMPONENT.search(sentence[:match.start()]))
+        is_comparative = bool(_COMPARATIVE.search(sentence[:match.start()])) or bool(_COMPARATIVE.search(clause))
+        key = (is_component or is_comparative,
                bool(_CONTINUING.search(sentence)),
                rank,
                bool(_NON_GAAP.search(sentence)),
@@ -349,9 +366,21 @@ def _from_prose(text: str) -> Dict[str, Any]:
         candidates.append((key, value, basis, sentence.strip()))
 
     if candidates:
-        _, value, basis, evidence = min(candidates)
-        return {"eps": value, "basis": basis, "evidence": evidence,
-                "reason": None}
+        quarterly = [c for c in candidates if c[0][2] < 2 and not c[0][0]]
+        if quarterly:
+            _, value, basis, evidence = min(quarterly)
+            return {"eps": value, "basis": basis, "evidence": evidence,
+                    "reason": None}
+        if all(c[0][0] for c in candidates):
+            reason = ("every diluted per-share figure describes an earnings "
+                      "component or comparative, not net income")
+        elif all(c[0][2] == 2 for c in candidates):
+            reason = ("every diluted per-share figure is for an annual or "
+                      "multi-period term, not the quarter")
+        else:
+            reason = ("a diluted per-share phrase was found but no dollar figure "
+                      "sits beside it")
+        return {"eps": None, "basis": None, "evidence": None, "reason": reason}
     if not saw_phrase:
         reason = "no diluted per-share figure named in the release"
     elif not saw_gaap:
@@ -405,6 +434,12 @@ def _from_table(text: str, period_end: Optional[str]) -> Dict[str, Any]:
     day = int(header.group(2))
     columns = [f"{int(y)}-{month:02d}-{day:02d}" for y in header.group(3).split()]
     cells = _CELL.findall(row.group(2))
+    # If the row has "Basic $ 4.86 $ 2.21 Diluted $ 4.71 $ 2.20", the diluted cells follow "Diluted".
+    if row.group(3) and re.search(r"diluted", row.group(3), re.I) and re.search(r"\bbasic\b", row.group(1), re.I):
+        after_row = text[row.end():row.end() + 100]
+        diluted_cells = _CELL.findall(after_row)
+        if len(diluted_cells) == len(columns):
+            cells = diluted_cells
     if period_end not in columns:
         out["reason"] = (f"the table's columns are {columns} and none is the "
                          f"quarter's period end {period_end}")
