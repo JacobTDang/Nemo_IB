@@ -4,6 +4,7 @@
     /status         the jobs, the book, the risk switch and the gate
     /orders         each book's latest decision and what its orders did
     /ticker SYMBOL  everything Nemo holds on one name
+    /ask QUESTION   Claude's answer, from Nemo's own tools
 
 The client connects out to Discord's gateway, so nothing on the host listens
 for Discord. The commands are registered to one server, `NEMO_DISCORD_GUILD_ID`,
@@ -26,13 +27,13 @@ import asyncio
 import os
 import sys
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict
+from typing import Any, Awaitable, Callable, Dict, List, Union
 
 import discord
 from discord import app_commands
 
 from research import discord_post, lookup, pit_store, status
-from tools.alpaca import portfolio
+from tools.alpaca import ask, portfolio
 
 TOKEN_SETTING = "NEMO_DISCORD_BOT_TOKEN"
 GUILD_SETTING = "NEMO_DISCORD_GUILD_ID"
@@ -82,26 +83,44 @@ async def ticker_card(raw: str) -> dict:
     return discord_post.ticker_card(found)
 
 
+async def ask_cards(question: str) -> List[dict]:
+    """Claude's answer, as one card or several when it is long."""
+    try:
+        result = await asyncio.wait_for(ask.ask(question), ask.TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        raise RuntimeError(
+            f"no answer within {ask.TIMEOUT_SECONDS:g} seconds") from None
+    return discord_post.answer_messages(result)
+
+
+Cards = Union[dict, List[dict]]
+
+
 async def answer(interaction, command: str,
-                 build: Callable[[], Awaitable[dict]]) -> None:
+                 build: Callable[[], Awaitable[Cards]]) -> None:
     """Build the card, then replace the deferred message with it.
 
     Whatever stops the card is the answer instead, so a command never leaves
     the loading message standing. An edit takes only IS_COMPONENTS_V2 of the
     flags a post sets; the daily portfolio card also sets the silent flag.
+    Cards after the first are private follow-ups to the same interaction.
     """
     try:
-        payload = await build()
+        built = await build()
     except Exception as exc:  # noqa: BLE001 - shown in the reply and logged
         error = f"{type(exc).__name__}: {exc}"
         print(f"/{command}: {error}", file=sys.stderr, flush=True)
-        payload = discord_post.ops_message(
+        built = discord_post.ops_message(
             f"/{command}", "Nemo could not answer", ok=False, error=error)
-    payload["flags"] = discord_post.IS_COMPONENTS_V2
+    first, *rest = built if isinstance(built, list) else [built]
+    first["flags"] = discord_post.IS_COMPONENTS_V2
+    app, token = str(interaction.application_id), interaction.token
     try:
-        await asyncio.to_thread(
-            discord_post.edit_interaction_reply,
-            str(interaction.application_id), interaction.token, payload)
+        await asyncio.to_thread(discord_post.edit_interaction_reply,
+                                app, token, first)
+        for payload in rest:
+            await asyncio.to_thread(discord_post.follow_up_interaction,
+                                    app, token, payload)
     except discord_post.DiscordError as exc:
         print(f"/{command}: {discord_post.redact(str(exc))}", file=sys.stderr,
               flush=True)
@@ -155,6 +174,15 @@ def build(guild_id: int) -> NemoClient:
     async def ticker_command(interaction: discord.Interaction,
                              symbol: str) -> None:
         await respond(interaction, "ticker", lambda: ticker_card(symbol))
+
+    @command("ask", "A question answered by Claude from Nemo's own tools")
+    @app_commands.describe(question="For example: what did NVDA report "
+                                    "last quarter?")
+    @admins
+    async def ask_command(
+            interaction: discord.Interaction,
+            question: app_commands.Range[str, 1, ask.QUESTION_LIMIT]) -> None:
+        await respond(interaction, "ask", lambda: ask_cards(question))
 
     return client
 

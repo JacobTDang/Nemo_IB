@@ -23,6 +23,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 IS_COMPONENTS_V2 = 1 << 15
 SUPPRESS_NOTIFICATIONS = 1 << 12
+EPHEMERAL = 1 << 6
 
 CONTAINER = 17
 TEXT = 10
@@ -1153,6 +1154,55 @@ def ticker_card(data: dict, *, when: Optional[int] = None,
                           detail="\n".join(detail), when=when)
 
 
+ANSWER_TOOLS_NAMED = 4
+
+
+def answer_messages(result: dict, *, when: Optional[int] = None,
+                    source: str = "nemo /ask") -> List[dict]:
+    """Claude's answer to /ask: the question, the answer as Claude wrote it,
+    and in the footer the model, the tools it called and the tokens it used.
+
+    A long answer is split at paragraphs into numbered cards, never cut. An
+    answer that was declined or stopped short says so above what it had.
+    """
+    when = int(time.time()) if when is None else int(when)
+    stop = result.get("stop_reason")
+    text = (result.get("answer") or "").strip()
+    notes = []
+    if stop == "refusal":
+        notes.append("⚠️ Claude declined to answer this question.")
+    elif stop in ("tool_use", "pause_turn"):
+        notes.append(f"⚠️ Stopped after **{int(result.get('rounds') or 0):,}** "
+                     f"rounds before a final answer; this is what it had.")
+    elif stop == "max_tokens":
+        notes.append("⚠️ The answer reached its length limit and stops "
+                     "part-way.")
+    if not text and not notes:
+        notes.append("⚠️ Claude returned no text.")
+    warning = bool(notes)
+
+    tools = list(result.get("tools") or [])
+    named = (" · ".join(tools) if len(tools) <= ANSWER_TOOLS_NAMED
+             else _count(len(tools), "tool", bold=False))
+    footer_source = (
+        f"{source} · {result.get('model')} · {named or 'no tools'} · "
+        f"{int(result.get('input_tokens') or 0):,} tokens in · "
+        f"{int(result.get('output_tokens') or 0):,} out")
+    asked = f"-# Asked: {escape_text(' '.join(str(result.get('question') or '').split()))}"
+    body = "\n\n".join(part for part in ("\n".join(notes), text) if part)
+    budget = (TEXT_LIMIT - len(_footer(footer_source, when)) - len(asked)
+              - 80)
+    pages = _pages(body, budget)
+    total = len(pages)
+    emoji, color = ("⚠️", YELLOW) if warning else ("📋", BLURPLE)
+    return [_assemble(
+        emoji=emoji,
+        headline="Nemo's answer" if total == 1 else f"Nemo's answer ({i}/{total})",
+        color=color, facts=asked if i == 1 else "", detail=page, error="",
+        links=(), source=footer_source, when=when, suppress=False)
+        for i, page in enumerate(pages, start=1)]
+
+
 def _daily(result, failed, seconds, when, error):
     if "days" in result and isinstance(result["days"], dict):
         days = result["days"]
@@ -1394,6 +1444,38 @@ def edit_interaction_reply(application_id: str, token: str,
     if not isinstance(saved, dict) or not saved.get("id"):
         raise DiscordError(f"Discord answered the edit with {response.status_code} "
                            f"and no message id")
+
+
+def follow_up_interaction(application_id: str, token: str,
+                          payload: dict) -> None:
+    """Post ``payload`` as a further private message on an interaction.
+
+    For an answer longer than one card. Discord keeps the message only for
+    the person who asked when it carries EPHEMERAL, so the flag is set here
+    rather than trusted to the caller.
+    """
+    import httpx
+
+    _check(payload)
+    body = {**payload, "flags": EPHEMERAL | IS_COMPONENTS_V2}
+    url = (f"{INTERACTION_API}/webhooks/{application_id}/{token}"
+           f"?with_components=true")
+    try:
+        response = httpx.post(url, json=body, timeout=30)
+    except Exception as exc:
+        raise DiscordError(
+            f"Discord follow-up failed: {type(exc).__name__}") from None
+    if response.status_code >= 300:
+        detail = _discord_detail(response)
+        raise DiscordError(f"Discord follow-up returned {response.status_code}"
+                           + (f": {detail}" if detail else ""))
+    try:
+        saved = response.json()
+    except ValueError:
+        saved = None
+    if not isinstance(saved, dict) or not saved.get("id"):
+        raise DiscordError(f"Discord answered the follow-up with "
+                           f"{response.status_code} and no message id")
 
 
 # ------------------------------------------------------------------- the log

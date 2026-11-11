@@ -18,7 +18,7 @@ import research.discord_post as post
 discord = pytest.importorskip("discord")
 
 from research import lookup, status  # noqa: E402
-from tools.alpaca import bot, portfolio  # noqa: E402
+from tools.alpaca import ask, bot, portfolio  # noqa: E402
 
 TOKEN = "interaction-token-that-is-a-secret"
 APP = "123456789012345678"
@@ -248,7 +248,7 @@ def test_every_command_is_registered_to_one_server_for_its_administrators():
     guild = discord.Object(id=GUILD)
 
     names = sorted(c.name for c in client.tree.get_commands(guild=guild))
-    assert names == ["orders", "portfolio", "status", "ticker"]
+    assert names == ["ask", "orders", "portfolio", "status", "ticker"]
     assert client.tree.get_commands() == []
     for name in names:
         command = client.tree.get_command(name, guild=guild)
@@ -260,6 +260,14 @@ def test_ticker_takes_one_required_symbol():
 
     assert param.name == "symbol"
     assert param.required is True
+
+
+def test_ask_takes_one_required_question_of_bounded_length():
+    [param] = _command("ask").parameters
+
+    assert param.name == "question"
+    assert param.required is True
+    assert param.max_value == ask.QUESTION_LIMIT
 
 
 def test_a_missing_token_stops_the_bot_and_names_the_setting(
@@ -347,3 +355,118 @@ def test_the_bot_reads_the_copy_switch_the_copy_job_reads():
 
     assert (services["nemo-bot"]["environment"]["NEMO_COPY_TRADING"]
             == services["research-copy"]["environment"]["NEMO_COPY_TRADING"])
+
+
+# ------------------------------------------------------------- /ask
+
+def _asked(answer):
+    async def fake(question):
+        return {"question": question, "answer": answer, "tools": [],
+                "rounds": 1, "input_tokens": 10, "output_tokens": 5,
+                "stop_reason": "end_turn", "model": "claude-opus-5-5"}
+    return fake
+
+
+def _follow_ups(monkeypatch):
+    sent = []
+    monkeypatch.setattr(
+        post, "follow_up_interaction",
+        lambda app, token, payload: sent.append((app, token, payload)))
+    return sent
+
+
+def test_ask_answers_in_one_card_when_the_answer_fits(monkeypatch):
+    monkeypatch.setattr(ask, "ask", _asked("NVDA closed at $181.20."))
+    edits = _edits(monkeypatch)
+    follows = _follow_ups(monkeypatch)
+    interaction = Interaction()
+
+    asyncio.run(_command("ask").callback(interaction, "What did NVDA close at?"))
+
+    assert interaction.deferred == {"ephemeral": True, "thinking": True}
+    [(_, _, payload)] = edits
+    assert "NVDA closed at $181.20." in _texts(payload)
+    assert follows == []
+
+
+def test_a_long_answer_edits_the_first_card_and_follows_up_with_the_rest(
+        monkeypatch):
+    long_answer = "\n\n".join(f"Paragraph {i}: " + "word " * 120
+                               for i in range(12))
+    monkeypatch.setattr(ask, "ask", _asked(long_answer))
+    edits = _edits(monkeypatch)
+    follows = _follow_ups(monkeypatch)
+
+    asyncio.run(_command("ask").callback(Interaction(), "Tell me everything"))
+
+    [(_, _, first)] = edits
+    assert "(1/" in _texts(first)
+    assert follows
+    assert all((app, token) == (APP, TOKEN) for app, token, _ in follows)
+    assert "Paragraph 11:" in _texts(follows[-1][2])
+
+
+def test_an_answer_that_takes_too_long_says_so(monkeypatch):
+    async def slow(question):
+        await asyncio.sleep(5)
+
+    monkeypatch.setattr(ask, "ask", slow)
+    monkeypatch.setattr(ask, "TIMEOUT_SECONDS", 0.01)
+    edits = _edits(monkeypatch)
+
+    asyncio.run(_command("ask").callback(Interaction(), "What did NVDA close at?"))
+
+    [(_, _, payload)] = edits
+    text = _texts(payload)
+    assert "❌ /ask" in text
+    assert "no answer within" in text
+
+
+def test_a_follow_up_is_private_and_names_no_token(monkeypatch):
+    seen = {}
+
+    def handler(request):
+        import json
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        seen["flags"] = json.loads(request.content)["flags"]
+        return httpx.Response(400, json={"code": 50035,
+                                         "message": "Invalid Form Body"})
+
+    def fake_post(url, **kwargs):
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            return client.post(url, **kwargs)
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    [payload] = post.answer_messages({"question": "q", "answer": "a",
+                                      "stop_reason": "end_turn"})
+
+    with pytest.raises(post.DiscordError) as caught:
+        post.follow_up_interaction(APP, TOKEN, payload)
+
+    assert seen["method"] == "POST"
+    assert seen["url"] == (f"https://discord.com/api/v10/webhooks/{APP}/{TOKEN}"
+                           f"?with_components=true")
+    assert seen["flags"] == post.EPHEMERAL | post.IS_COMPONENTS_V2
+    assert "Invalid Form Body" in str(caught.value)
+    assert TOKEN not in str(caught.value)
+
+
+def test_only_the_bot_is_handed_the_anthropic_key_and_never_the_operator_token():
+    """/ask reaches the gateway as its own agent, so its access can be
+    withdrawn alone, and no other service can spend the Anthropic key."""
+    import yaml
+
+    from pathlib import Path
+
+    compose = yaml.safe_load((Path(__file__).resolve().parents[1] / "deploy"
+                              / "docker-compose.yml").read_text())
+    services = compose["services"]
+    holders = sorted(name for name, service in services.items()
+                     if "ANTHROPIC_API_KEY" in (service.get("environment") or {}))
+    env = services["nemo-bot"]["environment"]
+
+    assert holders == ["nemo-bot"]
+    assert env["NEMO_MCP_BOT_TOKEN"] == "${NEMO_MCP_BOT_TOKEN:-}"
+    assert not any(value and "NEMO_MCP_TOKEN" in str(value).replace(
+        "NEMO_MCP_BOT_TOKEN", "") for value in env.values())
