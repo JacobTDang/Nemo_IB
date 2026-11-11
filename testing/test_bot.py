@@ -155,7 +155,7 @@ def test_status_answers_with_the_status_report(monkeypatch):
     assert interaction.deferred == {"ephemeral": True, "thinking": True}
     [(_, _, payload)] = edits
     assert payload["flags"] == post.IS_COMPONENTS_V2
-    assert "Nemo status · all clear" in _texts(payload)
+    assert "All good" in _texts(payload)
     assert "nemo /status" in _texts(payload)
 
 
@@ -203,8 +203,8 @@ def test_ticker_reads_the_symbol_and_puts_the_position_beside_it(monkeypatch):
     assert seen == ["NVDA"]
     [(_, _, payload)] = edits
     text = _texts(payload)
-    assert "NVDA · long" in text
-    assert "**Last release** 2026-10-21" in text
+    assert "NVDA · you own" in text
+    assert "**Last earnings report** Oct 21" in text
 
 
 def test_ticker_still_answers_from_the_store_when_the_account_fails(
@@ -220,9 +220,9 @@ def test_ticker_still_answers_from_the_store_when_the_account_fails(
 
     [(_, _, payload)] = edits
     text = _texts(payload)
-    assert "NVDA · position unknown" in text
+    assert "NVDA · couldn't check your account" in text
     assert "Missing Alpaca paper credentials" in text
-    assert "**Last release** 2026-10-21" in text
+    assert "**Last earnings report** Oct 21" in text
 
 
 def test_ticker_refuses_what_is_not_a_ticker_without_reading_anything(
