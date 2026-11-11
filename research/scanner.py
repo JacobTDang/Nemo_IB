@@ -78,6 +78,11 @@ MIN_SIGMA_QUARTERS = sue.MIN_SIGMA_QUARTERS
 # from one signal and half from the other, which is not a study of either.
 SIGNAL_VARIANT = "ts"
 
+# Pre-registered screen for the release-timed arm (#115): trade only when the
+# issuer's median release-to-10-Q lag over its last LAG_QUARTERS quarters filed
+# on or before the decision date is this many calendar days or more.
+LONG_LAG_DAYS = 7
+
 # The drift is a few weeks long and then it is gone. A surprise from last
 # quarter is not a reason to buy today, and nothing in the signal itself says
 # so -- `sue_ts` will happily return a six-month-old quarter as "the most
@@ -192,14 +197,31 @@ def _signal_for(ticker: str, as_of: str) -> Dict[str, Any]:
         from research import release_eps
         return {**release_eps.sue_ts_release(ticker, as_of=as_of),
                 "variant": "ts_release"}
+    if SIGNAL_VARIANT == "ts_release_long_lag":
+        # The release-timed surprise, only when the issuer's usual
+        # release-to-10-Q lag clears the pre-registered floor (#115).
+        from research import release_eps
+        lag = release_eps.usual_filing_lag_for(ticker, as_of=as_of)
+        if lag["lag_days"] is None:
+            return {**sue._signal_shell(ticker, as_of),
+                    "variant": "ts_release_long_lag",
+                    "error": lag["reason"]}
+        if lag["lag_days"] < LONG_LAG_DAYS:
+            return {**sue._signal_shell(ticker, as_of),
+                    "variant": "ts_release_long_lag",
+                    "error": (f"usual release-to-10-Q lag is "
+                              f"{lag['lag_days']} days, under the "
+                              f"{LONG_LAG_DAYS}-day screen")}
+        return {**release_eps.sue_ts_release(ticker, as_of=as_of),
+                "variant": "ts_release_long_lag"}
     if SIGNAL_VARIANT == "cs":
         from research import sue_cs
         return {**sue_cs.surprise_rank(ticker, as_of=as_of,
                                        peers=_peers_for(as_of)),
                 "variant": "cs"}
     raise ValueError(
-        f"SIGNAL_VARIANT must be 'ts', 'af', 'af_or_ts', 'ts_release' or "
-        f"'cs'; got "
+        f"SIGNAL_VARIANT must be 'ts', 'af', 'af_or_ts', 'ts_release', "
+        f"'ts_release_long_lag' or 'cs'; got "
         f"{SIGNAL_VARIANT!r}")
 
 

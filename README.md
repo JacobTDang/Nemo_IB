@@ -308,7 +308,10 @@ The scan ranks on one earnings surprise. The constant SIGNAL_VARIANT in
 `research/scanner.py` names it, and the scan ships with `ts`. The environment
 does not set it. The `ts` variant
 computes the surprise from the XBRL financials. The `ts_release` variant reads
-diluted EPS from the 8-K earnings release on the day that it is filed. The `cs`
+diluted EPS from the 8-K earnings release on the day that it is filed. The
+`ts_release_long_lag` variant uses that same release-timed surprise. It trades
+only when the issuer's usual release-to-10-Q lag over the last four quarters is
+7 calendar days or more. The `cs`
 variant uses the recorded consensus. Every paper order records the variant that
 produced it.
 
