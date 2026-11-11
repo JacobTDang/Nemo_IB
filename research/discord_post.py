@@ -1371,9 +1371,9 @@ def answer_messages(result: dict, *, when: Optional[int] = None,
     notes = []
     if stop == "refusal":
         notes.append("⚠️ Claude declined to answer this question.")
-    elif stop in ("tool_use", "pause_turn"):
+    elif stop == "max_turns":
         notes.append(f"⚠️ Stopped after **{int(result.get('rounds') or 0):,}** "
-                     f"rounds before a final answer; this is what it had.")
+                     f"turns before a final answer; this is what it had.")
     elif stop == "max_tokens":
         notes.append("⚠️ The answer reached its length limit and stops "
                      "part-way.")

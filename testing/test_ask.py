@@ -1,22 +1,19 @@
-"""/ask: a question answered by Claude with Nemo's own tools.
+"""/ask: a question answered by Claude Code, signed in as the bot's owner.
 
-The model and the MCP session are stand-ins here: nothing reaches Anthropic
-or a Nemo server. What is pinned is what the bot sends, how it reads the
-answer back, and the card a reader sees.
+The bot runs the unmodified `claude` program in print mode with the owner's
+own subscription token. Here the program is a stand-in that prints what the
+real one prints: nothing reaches Anthropic or a Nemo server. What is pinned
+is what the bot runs, what it hands the program, and how it reads the answer.
 """
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
+import json
 
 import pytest
 
 import research.discord_post as post
-
-pytest.importorskip("anthropic")
-mcp_types = pytest.importorskip("mcp.types")
-
-from tools.alpaca import ask  # noqa: E402
+from tools.alpaca import ask
 
 WHEN = 1_794_000_000
 
@@ -34,129 +31,228 @@ def _texts(payload):
     return "\n".join(found)
 
 
-def _tool(name):
-    return mcp_types.Tool(name=name, description=f"{name} tool",
-                          inputSchema={"type": "object", "properties": {}})
+def _init(tools=("ToolSearch", "mcp__nemo__get_market_data"),
+          status="connected", model="claude-opus-5-5"):
+    return {"type": "system", "subtype": "init", "model": model,
+            "tools": list(tools),
+            "mcp_servers": [{"name": "nemo", "status": status}]}
 
 
-class Session:
-    def __init__(self, names=("get_market_data", "get_sic_code")):
-        self.names = names
-
-    async def list_tools(self):
-        return SimpleNamespace(tools=[_tool(n) for n in self.names])
+def _assistant(*blocks):
+    return {"type": "assistant", "message": {"content": list(blocks)}}
 
 
-def _block(kind, **fields):
-    return SimpleNamespace(type=kind, **fields)
+def _result(text="NVDA closed at **$181.20** (get_market_data, Nov 10).",
+            subtype="success", turns=3, stop="end_turn", is_error=False):
+    return {"type": "result", "subtype": subtype, "is_error": is_error,
+            "result": text if subtype == "success" else None,
+            "num_turns": turns, "stop_reason": stop,
+            "usage": {"input_tokens": 500, "output_tokens": 120,
+                      "cache_read_input_tokens": 4000,
+                      "cache_creation_input_tokens": 1500}}
 
 
-def _message(content, stop="end_turn", input_tokens=1000, output_tokens=50,
-             cached=0):
-    return SimpleNamespace(
-        content=content, stop_reason=stop, model="claude-opus-5-5",
-        usage=SimpleNamespace(input_tokens=input_tokens,
-                              output_tokens=output_tokens,
-                              cache_read_input_tokens=cached,
-                              cache_creation_input_tokens=0))
+def _answered():
+    return [_init(),
+            _assistant({"type": "tool_use", "name": "ToolSearch", "input": {}}),
+            _assistant({"type": "tool_use", "name": "mcp__nemo__get_market_data",
+                        "input": {"ticker": "NVDA"}}),
+            _assistant({"type": "text", "text": "NVDA closed at $181.20."}),
+            _result()]
 
 
-class Runner:
-    def __init__(self, messages):
-        self.messages = messages
+class Program:
+    """Stands in for `claude`: records how it was run, prints its lines."""
 
-    def __aiter__(self):
-        async def gen():
-            for message in self.messages:
-                yield message
-        return gen()
+    def __init__(self, lines, code=0, stderr=b"", hang=False):
+        self.lines, self.code, self.stderr, self.hang = lines, code, stderr, hang
+        self.argv = self.env = self.cwd = self.stdin = None
+        self.killed = False
+        self.config = None
 
+    async def exec(self, *argv, stdin=None, stdout=None, stderr=None,
+                   cwd=None, env=None):
+        self.argv, self.env, self.cwd = list(argv), env, cwd
+        config = self.argv[self.argv.index("--mcp-config") + 1]
+        with open(config) as handle:
+            self.config = json.load(handle)
+        program = self
 
-class Client:
-    def __init__(self, messages):
-        self.sent = None
-        outer = self
+        class Process:
+            returncode = None
 
-        class Messages:
-            def tool_runner(inner, **kwargs):
-                outer.sent = kwargs
-                return Runner(messages)
+            async def communicate(inner, data=None):
+                program.stdin = data
+                if program.hang:
+                    await asyncio.sleep(5)
+                inner.returncode = program.code
+                out = "\n".join(json.dumps(line) for line in program.lines)
+                return out.encode(), program.stderr
 
-        self.beta = SimpleNamespace(messages=Messages())
+            def kill(inner):
+                program.killed = True
 
+            async def wait(inner):
+                return -9
 
-def _answered(text="NVDA closed at **$181.20** (get_market_data, 2026-11-10)."):
-    return [
-        _message([_block("server_tool_use", name="tool_search_tool_bm25"),
-                  _block("tool_use", name="get_market_data", input={})],
-                 stop="tool_use", input_tokens=3000, output_tokens=80),
-        _message([_block("text", text=text)], input_tokens=500,
-                 output_tokens=40, cached=2500),
-    ]
-
-
-# ------------------------------------------------------------- the request
-
-def test_every_nemo_tool_is_deferred_behind_tool_search():
-    client = Client(_answered())
-
-    asyncio.run(ask.answer("What did NVDA close at?", Session(), client))
-
-    tools = list(client.sent["tools"])
-    assert tools[0] == ask.SEARCH_TOOL
-    assert [t.to_dict()["name"] for t in tools[1:]] == ["get_market_data",
-                                                         "get_sic_code"]
-    assert all(t.to_dict().get("defer_loading") is True for t in tools[1:])
+        return Process()
 
 
-def test_the_request_names_the_model_effort_and_its_limits():
-    client = Client(_answered())
-
-    asyncio.run(ask.answer("What did NVDA close at?", Session(), client))
-
-    sent = client.sent
-    assert sent["model"] == "claude-opus-5-5"
-    assert sent["output_config"] == {"effort": ask.EFFORT}
-    assert sent["max_iterations"] == ask.MAX_ITERATIONS
-    assert sent["cache_control"] == {"type": "ephemeral"}
-    assert sent["fallbacks"] == "default"
-    assert "server-side-fallback-2026-07-01" in sent["betas"]
-    assert sent["messages"] == [{"role": "user",
-                                 "content": "What did NVDA close at?"}]
+@pytest.fixture
+def settings(monkeypatch):
+    monkeypatch.setenv(ask.OAUTH_SETTING, "sk-ant-oat-owner")
+    monkeypatch.setenv(ask.MCP_TOKEN_SETTING, "mcp-bot-token")
+    monkeypatch.setenv("ALPACA_PAPER_KEY", "paper-key")
+    monkeypatch.setenv("NEMO_DISCORD_BOT_TOKEN", "discord-token")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api-would-bill-the-api")
 
 
-def test_the_system_prompt_carries_todays_date_in_utc(monkeypatch):
-    monkeypatch.setattr(ask, "_today", lambda: "2026-11-11")
-    client = Client(_answered())
-
-    asyncio.run(ask.answer("What did NVDA close at?", Session(), client))
-
-    assert "2026-11-11" in client.sent["system"]
+def _run(monkeypatch, program, question="What did NVDA close at?"):
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", program.exec)
+    return asyncio.run(ask.ask(question))
 
 
-# ------------------------------------------------------------- the answer
+# ------------------------------------------------------------- what it runs
 
-def test_the_answer_is_the_final_text_with_the_tools_it_used_and_its_tokens():
-    result = asyncio.run(ask.answer("What did NVDA close at?", Session(),
-                                    Client(_answered())))
+def test_the_question_goes_in_on_stdin_never_on_the_command_line(
+        monkeypatch, settings):
+    program = Program(_answered())
+
+    _run(monkeypatch, program, "-5% movers today?")
+
+    assert program.stdin == b"-5% movers today?"
+    assert "-5% movers today?" not in program.argv
+
+
+def test_claude_code_gets_only_tool_search_and_nemo_tools(monkeypatch, settings):
+    program = Program(_answered())
+
+    _run(monkeypatch, program)
+
+    argv = program.argv
+    assert argv[:2] == [ask.CLAUDE, "-p"]
+    assert argv[argv.index("--tools") + 1] == "ToolSearch"
+    assert "--strict-mcp-config" in argv
+    assert argv[argv.index("--allowedTools") + 1] == "mcp__nemo__*"
+    assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
+    assert argv[argv.index("--max-turns") + 1] == str(ask.MAX_TURNS)
+    assert "--no-session-persistence" in argv
+    denied = argv[argv.index("--disallowedTools") + 1:]
+    for tool in ("Bash", "Read", "Write", "Edit", "WebFetch", "WebSearch",
+                 "Agent"):
+        assert tool in denied
+
+
+def test_the_nemo_server_is_reached_with_the_bots_own_token_by_reference(
+        monkeypatch, settings, tmp_path):
+    monkeypatch.setenv(ask.MCP_URL_SETTING, "http://gateway:8080/mcp/")
+    program = Program(_answered())
+
+    _run(monkeypatch, program)
+
+    server = program.config["mcpServers"]["nemo"]
+    assert server == {"type": "http", "url": "http://gateway:8080/mcp/",
+                      "headers": {"Authorization": "Bearer ${NEMO_MCP_BOT_TOKEN}"}}
+
+
+def test_the_program_sees_no_secret_but_its_own_two(monkeypatch, settings):
+    program = Program(_answered())
+
+    _run(monkeypatch, program)
+
+    env = program.env
+    assert env[ask.OAUTH_SETTING] == "sk-ant-oat-owner"
+    assert env[ask.MCP_TOKEN_SETTING] == "mcp-bot-token"
+    for secret in ("ANTHROPIC_API_KEY", "ALPACA_PAPER_KEY",
+                   "NEMO_DISCORD_BOT_TOKEN"):
+        assert secret not in env
+    assert env["DISABLE_UPDATES"] == "1"
+    assert env["HOME"] == program.cwd
+
+
+def test_it_runs_in_an_empty_directory_that_is_removed_after(
+        monkeypatch, settings):
+    import os
+
+    program = Program(_answered())
+
+    _run(monkeypatch, program)
+
+    assert not os.path.exists(program.cwd)
+
+
+# ------------------------------------------------------------- what it reads
+
+def test_the_answer_is_the_result_with_the_nemo_tools_it_called():
+    result = ask.read_stream(
+        "\n".join(json.dumps(line) for line in _answered()), "q")
 
     assert result["answer"].startswith("NVDA closed at")
     assert result["tools"] == ["get_market_data"]
-    assert result["rounds"] == 2
-    assert result["input_tokens"] == 3000 + 500 + 2500
+    assert result["rounds"] == 3
+    assert result["input_tokens"] == 500 + 4000 + 1500
     assert result["output_tokens"] == 120
+    assert result["model"] == "claude-opus-5-5"
     assert result["stop_reason"] == "end_turn"
 
 
-def test_an_empty_question_is_refused_before_anything_is_called():
+def test_a_built_in_tool_left_in_reach_stops_the_answer():
+    lines = [_init(tools=("ToolSearch", "Bash", "mcp__nemo__get_sic_code")),
+             _result()]
+
+    with pytest.raises(RuntimeError, match="Bash"):
+        ask.read_stream("\n".join(json.dumps(line) for line in lines), "q")
+
+
+def test_nemo_tools_that_could_not_be_reached_are_said():
+    lines = [_init(status="failed"), _result()]
+
+    with pytest.raises(RuntimeError, match="could not reach Nemo's tools"):
+        ask.read_stream("\n".join(json.dumps(line) for line in lines), "q")
+
+
+def test_an_answer_stopped_at_the_turn_limit_is_kept_and_marked():
+    lines = [_init(), _result(subtype="error_max_turns", turns=10)]
+
+    result = ask.read_stream("\n".join(json.dumps(line) for line in lines), "q")
+
+    assert result["stop_reason"] == "max_turns"
+    assert result["rounds"] == 10
+
+
+def test_a_failed_run_is_an_error_naming_what_went_wrong(monkeypatch, settings):
+    lines = [_init(), {**_result(subtype="error_during_execution",
+                                 is_error=True), "errors": ["rate limited"]}]
+
+    with pytest.raises(RuntimeError, match="rate limited"):
+        _run(monkeypatch, Program(lines, code=1))
+
+
+def test_a_program_that_prints_nothing_is_an_error_with_its_stderr(
+        monkeypatch, settings):
+    with pytest.raises(RuntimeError, match="Invalid API key"):
+        _run(monkeypatch, Program([], code=1,
+                                  stderr=b"Invalid API key \xc2\xb7 Please run /login"))
+
+
+def test_a_program_that_runs_too_long_is_killed(monkeypatch, settings):
+    monkeypatch.setattr(ask, "TIMEOUT_SECONDS", 0.01)
+    program = Program(_answered(), hang=True)
+
+    with pytest.raises(RuntimeError, match="no answer within"):
+        _run(monkeypatch, program)
+
+    assert program.killed
+
+
+def test_an_empty_question_is_refused_before_anything_runs(settings):
     with pytest.raises(ValueError, match="empty"):
         asyncio.run(ask.ask("   "))
 
 
-@pytest.mark.parametrize("missing", [ask.KEY_SETTING, ask.MCP_TOKEN_SETTING])
-def test_a_missing_setting_is_named(monkeypatch, missing):
-    monkeypatch.setenv(ask.KEY_SETTING, "sk-test")
-    monkeypatch.setenv(ask.MCP_TOKEN_SETTING, "mcp-test")
+@pytest.mark.parametrize("missing", ["CLAUDE_CODE_OAUTH_TOKEN",
+                                     "NEMO_MCP_BOT_TOKEN"])
+def test_a_missing_setting_is_named(monkeypatch, settings, missing):
     monkeypatch.delenv(missing)
 
     with pytest.raises(RuntimeError, match=missing):
@@ -165,17 +261,17 @@ def test_a_missing_setting_is_named(monkeypatch, missing):
 
 # ------------------------------------------------------------- the card
 
-def _result(**extra):
+def _card(**extra):
     result = {"question": "What did NVDA close at?",
               "answer": "NVDA closed at **$181.20**.", "tools": ["get_market_data"],
-              "rounds": 2, "input_tokens": 6000, "output_tokens": 120,
+              "rounds": 3, "input_tokens": 6000, "output_tokens": 120,
               "stop_reason": "end_turn", "model": "claude-opus-5-5"}
     result.update(extra)
     return result
 
 
 def test_the_answer_card_shows_the_question_the_answer_and_what_it_used():
-    [payload] = post.answer_messages(_result(), when=WHEN)
+    [payload] = post.answer_messages(_card(), when=WHEN)
 
     text = _texts(payload)
     assert "## 📋 Nemo's answer" in text
@@ -187,7 +283,7 @@ def test_the_answer_card_shows_the_question_the_answer_and_what_it_used():
 
 
 def test_the_question_is_escaped_but_the_answer_keeps_its_markdown():
-    [payload] = post.answer_messages(_result(question="is *this* `ok`?"),
+    [payload] = post.answer_messages(_card(question="is *this* `ok`?"),
                                      when=WHEN)
 
     text = _texts(payload)
@@ -197,7 +293,7 @@ def test_the_question_is_escaped_but_the_answer_keeps_its_markdown():
 
 def test_a_long_answer_is_split_into_numbered_cards_without_losing_text():
     paragraphs = [f"Paragraph {i}: " + "word " * 120 for i in range(12)]
-    pages = post.answer_messages(_result(answer="\n\n".join(paragraphs)),
+    pages = post.answer_messages(_card(answer="\n\n".join(paragraphs)),
                                  when=WHEN)
 
     assert len(pages) > 1
@@ -210,7 +306,7 @@ def test_a_long_answer_is_split_into_numbered_cards_without_losing_text():
 
 
 def test_a_declined_question_says_so_in_yellow():
-    [payload] = post.answer_messages(_result(answer="", stop_reason="refusal"),
+    [payload] = post.answer_messages(_card(answer="", stop_reason="refusal"),
                                      when=WHEN)
 
     assert "⚠️ Claude declined to answer this question." in _texts(payload)
@@ -219,10 +315,10 @@ def test_a_declined_question_says_so_in_yellow():
 
 def test_an_answer_cut_short_says_why_and_keeps_what_it_had():
     [payload] = post.answer_messages(
-        _result(answer="Partial: NVDA closed at $181.20.", stop_reason="tool_use",
-                rounds=ask.MAX_ITERATIONS), when=WHEN)
+        _card(answer="Partial: NVDA closed at $181.20.", stop_reason="max_turns",
+              rounds=ask.MAX_TURNS), when=WHEN)
 
     text = _texts(payload)
-    assert "⚠️ Stopped after **10** rounds before a final answer" in text
+    assert "⚠️ Stopped after **10** turns before a final answer" in text
     assert "Partial: NVDA closed at $181.20." in text
     assert payload["components"][0]["accent_color"] == post.YELLOW

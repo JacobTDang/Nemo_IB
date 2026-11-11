@@ -750,9 +750,10 @@ services:
       ALPACA_PAPER_SECRET: ${ALPACA_PAPER_SECRET:-}
       NEMO_DISCORD_BOT_TOKEN: ${NEMO_DISCORD_BOT_TOKEN:-}
       NEMO_DISCORD_GUILD_ID: ${NEMO_DISCORD_GUILD_ID:-}
-      # /ask: Claude, and the bot's own agent token for the gateway, never the
+      # /ask: the owner's Claude Code sign-in (`claude setup-token`), never an
+      # API key, and the bot's own agent token for the gateway, never the
       # operator's. NEMO_MCP_AGENT_TOKENS must name it with the same token.
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
       NEMO_MCP_BOT_TOKEN: ${NEMO_MCP_BOT_TOKEN:-}
     volumes:
       - research-data:/app/data

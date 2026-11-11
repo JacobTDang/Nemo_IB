@@ -9,6 +9,7 @@ Discord.
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -67,11 +68,22 @@ def test_a_failed_read_replies_with_its_error():
     assert "401 unauthorized" in text
 
 
+OWNER = 111111111111111111
+
+
 class Interaction:
-    def __init__(self):
+    def __init__(self, user=OWNER):
         self.application_id = int(APP)
         self.token = TOKEN
         self.deferred = None
+        self.user = SimpleNamespace(id=user)
+
+        class Client:
+            async def application_info(inner):
+                return SimpleNamespace(team=None,
+                                       owner=SimpleNamespace(id=OWNER))
+
+        self.client = Client()
 
         class Response:
             async def defer(inner, **kwargs):
@@ -406,12 +418,11 @@ def test_a_long_answer_edits_the_first_card_and_follows_up_with_the_rest(
     assert "Paragraph 11:" in _texts(follows[-1][2])
 
 
-def test_an_answer_that_takes_too_long_says_so(monkeypatch):
-    async def slow(question):
-        await asyncio.sleep(5)
+def test_an_answer_that_fails_says_why(monkeypatch):
+    async def failing(question):
+        raise RuntimeError("no answer within 600 seconds")
 
-    monkeypatch.setattr(ask, "ask", slow)
-    monkeypatch.setattr(ask, "TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(ask, "ask", failing)
     edits = _edits(monkeypatch)
 
     asyncio.run(_command("ask").callback(Interaction(), "What did NVDA close at?"))
@@ -419,7 +430,21 @@ def test_an_answer_that_takes_too_long_says_so(monkeypatch):
     [(_, _, payload)] = edits
     text = _texts(payload)
     assert "❌ /ask" in text
-    assert "no answer within" in text
+    assert "no answer within 600 seconds" in text
+
+
+def test_ask_answers_its_owner_only_and_runs_nothing_for_anybody_else(
+        monkeypatch):
+    async def must_not_run(question):
+        raise AssertionError("asked Claude for somebody else")
+
+    monkeypatch.setattr(ask, "ask", must_not_run)
+    edits = _edits(monkeypatch)
+
+    asyncio.run(_command("ask").callback(Interaction(user=222), "Anything?"))
+
+    [(_, _, payload)] = edits
+    assert "Only the bot's owner can use /ask" in _texts(payload)
 
 
 def test_a_follow_up_is_private_and_names_no_token(monkeypatch):
@@ -452,9 +477,10 @@ def test_a_follow_up_is_private_and_names_no_token(monkeypatch):
     assert TOKEN not in str(caught.value)
 
 
-def test_only_the_bot_is_handed_the_anthropic_key_and_never_the_operator_token():
-    """/ask reaches the gateway as its own agent, so its access can be
-    withdrawn alone, and no other service can spend the Anthropic key."""
+def test_only_the_bot_signs_in_to_claude_and_no_service_holds_an_api_key():
+    """/ask runs on the owner's Claude Code sign-in. An API key anywhere in
+    reach would bill the API instead, and the bot reaches the gateway as its
+    own agent, never as the operator."""
     import yaml
 
     from pathlib import Path
@@ -463,10 +489,13 @@ def test_only_the_bot_is_handed_the_anthropic_key_and_never_the_operator_token()
                               / "docker-compose.yml").read_text())
     services = compose["services"]
     holders = sorted(name for name, service in services.items()
-                     if "ANTHROPIC_API_KEY" in (service.get("environment") or {}))
+                     if "CLAUDE_CODE_OAUTH_TOKEN" in (service.get("environment") or {}))
     env = services["nemo-bot"]["environment"]
 
     assert holders == ["nemo-bot"]
+    assert not [name for name, service in services.items()
+                if {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"}
+                & set(service.get("environment") or {})]
     assert env["NEMO_MCP_BOT_TOKEN"] == "${NEMO_MCP_BOT_TOKEN:-}"
     assert not any(value and "NEMO_MCP_TOKEN" in str(value).replace(
         "NEMO_MCP_BOT_TOKEN", "") for value in env.values())

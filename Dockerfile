@@ -106,12 +106,35 @@ CMD ["python", "-m", "tools.news_agregator.fred_server", "server"]
 # the data image, which cannot trade (testing/test_paper_fills.py pins it).
 # --------------------------------------------------------------------------
 FROM base AS fills-src
-# The nemo bot's Discord client and the Anthropic SDK its /ask calls, beside
-# the server group. Only this image carries them.
+# The nemo bot's Discord client, beside the server group. Only this image
+# carries it.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-install-project --only-group server --only-group bot
 COPY tools/alpaca/__init__.py tools/alpaca/async_broker.py tools/alpaca/fills.py tools/alpaca/portfolio.py tools/alpaca/bot.py tools/alpaca/ask.py ./tools/alpaca/
-RUN python -c "import tools.alpaca.fills, tools.alpaca.portfolio, tools.alpaca.bot, tools.alpaca.ask, anthropic.lib.tools.mcp; print('the paper-fill job, the portfolio card and the bot import')"
+RUN python -c "import tools.alpaca.fills, tools.alpaca.portfolio, tools.alpaca.bot, tools.alpaca.ask; print('the paper-fill job, the portfolio card and the bot import')"
+
+# The unmodified Claude Code program, which /ask runs signed in as the bot's
+# owner (tools/alpaca/ask.py). One release, from Anthropic's download site,
+# checked against the checksum its manifest gives for that release, so a
+# rebuild cannot pick up a different binary. To move to another release,
+# take both checksums from
+#   https://downloads.claude.ai/claude-code-releases/<version>/manifest.json
+FROM base AS claude-code
+ARG TARGETARCH
+ARG CLAUDE_CODE_VERSION=2.1.322
+ARG CLAUDE_CODE_SHA256_AMD64=bfb3703ad5380242328459bc62ada4bde8ae7ba57c6e1eeadb9c00e08874c478
+ARG CLAUDE_CODE_SHA256_ARM64=f220ca50ea4f3222043ff83cc224a1262e0196e9897acc0871efa94235b0c1fd
+RUN python -c "\
+import hashlib, os, sys, urllib.request; \
+arch = os.environ['TARGETARCH']; \
+platform, want = {'amd64': ('linux-x64', os.environ['CLAUDE_CODE_SHA256_AMD64']), \
+                  'arm64': ('linux-arm64', os.environ['CLAUDE_CODE_SHA256_ARM64'])}[arch]; \
+url = 'https://downloads.claude.ai/claude-code-releases/%s/%s/claude' % (os.environ['CLAUDE_CODE_VERSION'], platform); \
+urllib.request.urlretrieve(url, '/usr/local/bin/claude'); \
+got = hashlib.sha256(open('/usr/local/bin/claude', 'rb').read()).hexdigest(); \
+sys.exit(0 if got == want else 'checksum mismatch for %s: %s' % (url, got))" \
+ && chmod 0755 /usr/local/bin/claude \
+ && DISABLE_UPDATES=1 HOME=/tmp /usr/local/bin/claude --version
 
 FROM python:3.12-slim AS fills
 ENV PYTHONUNBUFFERED=1 \
@@ -123,6 +146,7 @@ COPY --from=fills-src /app/.venv /app/.venv
 COPY --from=fills-src /app/tools /app/tools
 COPY --from=fills-src /app/research /app/research
 COPY --from=fills-src /app/common /app/common
+COPY --from=claude-code /usr/local/bin/claude /usr/local/bin/claude
 ENTRYPOINT ["python", "-m", "tools.alpaca.fills"]
 
 
