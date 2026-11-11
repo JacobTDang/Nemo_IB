@@ -134,3 +134,88 @@ def test_sentence_boundary_before_four_digit_year():
     out = release_eps.extract_diluted_eps(text)
 
     assert out["eps"] == pytest.approx(0.16)
+
+
+def test_include_marks_a_component_of_earnings():
+    """0001046025-24-000159. "The second quarter results include a loss on
+    sale of securities of $1.9 million, or $0.04 per diluted share" names the
+    quarter, so it outranked the headline. It is a component; the headline's
+    $0.41 is the figure."""
+    text = _fixture("0001046025-24-000159_include_loss_on_sale_component.txt")
+    out = release_eps.extract_diluted_eps(text)
+
+    assert out["eps"] == pytest.approx(0.41)
+
+
+def test_six_month_period_is_not_the_quarter():
+    """0001564590-21-036632. The quote with "the six-month period ended June
+    30, 2021 ... $1.03" comes first; the three-month period's $0.48 is the
+    quarter."""
+    text = _fixture("0001564590-21-036632_six_month_period.txt")
+    out = release_eps.extract_diluted_eps(text)
+
+    assert out["eps"] == pytest.approx(0.48)
+
+
+def test_three_and_twelve_months_reads_the_first_figure():
+    """0000950170-24-007227. "were $0.70 and $2.82 in the three and twelve
+    months ended": the quarter comes first."""
+    text = _fixture("0000950170-24-007227_three_and_twelve_months.txt")
+    out = release_eps.extract_diluted_eps(text)
+
+    assert out["eps"] == pytest.approx(0.70)
+
+
+def test_quarter_and_fiscal_year_reads_the_first_figure():
+    """0001140361-21-025390. "Net income for the quarter and fiscal year ...
+    was $7.6 million, or $0.89 per basic and diluted share, and $23.9 million,
+    or $2.81 ..., respectively": the quarter comes first."""
+    text = _fixture("0001140361-21-025390_quarter_and_fiscal_year.txt")
+    out = release_eps.extract_diluted_eps(text)
+
+    assert out["eps"] == pytest.approx(0.89)
+
+
+def test_including_in_the_company_description_is_not_a_component():
+    """0000719220-22-000024. "with operations in five markets including
+    Western Pennsylvania, ... announced net income of $29.1 million, or $0.74
+    per diluted share". The net income phrase comes after "including", so the
+    figure is net income, not a component."""
+    text = _fixture("0000719220-22-000024_including_in_company_description.txt")
+    out = release_eps.extract_diluted_eps(text)
+
+    assert out["eps"] == pytest.approx(0.74)
+
+
+def test_diluted_cells_that_do_not_fill_the_columns_are_refused():
+    """0001326801-24-000044, cut after the first diluted cell. The row opens
+    with the basic figures; when the diluted figures after it do not fill the
+    columns, the basic $4.86 is not read in their place."""
+    text = _fixture("0001326801-24-000044_diluted_cells_cut_short.txt")
+    out = release_eps.extract_diluted_eps(text, period_end="2024-03-31")
+
+    assert out["eps"] is None
+    assert "against 2 columns" in out["reason"]
+
+
+def test_basic_and_split_around_the_cells_reads_them_as_diluted():
+    """0001506293-22-000039. Pinterest's row is "Net loss per share, basic and
+    $ -0.01 $ -0.03 diluted": the label is split around cells that are both
+    basic and diluted, so they are read in place."""
+    text = _fixture("0001506293-22-000039_basic_and_split_around_cells.txt")
+    out = release_eps.extract_diluted_eps(text, period_end="2022-03-31")
+
+    assert out["basis"] == "table"
+    assert out["eps"] == pytest.approx(-0.01)
+
+
+def test_quarter_and_year_after_the_figure_is_not_a_quarter_word():
+    """0001437749-21-001576. A bullet splits "merger-related expenses of
+    approximately ● $547,000 ... ($0.07 per diluted share ...), for the quarter
+    and year ended", and the fragment keeps no component word. After the
+    figure, "quarter and year" does not name the quarter, so the headline's
+    $0.52 is read."""
+    text = _fixture("0001437749-21-001576_quarter_and_year_after_split_figure.txt")
+    out = release_eps.extract_diluted_eps(text)
+
+    assert out["eps"] == pytest.approx(0.52)
