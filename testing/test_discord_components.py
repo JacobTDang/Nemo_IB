@@ -276,7 +276,7 @@ def _bot_examples():
                      "unrealized_plpc": 0.012, "books": ["Earnings"]},
         "signal": {"as_of_date": "2026-11-10", "accepted": True,
                    "sue": 1.42, "side": "long"},
-        "orders": [{"as_of_date": f"2026-11-{d}", "side": "long",
+        "orders": [{"as_of_date": f"2026-11-{d:02d}", "side": "long",
                     "target_dollars": 3187.92, "entry": fill, "exit": fill}
                    for d in (10, 6, 5)],
         "releases": [{"fiscal_period": f"2026Q{q}", "timing": "bmo",

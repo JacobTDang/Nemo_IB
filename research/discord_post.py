@@ -17,6 +17,7 @@ import os
 import re
 import sys
 import time
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -856,10 +857,101 @@ def portfolio_message(result: dict, *, when: Optional[int] = None,
 
 
 # ------------------------------------------------- the bot's on-demand cards
+#
+# Read by the owner on a phone, not by an engineer: plain words throughout,
+# and none of Nemo's own terms (SUE, gate, drawdown, issuer, job names).
 
-_GLANCE = {"never": "not run yet", "running": "running", "off": "off",
-           "partial": "partial", "stale": "stale", "crashed": "crashed",
-           "failed": "failed"}
+JOB_NAMES = {
+    "congress_copy": "Congress copying",
+    "daily_bars": "Price update",
+    "newcomers": "Price history for new stocks",
+    "universe": "Stock list update",
+    "consensus": "Analyst estimate update",
+    "scan": "Stock picking",
+    "activist_watch": "Activist watch",
+    "score": "Weekly scoring",
+    "announce": "Earnings-date check",
+    "seed": "Monthly estimate history",
+    "fill_submit": "Sending orders",
+    "fill_collect": "Checking orders",
+}
+
+_GLANCE = {"never": "hasn't run yet", "running": "is still running",
+           "off": "is turned off", "partial": "ran with gaps"}
+
+COPY_REASONS = {
+    "no_ticker": "no stock symbol",
+    "below_amount_floor": "too small",
+    "member_not_followed": "member not followed",
+    "trade_too_old": "reported too late",
+    "not_eligible": "stock not tracked",
+    "already_held": "already owned",
+    "duplicate_issuer": "same company twice",
+    "book_full": "at the limit of open trades",
+}
+
+# The scanner's reasons, which are written for the record, said plainly.
+# First match wins; a reason with no match is shown as written.
+PICK_REASONS = (
+    (r"^\|SUE\| ", "the surprise was too small"),
+    (r"^surprise of .* under the", "the surprise was too small"),
+    (r"into a tail, under the", "the surprise was too small"),
+    (r"^sigma from \d+ quarters", "not enough earnings history"),
+    (r"lag is .* under the", "its report timing does not fit the strategy"),
+    (r"^already acted on", "already traded this earnings report"),
+    (r"^signal unavailable", "its earnings could not be read"),
+    (r"^no percentile computed|^no scaled surprise",
+     "its earnings could not be compared"),
+    (r"^(sizing|cost|borrow) unavailable", "the trade could not be priced"),
+    (r"does not clear", "the expected gain was smaller than the cost"),
+    (r"is the same issuer", "another pick is the same company"),
+    (r"^ranked below the top", "other picks ranked higher"),
+)
+
+_TIMING = {"bmo": "before the market opened", "amc": "after the market closed",
+           "dmh": "during the trading day"}
+
+SURPRISE_NOTE = ("-# Surprise: how far earnings beat (+) or missed (−) what "
+                 "was expected. The bigger it is, the bigger the surprise.")
+
+
+def day(iso: Any, *, this_year: Optional[int] = None) -> str:
+    """``Nov 10``, with the year only when it is not this one."""
+    when = date.fromisoformat(str(iso)[:10])
+    if this_year is None:
+        this_year = datetime.now(timezone.utc).year
+    text = f"{when.strftime('%b')} {when.day}"
+    return text if when.year == this_year else f"{text}, {when.year}"
+
+
+def _year(when: int) -> int:
+    return datetime.fromtimestamp(when, timezone.utc).year
+
+
+def _dollars(amount: Any) -> str:
+    return f"${float(amount or 0):,.0f}"
+
+
+def _surprise(value: Any) -> str:
+    return f"surprise **{float(value):+.2f}**"
+
+
+def _quarter(period: Any) -> str:
+    match = re.fullmatch(r"(\d{4})Q(\d)", str(period or ""))
+    return f"Q{match[2]} {match[1]}" if match else escape_text(str(period or ""))
+
+
+def _pick_reason(reason: Any) -> str:
+    text = str(reason or "")
+    for pattern, plain in PICK_REASONS:
+        if re.search(pattern, text):
+            return plain
+    return escape_text(text) if text else "no reason given"
+
+
+def _copy_reason(reason: Any) -> str:
+    text = str(reason or "")
+    return COPY_REASONS.get(text, escape_text(text.replace("_", " ")))
 
 
 def _job_is_clean(job: dict) -> bool:
@@ -867,11 +959,36 @@ def _job_is_clean(job: dict) -> bool:
             or (job.get("state") == "partial" and job.get("partial_is_normal")))
 
 
+def _job_name(job: dict) -> str:
+    return JOB_NAMES.get(job["job"], escape_text(job["job"].replace("_", " ")))
+
+
+def _trouble(job: dict, year: int) -> str:
+    """What went wrong with a job that needs a person, in one line."""
+    name, state = _job_name(job), job.get("state")
+    last = day(job["last_run"], this_year=year) if job.get("last_run") else "?"
+    if state == "failed":
+        error = (str(job.get("error") or "").strip().splitlines() or [""])[0]
+        if len(error) > 120:
+            error = error[:119] + "…"
+        return f"❌ {name} failed on {last}" + (
+            f": {escape_text(redact(error))}" if error else "")
+    if state == "stale":
+        return f"❌ {name} hasn't run since {last}"
+    if state == "crashed":
+        return f"❌ {name} stopped partway through on {last}"
+    if state == "never":
+        return f"❌ {name} has never run"
+    return f"❌ {name}: {escape_text(str(state))}"
+
+
 def status_card(report: dict, *, when: Optional[int] = None,
                 source: str = "nemo /status") -> dict:
-    """`research.status.collect` as one card: the book, the risk switch and
-    the gate first, then every clean job on one line, the ones worth a glance
-    on a second, and each item that needs a person on its own line."""
+    """`research.status.collect` in plain words: what Nemo picked last, how
+    close the safety stop is, how far the strategy is from being judged, and
+    whether every job ran."""
+    when = int(time.time()) if when is None else int(when)
+    year = _year(when)
     attention = [str(item) for item in report.get("attention") or []]
     jobs = report.get("jobs") or []
     raised = {job["job"] for job in jobs
@@ -879,55 +996,81 @@ def status_card(report: dict, *, when: Optional[int] = None,
 
     book = report.get("book") or {}
     if book.get("as_of"):
-        facts = [f"**Book** {_count(int(book.get('accepted') or 0), 'order')} "
-                 f"for {book['as_of']} · "
-                 f"{_count(int(book.get('issuers') or 0), 'issuer')} · "
-                 f"**{int(book.get('shorts') or 0):,}** short"]
+        shorts = int(book.get("shorts") or 0)
+        longs = int(book.get("accepted") or 0) - shorts
+        parts = []
+        if longs:
+            parts.append(f"**{longs:,}** stock{'s' if longs != 1 else ''} to buy")
+        if shorts:
+            parts.append(f"**{shorts:,}** to bet against" if longs else
+                         f"**{shorts:,}** stock{'s' if shorts != 1 else ''} "
+                         f"to bet against")
+        facts = [f"**Latest picks** {' and '.join(parts) or 'none'}, chosen "
+                 f"{day(book['as_of'], this_year=year)}"]
     else:
-        facts = ["**Book** no orders yet"]
+        facts = ["**Latest picks** none yet"]
+
     risk = report.get("risk") or {}
     latest = risk.get("latest")
     if risk.get("halted"):
-        facts.append(f"**Risk** switch **tripped** on "
-                     f"{(risk.get('tripped') or {}).get('as_of_date')}")
+        tripped = (risk.get("tripped") or {}).get("as_of_date")
+        facts.append(f"**Safety stop** ❌ on since {day(tripped, this_year=year)}"
+                     f": no new trades until it is reset")
     elif latest:
-        facts.append(
-            f"**Risk** switch armed · drawdown "
-            f"**{format_money(float(risk.get('drawdown_dollars') or 0))}** of "
-            f"**{format_money(float(latest['limit_dollars']))}**")
+        down = float(risk.get("drawdown_dollars") or 0)
+        where = (f"down **{_dollars(down)}** from its best" if down > 0
+                 else "at its best so far")
+        facts.append(f"**Safety stop** not triggered · {where}; it pauses new "
+                     f"trades at **{_dollars(latest['limit_dollars'])}** down")
     else:
-        facts.append("**Risk** no equity recorded yet")
+        facts.append("**Safety stop** nothing traded yet")
+
     gate = report.get("gate")
-    if gate:
-        facts.append(f"**Gate** **{int(gate['measured_trades']):,}** of "
-                     f"**{int(gate['min_trades']):,}** trades measured · "
-                     f"{'**passed**' if gate['passed'] else 'not passed'}")
+    if not gate:
+        facts.append("**Track record** not checked yet; it is checked each "
+                     "Saturday")
+    elif gate.get("passed"):
+        facts.append(f"**Track record** proven on "
+                     f"**{int(gate['measured_trades']):,}** finished trades")
     else:
-        facts.append("**Gate** not checked yet")
+        facts.append(f"**Track record** **{int(gate['measured_trades']):,}** of "
+                     f"the **{int(gate['min_trades']):,}** finished trades "
+                     f"needed to judge the strategy")
+
     copy = report.get("copy") or {}
-    line = (f"**Copy book** **{int(copy.get('open') or 0):,}** open · "
-            f"**{int(copy.get('closed') or 0):,}** closed")
+    line = (f"**Congress copying** **{int(copy.get('open') or 0):,}** open "
+            f"trades · **{int(copy.get('closed') or 0):,}** closed")
     if copy.get("mean_return") is not None:
-        line += f", mean **{format_signed_percent(copy['mean_return'])}**"
+        line += f", average **{format_signed_percent(copy['mean_return'])}**"
     facts.append(line)
 
+    clean = [job for job in jobs if _job_is_clean(job)]
     detail = []
-    clean = [job["job"] for job in jobs if _job_is_clean(job)]
-    if clean:
-        detail.append("✅ " + " · ".join(clean))
-    glance = [f"{job['job']} {_GLANCE.get(job['state'], job['state'])}"
+    if clean and len(clean) == len(jobs):
+        detail.append(f"✅ All **{len(jobs):,}** jobs ran on time")
+    elif clean:
+        detail.append(f"✅ **{len(clean):,}** of **{len(jobs):,}** jobs ran "
+                      f"on time")
+    glance = [f"{_job_name(job)} {_GLANCE.get(job['state'], escape_text(str(job['state'])))}"
               for job in jobs
               if job["job"] not in raised and not _job_is_clean(job)]
     if glance:
         detail.append("-# " + " · ".join(glance))
-    detail.extend(f"❌ {escape_text(item)}" for item in attention)
+    detail.extend(_trouble(job, year) for job in jobs if job["job"] in raised)
+    for item in attention:
+        if any(item.startswith(job + " ") for job in raised):
+            continue
+        if item.startswith("risk switch"):
+            continue    # the safety stop line above says it
+        detail.append(f"❌ {escape_text(item)}")
 
     if attention:
-        verb = "needs" if len(attention) == 1 else "need"
-        headline = f"Nemo status · {_count(len(attention), 'item')} {verb} attention"
+        count = len(attention)
+        headline = (f"**{count:,}** thing{'s' if count != 1 else ''} "
+                    f"need{'s' if count == 1 else ''} a look")
         emoji, color = "⚠️", YELLOW
     else:
-        headline, emoji, color = "Nemo status · all clear", "✅", GREEN
+        headline, emoji, color = "All good", "✅", GREEN
     return signal_message(headline, facts, emoji=emoji, color=color,
                           source=source, detail="\n".join(detail), when=when)
 
@@ -943,38 +1086,59 @@ def _leg_outcome(leg: Optional[dict]) -> str:
     status = leg.get("status")
     filled = float(leg.get("filled_qty") or 0)
     if status == "filled":
-        return "filled"
+        return "done"
     if status in ("expired", "canceled"):
-        return "part-filled" if filled > 0 else f"{status} unfilled"
-    if status in ("rejected", "skipped"):
-        return status
+        return "partly done" if filled > 0 else "not done"
+    if status == "rejected":
+        return "refused"
+    if status == "skipped":
+        return "skipped"
     return "waiting"
 
 
-_OUTCOMES = ("filled", "part-filled", "expired unfilled", "canceled unfilled",
-             "rejected", "skipped", "waiting", "not sent")
+def _verbs(leg: dict) -> Tuple[str, str]:
+    """What the leg does, done and not done: buy, bet against, sell, buy back."""
+    entry = leg.get("leg", "entry") == "entry"
+    if leg.get("side") == "sell":
+        return ("sold short", "not sold short") if entry else ("sold", "not sold")
+    return ("bought", "not bought") if entry else ("bought back", "not bought back")
+
+
+def _shares(amount: Any) -> str:
+    value = abs(float(amount or 0))
+    number = f"{value:,.0f}" if value.is_integer() else f"{value:,.4f}".rstrip("0")
+    return f"**{number}** share" + ("" if value == 1 else "s")
 
 
 def _leg_text(leg: Optional[dict]) -> str:
-    """One leg as a reader needs it: what filled, at what price, or why not."""
+    """One leg in plain words: what went through, at what price, or why not."""
     outcome = _leg_outcome(leg)
     if outcome == "not sent":
         return "not sent yet"
+    done, not_done = _verbs(leg)
     filled = float(leg.get("filled_qty") or 0)
-    if outcome == "filled":
-        return f"filled **{filled:,.0f}** at **{_price(leg['filled_price'])}**"
-    if outcome == "part-filled":
-        return (f"**{filled:,.0f}** of **{int(leg['qty']):,}** filled at "
-                f"**{_price(leg['filled_price'])}**, then {leg['status']}")
-    if outcome.endswith("unfilled"):
-        return f"{leg['status']}, nothing filled"
-    if outcome in ("rejected", "skipped"):
+    if outcome == "done":
+        return f"{done} {_shares(filled)} at **{_price(leg['filled_price'])}**"
+    rest = "expired" if leg.get("status") == "expired" else "was canceled"
+    if outcome == "partly done":
+        return (f"{done} **{filled:,.0f}** of {_shares(leg['qty'])} at "
+                f"**{_price(leg['filled_price'])}**; the rest {rest}")
+    if outcome == "not done":
+        return (f"{not_done}: the order expired at the open"
+                if leg.get("status") == "expired"
+                else f"{not_done}: the order was canceled")
+    if outcome in ("refused", "skipped"):
         reason = escape_text(str(leg.get("reason") or "no reason given"))
-        return f"{outcome}: {reason}"
-    text = "sent, waiting"
+        return ("the broker refused it: " if outcome == "refused"
+                else "skipped: ") + reason
+    text = "sent, waiting for the market"
     if filled > 0:
-        text += f" · **{filled:,.0f}** of **{int(leg['qty']):,}** filled so far"
+        text += f" · {done} **{filled:,.0f}** of {_shares(leg['qty'])} so far"
     return text
+
+
+_TALLY = ("done", "partly done", "not done", "refused", "skipped", "waiting",
+          "not sent")
 
 
 def _shown(lines: List[str], items: Sequence[Any], line) -> None:
@@ -983,80 +1147,109 @@ def _shown(lines: List[str], items: Sequence[Any], line) -> None:
         lines.append(f"and **{len(items) - WATCH_EVENTS_SHOWN}** more")
 
 
+def _side_word(side: Any) -> str:
+    return "bet against" if side == "short" else "buy"
+
+
 def orders_card(data: dict, *, when: Optional[int] = None,
                 source: str = "nemo /orders") -> dict:
-    """Each book's latest decision, every order with what its entry did, and
-    the exits sent for the same session."""
+    """What each strategy picked last, and what each order did at the
+    broker, in plain words."""
+    when = int(time.time()) if when is None else int(when)
+    year = _year(when)
     earnings, copy = data.get("earnings"), data.get("copy")
     if not earnings and not copy:
         return signal_message("No orders yet",
-                              ["Nemo has not decided any orders."],
+                              ["Nemo has not picked any trades yet."],
                               emoji="💤", source=source, when=when)
     facts: List[str] = []
     detail: List[str] = []
+    surprises = False
     if earnings:
         orders = earnings.get("orders") or []
         exits = earnings.get("exits") or []
-        line = (f"**Earnings** {_count(len(orders), 'order')} decided "
-                f"{earnings['decided']}")
+        line = (f"**Earnings strategy** **{len(orders):,}** "
+                f"stock{'s' if len(orders) != 1 else ''} picked on "
+                f"{day(earnings['decided'], this_year=year)}")
         if exits:
-            line += f" · {_count(len(exits), 'exit')}"
+            line += (f" · **{len(exits):,}** earlier "
+                     f"trade{'s' if len(exits) != 1 else ''} closing")
         facts.append(line)
-        tally = {outcome: 0 for outcome in _OUTCOMES}
+        tally = {outcome: 0 for outcome in _TALLY}
         for order in orders:
             tally[_leg_outcome(order.get("entry"))] += 1
-        facts.append(" · ".join(f"**{n:,}** {outcome}"
+        all_buys = all(order.get("side") != "short" for order in orders)
+        words = {"done": "bought", "partly done": "partly bought",
+                 "not done": "not bought", "not sent": "not sent yet"} \
+            if all_buys else {"not sent": "not sent yet"}
+        facts.append(" · ".join(f"**{n:,}** {words.get(outcome, outcome)}"
                                 for outcome, n in tally.items() if n))
 
         def order_line(order):
-            sue = ("" if order.get("sue") is None
-                   else f" · SUE **{_fixed(order['sue'], 2)}**")
+            nonlocal surprises
+            sue = ""
+            if order.get("sue") is not None:
+                sue, surprises = f" · {_surprise(order['sue'])}", True
             return (f"**{escape_text(str(order['ticker']))}** "
-                    f"{escape_text(str(order.get('side') or ''))}{sue} · "
-                    f"**{_price(order.get('target_dollars') or 0)}** · "
+                    f"{_side_word(order.get('side'))} "
+                    f"**{_dollars(order.get('target_dollars'))}**{sue} · "
                     f"{_leg_text(order.get('entry'))}")
 
         _shown(detail, orders, order_line)
         _shown(detail, exits, lambda leg: (
-            f"**{escape_text(str(leg['ticker']))}** exit · {_leg_text(leg)}"))
+            f"**{escape_text(str(leg['ticker']))}** closing an earlier trade · "
+            f"{_leg_text(leg)}"))
     if copy:
         copied = copy.get("orders") or []
         seen = int(copy.get("seen") or 0)
+        trades = ("trade by a member of Congress" if seen == 1
+                  else "trades by members of Congress")
         facts.append(
-            f"**Copy** {_count(seen, 'congressional trade')} seen "
-            f"{copy['decided']} · "
+            f"**Congress copying** **{seen:,}** {trades} seen "
+            f"{day(copy['decided'], this_year=year)} · "
             + (f"**{len(copied):,}** copied" if copied else "none copied"))
         _shown(detail, copied, lambda order: (
-            f"**{escape_text(str(order['ticker']))}** copy · "
-            f"{escape_text(str(order.get('member') or ''))} · "
-            f"**{_price(order.get('target_dollars') or 0)}** · "
+            f"**{escape_text(str(order['ticker']))}** copying "
+            f"{escape_text(str(order.get('member') or 'a member'))} · "
+            f"**{_dollars(order.get('target_dollars'))}** · "
             f"{_leg_text(order.get('entry'))}"))
         refused = sorted((copy.get("refused") or {}).items(),
                          key=lambda item: (-item[1], str(item[0])))
         if refused:
             detail.append("-# Not copied: " + " · ".join(
-                f"{escape_text(str(reason).replace('_', ' '))} **{n:,}**"
-                for reason, n in refused))
+                f"{_copy_reason(reason)} **{n:,}**" for reason, n in refused))
+    if surprises:
+        detail.append(SURPRISE_NOTE)
     session = earnings["session"] if earnings else data.get("as_of")
-    return signal_message(f"Orders for {session}", facts, source=source,
-                          detail="\n".join(detail), when=when)
+    return signal_message(f"Orders for {day(session, this_year=year)}", facts,
+                          source=source, detail="\n".join(detail), when=when)
 
 
-_TIMING = {"bmo": "before the open", "amc": "after the close",
-           "dmh": "during market hours"}
+def _held_by(books: Sequence[str]) -> str:
+    names = {"Earnings": "the earnings strategy", "Copy": "congress copying"}
+    books = list(books or [])
+    if not books:
+        return "not from either strategy"
+    if len(books) > 1:
+        return "from both strategies"
+    return f"from {names.get(books[0], escape_text(books[0]))}"
 
 
-def _shares(qty: Any) -> str:
-    amount = abs(float(qty or 0))
-    number = f"{amount:,.0f}" if amount.is_integer() else f"{amount:,.4f}".rstrip("0")
-    return f"**{number}** share" + ("" if amount == 1 else "s")
+def _filing_said(form: str) -> str:
+    if "/A" in form:
+        return "updated their stake"
+    if "13G" in form:
+        return "reported a passive stake of 5% or more"
+    return "reported a stake of 5% or more"
 
 
 def ticker_card(data: dict, *, when: Optional[int] = None,
                 source: str = "nemo /ticker") -> dict:
-    """What Nemo holds on one name: the position, the latest signal and why it
-    was or was not traded, the orders, the releases, 13D filings and the
-    congressional trades the copy book saw."""
+    """What Nemo has on one stock, in plain words: what you own, whether
+    Nemo picked it and why or why not, its orders, its earnings reports,
+    activist investors and congress trades."""
+    when = int(time.time()) if when is None else int(when)
+    year = _year(when)
     symbol = escape_text(str(data.get("symbol") or ""))
     position, error = data.get("position"), data.get("position_error")
     signal = data.get("signal")
@@ -1068,88 +1261,95 @@ def ticker_card(data: dict, *, when: Optional[int] = None,
     if not (position or error or signal or orders or releases or filings
             or congress):
         return signal_message(
-            f"{symbol} · nothing on record",
-            [f"Nemo has no signal, order, release, 13D or congressional "
-             f"trade for **{symbol}**."], emoji="💤", source=source, when=when)
+            f"{symbol} · Nemo has nothing on it",
+            [f"No picks, orders, earnings reports, activist filings or "
+             f"congress trades for **{symbol}**."], emoji="💤", source=source,
+            when=when)
 
     facts: List[str] = []
     if position:
-        value = float(position.get("market_value") or 0)
-        money = ("-" if value < 0 else "") + format_money(abs(value))
-        headline = (f"{symbol} · {escape_text(str(position.get('side')))} "
-                    f"{_shares(position.get('qty'))} · **{money}**")
-        books = " · ".join(position.get("books") or []) or "no book"
+        worth = format_money(abs(float(position.get("market_value") or 0)))
+        holds = ("you're betting against" if position.get("side") == "short"
+                 else "you own")
+        headline = (f"{symbol} · {holds} {_shares(position.get('qty'))} "
+                    f"worth **{worth}**")
         facts.append(
-            f"**Unrealized** "
+            f"**Gain/loss** "
             f"**{format_signed_money(float(position.get('unrealized_pl') or 0))}** "
             f"(**{format_signed_percent(float(position.get('unrealized_plpc') or 0))}**)"
-            f" · {escape_text(books)}")
+            f" · {_held_by(position.get('books'))}")
     elif error:
-        headline = f"{symbol} · position unknown"
+        headline = f"{symbol} · couldn't check your account"
         facts.append(f"⚠️ The paper account could not be read: "
                      f"{escape_text(redact(str(error)))}")
     else:
-        headline = f"{symbol} · no position"
+        headline = f"{symbol} · you don't own it"
 
+    surprises = False
     if signal:
-        sue = ("" if signal.get("sue") is None
-               else f" · SUE **{_fixed(signal['sue'], 2)}**")
-        if signal.get("accepted"):
-            outcome = f"**{escape_text(str(signal.get('side')))}**, ordered"
-        else:
-            outcome = ("not traded: "
-                       + escape_text(str(signal.get("reason") or "no reason given")))
-        facts.append(f"**Signal** {signal['as_of_date']}{sue} · {outcome}")
+        sue = ""
+        if signal.get("sue") is not None:
+            sue, surprises = f" · {_surprise(signal['sue'])}", True
+        outcome = (f"picked to {_side_word(signal.get('side'))}"
+                   if signal.get("accepted")
+                   else f"not traded: {_pick_reason(signal.get('reason'))}")
+        facts.append(f"**Latest check** "
+                     f"{day(signal['as_of_date'], this_year=year)}{sue} · "
+                     f"{outcome}")
     if releases:
         last = releases[0]
-        line = (f"**Last release** {last['announced_date']} · "
-                f"{escape_text(str(last['fiscal_period']))}")
+        line = (f"**Last earnings report** "
+                f"{day(last['announced_date'], this_year=year)} "
+                f"({_quarter(last['fiscal_period'])})")
         if _TIMING.get(last.get("timing")):
-            line += f" · {_TIMING[last['timing']]}"
+            line += f", {_TIMING[last['timing']]}"
         facts.append(line)
 
     detail: List[str] = []
     if len(releases) > 1:
-        detail.append("-# Earlier: " + " · ".join(
-            f"{r['announced_date']} ({escape_text(str(r['fiscal_period']))})"
-            for r in releases[1:]))
+        detail.append("-# Earlier reports: " + " · ".join(
+            day(r["announced_date"], this_year=year) for r in releases[1:]))
     if orders:
         detail.append("**Orders**")
         for order in orders:
-            line = (f"{order['as_of_date']} "
-                    f"{escape_text(str(order.get('side') or ''))} "
-                    f"**{_price(order.get('target_dollars') or 0)}** · "
+            line = (f"{day(order['as_of_date'], this_year=year)} "
+                    f"{_side_word(order.get('side'))} "
+                    f"**{_dollars(order.get('target_dollars'))}** · "
                     f"{_leg_text(order.get('entry'))}")
             if order.get("exit"):
-                line += f" · exit {_leg_text(order['exit'])}"
+                line += f" · then {_leg_text(order['exit'])}"
             detail.append(line)
     links = []
     if filings:
-        detail.append("**13D/G filings**")
+        detail.append("**Activist investors**")
         for filing in filings:
             form = str(filing.get("form") or "13D")
-            detail.append(f"**{escape_text(form)}** {filing['filing_date']} · "
-                          f"{escape_text(str(filing.get('filer_name') or ''))}")
+            when_filed = day(filing["filing_date"], this_year=year)
+            detail.append(
+                f"{when_filed} · "
+                f"{escape_text(str(filing.get('filer_name') or 'an investor'))} · "
+                f"{_filing_said(form)}")
             if filing.get("url"):
-                links.append((f"{form} {filing['filing_date']}"[:LABEL_LIMIT],
+                links.append((f"Filing {when_filed}"[:LABEL_LIMIT],
                               filing["url"]))
     if congress:
         detail.append("**Congress**")
         for trade in congress:
-            if trade.get("accepted"):
-                verdict = f"copied **{_price(trade.get('target_dollars') or 0)}**"
-            else:
-                verdict = "not copied: " + escape_text(
-                    str(trade.get("reason") or "").replace("_", " "))
+            verdict = (f"copied with **{_dollars(trade.get('target_dollars'))}**"
+                       if trade.get("accepted")
+                       else f"not copied: {_copy_reason(trade.get('reason'))}")
             amount = ""
             if trade.get("amount_min") is not None:
                 amount = (f" · ${int(trade['amount_min']):,}"
                           f"–${int(trade.get('amount_max') or 0):,}")
+            traded = (day(trade["transaction_date"], this_year=year)
+                      if trade.get("transaction_date") else "?")
             detail.append(
-                f"{trade.get('transaction_date') or '?'} · "
-                f"{escape_text(str(trade.get('member') or ''))} "
-                f"({escape_text(str(trade.get('chamber') or ''))}){amount} · "
-                f"{verdict}")
+                f"{traded} · {escape_text(str(trade.get('member') or ''))} "
+                f"({escape_text(str(trade.get('chamber') or '').title())})"
+                f"{amount} · {verdict}")
+    if surprises:
+        detail.append(SURPRISE_NOTE)
     return signal_message(headline, facts, source=source, links=links,
                           detail="\n".join(detail), when=when)
 
