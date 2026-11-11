@@ -56,6 +56,8 @@ LOCK_HELD = 99
 # reported to Discord, or deliberately did not repeat.
 REPORTED = "nemo-discord: failure reported"
 
+INTERACTION_API = "https://discord.com/api/v10"
+
 OPS_SETTING = "NEMO_DISCORD_OPS_WEBHOOK_URL"
 SIGNALS_SETTING = "NEMO_DISCORD_SIGNALS_WEBHOOK_URL"
 
@@ -69,6 +71,7 @@ JOB_CHANNELS: Dict[str, Tuple[str, ...]] = {
     "research-score": ("ops", "signals"),
     "research-announce": ("ops", "signals"),
     "research-fills": ("ops", "signals"),
+    "research-portfolio": ("ops", "signals"),
     "research-daily": ("ops",),
     "research-seed": ("ops",),
     "congress-sync": ("ops",),
@@ -83,8 +86,10 @@ FAILURES_SHOWN = 10
 CUT_MARK = "[earlier lines cut]"
 ZERO_WIDTH_SPACE = "​"
 
+# A webhook URL, and an interaction's (/api/v10/webhooks/<app>/<token>), whose
+# token answers for the interaction for 15 minutes.
 _WEBHOOK_URL = re.compile(
-    r"https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/\S+",
+    r"https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/(?:v\d+/)?webhooks/\S+",
     re.I)
 _MARKDOWN = re.compile(r"([\\*_`~|>\[\]])")
 _FENCE = re.compile(r"^\s*```")
@@ -111,6 +116,16 @@ def format_money(amount: float) -> str:
 
 def format_percent(fraction: float) -> str:
     return f"{fraction * 100:.0f}%"
+
+
+def format_signed_money(amount: float) -> str:
+    """``+$412.10`` or ``-$1,000.00``: a change, with its sign always shown."""
+    return ("+" if amount >= 0 else "-") + format_money(abs(amount))
+
+
+def format_signed_percent(fraction: float) -> str:
+    """``+0.41%`` or ``-0.85%``: a return, to two places."""
+    return f"{fraction * 100:+.2f}%"
 
 
 def format_duration(seconds: float) -> str:
@@ -487,6 +502,8 @@ def messages_for(job: str, code: int, result: Optional[dict], *,
 
     if job == "research-fills":
         messages = _fills(result, seconds, when)
+    elif job == "research-portfolio":
+        messages = _portfolio(result, failed, seconds, when, error)
     elif job == "research-copy":
         messages = _copy(result, failed, seconds, when, error)
     elif job == "research-scan":
@@ -781,6 +798,62 @@ def _fills(result, seconds, when):
     return messages
 
 
+def _portfolio(result, failed, seconds, when, error):
+    """The card every weekday, silent. A failed read goes to #ops instead."""
+    if failed:
+        return [("ops", ops_message(
+            "research-portfolio", "the paper account could not be read",
+            ok=False, seconds=seconds, error=error, when=when))]
+    return [("signals", portfolio_message(result, when=when))]
+
+
+def _position_line(position: dict) -> str:
+    symbol = f"**{escape_text(str(position.get('symbol') or ''))}**"
+    if position.get("side") == "short":
+        symbol += " short"
+    books = " · ".join(position.get("books") or []) or "no book"
+    value = float(position.get("market_value") or 0)
+    money = ("-" if value < 0 else "") + format_money(abs(value))
+    gain = format_signed_percent(float(position.get("unrealized_plpc") or 0))
+    return f"{symbol} · {books} · {money} · **{gain}**"
+
+
+def portfolio_message(result: dict, *, when: Optional[int] = None,
+                      source: str = "nemo research-portfolio",
+                      suppress: bool = True) -> dict:
+    """The paper account: its value and the day's change, its open positions
+    largest first with the books that hold them, and each book's closed
+    trades. The daily post and the /portfolio reply are this one card."""
+    equity = float(result.get("equity") or 0)
+    last = float(result.get("last_equity") or 0)
+    positions = result.get("positions") or []
+    facts = []
+    # A new account has no previous close to measure the day from.
+    if last > 0:
+        change = equity - last
+        facts.append(f"**Today** **{format_signed_money(change)}** "
+                      f"(**{format_signed_percent(change / last)}**)")
+    unrealized = sum(float(p.get("unrealized_pl") or 0) for p in positions)
+    facts.append(f"**Cash** **{format_money(float(result.get('cash') or 0))}**"
+                 f" · **Unrealized** **{format_signed_money(unrealized)}**")
+    lines = [_count(len(positions), "open position")]
+    lines.extend(_position_line(p) for p in positions[:WATCH_EVENTS_SHOWN])
+    if len(positions) > WATCH_EVENTS_SHOWN:
+        lines.append(f"and **{len(positions) - WATCH_EVENTS_SHOWN}** more")
+    closed = []
+    for name, book in (result.get("books") or {}).items():
+        part = f"{escape_text(name)} {_count(int(book.get('closed') or 0), 'trade')}"
+        if book.get("mean_return") is not None:
+            part += f", mean **{format_signed_percent(book['mean_return'])}**"
+        closed.append(part)
+    if closed:
+        lines.append("-# Closed: " + " · ".join(closed))
+    return signal_message(
+        f"Paper portfolio · {format_money(equity)}", facts, emoji="📋",
+        color=BLURPLE, source=source, detail="\n".join(lines), when=when,
+        suppress=suppress)
+
+
 def _daily(result, failed, seconds, when, error):
     if "days" in result and isinstance(result["days"], dict):
         days = result["days"]
@@ -993,6 +1066,35 @@ def _http_send(url: str, body: dict) -> None:
                 f"Discord answered {response.status_code} without a message id; "
                 f"the message may not be saved")
         return
+
+
+def edit_interaction_reply(application_id: str, token: str,
+                           payload: dict) -> None:
+    """Replace a deferred interaction's loading message with ``payload``.
+
+    The token is the interaction's, and like a webhook URL it is never put
+    in an error. Only a 200 that carries the saved message's id is an edit.
+    """
+    import httpx
+
+    _check(payload)
+    url = (f"{INTERACTION_API}/webhooks/{application_id}/{token}"
+           f"/messages/@original?with_components=true")
+    try:
+        response = httpx.patch(url, json=payload, timeout=30)
+    except Exception as exc:
+        raise DiscordError(f"Discord edit failed: {type(exc).__name__}") from None
+    if response.status_code >= 300:
+        detail = _discord_detail(response)
+        raise DiscordError(f"Discord edit returned {response.status_code}"
+                           + (f": {detail}" if detail else ""))
+    try:
+        saved = response.json()
+    except ValueError:
+        saved = None
+    if not isinstance(saved, dict) or not saved.get("id"):
+        raise DiscordError(f"Discord answered the edit with {response.status_code} "
+                           f"and no message id")
 
 
 # ------------------------------------------------------------------- the log

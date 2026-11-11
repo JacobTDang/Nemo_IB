@@ -137,6 +137,9 @@ class AsyncBroker:
     return {
       "paper": self.paper,
       "equity": float(data.get("equity", 0)),
+      # The equity at the previous session's close, which the day's change
+      # is measured from.
+      "last_equity": float(data.get("last_equity", 0)),
       "cash": float(data.get("cash", 0)),
       "buying_power": float(data.get("buying_power", 0)),
       "portfolio_value": float(data.get("portfolio_value", 0)),
@@ -157,6 +160,9 @@ class AsyncBroker:
         "side": p.get("side", "long"),
         "market_value": float(p.get("market_value", 0) or 0),
         "avg_entry_price": float(p.get("avg_entry_price", 0) or 0),
+        "unrealized_pl": float(p.get("unrealized_pl", 0) or 0),
+        # A fraction of the cost basis: 0.0412 is 4.12%.
+        "unrealized_plpc": float(p.get("unrealized_plpc", 0) or 0),
       })
     return out
 

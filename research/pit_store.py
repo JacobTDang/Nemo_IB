@@ -1747,13 +1747,19 @@ def measured_round_trips(as_of_date: str) -> List[Dict[str, Any]]:
 
 
 def copy_book_summary(as_of_date: str) -> Dict[str, Any]:
-    """Open and closed copy positions, and the share-weighted mean return.
+    """Open and closed copy positions, and the share-weighted mean return."""
+    return book_summary(as_of_date, "copy_fill")
 
-    Return is exit fill over entry fill, minus one, for a long. Exit fills
-    across attempts are quantity-weighted into one exit price. Positions that
-    still hold shares after every terminal exit are open.
+
+def book_summary(as_of_date: str, table: str) -> Dict[str, Any]:
+    """One book's open and closed positions, and the share-weighted mean return.
+
+    Return is exit fill over entry fill, minus one, for a long, and the
+    opposite for a short, whose entry is a sell. Exit fills across attempts
+    are quantity-weighted into one exit price. Positions that still hold
+    shares after every terminal exit are open, and their tickers are listed.
     """
-    fills = fills_as_of(as_of_date, table="copy_fill")
+    fills = fills_as_of(as_of_date, table=table)
     by_key: Dict[tuple, Dict[str, Any]] = {}
     for row in fills:
         slot = by_key.setdefault(
@@ -1765,9 +1771,10 @@ def copy_book_summary(as_of_date: str) -> Dict[str, Any]:
             slot["exits"].append(row)
 
     open_n = closed_n = 0
+    open_tickers = set()
     weighted_return = 0.0
     weight = 0.0
-    for slot in by_key.values():
+    for (_, ticker), slot in by_key.items():
         entry = slot["entry"]
         if (entry is None or entry["status"] not in FILL_TERMINAL
                 or not entry.get("filled_qty") or not entry.get("filled_price")):
@@ -1785,15 +1792,19 @@ def copy_book_summary(as_of_date: str) -> Dict[str, Any]:
             exit_value += qty * float(exit_row["filled_price"])
         if exit_qty + 1e-9 < entry_qty:
             open_n += 1
+            open_tickers.add(ticker)
             continue
         closed_n += 1
         exit_price = exit_value / exit_qty
         ret = exit_price / float(entry["filled_price"]) - 1.0
+        if entry["side"] == "sell":
+            ret = -ret
         weighted_return += entry_qty * ret
         weight += entry_qty
     return {
         "open": open_n,
         "closed": closed_n,
+        "open_tickers": sorted(open_tickers),
         "mean_return": (weighted_return / weight) if weight else None,
     }
 

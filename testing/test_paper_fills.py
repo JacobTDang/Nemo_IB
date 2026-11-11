@@ -687,15 +687,18 @@ def test_the_fill_image_is_its_own_target_and_carries_the_broker():
     assert "tools/alpaca" in body
 
 
-def test_only_the_fill_service_is_handed_a_broker_key():
+def test_only_the_fill_image_services_are_handed_a_broker_key():
+    """The fills, and the portfolio card and bot that read the same paper
+    account. Every one runs the fill image; no data-image service holds a key."""
     compose = yaml.safe_load(
         (ROOT / "deploy" / "docker-compose.yml").read_text())
     holders = sorted(name for name, service in compose["services"].items()
                      if any(k.startswith("ALPACA")
                             for k in (service.get("environment") or {})))
 
-    assert holders == ["research-fills"]
-    assert "nemo-fills" in compose["services"]["research-fills"]["image"]
+    assert holders == ["portfolio-bot", "research-fills", "research-portfolio"]
+    for name in holders:
+        assert "nemo-fills" in compose["services"][name]["image"]
 
 
 # --- the gate reads them -----------------------------------------------------

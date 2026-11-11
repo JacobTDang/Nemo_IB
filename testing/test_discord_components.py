@@ -287,6 +287,23 @@ def _examples():
         "copy": {"status": "ok", "submitted": 1, "skipped": 0, "rejected": 0,
                  "missed": 0}})
     examples += messages("congress-sync", 0, {"parsed": 12, "failures": 0})
+    examples += messages("research-portfolio", 0, {
+        "status": "ok", "equity": 100523.40, "last_equity": 100111.30,
+        "cash": 61230.0,
+        "positions": [
+            {"symbol": "NVDA", "side": "long", "market_value": 18402.0,
+             "unrealized_pl": 728.0, "unrealized_plpc": 0.0412,
+             "books": ["Earnings"]},
+            {"symbol": "AAPL", "side": "long", "market_value": 12050.0,
+             "unrealized_pl": -103.0, "unrealized_plpc": -0.0085,
+             "books": ["Copy"]},
+            {"symbol": "TSLA", "side": "short", "market_value": -8840.0,
+             "unrealized_pl": 115.0, "unrealized_plpc": 0.013,
+             "books": ["Earnings"]}],
+        "books": {"Earnings": {"open": 2, "closed": 14, "mean_return": 0.0062},
+                  "Copy": {"open": 1, "closed": 2, "mean_return": 0.031}}})
+    examples += messages("research-portfolio", 1, {
+        "status": "failed", "error": "AsyncBrokerError: 401 unauthorized"})
     examples += messages("research-backup", 0, {"bytes": 2_200_000_000,
                                                 "removed": 1})
     examples += messages("research-status", 1, {
