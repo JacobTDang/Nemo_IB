@@ -728,21 +728,24 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # /portfolio in Discord: the same card on demand, seen only by whoever asks,
-  # and only the server's administrators see the command. It connects out to
-  # Discord, so nothing listens on the host. It needs NEMO_DISCORD_BOT_TOKEN
-  # and NEMO_DISCORD_GUILD_ID, so it has its own profile and `up -d` leaves it
-  # off until both are in .env:
+  # The nemo bot in Discord: /portfolio, /status, /orders and /ticker, each
+  # seen only by whoever asks, and only the server's administrators see the
+  # commands. Read only. It connects out to Discord, so nothing listens on the
+  # host. It needs NEMO_DISCORD_BOT_TOKEN and NEMO_DISCORD_GUILD_ID, so it has
+  # its own profile and `up -d` leaves it off until both are in .env:
   #
-  #   docker compose --env-file ../.env --profile bot up -d portfolio-bot
-  portfolio-bot:
+  #   docker compose --env-file ../.env --profile bot up -d nemo-bot
+  nemo-bot:
     image: ${NEMO_FILLS_IMAGE:-nemo-fills:local}
     profiles: ["bot"]
     restart: unless-stopped
-    entrypoint: ["python", "-m", "tools.alpaca.portfolio_bot"]
+    entrypoint: ["python", "-m", "tools.alpaca.bot"]
     environment:
       <<: *clock-env
       NEMO_PIT_DB: /app/data/pit.db
+      # /status reports the copy job as off unless this is on, as the job
+      # itself reads it.
+      NEMO_COPY_TRADING: ${NEMO_COPY_TRADING:-}
       ALPACA_PAPER_KEY: ${ALPACA_PAPER_KEY:-}
       ALPACA_PAPER_SECRET: ${ALPACA_PAPER_SECRET:-}
       NEMO_DISCORD_BOT_TOKEN: ${NEMO_DISCORD_BOT_TOKEN:-}

@@ -270,7 +270,7 @@ server = [
   "yfinance==1.0",
 ]
 
-# The /portfolio command's Discord client (tools/alpaca/portfolio_bot.py). The
+# The nemo bot's Discord client (tools/alpaca/bot.py). The
 # paper-fill image installs it beside the server group; the data image does
 # not, so the five servers never carry it.
 bot = [

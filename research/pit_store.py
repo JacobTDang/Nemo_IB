@@ -1364,8 +1364,8 @@ def record_paper_orders(as_of_date: str, candidates: Iterable[Dict[str, Any]],
     return written
 
 
-def paper_orders_as_of(as_of: str, accepted_only: bool = False
-                       ) -> List[Dict[str, Any]]:
+def paper_orders_as_of(as_of: str, accepted_only: bool = False,
+                       ticker: Optional[str] = None) -> List[Dict[str, Any]]:
     """Orders decided on or before `as_of`, as they were decided.
 
     `recorded_at` is filtered like everywhere else: a scan run today is not
@@ -1376,6 +1376,9 @@ def paper_orders_as_of(as_of: str, accepted_only: bool = False
     params: tuple = (as_of, as_of)
     if accepted_only:
         sql += " AND accepted = 1"
+    if ticker:
+        sql += " AND ticker = ?"
+        params += (ticker,)
     sql += " ORDER BY as_of_date, rank IS NULL, rank, ticker"
     with connect() as conn:
         rows = conn.execute(sql, params).fetchall()

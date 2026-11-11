@@ -236,6 +236,65 @@ def test_a_long_brief_splits_into_numbered_containers():
 REAL_SEND = post._http_send  # the conftest fixture replaces the module attribute
 
 
+def _bot_examples():
+    """The bot's /status, /orders and /ticker cards, each at its fullest."""
+    jobs = [{"job": name, "state": state, "partial_is_normal": normal}
+            for name, state, normal in (
+                ("congress_copy", "ok", False), ("daily_bars", "partial", False),
+                ("newcomers", "ok", False), ("universe", "ok", False),
+                ("consensus", "ok", False), ("scan", "failed", False),
+                ("activist_watch", "partial", True), ("score", "ok", False),
+                ("announce", "running", False), ("seed", "never", False),
+                ("fill_submit", "ok", False), ("fill_collect", "ok", False))]
+    report = {
+        "as_of": "2026-11-11", "jobs": jobs,
+        "book": {"as_of": "2026-11-10", "accepted": 8, "issuers": 8,
+                 "shorts": 0},
+        "risk": {"halted": False, "drawdown_dollars": 412.5,
+                 "latest": {"limit_dollars": 5000.0}},
+        "gate": {"measured_trades": 4, "min_trades": 30, "passed": 0},
+        "copy": {"open": 1, "closed": 2, "mean_return": 0.031},
+        "attention": ["scan failed on 2026-11-10: HTTPError: 503 Service "
+                      "Unavailable from EDGAR full-text search"]}
+    fill = {"status": "expired", "qty": 154, "filled_qty": 113,
+            "filled_price": 21.15, "reason": None}
+    orders = {"as_of": "2026-11-11", "earnings": {
+        "decided": "2026-11-10", "session": "2026-11-11",
+        "orders": [{"ticker": f"T{i}", "side": "long", "sue": 1.42,
+                    "target_dollars": 3187.92, "entry": fill}
+                   for i in range(11)],
+        "exits": [{**fill, "ticker": f"X{i}", "leg": "exit"}
+                  for i in range(10)]},
+        "copy": {"decided": "2026-11-10", "seen": 12,
+                 "orders": [{"ticker": "AAPL", "member": "Ada Lovelace",
+                             "target_dollars": 5000.0, "entry": fill}],
+                 "refused": {"no_ticker": 7, "stale": 3, "sale": 1}}}
+    ticker = {
+        "symbol": "TMO", "as_of": "2026-11-11",
+        "position": {"symbol": "TMO", "side": "long", "qty": 7,
+                     "market_value": 3180.4, "unrealized_pl": 37.6,
+                     "unrealized_plpc": 0.012, "books": ["Earnings"]},
+        "signal": {"as_of_date": "2026-11-10", "accepted": True,
+                   "sue": 1.42, "side": "long"},
+        "orders": [{"as_of_date": f"2026-11-{d}", "side": "long",
+                    "target_dollars": 3187.92, "entry": fill, "exit": fill}
+                   for d in (10, 6, 5)],
+        "releases": [{"fiscal_period": f"2026Q{q}", "timing": "bmo",
+                      "announced_date": f"2026-{m}-21"}
+                     for q, m in ((3, 10), (2, "07"), (1, "04"))],
+        "filings": [{"form": "SC 13D/A", "filing_date": f"2026-10-0{d}",
+                     "filer_name": "Example Capital Management LP",
+                     "url": f"https://www.sec.gov/Archives/edgar/data/{d}/x.htm"}
+                    for d in (1, 2, 3)],
+        "congress": [{"transaction_date": "2026-10-20",
+                      "member": "Ada Lovelace", "chamber": "senate",
+                      "amount_min": 250001, "amount_max": 500000,
+                      "accepted": False, "reason": "no_ticker"}] * 3}
+    return [post.status_card(report, when=WHEN),
+            post.orders_card(orders, when=WHEN),
+            post.ticker_card(ticker, when=WHEN)]
+
+
 def _examples():
     """One of every message type, built from fixtures, for the preview webhook."""
     examples = []
@@ -309,6 +368,7 @@ def _examples():
     examples += messages("research-status", 1, {
         "attention": ["score has no usable coefficient"]})
     examples += messages("research-status", 0, {"attention": []})
+    examples += _bot_examples()
     examples.append(post.cron_message(
         "research-watch", post.LOCK_HELD, "", when=WHEN))
     examples.append(post.cron_message(

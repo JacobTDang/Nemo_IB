@@ -710,10 +710,20 @@ this line to the same crontab:
 
 21:15 UTC is after the 16:00 ET close in summer and winter time.
 
-`/portfolio` shows the same card at any time. Only the person who asks sees
-the answer, and Discord shows the command only to the administrators of the
-server. The bot connects out to Discord, so nothing on the host listens for
-it. To start it:
+The nemo bot answers four commands in Discord at any time:
+
+- `/portfolio` shows the same card.
+- `/status` shows the jobs, the book, the risk switch, and the gate, as
+  `research-status` does.
+- `/orders` shows the latest decision of each book and what each order did
+  at the broker.
+- `/ticker` shows what Nemo has on one ticker: the position, the latest
+  signal, the orders, the earnings releases, the 13D filings, and the
+  congressional trades.
+
+Only the person who asks sees the answer, and Discord shows the commands only
+to the administrators of the server. The bot only reads. It connects out to
+Discord, so nothing on the host listens for it. To start it:
 
 1. In the Discord Developer Portal, create an application. On its **Bot**
    page, reset the token and copy it.
@@ -728,12 +738,12 @@ it. To start it:
 
 ```bash
 cd /srv/nemo/deploy
-docker compose --env-file ../.env --profile bot up -d portfolio-bot
+docker compose --env-file ../.env --profile bot up -d nemo-bot
 ```
 
 After each deploy, run that command again, so that the bot uses the new image.
 If a setting is missing, the bot stops and names the setting in
-`docker compose --env-file ../.env logs portfolio-bot`.
+`docker compose --env-file ../.env logs nemo-bot`.
 
 ### Seeing what happened, from a terminal
 
