@@ -720,9 +720,11 @@ The nemo bot answers four commands in Discord at any time:
 - `/ticker` shows what Nemo has on one ticker: the position, the latest
   signal, the orders, the earnings releases, the 13D filings, and the
   congressional trades.
-- `/ask` sends a question to Claude, which answers it with the tools of the
-  five servers, through the gateway. Each question is billed to the
-  Anthropic account of the key.
+- `/ask` sends a question to Claude Code, which answers it with the tools
+  of the five servers, through the gateway. It runs on your own Claude
+  subscription, not on an API key, so each question counts toward the usage
+  limits of your plan. Only the owner of the bot can use it, because the
+  subscription is for your own use only.
 
 Only the person who asks sees the answer, and Discord shows the commands only
 to the administrators of the server. The bot only reads. It connects out to
@@ -751,8 +753,12 @@ If a setting is missing, the bot stops and names the setting in
 `/ask` needs two more settings. Without them, the other commands still work,
 and `/ask` names the missing setting in its answer.
 
-1. In the Anthropic Console, create an API key. Add it to `/srv/nemo/.env` as
-   `ANTHROPIC_API_KEY`. The key is a secret. Do not print it or commit it.
+1. On your own computer, run `claude setup-token`. It opens your browser to
+   sign in to your Claude account, then prints a token that is valid for one
+   year. Add the token to `/srv/nemo/.env` as `CLAUDE_CODE_OAUTH_TOKEN`. The
+   token is a secret. Do not print it or commit it. Do not add an Anthropic
+   API key to `.env`: Claude Code uses an API key before the token, and the
+   questions are then billed to the API.
 2. Give the bot its own agent token for the gateway (see "One token per
    agent, and a budget each"). Put the token in `NEMO_MCP_BOT_TOKEN`, and add
    `nemo-bot:` followed by the same token to `NEMO_MCP_AGENT_TOKENS`. The

@@ -62,8 +62,9 @@ setting. The job still keeps the rows it already recorded.
 
 The nemo bot answers `/portfolio`, `/status`, `/orders`, `/ticker`, and
 `/ask` in Discord. It needs a Discord bot. Put its token in `NEMO_DISCORD_BOT_TOKEN` and the server ID in
-`NEMO_DISCORD_GUILD_ID`. `/ask` also needs an Anthropic API key in
-`ANTHROPIC_API_KEY` and an agent token for the gateway in
+`NEMO_DISCORD_GUILD_ID`. `/ask` runs Claude Code on the owner's own Claude
+subscription. It also needs the token from `claude setup-token` in
+`CLAUDE_CODE_OAUTH_TOKEN` and an agent token for the gateway in
 `NEMO_MCP_BOT_TOKEN`. [`deploy/README.md`](deploy/README.md) gives the steps.
 
 ### Registering with an MCP client

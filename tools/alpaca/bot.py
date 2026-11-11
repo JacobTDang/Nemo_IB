@@ -4,7 +4,7 @@
     /status         the jobs, the book, the risk switch and the gate
     /orders         each book's latest decision and what its orders did
     /ticker SYMBOL  everything Nemo holds on one name
-    /ask QUESTION   Claude's answer, from Nemo's own tools
+    /ask QUESTION   Claude Code's answer, from Nemo's own tools (owner only)
 
 The client connects out to Discord's gateway, so nothing on the host listens
 for Discord. The commands are registered to one server, `NEMO_DISCORD_GUILD_ID`,
@@ -83,14 +83,26 @@ async def ticker_card(raw: str) -> dict:
     return discord_post.ticker_card(found)
 
 
-async def ask_cards(question: str) -> List[dict]:
-    """Claude's answer, as one card or several when it is long."""
-    try:
-        result = await asyncio.wait_for(ask.ask(question), ask.TIMEOUT_SECONDS)
-    except asyncio.TimeoutError:
-        raise RuntimeError(
-            f"no answer within {ask.TIMEOUT_SECONDS:g} seconds") from None
-    return discord_post.answer_messages(result)
+async def is_owner(interaction) -> bool:
+    """Whether whoever asked owns the bot's Discord application."""
+    info = await interaction.client.application_info()
+    owner = info.team.owner_id if info.team else info.owner.id
+    return interaction.user.id == owner
+
+
+async def ask_cards(interaction, question: str) -> List[dict]:
+    """Claude Code's answer, as one card or several when it is long.
+
+    /ask runs on the owner's own Claude subscription, which is for the owner
+    alone, so anybody else is told so and nothing runs.
+    """
+    if not await is_owner(interaction):
+        return [discord_post.signal_message(
+            "Only the bot's owner can use /ask",
+            ["It answers with the owner's own Claude plan, which is for the "
+             "owner alone."], emoji="⚠️", color=discord_post.YELLOW,
+            source="nemo /ask")]
+    return discord_post.answer_messages(await ask.ask(question))
 
 
 Cards = Union[dict, List[dict]]
@@ -175,14 +187,15 @@ def build(guild_id: int) -> NemoClient:
                              symbol: str) -> None:
         await respond(interaction, "ticker", lambda: ticker_card(symbol))
 
-    @command("ask", "A question answered by Claude from Nemo's own tools")
+    @command("ask", "A question answered by Claude Code from Nemo's own tools")
     @app_commands.describe(question="For example: what did NVDA report "
                                     "last quarter?")
     @admins
     async def ask_command(
             interaction: discord.Interaction,
             question: app_commands.Range[str, 1, ask.QUESTION_LIMIT]) -> None:
-        await respond(interaction, "ask", lambda: ask_cards(question))
+        await respond(interaction, "ask",
+                      lambda: ask_cards(interaction, question))
 
     return client
 
