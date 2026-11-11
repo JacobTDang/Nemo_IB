@@ -720,6 +720,9 @@ The nemo bot answers four commands in Discord at any time:
 - `/ticker` shows what Nemo has on one ticker: the position, the latest
   signal, the orders, the earnings releases, the 13D filings, and the
   congressional trades.
+- `/ask` sends a question to Claude, which answers it with the tools of the
+  five servers, through the gateway. Each question is billed to the
+  Anthropic account of the key.
 
 Only the person who asks sees the answer, and Discord shows the commands only
 to the administrators of the server. The bot only reads. It connects out to
@@ -744,6 +747,19 @@ docker compose --env-file ../.env --profile bot up -d nemo-bot
 After each deploy, run that command again, so that the bot uses the new image.
 If a setting is missing, the bot stops and names the setting in
 `docker compose --env-file ../.env logs nemo-bot`.
+
+`/ask` needs two more settings. Without them, the other commands still work,
+and `/ask` names the missing setting in its answer.
+
+1. In the Anthropic Console, create an API key. Add it to `/srv/nemo/.env` as
+   `ANTHROPIC_API_KEY`. The key is a secret. Do not print it or commit it.
+2. Give the bot its own agent token for the gateway (see "One token per
+   agent, and a budget each"). Put the token in `NEMO_MCP_BOT_TOKEN`, and add
+   `nemo-bot:` followed by the same token to `NEMO_MCP_AGENT_TOKENS`. The
+   servers then rate the bot like other agents, and you can withdraw the bot
+   alone.
+3. Apply both with `docker compose --env-file ../.env up -d`, then start the
+   bot again with the command above.
 
 ### Seeing what happened, from a terminal
 

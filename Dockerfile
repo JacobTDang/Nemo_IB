@@ -106,12 +106,12 @@ CMD ["python", "-m", "tools.news_agregator.fred_server", "server"]
 # the data image, which cannot trade (testing/test_paper_fills.py pins it).
 # --------------------------------------------------------------------------
 FROM base AS fills-src
-# The /portfolio command's Discord client, beside the server group. Only this
-# image carries it.
+# The nemo bot's Discord client and the Anthropic SDK its /ask calls, beside
+# the server group. Only this image carries them.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-install-project --only-group server --only-group bot
-COPY tools/alpaca/__init__.py tools/alpaca/async_broker.py tools/alpaca/fills.py tools/alpaca/portfolio.py tools/alpaca/bot.py ./tools/alpaca/
-RUN python -c "import tools.alpaca.fills, tools.alpaca.portfolio, tools.alpaca.bot; print('the paper-fill job, the portfolio card and the bot import')"
+COPY tools/alpaca/__init__.py tools/alpaca/async_broker.py tools/alpaca/fills.py tools/alpaca/portfolio.py tools/alpaca/bot.py tools/alpaca/ask.py ./tools/alpaca/
+RUN python -c "import tools.alpaca.fills, tools.alpaca.portfolio, tools.alpaca.bot, tools.alpaca.ask, anthropic.lib.tools.mcp; print('the paper-fill job, the portfolio card and the bot import')"
 
 FROM python:3.12-slim AS fills
 ENV PYTHONUNBUFFERED=1 \

@@ -728,11 +728,11 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # The nemo bot in Discord: /portfolio, /status, /orders and /ticker, each
-  # seen only by whoever asks, and only the server's administrators see the
-  # commands. Read only. It connects out to Discord, so nothing listens on the
-  # host. It needs NEMO_DISCORD_BOT_TOKEN and NEMO_DISCORD_GUILD_ID, so it has
-  # its own profile and `up -d` leaves it off until both are in .env:
+  # The nemo bot in Discord: /portfolio, /status, /orders, /ticker and /ask,
+  # each seen only by whoever asks, and only the server's administrators see
+  # the commands. Read only. It connects out to Discord, so nothing listens on
+  # the host. It needs NEMO_DISCORD_BOT_TOKEN and NEMO_DISCORD_GUILD_ID, so it
+  # has its own profile and `up -d` leaves it off until both are in .env:
   #
   #   docker compose --env-file ../.env --profile bot up -d nemo-bot
   nemo-bot:
@@ -750,6 +750,10 @@ services:
       ALPACA_PAPER_SECRET: ${ALPACA_PAPER_SECRET:-}
       NEMO_DISCORD_BOT_TOKEN: ${NEMO_DISCORD_BOT_TOKEN:-}
       NEMO_DISCORD_GUILD_ID: ${NEMO_DISCORD_GUILD_ID:-}
+      # /ask: Claude, and the bot's own agent token for the gateway, never the
+      # operator's. NEMO_MCP_AGENT_TOKENS must name it with the same token.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      NEMO_MCP_BOT_TOKEN: ${NEMO_MCP_BOT_TOKEN:-}
     volumes:
       - research-data:/app/data
     tmpfs:
