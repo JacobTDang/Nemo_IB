@@ -30,6 +30,7 @@ dependencies = [
   "dataclasses-json==0.6.7",
   "dateparser==1.2.2",
   "ddgs==9.10.0",
+  "discord.py==2.7.1",
   "distro==1.9.0",
   "edgartools==5.62.0",
   "et-xmlfile==2.0.0",
@@ -267,6 +268,13 @@ server = [
   "requests==2.32.5",
   "trafilatura==2.0.0",
   "yfinance==1.0",
+]
+
+# The /portfolio command's Discord client (tools/alpaca/portfolio_bot.py). The
+# paper-fill image installs it beside the server group; the data image does
+# not, so the five servers never carry it.
+bot = [
+  "discord.py==2.7.1",
 ]
 
 # Optional extra. state/schema.py guards its sqlite-vec import and the RAG

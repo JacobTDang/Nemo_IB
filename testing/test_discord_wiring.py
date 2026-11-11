@@ -139,6 +139,19 @@ def _fills(monkeypatch, tmp_path, ok=True):
     return fills.main(["submit"])
 
 
+def _portfolio(monkeypatch, tmp_path, ok=True):
+    from tools.alpaca import portfolio
+
+    async def fake_read():
+        return {"status": "ok", "equity": 1000.0, "last_equity": 990.0,
+                "cash": 1000.0, "positions": [],
+                "books": {"Earnings": {"open": 0, "closed": 0,
+                                       "mean_return": None}}}
+
+    monkeypatch.setattr(portfolio, "read", fake_read)
+    return portfolio.main()
+
+
 def _daily(monkeypatch, tmp_path, ok=True):
     from research import daily_job
 
@@ -197,6 +210,7 @@ JOBS = {
     "research-score": (_score, ["ops", "signals"]),
     "research-announce": (_announce, ["ops", "signals"]),
     "research-fills": (_fills, ["ops", "signals"]),
+    "research-portfolio": (_portfolio, ["signals"]),
     "research-daily": (_daily, ["ops"]),
     "research-seed": (_seed, ["ops"]),
     "congress-sync": (_sync, ["ops"]),
@@ -221,7 +235,10 @@ def test_a_job_posts_its_own_name_to_the_right_channels(
         assert f"nemo {job}" in recorder.texts(channel)
 
 
-@pytest.mark.parametrize("job", sorted(set(JOBS) - {"research-watch"}))
+# The watch posts only a change of state, and the portfolio card is a
+# digest: neither posts to #ops when it succeeds.
+@pytest.mark.parametrize("job", sorted(set(JOBS) - {"research-watch",
+                                                    "research-portfolio"}))
 def test_a_job_shows_how_long_it_ran(job, store, monkeypatch, tmp_path):
     scenario, _ = JOBS[job]
     recorder = Recorder()

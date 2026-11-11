@@ -60,6 +60,11 @@ channel that service posts to. A run that finds nothing and does not fail
 posts nothing. A missing value is a failed run with exit code 75. It names the
 setting. The job still keeps the rows it already recorded.
 
+The `/portfolio` command shows the paper portfolio in Discord. It needs a
+Discord bot. Put its token in `NEMO_DISCORD_BOT_TOKEN` and the server ID in
+`NEMO_DISCORD_GUILD_ID`. [`deploy/README.md`](deploy/README.md) gives the
+steps.
+
 ### Registering with an MCP client
 
 The servers use streamable HTTP with a bearer token. Register one entry, for the

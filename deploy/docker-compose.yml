@@ -696,6 +696,68 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # The paper portfolio card: the account's value and the day's change, the
+  # open positions with the book that holds each, and each book's closed
+  # trades, posted to #signals after the close. Read only and paper only. It
+  # runs the fill image because that image alone holds the paper keys.
+  #
+  #   docker compose --env-file ../.env run --rm research-portfolio
+  #
+  # After the 16:00 ET close in both EDT and EST:
+  #   15 21 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n -E 99 /var/lock/nemo-research-portfolio.lock docker compose --env-file ../.env run --rm research-portfolio; } >> /srv/nemo/logs/research-portfolio.log 2>&1 || { rc=$?; tail -n 100 /srv/nemo/logs/research-portfolio.log; docker compose --env-file ../.env run --rm research-notify --job research-portfolio --log /srv/nemo/logs/research-portfolio.log --code $rc; }
+  research-portfolio:
+    image: ${NEMO_FILLS_IMAGE:-nemo-fills:local}
+    profiles: ["sync"]
+    restart: "no"
+    entrypoint: ["python", "-m", "tools.alpaca.portfolio"]
+    environment:
+      <<: *clock-env
+      NEMO_PIT_DB: /app/data/pit.db
+      ALPACA_PAPER_KEY: ${ALPACA_PAPER_KEY:-}
+      ALPACA_PAPER_SECRET: ${ALPACA_PAPER_SECRET:-}
+      NEMO_DISCORD_OPS_WEBHOOK_URL: ${NEMO_DISCORD_OPS_WEBHOOK_URL:-}
+      NEMO_DISCORD_SIGNALS_WEBHOOK_URL: ${NEMO_DISCORD_SIGNALS_WEBHOOK_URL:-}
+    volumes:
+      - research-data:/app/data
+    tmpfs:
+      - /root/.edgar:rw,size=16m
+      - /app/db_cache:rw,size=16m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # /portfolio in Discord: the same card on demand, seen only by whoever asks,
+  # and only the server's administrators see the command. It connects out to
+  # Discord, so nothing listens on the host. It needs NEMO_DISCORD_BOT_TOKEN
+  # and NEMO_DISCORD_GUILD_ID, so it has its own profile and `up -d` leaves it
+  # off until both are in .env:
+  #
+  #   docker compose --env-file ../.env --profile bot up -d portfolio-bot
+  portfolio-bot:
+    image: ${NEMO_FILLS_IMAGE:-nemo-fills:local}
+    profiles: ["bot"]
+    restart: unless-stopped
+    entrypoint: ["python", "-m", "tools.alpaca.portfolio_bot"]
+    environment:
+      <<: *clock-env
+      NEMO_PIT_DB: /app/data/pit.db
+      ALPACA_PAPER_KEY: ${ALPACA_PAPER_KEY:-}
+      ALPACA_PAPER_SECRET: ${ALPACA_PAPER_SECRET:-}
+      NEMO_DISCORD_BOT_TOKEN: ${NEMO_DISCORD_BOT_TOKEN:-}
+      NEMO_DISCORD_GUILD_ID: ${NEMO_DISCORD_GUILD_ID:-}
+    volumes:
+      - research-data:/app/data
+    tmpfs:
+      - /root/.edgar:rw,size=16m
+      - /app/db_cache:rw,size=16m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   # Consensus seeding. The analyst surprise needs eight quarters of what the
   # street expected before each print; Finnhub serves four and no more, so the
   # recorder fills the rest one day at a time. Seeding those four takes the

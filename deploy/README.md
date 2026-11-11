@@ -664,8 +664,9 @@ docker build --target fills -t nemo-fills:local .
 ```
 
 Create a free Alpaca paper account, generate its keys, and add them to `.env`
-as `ALPACA_PAPER_KEY` and `ALPACA_PAPER_SECRET`. Only `research-fills` is handed
-them. The job never builds a live broker. Then add two lines to the same
+as `ALPACA_PAPER_KEY` and `ALPACA_PAPER_SECRET`. Only the services that run
+the fill image are handed them: `research-fills`, and the portfolio card and
+bot below, which only read the account. The job never builds a live broker. Then add two lines to the same
 crontab, under its `CRON_TZ=UTC` line:
 
 ```cron
@@ -688,6 +689,51 @@ Know what it cannot tell you. Paper fills are simulated from quotes: they
 measure the quoted spread at the open, not the price impact of the order itself.
 Only small live orders measure impact, and that is a decision for the owner, not
 for this job.
+
+### The paper portfolio in Discord
+
+`research-portfolio` posts one card to #signals after the close each weekday.
+The card shows the paper account's value and the change since the last close,
+the cash, the open positions largest first with the book that holds each, and
+each book's closed trades with their mean return. The two books share one
+account. The card shows the trades of each book apart, and never adds the
+returns of the two books together. The card posts silently. If the job cannot
+read the account, it posts the error to #ops.
+
+The job reads the paper account and the fill tables. It places no order. It
+runs from the fill image, because only that image holds the paper keys. Add
+this line to the same crontab:
+
+```cron
+15 21 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n -E 99 /var/lock/nemo-research-portfolio.lock docker compose --env-file ../.env run --rm research-portfolio; } >> /srv/nemo/logs/research-portfolio.log 2>&1 || { rc=$?; tail -n 100 /srv/nemo/logs/research-portfolio.log; docker compose --env-file ../.env run --rm research-notify --job research-portfolio --log /srv/nemo/logs/research-portfolio.log --code $rc; }
+```
+
+21:15 UTC is after the 16:00 ET close in summer and winter time.
+
+`/portfolio` shows the same card at any time. Only the person who asks sees
+the answer, and Discord shows the command only to the administrators of the
+server. The bot connects out to Discord, so nothing on the host listens for
+it. To start it:
+
+1. In the Discord Developer Portal, create an application. On its **Bot**
+   page, reset the token and copy it.
+2. On its **OAuth2** page, make an install link with the `bot` and
+   `applications.commands` scopes and no permissions. Open the link and add
+   the bot to the server.
+3. In Discord, turn on Developer Mode. Right-click the server and copy its ID.
+4. Add the token and the ID to `/srv/nemo/.env` as `NEMO_DISCORD_BOT_TOKEN`
+   and `NEMO_DISCORD_GUILD_ID`. The token is a secret. Do not print it or
+   commit it.
+5. Start the bot. It has its own profile, so `up -d` does not start it:
+
+```bash
+cd /srv/nemo/deploy
+docker compose --env-file ../.env --profile bot up -d portfolio-bot
+```
+
+After each deploy, run that command again, so that the bot uses the new image.
+If a setting is missing, the bot stops and names the setting in
+`docker compose --env-file ../.env logs portfolio-bot`.
 
 ### Seeing what happened, from a terminal
 
