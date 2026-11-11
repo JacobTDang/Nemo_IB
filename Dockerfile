@@ -110,8 +110,8 @@ FROM base AS fills-src
 # image carries it.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-install-project --only-group server --only-group bot
-COPY tools/alpaca/__init__.py tools/alpaca/async_broker.py tools/alpaca/fills.py tools/alpaca/portfolio.py tools/alpaca/portfolio_bot.py ./tools/alpaca/
-RUN python -c "import tools.alpaca.fills, tools.alpaca.portfolio, tools.alpaca.portfolio_bot; print('the paper-fill job, the portfolio card and the bot import')"
+COPY tools/alpaca/__init__.py tools/alpaca/async_broker.py tools/alpaca/fills.py tools/alpaca/portfolio.py tools/alpaca/bot.py ./tools/alpaca/
+RUN python -c "import tools.alpaca.fills, tools.alpaca.portfolio, tools.alpaca.bot; print('the paper-fill job, the portfolio card and the bot import')"
 
 FROM python:3.12-slim AS fills
 ENV PYTHONUNBUFFERED=1 \

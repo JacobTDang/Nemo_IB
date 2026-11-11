@@ -696,7 +696,7 @@ def test_only_the_fill_image_services_are_handed_a_broker_key():
                      if any(k.startswith("ALPACA")
                             for k in (service.get("environment") or {})))
 
-    assert holders == ["portfolio-bot", "research-fills", "research-portfolio"]
+    assert holders == ["nemo-bot", "research-fills", "research-portfolio"]
     for name in holders:
         assert "nemo-fills" in compose["services"][name]["image"]
 

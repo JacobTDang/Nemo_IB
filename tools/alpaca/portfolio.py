@@ -11,7 +11,7 @@ account only:
 
     python -m tools.alpaca.portfolio
 
-The `/portfolio` command in Discord (`tools.alpaca.portfolio_bot`) shows the
+The `/portfolio` command in Discord (`tools.alpaca.bot`) shows the
 same card on demand.
 """
 from __future__ import annotations
