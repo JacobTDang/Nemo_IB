@@ -76,6 +76,7 @@ JOB_CHANNELS: Dict[str, Tuple[str, ...]] = {
     "research-portfolio": ("ops", "signals"),
     "research-daily": ("ops",),
     "research-seed": ("ops",),
+    "research-quiver": ("ops",),
     "congress-sync": ("ops",),
     "research-backup": ("ops",),
     "research-status": ("ops",),
@@ -520,6 +521,8 @@ def messages_for(job: str, code: int, result: Optional[dict], *,
         messages = _seed(result, failed, seconds, when, error)
     elif job == "congress-sync":
         messages = _sync(result, failed, seconds, when, error)
+    elif job == "research-quiver":
+        messages = _quiver(result, failed, seconds, when, error)
     elif job == "research-backup":
         messages = _backup(result, failed, seconds, when, error)
     elif job == "research-status":
@@ -730,6 +733,19 @@ def _sync(result, failed, seconds, when, error):
         seconds=seconds, error=error, when=when))]
 
 
+def _quiver(result, failed, seconds, when, error):
+    written = int(result.get("written") or 0)
+    failures = result.get("failed") or {}
+    summary = f"{_count(written, 'new record')} from QuiverQuant"
+    if failures:
+        summary += f", {_count(len(failures), 'feed')} failed"
+    detail = error or "\n".join(
+        f"{name}: {reason}" for name, reason in failures.items())
+    return [("ops", ops_message(
+        "research-quiver", summary, ok=not failed, quiet=not failed,
+        seconds=seconds, error=detail if failed else "", when=when))]
+
+
 def _backup(result, failed, seconds, when, error):
     removed = int(result.get("removed") or 0)
     size = format_gib(float(result.get("bytes") or 0))
@@ -874,6 +890,8 @@ JOB_NAMES = {
     "seed": "Monthly estimate history",
     "fill_submit": "Sending orders",
     "fill_collect": "Checking orders",
+    "quiver_feeds": "Trades and filings from QuiverQuant",
+    "quiver_lists": "Weekly lists from QuiverQuant",
 }
 
 _GLANCE = {"never": "hasn't run yet", "running": "is still running",

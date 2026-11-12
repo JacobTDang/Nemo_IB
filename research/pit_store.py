@@ -31,11 +31,12 @@ on 4 March. Only the recording timestamp prevents it.
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import sqlite3
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 _DEFAULT_DB = "db_cache/pit.db"
 
@@ -403,6 +404,45 @@ CREATE TABLE IF NOT EXISTS xbrl_class_eps (
 );
 CREATE INDEX IF NOT EXISTS idx_xbrl_class_eps_acc
     ON xbrl_class_eps(accession);
+
+-- QuiverQuant, scraped by research/quiver_record.py. Quiver publishes rolling
+-- windows, so a row that leaves the window is gone from the source. These are
+-- the only record that it was there and when we first saw it.
+CREATE TABLE IF NOT EXISTS quiver_record (
+    dataset       TEXT NOT NULL,
+    row_key       TEXT NOT NULL,
+    ticker        TEXT,
+    event_date    TEXT,
+    payload       TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    recorded_at   TEXT NOT NULL,
+    PRIMARY KEY (dataset, row_key)
+);
+CREATE INDEX IF NOT EXISTS idx_quiver_record_ticker
+    ON quiver_record(ticker, dataset);
+
+-- A row seen again with a different payload. The stored row stands.
+CREATE TABLE IF NOT EXISTS quiver_revision (
+    dataset     TEXT NOT NULL,
+    row_key     TEXT NOT NULL,
+    old_payload TEXT NOT NULL,
+    new_payload TEXT NOT NULL,
+    new_ticker  TEXT,
+    noticed_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_quiver_revision_key
+    ON quiver_revision(dataset, row_key);
+
+-- Lists that change slowly, copied once per ISO week.
+CREATE TABLE IF NOT EXISTS quiver_snapshot (
+    dataset     TEXT NOT NULL,
+    as_of_week  TEXT NOT NULL,
+    row_key     TEXT NOT NULL,
+    ticker      TEXT,
+    payload     TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY (dataset, as_of_week, row_key)
+);
 """
 
 
@@ -1495,9 +1535,9 @@ def missing_days(job: str, start: str, end: str,
     annually, which is how the one real gap stops being noticed.
 
     `every` is the job's schedule as `research.status` names it. A Saturday
-    job is due on Saturdays and a monthly one on the 1st; anything else is
-    due on weekdays. Counted on weekdays, a weekly job had a gap every
-    weekday while it ran on time (#181).
+    job is due on Saturdays and a monthly one on the 1st; a daily one every
+    calendar day, weekends included; anything else is due on weekdays. Counted
+    on weekdays, a weekly job had a gap every weekday while it ran on time (#181).
     """
     from datetime import date, timedelta
 
@@ -1519,6 +1559,8 @@ def missing_days(job: str, start: str, end: str,
             due = day.weekday() == 5
         elif every == "monthly":
             due = day.day == 1
+        elif every == "daily":
+            due = True
         else:
             due = day.weekday() < 5
         if due and day.isoformat() not in covered:
@@ -1948,3 +1990,137 @@ def xbrl_class_eps_as_of(as_of: str,
                 pass
         out.append(d)
     return out
+
+
+
+# ------------------------------------------------------------ QuiverQuant
+#
+# Written by research/quiver_record.py. A payload is stored as canonical JSON
+# so two nights' copies of one row compare equal when nothing changed.
+
+def _quiver_json(payload: Dict[str, Any]) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                      default=str)
+
+
+def _quiver_compared(text: str, volatile: Sequence[str]) -> str:
+    body = json.loads(text)
+    return _quiver_json({k: v for k, v in body.items() if k not in volatile})
+
+
+def record_quiver_rows(dataset: str, rows: Iterable[Dict[str, Any]], *,
+                       volatile: Sequence[str] = (),
+                       recorded_at: Optional[str] = None) -> Tuple[int, int]:
+    """Append Quiver rows. Returns (new, revised).
+
+    A row seen before keeps its first copy and its `first_seen_at`. When its
+    payload differs from the latest one known -- the newest revision, else the
+    stored row -- the difference is filed in `quiver_revision`, once. Fields
+    in `volatile` (an estimate that moves with prices, the list a row came
+    from) are stored but ignored when deciding whether a row changed, or every
+    night would file a revision for every row.
+    """
+    stamp = iso_utc(recorded_at) or _now()
+    new = revised = 0
+    with connect() as conn:
+        for row in rows:
+            payload = _quiver_json(row["payload"])
+            held = conn.execute(
+                "SELECT payload FROM quiver_record "
+                "WHERE dataset = ? AND row_key = ?",
+                (dataset, row["row_key"])).fetchone()
+            if held is None:
+                conn.execute(
+                    """INSERT INTO quiver_record
+                       (dataset, row_key, ticker, event_date, payload,
+                        first_seen_at, recorded_at)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    (dataset, row["row_key"], row.get("ticker"),
+                     row.get("event_date"), payload, stamp, stamp))
+                new += 1
+                continue
+            latest = conn.execute(
+                """SELECT new_payload FROM quiver_revision
+                   WHERE dataset = ? AND row_key = ?
+                   ORDER BY rowid DESC LIMIT 1""",
+                (dataset, row["row_key"])).fetchone()
+            known = latest["new_payload"] if latest else held["payload"]
+            if _quiver_compared(known, volatile) == _quiver_compared(
+                    payload, volatile):
+                continue
+            conn.execute(
+                """INSERT INTO quiver_revision
+                   (dataset, row_key, old_payload, new_payload, new_ticker,
+                    noticed_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (dataset, row["row_key"], known, payload, row.get("ticker"),
+                 stamp))
+            revised += 1
+    return new, revised
+
+
+def quiver_records_as_of(dataset: str, as_of: str,
+                         ticker: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Quiver rows as they were known on `as_of`, newest event first.
+
+    A row recorded after `as_of` is left out, and so is a revision noticed
+    after it: a ticker Quiver matched to a layoff a week later is found under
+    that ticker from the night the match was noticed, never before.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT * FROM quiver_record
+               WHERE dataset = ? AND date(recorded_at) <= ?""",
+            (dataset, as_of)).fetchall()
+        changes = conn.execute(
+            """SELECT row_key, new_payload, new_ticker FROM quiver_revision
+               WHERE dataset = ? AND date(noticed_at) <= ?
+               ORDER BY rowid""",
+            (dataset, as_of)).fetchall()
+    latest = {change["row_key"]: change for change in changes}
+    wanted = ticker.upper() if ticker else None
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        change = latest.get(row["row_key"])
+        row_ticker = change["new_ticker"] if change else row["ticker"]
+        if wanted and (row_ticker or "").upper() != wanted:
+            continue
+        out.append({
+            "dataset": dataset,
+            "row_key": row["row_key"],
+            "ticker": row_ticker,
+            "event_date": row["event_date"],
+            "payload": json.loads(change["new_payload"] if change
+                                  else row["payload"]),
+            "first_seen_at": row["first_seen_at"],
+            "revised": change is not None,
+        })
+    out.sort(key=lambda r: (r["event_date"] or "", r["row_key"]), reverse=True)
+    return out
+
+
+def record_quiver_snapshot(dataset: str, as_of_week: str,
+                           rows: Iterable[Dict[str, Any]],
+                           recorded_at: Optional[str] = None) -> int:
+    """One week's copy of a slow-moving list. A second copy of the same week
+    writes nothing."""
+    stamp = iso_utc(recorded_at) or _now()
+    written = 0
+    with connect() as conn:
+        for row in rows:
+            cur = conn.execute(
+                """INSERT OR IGNORE INTO quiver_snapshot
+                   (dataset, as_of_week, row_key, ticker, payload, recorded_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (dataset, as_of_week, row["row_key"], row.get("ticker"),
+                 _quiver_json(row["payload"]), stamp))
+            written += cur.rowcount
+    return written
+
+
+def has_quiver_snapshot(dataset: str, as_of_week: str) -> bool:
+    with connect() as conn:
+        return conn.execute(
+            "SELECT 1 FROM quiver_snapshot "
+            "WHERE dataset = ? AND as_of_week = ? LIMIT 1",
+            (dataset, as_of_week)).fetchone() is not None

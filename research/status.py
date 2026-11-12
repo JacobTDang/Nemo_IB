@@ -62,6 +62,15 @@ JOBS = (
     {"job": "congress_copy", "module": "research.congress_copy",
      "every": "weekday", "stale_after_days": 2,
      "max_run_seconds": 600, "partial_is_normal": False},
+    # QuiverQuant (research/quiver_record.py). Both stages log a run every
+    # night, the weekly lists included (0 rows once the week is held), so
+    # both are due every calendar day.
+    {"job": "quiver_feeds", "module": "research.quiver_record",
+     "every": "daily", "stale_after_days": 2,
+     "max_run_seconds": 600, "partial_is_normal": False},
+    {"job": "quiver_lists", "module": "research.quiver_record",
+     "every": "daily", "stale_after_days": 2,
+     "max_run_seconds": 600, "partial_is_normal": False},
     {"job": "daily_bars", "module": "research.daily_job",
      "every": "weeknight", "stale_after_days": 2,
      "max_run_seconds": 600,

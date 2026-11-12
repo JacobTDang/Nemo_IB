@@ -181,6 +181,7 @@ the keys the code it runs actually reads, and nothing else:
 | research-watch | `SEC_EMAIL`, `NAME`, `FINNHUB_API_KEY` |
 | research-score | nothing — it opens `pit.db` and calls no upstream |
 | research-backup | nothing |
+| research-quiver | nothing — Quiver's pages take no key |
 
 `CONGRESS_API_KEY` and `FINMIND_TOKEN` are optional and currently unset, so
 `get_policy_signals`, `get_government_contracts`, and
@@ -367,6 +368,7 @@ CRON_TZ=UTC
  0  9 * * 6 cd /srv/nemo/deploy && { date -u; flock -n -E 99 /var/lock/nemo-research-announce.lock docker compose --env-file ../.env run --rm research-announce; } >> /srv/nemo/logs/research-announce.log 2>&1 || { rc=$?; tail -n 100 /srv/nemo/logs/research-announce.log; docker compose --env-file ../.env run --rm research-notify --job research-announce --log /srv/nemo/logs/research-announce.log --code $rc; }
  0  8 1 * * cd /srv/nemo/deploy && { date -u; flock -n -E 99 /var/lock/nemo-research-seed.lock docker compose --env-file ../.env run --rm research-seed; } >> /srv/nemo/logs/research-seed.log 2>&1 || { rc=$?; tail -n 100 /srv/nemo/logs/research-seed.log; docker compose --env-file ../.env run --rm research-notify --job research-seed --log /srv/nemo/logs/research-seed.log --code $rc; }
  0  6 * * * cd /srv/nemo/deploy && { date -u; flock -n -E 99 /var/lock/nemo-congress-sync.lock docker compose --env-file ../.env run --rm congress-sync; } >> /srv/nemo/logs/congress-sync.log 2>&1 || { rc=$?; tail -n 100 /srv/nemo/logs/congress-sync.log; docker compose --env-file ../.env run --rm research-notify --job congress-sync --log /srv/nemo/logs/congress-sync.log --code $rc; }
+30  6 * * * cd /srv/nemo/deploy && { date -u; flock -n -E 99 /var/lock/nemo-research-quiver.lock docker compose --env-file ../.env run --rm research-quiver; } >> /srv/nemo/logs/research-quiver.log 2>&1 || { rc=$?; tail -n 100 /srv/nemo/logs/research-quiver.log; docker compose --env-file ../.env run --rm research-notify --job research-quiver --log /srv/nemo/logs/research-quiver.log --code $rc; }
 15  3 * * * cd /srv/nemo/deploy && { date -u; flock -n -E 99 /var/lock/nemo-research-backup.lock docker compose --env-file ../.env run --rm research-backup; } >> /srv/nemo/logs/research-backup.log 2>&1 || { rc=$?; tail -n 100 /srv/nemo/logs/research-backup.log; docker compose --env-file ../.env run --rm research-notify --job research-backup --log /srv/nemo/logs/research-backup.log --code $rc; }
  0  4 * * * cd /srv/nemo/deploy && { date -u; docker container prune -f --filter until=24h --filter label=com.docker.compose.project=deploy && docker compose --env-file ../.env run --rm research-notify --job docker-prune --ok; } >> /srv/nemo/logs/docker-prune.log 2>&1 || { rc=$?; tail -n 100 /srv/nemo/logs/docker-prune.log; docker compose --env-file ../.env run --rm research-notify --job docker-prune --log /srv/nemo/logs/docker-prune.log --code $rc; }
 0 12 * * 1-5 cd /srv/nemo/deploy && { date -u; docker compose --env-file ../.env run --rm research-status; } >> /srv/nemo/logs/research-status.log 2>&1 || { rc=$?; tail -n 100 /srv/nemo/logs/research-status.log; docker compose --env-file ../.env run --rm research-notify --job research-status --log /srv/nemo/logs/research-status.log --code $rc; }
@@ -411,6 +413,27 @@ The scanner supplies the weekday calendar, which does not exclude holidays.
 A House sync older than three days fails the run. A current House sync with
 no new purchases records an `ok` run and writes no decisions. The decision
 job itself still sends no order.
+
+### QuiverQuant's feeds, recorded nightly
+
+`research-quiver` runs at 06:30 UTC every day, after `congress-sync`. It
+records seven of Quiver's feeds into `pit.db` — congressional trades, insider
+trades, WARN layoff notices, contract awards, federal spending, lobbying
+filings and revolving-door registrations — and once per ISO week three lists
+that change slowly: congress net worth, corporate donations and the top
+lobbying spenders.
+
+Quiver publishes windows, not registers: the latest 300 congressional trades,
+the latest 100 contract awards. A row that leaves the window is gone from
+Quiver. The job keeps the first copy of each row with the time it was first
+seen, and files a later change as a revision instead of overwriting it.
+
+Each feed fails alone. A rate limit, a page that changed shape, or a feed that
+parses no rows is named in the run and in #ops, the other feeds still record,
+and the job exits non-zero. The status screen shows the two stages as
+`quiver_feeds` and `quiver_lists`.
+
+    docker compose --env-file ../.env run --rm research-quiver
 
 ### Where a cron line's output goes
 
