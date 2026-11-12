@@ -27,7 +27,12 @@ import socket
 
 import pytest
 
-pytestmark = pytest.mark.skipif(
+from tools.manifest import SERVERS as SHIPPED
+
+# On each test that needs the stack, not on the module: the check that this
+# gate covers every shipped server needs no network, and a module-level skip
+# would hide it in exactly the offline run that should catch the omission.
+network = pytest.mark.skipif(
     os.environ.get("SKIP_NETWORK_TESTS") == "1",
     reason="requires the compose stack")
 
@@ -37,6 +42,7 @@ SERVERS = {
     "finnhub":   (8812, "finnhub", "get_insider_transactions", {"ticker": "NVDA"}),
     "fred":      (8813, "fred", "get_treasury_yields", {}),
     "altdata":   (8814, "altdata", "get_capex_announcements", {"ticker": "TSM"}),
+    "quiver":    (8816, "quiver", "get_quiver_congress_trades", {"limit": 1}),
 }
 
 
@@ -83,6 +89,13 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+def test_the_gate_covers_every_shipped_server():
+    """A server the image ships and this list omits is never checked, and its
+    absence reads as a pass. quiver shipped in #208 and was missing here."""
+    assert sorted(SERVERS) == sorted(spec.name for spec in SHIPPED)
+
+
+@network
 @pytest.mark.parametrize("name", sorted(SERVERS))
 def test_server_completes_a_handshake_and_a_real_call(name):
     port, expected_name, tool, args = SERVERS[name]
@@ -104,6 +117,7 @@ def test_server_completes_a_handshake_and_a_real_call(name):
     assert result.content, f"{name}: {tool} returned no content"
 
 
+@network
 def test_sec_server_gates_capabilities_over_http_too():
     """Capability gating is applied in list_tools, so it must survive the
     transport swap. Without SearXNG and the RAG stack the SEC server advertises
@@ -126,6 +140,7 @@ def test_sec_server_gates_capabilities_over_http_too():
     assert "get_revenue_base" in names and "get_share_count_series" in names
 
 
+@network
 def test_repeated_requests_leave_no_residue():
     """The property that replaces --rm.
 
