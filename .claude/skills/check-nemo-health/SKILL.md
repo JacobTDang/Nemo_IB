@@ -1,29 +1,44 @@
 ---
 name: check-nemo-health
-description: Verify the five deployed Nemo MCP data servers (sec, financial, finnhub, fred, altdata) are registered, reachable, authenticated, and actually serving tools — and that the congressional store is populated. Separates "not registered" / "nothing listening" / "401" / "serving", which are routinely confused. Use after a Docker restart, after a Claude Code restart, when a research run returns suspicious empty results, or before trusting a deployment as healthy.
+description: Verify the deployed Nemo stack on the homelab VM — six MCP data servers (sec, financial, finnhub, fred, altdata, quiver) behind one gateway, 111 tools, reached over Tailscale through the single `nemo` Claude Code entry — is reachable, registered, authenticated, and actually serving tools, and that the congressional store is populated. Separates "Tailscale down" / "not registered" / "nothing listening" / "401" / "serving", which are routinely confused. Use after a deploy or restart on the VM, after a Claude Code restart, when a research run returns suspicious empty results, or before trusting a deployment as healthy.
 ---
 
 # /check-nemo-health — Is the deployed stack actually serving?
 
-Five servers, **96 tools**, streamable HTTP on `127.0.0.1:8810-8814`.
+Six servers and a gateway, **111 tools**, streamable HTTP on the Proxmox VM
+`nemo-finn-server`, reached over Tailscale: `ssh jacob@100.118.253.108`. Code
+at `/srv/nemo`; compose runs from `/srv/nemo/deploy` as
+`docker compose --env-file ../.env ...`. Ports publish on the tailnet IP
+**only** — `127.0.0.1:8810-8816` refuses on the Mac and on the VM, so a check
+aimed at loopback reports a healthy stack as dead.
+
 The failure this skill exists to prevent is believing a deployment is
 healthy while a service is absent or dead — so it checks every server
 that ships, and none that does not.
 
 ## What is deployed
 
-| Server | Port | Registered as | Tools | Probe |
+| Service | Container | Port | Tools | Probe |
 | --- | --- | --- | ---: | --- |
-| sec | 8810 | `nemo-sec` | 48 | `get_sic_code(ticker="AAPL")` |
-| financial | 8811 | `nemo-financial` | 20 | `get_market_data(ticker="SPY")` |
-| finnhub | 8812 | `nemo-finnhub` | 14 | `get_company_profile(ticker="AAPL")` |
-| fred | 8813 | `nemo-fred` | 5 | `get_treasury_yields()` |
-| altdata | 8814 | `nemo-altdata` | 9 | `get_congress_coverage()` |
+| sec | `nemo-sec` | 8810 | 48 | `get_sic_code(ticker="AAPL")` |
+| financial | `nemo-financial` | 8811 | 20 | `get_market_data(ticker="SPY")` |
+| finnhub | `nemo-finnhub` | 8812 | 14 | `get_company_profile(ticker="AAPL")` |
+| fred | `nemo-fred` | 8813 | 5 | `get_treasury_yields()` |
+| altdata | `nemo-altdata` | 8814 | 9 | `get_congress_coverage()` |
+| quiver | `nemo-quiver` | 8816 | 15 | `get_quiver_congress_trades(limit=1)` |
+| nemo (gateway) | `nemo-gateway` | 8815 | 111 | — |
 
-The MCP namespace is **hyphenated**: `mcp__nemo-sec__get_sic_code`,
-`mcp__nemo-altdata__get_congress_coverage`. Underscore forms
-(`mcp__nemo_web__`, `mcp__nemo_alpaca__`) are from an older layout and
-resolve to nothing.
+Claude Code on the Mac has **one** user-scope entry, `nemo` →
+`http://nemo-finn-server:8815/mcp/`, with a bearer header. Tools are
+`mcp__nemo__<tool>` (`mcp__nemo__get_quiver_congress_trades`). The per-server
+entries (`nemo-sec`, ...), their `mcp__nemo-sec__` names and the underscore
+forms (`mcp__nemo_web__`) are from older layouts and resolve to nothing.
+
+**The gateway hides a dead server.** It reads every server's tool list once
+and keeps it, so a server that dies later leaves the list at 111 and the
+entry `✔ Connected`; only calls to its tools fail, with `the <name> server
+did not answer <tool>`. (A gateway that starts while a server is down lists
+nothing and names it.) Step 2 checks each server behind it.
 
 **Absent on purpose — never probe these:**
 
@@ -31,231 +46,224 @@ resolve to nothing.
   positions and must not be able to trade, so the image excludes it.
   A check that expects alpaca reports a *correct* deployment as broken.
 - `excel` (3 tools), `sentry` (19, reads book state).
-- SearXNG and the RAG stack. The sec server declares 50 tools and
+- SearXNG and the RAG stack. The sec server declares 51 tools and
   serves 48: `search`, `rag_search` and `rag_ingest` are hidden because
   advertising a `search` that silently returns nothing would make an
-  absent container look like a query that matched nothing. Their
-  absence is the design.
+  absent container look like a query that matched nothing.
 
-## The four states, and why they get confused
+## The five states, and why they get confused
 
-A server is in exactly one of these. Naming the wrong one sends the
-next reader debugging the wrong thing.
+Naming the wrong one sends the next reader debugging the wrong thing.
 
 | State | Signature | Fix |
 | --- | --- | --- |
-| **Not registered** | absent from `claude mcp list` | `claude mcp add`, then restart Claude Code |
-| **Nothing listening** | `ConnectionRefused` — `/health` refuses the TCP connection | container down or port not published; `docker compose up -d` |
-| **Rejecting auth** | `/health` answers 200, `/mcp/` answers **401** | registered bearer token ≠ server's `NEMO_MCP_TOKEN` |
-| **Serving** | handshake + a real tool call both succeed | — |
+| **Tailscale down on the Mac** | `tailscale status` prints `Tailscale is stopped.` or has no `nemo-finn-server` line; `ssh` and every port fail | Start Tailscale on the Mac. The box is fine. |
+| **Not registered** | no `nemo` line in `claude mcp list` | Re-add the `nemo` entry, restart Claude Code |
+| **Nothing listening** | Tailscale up, `/health` refused (`000`, curl exit 7) | Container down; `nemo services` on the VM |
+| **Rejecting auth** | `/health` 200, `/mcp/` **401** | The Mac's token ≠ the server's |
+| **Serving** | a tool list and a real tool call both succeed | — |
 
 **The trap.** A stale registration pointing at a dead port has been
-reported as `Auth: ✘ not authenticated` / `SDK auth failed`. Nothing
-was listening; the auth line was a symptom. Chasing the token there
-wastes the whole session. Settle it with the ports before touching a
-token:
-
-```bash
-# The server's own token, so this probes the port and not the client config.
-# It is supplied to compose from the shell, so it is not always in .env.
-NEMO_MCP_TOKEN=$(docker exec nemo-sec printenv MCP_AUTH_TOKEN)
-for p in 8810 8811 8812 8813 8814; do
-  printf '%s ' "$p"
-  curl -s -m 3 -o /dev/null -w 'health=%{http_code} ' "http://127.0.0.1:$p/health"
-  curl -s -m 5 -o /dev/null -w 'mcp=%{http_code}\n' -X POST "http://127.0.0.1:$p/mcp/" \
-    -H "Authorization: Bearer $NEMO_MCP_TOKEN" \
-    -H 'Content-Type: application/json' \
-    -H 'Accept: application/json, text/event-stream' \
-    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"health","version":"1"}}}'
-done
-```
-
-If the `docker exec` itself fails with `cannot exec in a stopped
-container`, stop there: the stack is down, and no token question
-arises. Run the `/health` half of the loop alone to see how far it goes.
-
-- `health=000` (curl exit 7) → **nothing listening**. Not auth.
-- `health=200 mcp=401` → **the token is wrong**, and only this is auth.
-  `/health` is exempt from auth by design, which is what makes the pair
-  diagnostic.
-- `health=200 mcp=200` → the port and the token are fine; go to step 2.
-
-`claude mcp list` does distinguish the two — `ConnectionRefused: Unable
-to connect` versus `Server rejected the configured Authorization header
-(HTTP 401)`. Read the whole line, not the `✘`.
-
-On a real 401, compare the two ends — they must be identical:
-
-```bash
-docker exec nemo-sec printenv MCP_AUTH_TOKEN                      # server
-claude mcp get nemo-sec | sed -n 's/.*Authorization: Bearer //p'  # client
-```
-
-The client's copy lives in `~/.claude.json` in plaintext; re-add the
-server with the correct header rather than editing it by hand.
+reported as `Auth: ✘ not authenticated` / `SDK auth failed`; nothing was
+listening. A stopped Tailscale on the Mac — found more than once — looks the
+same from Claude Code. Settle reachability before touching a token. (If
+Tailscale shows `nemo-finn-server` as `offline`, the VM itself is down.)
 
 ## Workflow
 
-### 1. Confirm registration
+### 1. The Mac: Tailscale, the entry, the path
 
 ```bash
+tailscale status | grep nemo-finn-server
 claude mcp list 2>&1 | grep nemo
-docker ps --filter name=nemo- --format '{{.Names}}\t{{.Status}}\t{{.Ports}}'
+for p in 8810 8811 8812 8813 8814 8816 8815; do
+  printf '%s ' "$p"; curl -s -m 5 -o /dev/null -w 'health=%{http_code}' "http://nemo-finn-server:$p/health"; echo " curl=$?"
+done
+# The registered token, read inside the command and never printed.
+curl -s -m 10 -o /dev/null -w 'mcp=%{http_code}\n' -X POST http://nemo-finn-server:8815/mcp/ \
+  -H "Authorization: Bearer $(claude mcp get nemo | sed -n 's/.*Authorization: Bearer //p')" \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-Expect exactly five `nemo-*` entries, all `✔ Connected`, and five
-containers `Up … (healthy)`.
+Expect a `nemo-finn-server` line that is not `offline`; one entry,
+`nemo: http://nemo-finn-server:8815/mcp/ (HTTP) - ✔ Connected`; seven
+`health=200 curl=0`; `mcp=200`. Trust curl's exit code only once Tailscale
+shows the box. `health=000 curl=7` is **nothing listening**, not auth.
+`health=200` with `mcp=401` is **the token is wrong**, and only that is auth:
+`/health` is exempt from auth, which makes the pair diagnostic.
 
-- **Four entries, no `nemo-altdata`** → the most likely gap. A stack
-  registered before altdata shipped is missing 9 tools including the
-  entire congressional pipeline, and every congress question will
-  answer "tool not found" rather than "no data". Re-add per
-  `README.md` → *Registering with an MCP client*.
-- **`nemo_alpaca` / `nemo_web` present** → stale registrations from the
-  old layout. Remove them.
-- A newly added server does not appear until Claude Code restarts.
+**No `nemo` entry** → add one user-scope HTTP entry `nemo` for that URL with
+`Authorization: Bearer <NEMO_MCP_TOKEN>` (`deploy/README.md` → *Registering
+with an MCP client*); the token is in `/srv/nemo/.env` on the VM, and the
+Mac's `.env` has none. Remove any `nemo-*` or `nemo_*` entries. Restart
+Claude Code after either change.
 
-### 2. Probe each server with a real tool call
+On a 401, compare the two ends without printing either token:
 
-Run the five probes **in parallel**. `/health` is not a probe: it
-reports only that uvicorn bound the port and the app started, and a
-server whose MCP layer failed still answers it 200. Only a tool call
-proves the thing serves.
+```bash
+srv=$(ssh jacob@100.118.253.108 'docker exec nemo-gateway printenv MCP_AUTH_TOKEN' | shasum -a 256)
+cli=$(claude mcp get nemo | sed -n 's/.*Authorization: Bearer //p' | shasum -a 256)
+[ "$srv" = "$cli" ] && echo "tokens match" || echo "tokens differ"
+```
+
+`differ` on an entry that connects is an agent token from
+`NEMO_MCP_AGENT_TOKENS`, not a fault. Fix a wrong token by re-adding the entry.
+
+### 2. The box: containers and each server
+
+```bash
+ssh jacob@100.118.253.108 nemo services
+```
+
+It reads the servers from the compose file and exits non-zero unless all six
+and the gateway (`nemo`) are running and healthy; a server with no container
+gets a `missing` row. `nemo-bot` (the Discord bot) shows health `-`: normal.
+Healthy means `/ready` passed. For an unhealthy row, `blocking` names why:
+
+```bash
+ssh jacob@100.118.253.108 "docker inspect --format '{{range .State.Health.Log}}{{.ExitCode}} {{.Output}}{{println}}{{end}}' nemo-sec | grep . | tail -1"
+```
+
+Then list every server's tools from inside the compose network (the image has
+python and httpx, not curl). The script reads `nemo-sec`'s own
+`MCP_AUTH_TOKEN`, so no token crosses a command line and the result describes
+the box, not the Mac. If `nemo-sec` is down, use `nemo-gateway`.
+
+```bash
+ssh jacob@100.118.253.108 'docker exec -i nemo-sec python -' <<'EOF'
+import json, os, httpx
+H = {"Authorization": "Bearer " + os.environ["MCP_AUTH_TOKEN"],
+     "Accept": "application/json, text/event-stream"}
+for svc in ["sec", "financial", "finnhub", "fred", "altdata", "quiver", "nemo"]:
+    try:
+        health = httpx.get(f"http://{svc}:8080/health", timeout=3).status_code
+        r = httpx.post(f"http://{svc}:8080/mcp/", headers=H, timeout=60,
+                       json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    except httpx.HTTPError as exc:
+        print(f"{svc:10} {type(exc).__name__}: {exc}")
+        continue
+    data = [l[5:] for l in r.text.splitlines() if l.startswith("data:")]
+    tools = len(json.loads(data[0])["result"]["tools"]) if r.status_code == 200 else "-"
+    print(f"{svc:10} health={health} mcp={r.status_code} tools={tools}")
+EOF
+```
+
+Expect `health=200 mcp=200` and the table's counts. A name that does not
+resolve has no container.
+
+### 3. Probe each server with a real tool call
+
+Call the six probes as `mcp__nemo__*` tools, **in parallel**: this proves
+the whole path research runs use. `/health` is not a probe: it reports only
+that uvicorn bound the port, and a server whose MCP layer failed answers 200.
 
 | Probe | Pass means | Latency |
 | --- | --- | --- |
-| `get_sic_code("AAPL")` | `sic == "3571"` | ~0.1s |
-| `get_market_data("SPY")` | `currentPrice > 0` | ~0.2s, ~1s cold |
-| `get_company_profile("AAPL")` | `data.name` present | ~0.1s |
-| `get_treasury_yields()` | `data.curve["10Y"]` present | **~7s**, 0.4s cached |
-| `get_congress_coverage()` | `data.total` is an integer | ~0.01s |
+| `get_sic_code("AAPL")` | `sic == "3571"` | ~0.3s |
+| `get_market_data("SPY")` | `currentPrice > 0` | ~0.3s, ~1s cold |
+| `get_company_profile("AAPL")` | `data.name` present | ~0.2s |
+| `get_treasury_yields()` | `data.curve["10Y"]` present | **~7s**, <1s cached |
+| `get_congress_coverage()` | `data.total` is an integer | ~0.1s |
+| `get_quiver_congress_trades(limit=1)` | `data.trades` non-empty | ~0.1s cached (15 min) |
 
-Every payload carries `success`. Treat `success: false` as FAIL and
-quote `metadata.errors` verbatim.
+Every payload carries `success`. Treat `success: false` as FAIL and quote
+the error verbatim (`error`, `metadata.errors` or `data.reason`, by server).
 
-Two ways to false-fail a healthy server:
+Three ways to false-fail a healthy server:
 
-- **Timing out fred.** `get_treasury_yields` makes 10 FRED calls and
-  takes 7-10s uncached. The tool cache lives in a tmpfs, so every
-  container restart throws it away — a slow fred right after
-  `docker compose up` is expected. Allow 20s before calling it a
-  failure; only altdata's local read is genuinely instant.
-- **Asserting `marketCap > 0` on SPY.** An ETF has no market cap and
-  yfinance returns `null`. Check `currentPrice` instead.
+- **Timing out fred.** 10 FRED calls, 7-10s uncached, and the cache is a
+  tmpfs that every restart empties. Allow 20s.
+- **Asserting `marketCap > 0` on SPY.** An ETF has none; yfinance returns
+  `null`. Check `currentPrice`.
+- **Blaming the box for Quiver.** Quiver is quiverquant.com's web pages,
+  scraped, behind Cloudflare. A probe can fail with `data.reason`
+  `rate_limited` (Cloudflare answered 403 or 429) or `provider_unavailable`
+  (any other upstream failure) while `nemo-quiver` is healthy. Report Quiver
+  unavailable upstream, not the box broken. `parse_failed` means Quiver
+  changed a page: a parser fault, still not the box.
 
-### 3. Check the congressional store separately
+### 4. Check the congressional store separately
 
-altdata answering is not the same as the store holding anything.
-`get_congress_coverage` reports what it holds. Three states:
+altdata answering is not the store holding anything. `get_congress_coverage`:
 
-- **Populated** — `data.total > 0`, split `parsed` / `unparsed`.
-  `unparsed` are filings submitted on paper and carry no extractable
-  text; they never become readable on a retry, so `complete: false` is
-  permanent and normal. Not a fault.
-- **Empty, schema present** — `success: true`, `data.total: 0`, and
-  `data.note` opens *"The congressional disclosure store is empty, so
-  this is not a statement about what was traded"* and names the sync
-  command. `get_congress_trades`, `get_congress_holdings` and
-  `get_congress_leaderboard` additionally set `data.store_empty: true`.
-  **This is expected on a fresh deployment.** Report it as *unsynced*,
-  never as broken, and give the command:
-  ```bash
-  NEMO_MCP_TOKEN=$(docker exec nemo-sec printenv MCP_AUTH_TOKEN) \
-    docker compose -f deploy/docker-compose.yml run --rm congress-sync \
-      --house 2024 2025 2026 --senate --senate-annual
-  ```
-  Roughly 40 minutes of throttled requests. Safe to re-run and to cron.
-  `congress-sync` inherits the shared service anchor, so it **refuses to
-  start without `NEMO_MCP_TOKEN`** — `required variable NEMO_MCP_TOKEN
-  is missing a value` — even though it binds no port and authenticates
-  nothing. On a host where the token was only ever passed at
-  `compose up` time it is not in the environment, and the bare command
-  in the READMEs fails. That is a missing variable, not a broken sync.
-- **No store at all** — `success: false` with
-  `metadata.errors: ["OperationalError: no such table: filings"]`. This
-  **is** a fault: `NEMO_CONGRESS_DB` points where the schema was never
-  created, or the `congress-data` volume is not mounted. Syncing will
-  not fix a path problem.
+- **Populated** — `data.total > 0`, split `parsed` / `unparsed`, with a
+  `last_successful_sync` per chamber. `unparsed` are paper filings with no
+  extractable text, so `complete: false` is permanent and normal. Cron syncs
+  at 06:00 UTC daily; a sync more than a day old means that run failed, and
+  past 3 days the congress tools add a `stale_chamber_sync` warning.
+- **Empty** — `data.total: 0`, and `data.note` opens *"The congressional
+  disclosure store is empty, so this is not a statement about what was
+  traded"*. The trades, holdings and leaderboard tools also set
+  `data.store_empty: true`; coverage does not. On a fresh deployment this is
+  *unsynced*, not broken (backfill in `deploy/README.md`); on this box it is a
+  fault. The store creates its schema on first connect, so an unmounted
+  volume reads as empty too, not as `no such table`.
 
-`get_congress_coverage` never sets `store_empty` — it signals empty
-through `data.total: 0` plus the note. Keying only on `store_empty`
-misses the coverage tool entirely.
-
-The shell equivalent, when altdata itself is the thing in doubt:
+The same store read through the `congress-data` volume: totals, each chamber
+with its `last_successful_sync`, and member, transaction and holding counts.
+Filings here while altdata reports 0 means altdata is not reading the volume.
+Sync only through `congress-sync`: `nemo-altdata` has no `SEC_EMAIL`.
 
 ```bash
-NEMO_MCP_TOKEN=$(docker exec nemo-sec printenv MCP_AUTH_TOKEN) \
-  docker compose -f deploy/docker-compose.yml run --rm congress-sync --status
+ssh jacob@100.118.253.108 'cd /srv/nemo/deploy && docker compose --env-file ../.env run --rm -T congress-sync --status'
 ```
 
-### 4. Poll only if a failure can change
+### 5. Poll only if a failure can change
 
-Re-run **only** the failed probes every 10 seconds, capped at 30
-retries (5 minutes). One line per retry:
-`retry N/30: <server> still <reason>`. Bail at the cap with
-`TIMEOUT: <servers> still failing after 5 minutes.`
-
-Poll only states that time can fix — a container still reporting
-`health: starting`, or a cold first call. A missing registration, a
-wrong token and a missing congress schema read identically on retry 30;
-polling them just delays the report.
+Re-run **only** the failed probes every 10 seconds, at most 30 times:
+`retry N/30: <server> still <reason>`, then `TIMEOUT: <servers> still failing
+after 5 minutes.` Poll only what time can fix — `health: starting`, a cold
+call, a Quiver rate limit — never a stopped Tailscale, a missing entry or a
+wrong token.
 
 ## Output
 
 ```
 ## /check-nemo-health
+tailscale ✔ nemo-finn-server    entry ✔ nemo → :8815 Connected
 
-server     registered       listening  auth  tools  probe  latency
-sec        ✔ nemo-sec       ✔ :8810    ✔     48     PASS   0.09s
-financial  ✔ nemo-financial ✔ :8811    ✔     20     PASS   0.20s
-finnhub    ✔ nemo-finnhub   ✔ :8812    ✔     14     PASS   0.07s
-fred       ✔ nemo-fred      ✔ :8813    ✔     5      PASS   6.68s
-altdata    ✔ nemo-altdata   ✔ :8814    ✔     9      PASS   0.01s
+server     listening  auth  tools  probe  latency
+sec        ✔ :8810    ✔     48     PASS   0.30s
+financial  ✔ :8811    ✔     20     PASS   0.27s
+finnhub    ✔ :8812    ✔     14     PASS   0.17s
+fred       ✔ :8813    ✔     5      PASS   0.46s
+altdata    ✔ :8814    ✔     9      PASS   0.08s
+quiver     ✔ :8816    ✔     15     PASS   0.10s
+gateway    ✔ :8815    ✔     111    —      —
 
-96 tools across 5 servers.
-congress store: 2143 filings, 1894 parsed, 249 paper scans — populated
-
+congress store: 1594 filings, 1402 parsed, 192 paper scans, synced 06:00 UTC — populated
 Not deployed (expected): alpaca, excel, sentry, SearXNG/RAG.
 
 Failures:
-<server>: <state from the four-state table> — <verbatim error>
+<server>: <state from the five-state table> — <verbatim error>
 <the one command that fixes it>
 ```
 
-Report the tool count per server. A server that connects but serves
-fewer tools than the table above is a partially-started server, which
-looks healthy on every other line.
+Report the tool count per server. A server that serves fewer tools than the
+table is partially started, and looks healthy on every other line.
 
 ## Hard rules
 
-- **Never probe alpaca.** Excluded from the image on purpose; expecting
-  it turns a correct deployment into a red report.
-- **Never omit altdata.** A skipped server reads as a healthy stack
-  while a real service is absent — the failure this skill was rewritten
-  to fix.
-- **`/health` 200 is never proof.** It means the port is bound. Nothing
-  more.
-- **Say "refused" or "401", never a bare "auth failure".** Run the curl
-  pair first.
-- **An unsynced congressional store is not a failure.** Report it as
-  unsynced with the sync command.
+- **Never probe alpaca.** Expecting it turns a correct deployment red.
+- **Never omit a server.** A skipped server reads as a healthy stack, and
+  the gateway's 111 does not cover for a dead one.
+- **`/health` 200 is never proof**, and `127.0.0.1` is never the address.
+- **Say "Tailscale down", "refused" or "401", never "auth failure".**
+- **Never print a token or an `.env` value.** Read it inside the command.
 - Cheap probes only. Never `get_supply_chain`, `diff_10k`,
   `calculate_scenario_dcf`, or a wide-window `get_congress_trades`.
-- Do not restart servers from inside a skill run. Lifecycle belongs to
-  `docker compose`; a registration change needs a Claude Code restart.
-- Do not ingest probe results into any store. This is a diagnostic, not
-  a workflow event.
+- Read-only, and no probe result goes into any store. Never restart, rebuild
+  or recreate. Never run research jobs, `research-status` or `nemo status` —
+  they post to Discord.
 
 ## When to invoke
 
-- After `docker compose up -d` / `restart`, or after a Claude Code restart
-- After adding or re-pointing a registration
+- After a deploy or restart on the VM, a Claude Code restart, or a change to
+  the `nemo` entry
 - When a research run returns suspicious empties — especially congress
   tools, where an unsynced store and a dead server look alike
 - Before asserting anywhere that the deployment is healthy
 
-## When to skip
-
-- Mid-research while tools are already returning data
-- To diagnose one tool's *wrong answer* — that is a data-source
-  question, not a health question
+Skip it mid-research while tools are already returning data, and for one
+tool's *wrong answer* — that is a data-source question, not a health one.
