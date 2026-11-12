@@ -44,6 +44,7 @@ COPY tools/news_agregator/ ./tools/news_agregator/
 COPY tools/web_search_server/ ./tools/web_search_server/
 COPY tools/financial_modeling_engine/ ./tools/financial_modeling_engine/
 COPY tools/altdata_server/ ./tools/altdata_server/
+COPY tools/quiver_server/ ./tools/quiver_server/
 COPY tools/preearnings/ ./tools/preearnings/
 # The point-in-time recorder and the signals over it. No server, no port and no
 # bearer token: it is a batch job with a __main__, scheduled the same way

@@ -265,8 +265,27 @@ services:
       CONGRESS_API_KEY: ${CONGRESS_API_KEY:-}
       FINMIND_TOKEN: ${FINMIND_TOKEN:-}
 
-  # The five servers behind one URL (tools/gateway.py), so a client registers
-  # one entry rather than five. It forwards each call to the server that serves
+  quiver:
+    <<: *server
+    container_name: nemo-quiver
+    # The WSB dashboard is ~28 MB of HTML. The fetch streams and decodes in
+    # chunks, and the parse scans the page in place, so the whole call
+    # measures at ~240 MB peak. That fits 512 MB with headroom, but not the
+    # 256 MB a table-only server gets.
+    mem_limit: 512m
+    command: python -m tools.quiver_server.server http
+    ports: ["${NEMO_BIND_ADDR:-127.0.0.1}:8816:8080"]
+    environment:
+      <<: *server-env
+      # Optional and currently unset. Without it the bulls/bears section of
+      # get_quiver_ticker_snapshot degrades and names itself in
+      # degraded_sections; every other endpoint answers anonymously. Declared
+      # anyway so filling it in in ../.env would have an effect. Not passed to
+      # run_http -- a documented degradation must not make the healthcheck red.
+      QUIVER_SESSION_COOKIE: ${QUIVER_SESSION_COOKIE:-}
+
+  # The six servers behind one URL (tools/gateway.py), so a client registers
+  # one entry rather than six. It forwards each call to the server that serves
   # the tool, over this file's network, with the operator token.
   #
   # Not `<<: *server`. The gateway reads no filing and no congressional
@@ -287,13 +306,14 @@ services:
       <<: *server-env
       # Every data server, by its service name. testing/test_gateway.py fails
       # when a server in the image is missing from this list.
-      MCP_GATEWAY_BACKENDS: sec=http://sec:8080/mcp/,financial=http://financial:8080/mcp/,finnhub=http://finnhub:8080/mcp/,fred=http://fred:8080/mcp/,altdata=http://altdata:8080/mcp/
+      MCP_GATEWAY_BACKENDS: sec=http://sec:8080/mcp/,financial=http://financial:8080/mcp/,finnhub=http://finnhub:8080/mcp/,fred=http://fred:8080/mcp/,altdata=http://altdata:8080/mcp/,quiver=http://quiver:8080/mcp/
     depends_on:
       sec: {condition: service_healthy}
       financial: {condition: service_healthy}
       finnhub: {condition: service_healthy}
       fred: {condition: service_healthy}
       altdata: {condition: service_healthy}
+      quiver: {condition: service_healthy}
 
   # -------------------------------------------------------------------------
   # The scheduled jobs. Everything below binds no port, serves nothing and

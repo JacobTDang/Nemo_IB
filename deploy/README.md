@@ -57,7 +57,7 @@ and no token. They say so — `/ready` answers 503 and `resolve_auth_token`
 refuses to start — but the flag is what stops it happening.
 
 Then point the client at the gateway, with `Authorization: Bearer $NEMO_MCP_TOKEN`
-on every request. One entry serves all 96 tools:
+on every request. One entry serves all 111 tools:
 
 ```
 nemo            http://<host>:8815/mcp/
@@ -80,6 +80,7 @@ nemo-financial  http://<host>:8811/mcp/
 nemo-finnhub    http://<host>:8812/mcp/
 nemo-fred       http://<host>:8813/mcp/
 nemo-altdata    http://<host>:8814/mcp/
+nemo-quiver     http://<host>:8816/mcp/
 ```
 
 | Server | Port | Module | Tools |
@@ -89,8 +90,9 @@ nemo-altdata    http://<host>:8814/mcp/
 | Finnhub | 8812 | `tools.news_agregator.finnhub_server` | 14 |
 | FRED macro | 8813 | `tools.news_agregator.fred_server` | 5 |
 | Alt data | 8814 | `tools.altdata_server.server` | 9 |
+| QuiverQuant web | 8816 | `tools.quiver_server.server` | 15 |
 
-96 tools served. The SEC server declares 51 and serves 48: `search`,
+111 tools served. The SEC server declares 51 and serves 48: `search`,
 `rag_search` and `rag_ingest` are capability-gated and hidden, because this
 image installs neither SearXNG nor the RAG stack -- the Dockerfile copies three
 `agent/` modules and `agent.rag` is not among them.
@@ -172,6 +174,7 @@ the keys the code it runs actually reads, and nothing else:
 | finnhub | `FINNHUB_API_KEY` |
 | fred | `FRED_API_KEY` |
 | altdata | `CONGRESS_API_KEY`, `FINMIND_TOKEN` |
+| quiver | `QUIVER_SESSION_COOKIE` |
 | congress-sync | `SEC_EMAIL` |
 | research-daily, research-seed, research-announce | `SEC_EMAIL`, `FINNHUB_API_KEY` |
 | research-scan | `SEC_EMAIL` |
@@ -184,6 +187,12 @@ the keys the code it runs actually reads, and nothing else:
 `get_taiwan_monthly_revenue` will degrade. They are still named in the compose
 file: without those lines, filling them in in `.env` would change nothing, which
 is a worse failure than an absent key.
+
+`QUIVER_SESSION_COOKIE` is also optional and currently unset. It is not an API
+key but a logged-in quiverquant.com browser session cookie: with it the
+bulls/bears section of the ticker snapshot answers, without it that section
+degrades and names itself. Everything else on that server answers anonymously.
+Declared for the same reason as the two above.
 
 The table is checked, not maintained. `testing/test_compose_env_minimality.py`
 walks the import graph from the module each service runs and fails on any key
@@ -858,7 +867,7 @@ which store you are looking at.
 rather than the running ones, so a batch job that exited is on the table with
 its exit status, and a server whose container is gone entirely gets a row
 saying `missing` instead of quietly not being there. It exits non-zero unless
-all five servers are running and healthy, so it doubles as a check.
+all six servers are running and healthy, so it doubles as a check.
 
 ### Memory, and why it never goes down
 
@@ -1231,7 +1240,7 @@ The MCP specification defines an OAuth 2.1 flow, and it is right for a
 multi-user service. For one person it means running an auth server and debugging
 redirect URIs to authenticate exactly one identity.
 
-Blast radius argues the same way. These five servers are read-only — Alpaca is
+Blast radius argues the same way. These six servers are read-only — Alpaca is
 deliberately excluded — so a leaked token exposes market-data queries against
 free-tier keys, not money and not trades. The one genuine harm is SEC identity
 misuse getting `SEC_EMAIL` rate-limited. A rotatable token behind a private
@@ -1249,7 +1258,7 @@ disk under `/var/lib/docker/containers/`, outside the tmpfs mounts that bound
 everything else, and the default json-file driver has no limit at all.
 
 Per **container**, not per service, and that distinction is the whole reason the
-cron block ends in a prune. The five servers are one long-lived container each,
+cron block ends in a prune. The six servers are one long-lived container each,
 so 30MB each is the end of it. Every `docker compose run --rm` makes a new one,
 and an orphan left behind by a reboot keeps its 30MB — so the aggregate is
 bounded only by how many orphans accumulate. See

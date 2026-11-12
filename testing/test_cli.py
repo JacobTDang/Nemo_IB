@@ -73,6 +73,11 @@ PS_LINES = [
      "Publishers": [{"URL": "127.0.0.1", "TargetPort": 8080,
                      "PublishedPort": 8810, "Protocol": "tcp"}],
      "Name": "nemo-sec"},
+    {"Service": "quiver", "State": "running", "Health": "healthy",
+     "Status": "Up 2 days (healthy)", "ExitCode": 0,
+     "Publishers": [{"URL": "127.0.0.1", "TargetPort": 8080,
+                     "PublishedPort": 8816, "Protocol": "tcp"}],
+     "Name": "nemo-quiver"},
     # The gateway, added in the same shape when it joined the stack.
     {"Service": "nemo", "State": "running", "Health": "healthy",
      "Status": "Up 2 days (healthy)", "ExitCode": 0,
@@ -404,7 +409,7 @@ def test_the_servers_are_the_services_that_are_not_batch_jobs():
     expected = {n for n, s in services.items() if "profiles" not in s}
     assert set(cli.servers()) == expected
     assert expected == {"sec", "financial", "finnhub", "fred", "altdata",
-                        "nemo"}
+                        "quiver", "nemo"}
 
 
 def test_the_default_store_is_anchored_to_the_repository(monkeypatch):

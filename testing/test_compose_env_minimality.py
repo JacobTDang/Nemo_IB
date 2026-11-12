@@ -374,7 +374,7 @@ def test_every_operator_supplied_key_the_stack_hands_out_is_documented(services)
 
 # ------------------------------------------------------- the anchor merge trap
 
-SERVERS = ("sec", "financial", "finnhub", "fred", "altdata")
+SERVERS = ("sec", "financial", "finnhub", "fred", "altdata", "quiver")
 
 
 @pytest.mark.parametrize("name", SERVERS)

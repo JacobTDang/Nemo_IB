@@ -21,6 +21,7 @@ SERVERS = [
     ("finnhub", "tools.news_agregator.finnhub_server", "FinnhubServer"),
     ("fred", "tools.news_agregator.fred_server", "FredServer"),
     ("altdata", "tools.altdata_server.server", "AltDataServer"),
+    ("quiver", "tools.quiver_server.server", "QuiverServer"),
 ]
 
 
