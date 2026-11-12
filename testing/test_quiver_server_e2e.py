@@ -68,6 +68,18 @@ async def _exercise_all_tools() -> dict:
                 "ticker": "NVDA", "trade_limit": 2})
             results["get_quiver_ticker_snapshot"] = json.loads(r.content[0].text)
 
+            r = await session.call_tool("get_quiver_insider_trades", {"limit": 2})
+            results["get_quiver_insider_trades"] = json.loads(r.content[0].text)
+
+            r = await session.call_tool("get_quiver_congress_net_worth",
+                                        {"limit": 2})
+            results["get_quiver_congress_net_worth"] = json.loads(
+                r.content[0].text)
+
+            r = await session.call_tool("get_quiver_bills", {
+                "query": "semiconductor", "limit": 2})
+            results["get_quiver_bills"] = json.loads(r.content[0].text)
+
             # failure vocabulary: unknown entity must be success=false
             # with a machine reason, not an exception over the wire.
             r = await session.call_tool("get_quiver_politician_trades", {
@@ -80,14 +92,15 @@ async def _exercise_all_tools() -> dict:
 def test_quiver_server_e2e():
     results = asyncio.run(_exercise_all_tools())
 
-    assert results["__tool_count__"] == 6, results["__tool_names__"]
+    assert results["__tool_count__"] == 9, results["__tool_names__"]
     assert "get_quiver_congress_trades" in results["__tool_names__"]
 
     # Every response shares the envelope contract.
     for name in ["get_quiver_congress_trades", "get_quiver_congress_trades_filtered",
                  "get_quiver_politician_trades", "get_quiver_wsb_sentiment",
                  "get_quiver_lobbying", "get_quiver_gov_contracts",
-                 "get_quiver_ticker_snapshot"]:
+                 "get_quiver_ticker_snapshot", "get_quiver_insider_trades",
+                 "get_quiver_congress_net_worth", "get_quiver_bills"]:
         body = results[name]
         assert body["success"] is True, (name, body.get("error"))
         assert body["domain"] == "quiver", name
@@ -130,6 +143,29 @@ def test_quiver_server_e2e():
     # absent it must be named, never silently missing.
     if "bulls_bears" not in snap:
         assert "bulls_bears:no_auth" in snap.get("degraded_sections", []), snap
+
+    # Insider trades: the union of the dashboard's two lists, newest first,
+    # with the disclosure window stated rather than implied.
+    insiders = results["get_quiver_insider_trades"]["data"]
+    assert insiders["total_available"] > 1000, insiders["total_available"]
+    assert insiders["returned"] == 2
+    assert insiders["date_range"]["newest"], insiders
+    assert insiders["trades"][0]["transaction_date"], insiders["trades"][0]
+    assert insiders["trades"][0]["list"], insiders["trades"][0]
+
+    # Congressional net worth: ranked, richest first, with the id a caller
+    # needs to follow up.
+    worth = results["get_quiver_congress_net_worth"]["data"]
+    assert worth["total_members"] > 400, worth["total_members"]
+    assert worth["members"][0]["rank"] == 1, worth["members"][0]
+    assert worth["members"][0]["net_worth_usd"] > 0, worth["members"][0]
+    assert worth["members"][0]["bioguide_id"], worth["members"][0]
+
+    # Bills: a searchable index, with paging reported rather than assumed.
+    bills = results["get_quiver_bills"]["data"]
+    assert bills["total_indexed"] > 10000, bills["total_indexed"]
+    assert bills["matching"] >= bills["returned"], bills
+    assert all("semiconductor" in b["title"].lower() for b in bills["bills"])
 
     # Unknown entity -> success=false with a machine-readable reason.
     miss = results["unknown_politician"]
@@ -269,9 +305,112 @@ def test_a_ticker_with_no_data_is_not_returned_as_six_empty_sections():
     assert "bulls_bears:no_auth" in snap["degraded_sections"], snap
 
 
+# ---------------------------------------------------------------------------
+# The dashboard arrays. Offline: the page is a string this file writes, so the
+# union, dedup and date-sanity rules are tested without asking Quiver for them.
+# ---------------------------------------------------------------------------
+
+def _page_with(**arrays) -> str:
+    """A page-shaped string carrying the named JS array literals."""
+    body = "<html><script>"
+    for name, rows in arrays.items():
+        body += f"\nlet {name} = {json.dumps(rows)};\n"
+    return body + "</script></html>"
+
+
+def _insider(owner, ticker, date, shares=1, code="Purchase", value=100.0):
+    return {"rptOwnerName": owner, "officerTitle": "CEO",
+            "issuerTradingSymbol": ticker, "transactionCode": code,
+            "transactionShares": shares, "transactionPricePerShare": 10.0,
+            "transactionDate": date, "fileDate": date,
+            "rptOwnerCik": 1, "netWorthEstimate": "-",
+            "transactionValue": value}
+
+
+def test_inside_the_dashboard_union_duplicates_are_named_not_double_counted():
+    """The two lists overlap. Adding them end to end would report the same
+    trade twice and inflate the total a caller sizes a position against."""
+    from tools.quiver_server import client as qc
+
+    shared = _insider("ADA LOVELACE", "AAPL", "Nov 10, 2026")
+    c = qc.QuiverWebClient()
+    c._page = lambda path, **kw: _page_with(
+        recentInsiderTransactionsData=[
+            shared,
+            _insider("GRACE HOPPER", "NVDA", "Nov 09, 2026", code="Sale"),
+        ],
+        topMonthlyInsiderTransactionsData=[
+            shared,
+            _insider("ALAN TURING", "MSFT", "Oct 01, 2026"),
+        ],
+    )
+
+    d = c.get_insider_trades()
+    assert d["total_available"] == 3, d["total_available"]
+    by_owner = {t["owner"]: t for t in d["trades"]}
+    assert by_owner["ADA LOVELACE"]["list"] == "recent+top_monthly"
+    assert by_owner["GRACE HOPPER"]["list"] == "recent"
+    assert by_owner["ALAN TURING"]["list"] == "top_monthly"
+    # "-" is the site's stand-in for "not disclosed", not a number.
+    assert by_owner["ADA LOVELACE"]["net_worth_estimate"] is None
+
+
+def test_a_bad_transaction_date_is_flagged_and_kept_out_of_the_range():
+    """Two rows on the live page are dated years after they were filed. They
+    must not become the newest thing in the response."""
+    from tools.quiver_server import client as qc
+
+    c = qc.QuiverWebClient()
+    c._page = lambda path, **kw: _page_with(
+        recentInsiderTransactionsData=[
+            _insider("TYPO CORP", "TMUS", "May 24, 2028"),
+            _insider("ADA LOVELACE", "AAPL", "Nov 10, 2026"),
+        ],
+        topMonthlyInsiderTransactionsData=[],
+    )
+
+    d = c.get_insider_trades()
+    assert d["anomalous_rows"] == 1, d
+    assert d["date_range"]["newest"] == "2026-11-10", d["date_range"]
+    # Kept rather than dropped -- but last, so it cannot lead the list.
+    assert d["trades"][0]["ticker"] == "AAPL", d["trades"][0]
+    assert d["trades"][-1]["date_anomaly"] == "transaction_date_after_today"
+
+
+def test_bills_page_the_index_instead_of_dumping_it():
+    """33,000 rows will not fit in a reply. The window has to be a window, and
+    the caller has to be told whether more remains."""
+    from tools.quiver_server import client as qc
+
+    rows = [{"congress": "119", "number": i, "type": "hr",
+             "clean_title": f"H.R. {i}: Semiconductor Act {i}"}
+            for i in range(1, 6)]
+    rows.append({"congress": "118", "number": 9, "type": "s",
+                 "clean_title": "S. 9: Farm Bill"})
+
+    c = qc.QuiverWebClient()
+    c._page = lambda path, **kw: _page_with(searchBills=rows)
+
+    first = c.get_bills(query="semiconductor", limit=2)
+    assert first["total_indexed"] == 6, first["total_indexed"]
+    assert first["matching"] == 5, first["matching"]
+    assert first["returned"] == 2 and first["more"] is True, first
+
+    second = c.get_bills(query="semiconductor", limit=2, offset=4)
+    assert second["returned"] == 1, second
+    assert second["more"] is False, second
+
+    # Filters compose, and the type filter is exact rather than a substring.
+    assert c.get_bills(bill_type="s")["matching"] == 1
+    assert c.get_bills(congress="118")["matching"] == 1
+
+
 if __name__ == "__main__":
     test_quiver_server_e2e()
     test_a_rate_limit_is_retried_once_and_then_named()
     test_a_rate_limit_is_not_reported_as_an_unknown_ticker()
     test_a_ticker_with_no_data_is_not_returned_as_six_empty_sections()
+    test_inside_the_dashboard_union_duplicates_are_named_not_double_counted()
+    test_a_bad_transaction_date_is_flagged_and_kept_out_of_the_range()
+    test_bills_page_the_index_instead_of_dumping_it()
     print("quiver server e2e: PASS")

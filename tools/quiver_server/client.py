@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import ast
 import codecs
+import datetime as _dt
 import json
 import re
 import threading
@@ -886,3 +887,256 @@ class QuiverWebClient:
                 f"most likely not covered")
         out["coverage"] = "partial" if degraded else "full"
         return out
+
+    # -----------------------------------------------------------------------
+    # Insider transactions (the dashboard's embedded arrays)
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _insider_row(row: Dict[str, Any], source: str,
+                     normalize) -> Optional[Dict[str, Any]]:
+        """One dashboard record as a flat dict, or None if it is unusable."""
+        if not isinstance(row, dict):
+            return None
+        shares = row.get("transactionShares")
+        price = row.get("transactionPricePerShare")
+        value = row.get("transactionValue")
+        worth = row.get("netWorthEstimate")
+        return {
+            "ticker": (row.get("issuerTradingSymbol") or "").strip() or None,
+            "owner": (row.get("rptOwnerName") or "").strip() or None,
+            "title": (row.get("officerTitle") or "").strip() or None,
+            "tx_type": (row.get("transactionCode") or "").strip() or None,
+            "shares": shares if isinstance(shares, (int, float)) else None,
+            "price_per_share": (price if isinstance(price, (int, float))
+                                else None),
+            "value_usd": (value if isinstance(value, (int, float))
+                          else None),
+            "transaction_date": normalize(row.get("transactionDate") or ""),
+            "filed_date": normalize(
+                (row.get("fileDate") or "").split(" (")[0]),
+            "insider_cik": row.get("rptOwnerCik"),
+            # "-" is the site's stand-in for "not disclosed", not a number.
+            "net_worth_estimate": (worth if isinstance(worth, (int, float))
+                                   else None),
+            "list": source,
+        }
+
+    def get_insider_trades(self, *, ticker: Optional[str] = None,
+                           owner: Optional[str] = None,
+                           tx_type: Optional[str] = None,
+                           min_value: Optional[float] = None,
+                           days: Optional[int] = None,
+                           limit: Optional[int] = None
+                           ) -> Dict[str, Any]:
+        """Corporate insider purchases and sales from `/insiders/`.
+
+        The page embeds two 1,000-row arrays: the latest filings and the
+        month's largest. They overlap by about 165 rows, so the union is
+        ~1,824 distinct transactions -- roughly twice what either array
+        holds on its own. Rows are deduplicated on owner, ticker, date,
+        shares and code, and each row names the list it came from.
+        """
+        page = self._page("/insiders/")
+        recent = self._extract_js_array(page, "recentInsiderTransactionsData")
+        monthly = self._extract_js_array(page,
+                                         "topMonthlyInsiderTransactionsData")
+
+        seen: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+        for source, rows in (("recent", recent), ("top_monthly", monthly)):
+            for row in rows or []:
+                trade = self._insider_row(row, source, self._normalize_date)
+                if not trade or not trade["ticker"]:
+                    continue
+                key = (trade["owner"], trade["ticker"],
+                       trade["transaction_date"], trade["shares"],
+                       trade["tx_type"])
+                keep = seen.get(key)
+                # Keep the first-seen row but promote it to "both" when the
+                # second list carries it too, so the overlap stays visible.
+                if keep is None:
+                    seen[key] = trade
+                elif keep["list"] != source:
+                    keep["list"] = "both"
+
+        trades = list(seen.values())
+        for trade in trades:
+            if trade["list"] == "both":
+                trade["list"] = "recent+top_monthly"
+        total = len(trades)
+
+        if ticker:
+            needle = ticker.upper()
+            trades = [t for t in trades if (t["ticker"] or "") == needle]
+        if owner:
+            needle = owner.lower()
+            trades = [t for t in trades
+                      if needle in (t["owner"] or "").lower()]
+        if tx_type:
+            needle = tx_type.lower()
+            trades = [t for t in trades
+                      if needle in (t["tx_type"] or "").lower()]
+        if min_value is not None:
+            trades = [t for t in trades
+                      if (t["value_usd"] or 0) >= float(min_value)]
+        if days is not None:
+            cutoff = (_dt.date.today()
+                      - _dt.timedelta(days=int(days))).isoformat()
+            trades = [t for t in trades
+                      if (t["transaction_date"] or "") >= cutoff]
+
+        matching = len(trades)
+        total_value = sum(t["value_usd"] or 0 for t in trades)
+        # Two rows in the union carry a transaction date years after the
+        # filing date (TMUS, filed 2024-05-28, dated 2028-05-24). They are
+        # kept -- dropping rows silently is worse -- but flagged, and they
+        # do not get to define the date range a caller reads as freshness.
+        today = _dt.date.today().isoformat()
+        for trade in trades:
+            if (trade["transaction_date"] or "") > today:
+                trade["date_anomaly"] = "transaction_date_after_today"
+        anomalous = sum(1 for t in trades if "date_anomaly" in t)
+        clean = sorted((t["transaction_date"] for t in trades
+                        if t["transaction_date"]
+                        and "date_anomaly" not in t), reverse=True)
+        # Newest first, with the flagged rows last rather than on top.
+        trades = (sorted([t for t in trades if "date_anomaly" not in t],
+                         key=lambda t: t["transaction_date"] or "",
+                         reverse=True)
+                  + [t for t in trades if "date_anomaly" in t])
+        if limit is not None and limit > 0:
+            trades = trades[:limit]
+        return {
+            "trades": trades,
+            "total_available": total,
+            "returned": len(trades),
+            "matching": matching,
+            "matching_value_usd": round(total_value, 2),
+            "date_range": {"newest": clean[0] if clean else None,
+                           "oldest": clean[-1] if clean else None},
+            "anomalous_rows": anomalous,
+            "coverage": "partial",
+        }
+
+    # -----------------------------------------------------------------------
+    # Congressional net worth (embedded on the congress dashboard)
+    # -----------------------------------------------------------------------
+
+    def get_congress_net_worth(self, *, name: Optional[str] = None,
+                               chamber: Optional[str] = None,
+                               party: Optional[str] = None,
+                               state: Optional[str] = None,
+                               min_net_worth: Optional[float] = None,
+                               limit: Optional[int] = None
+                               ) -> Dict[str, Any]:
+        """Disclosed net worth per sitting member, ranked.
+
+        `netWorthData` rides on the congress dashboard, so this costs
+        nothing extra when that page is already cached. Columns are rank,
+        name, net worth, two fields that are zero or float noise on every
+        row, bioguide id, portrait, chamber, party and state; the two
+        empty ones are dropped rather than passed off as measurements.
+        """
+        page = self._page("/congresstrading/")
+        rows = self._extract_js_array(page, "netWorthData")
+        members: List[Dict[str, Any]] = []
+        for row in rows or []:
+            if not isinstance(row, list) or len(row) < 10:
+                continue
+            worth = row[2]
+            members.append({
+                "rank": row[0],
+                "name": row[1],
+                "net_worth_usd": (round(float(worth), 2)
+                                  if isinstance(worth, (int, float)) else None),
+                "bioguide_id": row[5],
+                "chamber": row[7],
+                "party": row[8],
+                "state": row[9],
+            })
+        total = len(members)
+
+        if name:
+            needle = name.lower()
+            members = [m for m in members
+                       if needle in (m["name"] or "").lower()]
+        if chamber:
+            members = [m for m in members
+                       if (m["chamber"] or "").lower() == chamber.lower()]
+        if party:
+            members = [m for m in members
+                       if (m["party"] or "").lower() == party.lower()]
+        if state:
+            members = [m for m in members
+                       if (m["state"] or "").lower() == state.lower()]
+        if min_net_worth is not None:
+            members = [m for m in members
+                       if (m["net_worth_usd"] or 0) >= float(min_net_worth)]
+
+        members.sort(key=lambda m: -(m["net_worth_usd"] or 0))
+        matching = len(members)
+        if limit is not None and limit > 0:
+            members = members[:limit]
+        return {
+            "members": members,
+            "total_members": total,
+            "matching": matching,
+            "returned": len(members),
+            "coverage": "full",
+        }
+
+    # -----------------------------------------------------------------------
+    # Bills (the legislation search index)
+    # -----------------------------------------------------------------------
+
+    def get_bills(self, *, query: Optional[str] = None,
+                  bill_type: Optional[str] = None,
+                  congress: Optional[str] = None,
+                  limit: Optional[int] = None,
+                  offset: int = 0) -> Dict[str, Any]:
+        """Bills from `/bills/`, which embeds the whole 119th/118th index.
+
+        The array is ~33,000 rows of {congress, number, type, clean_title}:
+        a title index, not the bill text. `query` matches the title
+        case-insensitively, which is how a theme is turned into a list of
+        bill numbers to follow up on congress.gov.
+        """
+        page = self._page("/bills/")
+        rows = self._extract_js_array(page, "searchBills")
+        bills: List[Dict[str, Any]] = []
+        for row in rows or []:
+            if not isinstance(row, dict) or not row.get("clean_title"):
+                continue
+            bills.append({
+                "congress": str(row.get("congress") or ""),
+                "number": row.get("number"),
+                "type": row.get("type"),
+                "title": row.get("clean_title"),
+            })
+        total = len(bills)
+
+        if query:
+            needle = query.lower()
+            bills = [b for b in bills if needle in (b["title"] or "").lower()]
+        if bill_type:
+            needle = bill_type.lower()
+            bills = [b for b in bills
+                     if (b["type"] or "").lower() == needle]
+        if congress:
+            needle = str(congress)
+            bills = [b for b in bills if b["congress"] == needle]
+
+        matching = len(bills)
+        offset = max(int(offset or 0), 0)
+        window = bills[offset:]
+        if limit is not None and limit > 0:
+            window = window[:limit]
+        return {
+            "bills": window,
+            "total_indexed": total,
+            "matching": matching,
+            "offset": offset,
+            "returned": len(window),
+            "more": offset + len(window) < matching,
+            "coverage": "full",
+        }

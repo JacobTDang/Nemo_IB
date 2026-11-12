@@ -186,10 +186,12 @@ def test_the_section_names_no_tool_the_server_does_not_serve(name, readme):
     # bare words like the server's own name do not.
     listed = {t for t in re.findall(r"`([a-z][a-z0-9_]+)`",
                                     _section(readme, name)) if "_" in t}
-    # Names the prose legitimately mentions that belong elsewhere.
+    # Names the prose legitimately mentions that belong elsewhere: response
+    # fields and query parameters, which are backticked for the same reason a
+    # tool name is -- because a reader types them.
     elsewhere = {"amount_min", "amount_max", "amount_max_total", "as_of",
                  "recorded_at", "fiscal_period", "eps_actual", "eps_estimate",
-                 "auto_adjust", "adj_close"}
+                 "auto_adjust", "adj_close", "date_anomaly"}
     stale = listed - real - elsewhere
     assert not stale, (
         f"the `{name}` section names tools it does not serve: {sorted(stale)}")

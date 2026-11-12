@@ -31,7 +31,7 @@ async def main() -> int:
             names = [t.name for t in tools.tools]
             print("tools:", names)
             assert "get_quiver_congress_trades" in names
-            assert len(names) == 6, f"expected 6 tools, got {names}"
+            assert len(names) == 9, f"expected 9 tools, got {names}"
 
             # 1. congress trades, small limit
             res = await asyncio.wait_for(session.call_tool(
@@ -102,6 +102,55 @@ async def main() -> int:
             assert payload["error"] == (
                 "no congress member matches 'Zzzqqq Nonexistent'")
             print("unknown-politician failure ok:", payload["error"])
+
+            # 8. insider trades, filtered to purchases worth a million plus
+            res = await asyncio.wait_for(session.call_tool(
+                "get_quiver_insider_trades",
+                {"tx_type": "Purchase", "min_value": 1_000_000,
+                 "limit": 5}), 180)
+            payload = json.loads(res.content[0].text)
+            assert payload["success"], payload.get("error")
+            d = payload["data"]
+            print(f"insider_trades ok: {d['total_available']} available, "
+                  f"{d['matching']} match the filter, range "
+                  f"{d['date_range']['newest']}..{d['date_range']['oldest']}, "
+                  f"anomalies={d['anomalous_rows']}")
+            assert d["returned"] == 5
+            assert all(t["value_usd"] >= 1_000_000 for t in d["trades"])
+            assert d["date_range"]["newest"] <= "2026-12-31", d["date_range"]
+
+            # 9. congress net worth, ranked
+            res = await asyncio.wait_for(session.call_tool(
+                "get_quiver_congress_net_worth", {"limit": 5}), 120)
+            payload = json.loads(res.content[0].text)
+            assert payload["success"], payload.get("error")
+            d = payload["data"]
+            print(f"net_worth ok: {d['total_members']} members, top "
+                  f"{d['members'][0]['name']} "
+                  f"${d['members'][0]['net_worth_usd']:,.0f}")
+            assert d["returned"] == 5
+            assert d["members"][0]["rank"] == 1
+
+            # 10. bills by title search, plus paging
+            res = await asyncio.wait_for(session.call_tool(
+                "get_quiver_bills",
+                {"query": "semiconductor", "limit": 3}), 180)
+            payload = json.loads(res.content[0].text)
+            assert payload["success"], payload.get("error")
+            d = payload["data"]
+            print(f"bills ok: {d['total_indexed']} indexed, "
+                  f"{d['matching']} mention semiconductor, more={d['more']}")
+            assert d["matching"] > 3 and d["more"] is True
+            assert all("semiconductor" in b["title"].lower()
+                       for b in d["bills"])
+
+            res = await asyncio.wait_for(session.call_tool(
+                "get_quiver_bills",
+                {"query": "semiconductor", "limit": 3, "offset": 3}), 180)
+            payload = json.loads(res.content[0].text)
+            assert payload["success"], payload.get("error")
+            print(f"bills paging ok: offset 3 -> {payload['data']['returned']} "
+                  f"rows, more={payload['data']['more']}")
 
     print("\nALL PASS")
     return 0

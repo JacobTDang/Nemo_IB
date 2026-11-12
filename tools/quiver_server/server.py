@@ -8,7 +8,7 @@ serves anonymous visitors. An optional logged-in session cookie
 (QUIVER_SESSION_COOKIE) unlocks session-gated sections such as
 bulls/bears analyst counts.
 
-6 tools:
+9 tools:
   get_quiver_congress_trades      -- ~300 most recent congressional trades,
                                      filterable by ticker/politician/party/
                                      chamber
@@ -22,6 +22,13 @@ bulls/bears analyst counts.
   get_quiver_ticker_snapshot      -- per-ticker JSON endpoints (price,
                                      insiders, institutions, forecast, ETF
                                      holders)
+  get_quiver_insider_trades       -- ~1,800 corporate insider purchases and
+                                     sales from the union of the dashboard's
+                                     two embedded lists
+  get_quiver_congress_net_worth   -- disclosed net worth per sitting member,
+                                     ranked
+  get_quiver_bills                -- ~33,000-bill legislation title index,
+                                     searchable by title
 
 Failure vocabulary, shared with tools/altdata_server/server.py:
 
@@ -164,6 +171,19 @@ _QUIVER_WEB = warning(
     "Data is parsed from QuiverQuant's public web pages, not a contracted "
     "API. A page layout change degrades the parser; failures carry "
     "reason=parse_failed. Page fetches are cached 15 minutes.")
+
+_INSIDER_LAG = warning(
+    "insider_filing_lag",
+    "A Form 4 is due within two business days of the transaction, so "
+    "filed_date trails transaction_date by a few days. The list is also a "
+    "window, not full history: about 1,800 distinct transactions across the "
+    "latest month.")
+
+_NET_WORTH_ESTIMATE = warning(
+    "net_worth_is_an_estimate",
+    "Net worth is Quiver's estimate from disclosed ranges, not a filed "
+    "total. Disclosures are banded and often partial, so treat the figure "
+    "as an order of magnitude, not a balance sheet.")
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +395,127 @@ class QuiverServer:
                         },
                     },
                 ),
+                Tool(
+                    name="get_quiver_insider_trades",
+                    description=(
+                        "Corporate insider purchases and sales from "
+                        "QuiverQuant's insider dashboard. The page embeds two "
+                        "1,000-row lists — latest filings and the month's "
+                        "largest — whose union is ~1,800 distinct "
+                        "transactions, each with owner, title, ticker, "
+                        "transaction type, shares, price per share, estimated "
+                        "value, transaction and filing dates, and an "
+                        "estimate of the owner's net worth. Filter by ticker, "
+                        "owner, purchase/sale, minimum value or recency. "
+                        "Distinct from get_insider_transactions (SEC "
+                        "primary-source Form 4 parsing): this is Quiver's "
+                        "pre-normalized view with values computed for you."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "ticker": {
+                                "type": "string",
+                                "description": "Exact ticker (e.g. NVDA).",
+                            },
+                            "owner": {
+                                "type": "string",
+                                "description": "Substring of the insider's name.",
+                            },
+                            "tx_type": {
+                                "type": "string",
+                                "description": "Purchase or Sale (substring match).",
+                            },
+                            "min_value": {
+                                "type": "number",
+                                "description": "Keep trades worth at least this many USD.",
+                            },
+                            "days": {
+                                "type": "integer",
+                                "description": "Keep trades in the last N days.",
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "default": 50,
+                                "description": "Max trades (newest-first).",
+                            },
+                        },
+                    },
+                ),
+                Tool(
+                    name="get_quiver_congress_net_worth",
+                    description=(
+                        "Disclosed net worth per sitting US member, ranked, "
+                        "from the array Quiver embeds on its congress-trading "
+                        "dashboard (494 members). Returns rank, name, net "
+                        "worth in USD, bioguide id, chamber, party and state. "
+                        "Filter by name, chamber, party, state or a minimum "
+                        "threshold. This is a disclosed-estimate ranking, not "
+                        "a filing-level holdings ledger — for positions and "
+                        "transactions use get_quiver_politician_trades."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string",
+                                     "description": "Substring of the member's name."},
+                            "chamber": {"type": "string",
+                                        "description": "House or Senate."},
+                            "party": {"type": "string",
+                                      "description": "Democratic, Republican or Independent."},
+                            "state": {"type": "string",
+                                      "description": "State name (e.g. California)."},
+                            "min_net_worth": {
+                                "type": "number",
+                                "description": "Keep members at or above this net worth in USD.",
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "default": 50,
+                                "description": "Max members (richest first).",
+                            },
+                        },
+                    },
+                ),
+                Tool(
+                    name="get_quiver_bills",
+                    description=(
+                        "Search Quiver's legislation index: ~33,000 bills "
+                        "from the 118th and 119th Congress as {congress, "
+                        "number, type, title}. `query` matches the title "
+                        "case-insensitively, which turns a theme into the "
+                        "bill numbers to follow up on congress.gov. This is "
+                        "a title index, not bill text or status — pair it "
+                        "with the SEC/government tools for the economic side."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Substring of the bill title (e.g. semiconductor).",
+                            },
+                            "bill_type": {
+                                "type": "string",
+                                "description": "hr or s.",
+                            },
+                            "congress": {
+                                "type": "string",
+                                "description": "118 or 119.",
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "default": 50,
+                                "description": "Max bills to return.",
+                            },
+                            "offset": {
+                                "type": "integer",
+                                "default": 0,
+                                "description": "Skip this many matches (for paging).",
+                            },
+                        },
+                    },
+                ),
             ]
 
         @self.server.call_tool()
@@ -387,6 +528,9 @@ class QuiverServer:
                 "get_quiver_lobbying": "QuiverQuant web (lobbying dashboard)",
                 "get_quiver_gov_contracts": "QuiverQuant web (govcontracts dashboard)",
                 "get_quiver_ticker_snapshot": "QuiverQuant web (ticker JSON endpoints)",
+                "get_quiver_insider_trades": "QuiverQuant web (insider dashboard)",
+                "get_quiver_congress_net_worth": "QuiverQuant web (congress dashboard net-worth array)",
+                "get_quiver_bills": "QuiverQuant web (legislation index)",
             },
             warnings_per_tool={
                 "get_quiver_congress_trades": [_DISCLOSURE_LAG, _QUIVER_WEB],
@@ -395,6 +539,11 @@ class QuiverServer:
                 "get_quiver_lobbying": [_QUIVER_WEB],
                 "get_quiver_gov_contracts": [_QUIVER_WEB],
                 "get_quiver_ticker_snapshot": [_QUIVER_WEB],
+                "get_quiver_insider_trades": [_INSIDER_LAG, _QUIVER_WEB],
+                "get_quiver_congress_net_worth": [_DISCLOSURE_LAG,
+                                                  _NET_WORTH_ESTIMATE,
+                                                  _QUIVER_WEB],
+                "get_quiver_bills": [_QUIVER_WEB],
             },
         )
         async def call_tool(name: str, args: Dict[str, Any]):
@@ -434,6 +583,34 @@ class QuiverServer:
                 return _run("get_quiver_ticker_snapshot", lambda: c.get_ticker_snapshot(
                     args["ticker"], trade_limit=args.get("trade_limit", 25),
                 ), ticker=ticker)
+            if name == "get_quiver_insider_trades":
+                return _run("get_quiver_insider_trades",
+                            lambda: c.get_insider_trades(
+                    ticker=args.get("ticker"),
+                    owner=args.get("owner"),
+                    tx_type=args.get("tx_type"),
+                    min_value=args.get("min_value"),
+                    days=args.get("days"),
+                    limit=args.get("limit", 50),
+                ), ticker=ticker)
+            if name == "get_quiver_congress_net_worth":
+                return _run("get_quiver_congress_net_worth",
+                            lambda: c.get_congress_net_worth(
+                    name=args.get("name"),
+                    chamber=args.get("chamber"),
+                    party=args.get("party"),
+                    state=args.get("state"),
+                    min_net_worth=args.get("min_net_worth"),
+                    limit=args.get("limit", 50),
+                ))
+            if name == "get_quiver_bills":
+                return _run("get_quiver_bills", lambda: c.get_bills(
+                    query=args.get("query"),
+                    bill_type=args.get("bill_type"),
+                    congress=args.get("congress"),
+                    limit=args.get("limit", 50),
+                    offset=args.get("offset", 0),
+                ))
             return _fail(name, {"success": False,
                                 "reason": "unknown_tool"},
                          f"unknown tool: {name}")
