@@ -31,7 +31,7 @@ async def main() -> int:
             names = [t.name for t in tools.tools]
             print("tools:", names)
             assert "get_quiver_congress_trades" in names
-            assert len(names) == 9, f"expected 9 tools, got {names}"
+            assert len(names) == 10, f"expected 10 tools, got {names}"
 
             # 1. congress trades, small limit
             res = await asyncio.wait_for(session.call_tool(
@@ -151,6 +151,32 @@ async def main() -> int:
             assert payload["success"], payload.get("error")
             print(f"bills paging ok: offset 3 -> {payload['data']['returned']} "
                   f"rows, more={payload['data']['more']}")
+
+            # 11. election contributions: both tables, with the party split
+            res = await asyncio.wait_for(session.call_tool(
+                "get_quiver_election_contributions", {"limit": 3}), 120)
+            payload = json.loads(res.content[0].text)
+            assert payload["success"], payload.get("error")
+            d = payload["data"]
+            print(f"election_contributions ok: {d['total_embedded']} rows "
+                  f"{d['by_source']}, top {d['contributions'][0]['ticker']} "
+                  f"${d['contributions'][0]['total_usd']:,.0f}")
+            assert d["by_source"] == {"pac": 100, "employee": 100}, d["by_source"]
+            assert d["returned"] == 3
+            assert d["contributions"][0]["democrat_pct"] is not None
+            assert d["contributions"][0]["republican_pct"] is not None
+            assert d["contributions"][0]["ticker"], d["contributions"][0]
+
+            # the ticker cell holds a ticker and a name; both must survive
+            res = await asyncio.wait_for(session.call_tool(
+                "get_quiver_election_contributions",
+                {"ticker": "HON"}), 120)
+            payload = json.loads(res.content[0].text)
+            assert payload["success"], payload.get("error")
+            rows = payload["data"]["contributions"]
+            assert rows and rows[0]["company"].startswith("Honeywell"), rows
+            print(f"election ticker filter ok: {len(rows)} row(s), "
+                  f"{rows[0]['company'][:32]}")
 
     print("\nALL PASS")
     return 0

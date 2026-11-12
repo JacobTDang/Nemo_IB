@@ -57,7 +57,7 @@ and no token. They say so — `/ready` answers 503 and `resolve_auth_token`
 refuses to start — but the flag is what stops it happening.
 
 Then point the client at the gateway, with `Authorization: Bearer $NEMO_MCP_TOKEN`
-on every request. One entry serves all 105 tools:
+on every request. One entry serves all 106 tools:
 
 ```
 nemo            http://<host>:8815/mcp/
@@ -90,9 +90,9 @@ nemo-quiver     http://<host>:8816/mcp/
 | Finnhub | 8812 | `tools.news_agregator.finnhub_server` | 14 |
 | FRED macro | 8813 | `tools.news_agregator.fred_server` | 5 |
 | Alt data | 8814 | `tools.altdata_server.server` | 9 |
-| QuiverQuant web | 8816 | `tools.quiver_server.server` | 9 |
+| QuiverQuant web | 8816 | `tools.quiver_server.server` | 10 |
 
-105 tools served. The SEC server declares 51 and serves 48: `search`,
+106 tools served. The SEC server declares 51 and serves 48: `search`,
 `rag_search` and `rag_ingest` are capability-gated and hidden, because this
 image installs neither SearXNG nor the RAG stack -- the Dockerfile copies three
 `agent/` modules and `agent.rag` is not among them.

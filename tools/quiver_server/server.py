@@ -8,7 +8,7 @@ serves anonymous visitors. An optional logged-in session cookie
 (QUIVER_SESSION_COOKIE) unlocks session-gated sections such as
 bulls/bears analyst counts.
 
-9 tools:
+10 tools:
   get_quiver_congress_trades      -- ~300 most recent congressional trades,
                                      filterable by ticker/politician/party/
                                      chamber
@@ -29,6 +29,9 @@ bulls/bears analyst counts.
                                      ranked
   get_quiver_bills                -- ~33,000-bill legislation title index,
                                      searchable by title
+  get_quiver_election_contributions -- top corporate PAC and employee
+                                     donations for the current cycle, with
+                                     the party split
 
 Failure vocabulary, shared with tools/altdata_server/server.py:
 
@@ -184,6 +187,14 @@ _NET_WORTH_ESTIMATE = warning(
     "Net worth is Quiver's estimate from disclosed ranges, not a filed "
     "total. Disclosures are banded and often partial, so treat the figure "
     "as an order of magnitude, not a balance sheet.")
+
+_CAMPAIGN_FINANCE = warning(
+    "campaign_finance_is_partial",
+    "Donations come from FEC filings for the cycle still in progress, and "
+    "only the largest 100 PAC donors and 100 employee donors are listed. A "
+    "company's PAC and its employees file separately, so the two are not "
+    "summed. Totals are contributions, not spending on lobbying or "
+    "advertising.")
 
 
 # ---------------------------------------------------------------------------
@@ -516,6 +527,50 @@ class QuiverServer:
                         },
                     },
                 ),
+                Tool(
+                    name="get_quiver_election_contributions",
+                    description=(
+                        "Corporate political donations per company for the "
+                        "current (2026) cycle: the top 100 company PAC "
+                        "donations and the top 100 employee donations, each "
+                        "with the total and its Democratic/Republican split "
+                        "and share. PAC money and employee money are filed "
+                        "separately, so a company can appear in both and "
+                        "every row names which it is. Useful for political-"
+                        "exposure questions — who is funding whom — and for "
+                        "reading a company's partisan lean. Not a complete "
+                        "FEC ledger: these are the cycle's largest donors."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "ticker": {
+                                "type": "string",
+                                "description": "Exact ticker (e.g. HON).",
+                            },
+                            "source": {
+                                "type": "string",
+                                "description": "pac or employee.",
+                            },
+                            "leans": {
+                                "type": "string",
+                                "description": (
+                                    "democrat or republican: keep companies "
+                                    "whose larger share went to that party."
+                                ),
+                            },
+                            "min_total": {
+                                "type": "number",
+                                "description": "Keep donations at or above this total in USD.",
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "default": 50,
+                                "description": "Max rows (largest first).",
+                            },
+                        },
+                    },
+                ),
             ]
 
         @self.server.call_tool()
@@ -531,6 +586,7 @@ class QuiverServer:
                 "get_quiver_insider_trades": "QuiverQuant web (insider dashboard)",
                 "get_quiver_congress_net_worth": "QuiverQuant web (congress dashboard net-worth array)",
                 "get_quiver_bills": "QuiverQuant web (legislation index)",
+                "get_quiver_election_contributions": "QuiverQuant web (election-contributions dashboard)",
             },
             warnings_per_tool={
                 "get_quiver_congress_trades": [_DISCLOSURE_LAG, _QUIVER_WEB],
@@ -544,6 +600,8 @@ class QuiverServer:
                                                   _NET_WORTH_ESTIMATE,
                                                   _QUIVER_WEB],
                 "get_quiver_bills": [_QUIVER_WEB],
+                "get_quiver_election_contributions": [_CAMPAIGN_FINANCE,
+                                                      _QUIVER_WEB],
             },
         )
         async def call_tool(name: str, args: Dict[str, Any]):
@@ -611,6 +669,15 @@ class QuiverServer:
                     limit=args.get("limit", 50),
                     offset=args.get("offset", 0),
                 ))
+            if name == "get_quiver_election_contributions":
+                return _run("get_quiver_election_contributions",
+                            lambda: c.get_election_contributions(
+                    ticker=args.get("ticker"),
+                    source=args.get("source"),
+                    leans=args.get("leans"),
+                    min_total=args.get("min_total"),
+                    limit=args.get("limit", 50),
+                ), ticker=ticker)
             return _fail(name, {"success": False,
                                 "reason": "unknown_tool"},
                          f"unknown tool: {name}")

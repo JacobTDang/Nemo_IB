@@ -80,6 +80,11 @@ async def _exercise_all_tools() -> dict:
                 "query": "semiconductor", "limit": 2})
             results["get_quiver_bills"] = json.loads(r.content[0].text)
 
+            r = await session.call_tool("get_quiver_election_contributions",
+                                        {"limit": 2})
+            results["get_quiver_election_contributions"] = json.loads(
+                r.content[0].text)
+
             # failure vocabulary: unknown entity must be success=false
             # with a machine reason, not an exception over the wire.
             r = await session.call_tool("get_quiver_politician_trades", {
@@ -92,7 +97,7 @@ async def _exercise_all_tools() -> dict:
 def test_quiver_server_e2e():
     results = asyncio.run(_exercise_all_tools())
 
-    assert results["__tool_count__"] == 9, results["__tool_names__"]
+    assert results["__tool_count__"] == 10, results["__tool_names__"]
     assert "get_quiver_congress_trades" in results["__tool_names__"]
 
     # Every response shares the envelope contract.
@@ -100,7 +105,8 @@ def test_quiver_server_e2e():
                  "get_quiver_politician_trades", "get_quiver_wsb_sentiment",
                  "get_quiver_lobbying", "get_quiver_gov_contracts",
                  "get_quiver_ticker_snapshot", "get_quiver_insider_trades",
-                 "get_quiver_congress_net_worth", "get_quiver_bills"]:
+                 "get_quiver_congress_net_worth", "get_quiver_bills",
+                 "get_quiver_election_contributions"]:
         body = results[name]
         assert body["success"] is True, (name, body.get("error"))
         assert body["domain"] == "quiver", name
@@ -166,6 +172,19 @@ def test_quiver_server_e2e():
     assert bills["total_indexed"] > 10000, bills["total_indexed"]
     assert bills["matching"] >= bills["returned"], bills
     assert all("semiconductor" in b["title"].lower() for b in bills["bills"])
+
+    # Election contributions: two tables of separate money, each row naming
+    # its source, with the party split as a number rather than a string.
+    money = results["get_quiver_election_contributions"]["data"]
+    assert money["total_embedded"] == 200, money["total_embedded"]
+    assert money["by_source"] == {"pac": 100, "employee": 100}, money["by_source"]
+    assert money["returned"] == 2
+    top = money["contributions"][0]
+    assert top["ticker"] and top["company"], top
+    assert top["total_usd"] > 0, top
+    # "45.20%" and "$2,006,000" are parsed, not passed through as text.
+    assert isinstance(top["democrat_pct"], float), top
+    assert isinstance(top["democrat_usd"], float), top
 
     # Unknown entity -> success=false with a machine-readable reason.
     miss = results["unknown_politician"]
@@ -405,6 +424,45 @@ def test_bills_page_the_index_instead_of_dumping_it():
     assert c.get_bills(congress="118")["matching"] == 1
 
 
+def test_the_two_donation_tables_are_told_apart_by_their_headings():
+    """Both tables have identical headers, so their labels cannot come from
+    the columns. They come from the heading above each table; a company's PAC
+    and its employees are separate money and summing them would be wrong."""
+    from tools.quiver_server import client as qc
+
+    header = ("<table><tr><th>Ticker</th><th>Amount (Total)</th>"
+              "<th>Amount (Democrat)</th><th>Amount (Republican)</th>"
+              "<th>Cycle</th></tr>")
+    pac = (header + "<tr><td>HON Honeywell International Inc</td>"
+           "<td>$4,455,171</td><td>$2,006,000 (45.20%)</td>"
+           "<td>$2,432,171 (54.80%)</td><td>2026</td></tr></table>")
+    employee = (header + "<tr><td>HON Honeywell International Inc</td>"
+                "<td>$120,000</td><td>$100,000 (83.33%)</td>"
+                "<td>$20,000 (16.67%)</td><td>2026</td></tr></table>")
+    page = ("<h2>Company PAC Donations</h2>" + pac
+            + "<h2>Company Employee Donations</h2>" + employee)
+
+    c = qc.QuiverWebClient()
+    c._page = lambda path, **kw: page
+
+    d = c.get_election_contributions()
+    assert d["by_source"] == {"pac": 1, "employee": 1}, d["by_source"]
+    by_source = {r["source"]: r for r in d["contributions"]}
+    assert by_source["pac"]["total_usd"] == 4455171.0, by_source["pac"]
+    assert by_source["employee"]["total_usd"] == 120000.0, by_source["employee"]
+    # The ticker cell carries the name too; both are kept.
+    assert by_source["pac"]["ticker"] == "HON", by_source["pac"]
+    assert by_source["pac"]["company"].startswith("Honeywell")
+
+    # The party split is a number, so a lean is a comparison not a guess.
+    assert by_source["pac"]["democrat_pct"] == 45.2, by_source["pac"]
+    assert [r["source"] for r in
+            c.get_election_contributions(leans="democrat")["contributions"]] \
+        == ["employee"]
+    assert len(c.get_election_contributions(leans="republican")["contributions"]) == 1
+    assert c.get_election_contributions(ticker="HON", source="pac")["matching"] == 1
+
+
 if __name__ == "__main__":
     test_quiver_server_e2e()
     test_a_rate_limit_is_retried_once_and_then_named()
@@ -413,4 +471,5 @@ if __name__ == "__main__":
     test_inside_the_dashboard_union_duplicates_are_named_not_double_counted()
     test_a_bad_transaction_date_is_flagged_and_kept_out_of_the_range()
     test_bills_page_the_index_instead_of_dumping_it()
+    test_the_two_donation_tables_are_told_apart_by_their_headings()
     print("quiver server e2e: PASS")

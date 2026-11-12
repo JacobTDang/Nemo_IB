@@ -1140,3 +1140,135 @@ class QuiverWebClient:
             "more": offset + len(window) < matching,
             "coverage": "full",
         }
+
+    # -----------------------------------------------------------------------
+    # Corporate election contributions
+    # -----------------------------------------------------------------------
+
+    _MONEY = re.compile(r"-?\$?\s*([\d,]+(?:\.\d+)?)")
+    _SHARE = re.compile(r"\(([\d.]+)\s*%\)")
+    _TICKER_PREFIX = re.compile(r"^([A-Z][A-Z0-9.\-]{0,6})\s+(\S.*)$")
+
+    @classmethod
+    def _money(cls, raw: str) -> Optional[float]:
+        """`'$4,455,171'` -> 4455171.0. Anything unparseable is None."""
+        m = cls._MONEY.search(raw or "")
+        if not m:
+            return None
+        try:
+            return float(m.group(1).replace(",", ""))
+        except ValueError:
+            return None
+
+    @classmethod
+    def _money_and_share(cls, raw: str
+                         ) -> Tuple[Optional[float], Optional[float]]:
+        """`'$2,006,000 (45.20%)'` -> (2006000.0, 45.2)."""
+        m = cls._SHARE.search(raw or "")
+        return cls._money(raw), (float(m.group(1)) if m else None)
+
+    @classmethod
+    def _ticker_and_name(cls, cell: str) -> Tuple[Optional[str], str]:
+        """`'HON Honeywell International Inc'` -> ('HON', 'Honeywell ...').
+
+        The first column is a ticker and a company name in one cell. A cell
+        whose leading word is not shaped like a ticker keeps its full text as
+        the name rather than guessing.
+        """
+        m = cls._TICKER_PREFIX.match((cell or "").strip())
+        if m:
+            return m.group(1), m.group(2).strip()
+        return None, (cell or "").strip()
+
+    def get_election_contributions(self, *, ticker: Optional[str] = None,
+                                   source: Optional[str] = None,
+                                   leans: Optional[str] = None,
+                                   min_total: Optional[float] = None,
+                                   limit: Optional[int] = None
+                                   ) -> Dict[str, Any]:
+        """Corporate PAC and employee donations per company, current cycle.
+
+        `/election-contributions/` renders two tables of 100 rows each, both
+        for the 2026 cycle: company PAC donations and company employee
+        donations. They are separate money — a company's PAC and its
+        employees file separately — so a ticker may appear once in each, and
+        every row names which table it came from. Each row carries the total
+        and the Democratic/Republican split with its share.
+        """
+        page = self._page("/election-contributions/")
+        pac_at = page.find("Company PAC Donations")
+        emp_at = page.find("Company Employee Donations")
+        labelled: List[Tuple[str, List[List[str]]]] = []
+        if 0 <= pac_at < emp_at:
+            # The headings are what name each table; take the table under
+            # each one instead of trusting document order.
+            for kind, chunk in (("pac", page[pac_at:emp_at]),
+                                ("employee", page[emp_at:])):
+                tables = self._parse_tables(chunk)
+                if tables:
+                    labelled.append((kind, tables[0]))
+        else:
+            # Headings gone: the page's order is PAC then employee.
+            for kind, table in zip(("pac", "employee"),
+                                   self._parse_tables(page)):
+                labelled.append((kind, table))
+
+        contributions: List[Dict[str, Any]] = []
+        by_source: Dict[str, int] = {}
+        for kind, table in labelled:
+            if len(table) < 2 or "ticker" not in " ".join(table[0]).lower():
+                continue
+            for row in table[1:]:
+                if len(row) < 4:
+                    continue
+                symbol, company = self._ticker_and_name(row[0])
+                democrat, democrat_pct = self._money_and_share(row[2])
+                republican, republican_pct = self._money_and_share(row[3])
+                contributions.append({
+                    "ticker": symbol,
+                    "company": company,
+                    "source": kind,
+                    "total_usd": self._money(row[1]),
+                    "democrat_usd": democrat,
+                    "democrat_pct": democrat_pct,
+                    "republican_usd": republican,
+                    "republican_pct": republican_pct,
+                    "cycle": row[4] if len(row) > 4 else None,
+                })
+            by_source[kind] = by_source.get(kind, 0) + len(table) - 1
+        total = len(contributions)
+
+        if ticker:
+            needle = ticker.upper()
+            contributions = [c for c in contributions
+                             if (c["ticker"] or "") == needle]
+        if source:
+            needle = source.lower()
+            contributions = [c for c in contributions
+                             if (c["source"] or "") == needle]
+        if min_total is not None:
+            contributions = [c for c in contributions
+                             if (c["total_usd"] or 0) >= float(min_total)]
+        if leans:
+            needle = leans.lower()
+            if needle.startswith("d"):
+                contributions = [c for c in contributions
+                                 if (c["democrat_pct"] or 0)
+                                 > (c["republican_pct"] or 0)]
+            elif needle.startswith("r"):
+                contributions = [c for c in contributions
+                                 if (c["republican_pct"] or 0)
+                                 > (c["democrat_pct"] or 0)]
+
+        contributions.sort(key=lambda c: -(c["total_usd"] or 0))
+        matching = len(contributions)
+        if limit is not None and limit > 0:
+            contributions = contributions[:limit]
+        return {
+            "contributions": contributions,
+            "total_embedded": total,
+            "by_source": by_source,
+            "matching": matching,
+            "returned": len(contributions),
+            "coverage": "full",
+        }

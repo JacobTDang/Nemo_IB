@@ -95,8 +95,8 @@ serves HTTP.
 
 ## MCP servers
 
-Six servers ship in the image. Together they serve **105 tools**.
-They declare 108: the image hides `search`, `rag_search`, and `rag_ingest`. It
+Six servers ship in the image. Together they serve **106 tools**.
+They declare 109: the image hides `search`, `rag_search`, and `rag_ingest`. It
 contains neither SearXNG nor the RAG stack.
 
 `testing/test_readme_counts.py` checks every count on this page against the
@@ -109,7 +109,7 @@ registry of each server. A count that drifts fails the test suite.
 | `finnhub` | 14 | Finnhub | `FINNHUB_API_KEY` |
 | `fred` | 5 | FRED | `FRED_API_KEY` |
 | `altdata` | 9 | House Clerk, Senate eFD, USAspending, GovTrack, ATS boards, FinMind | `SEC_EMAIL` |
-| `quiver` | 9 | QuiverQuant web app: congress trades, WSB mentions, lobbying, gov contracts, insiders, net worth, bills | — |
+| `quiver` | 10 | QuiverQuant web app: congress trades, WSB mentions, lobbying, gov contracts, insiders, net worth, bills, election contributions | — |
 
 Three more servers exist in the repository and stay out of the image. They are
 `alpaca` with 6 tools that place orders, `excel` with 3 tools, and `sentry` with
@@ -217,18 +217,19 @@ filing. Amounts stay as the ranges that the filings publish, under `amount_min`
 and `amount_max`. The store computes no midpoint. Only the Senate reports
 holdings.
 
-### `quiver` — 9 tools
+### `quiver` — 10 tools
 
 `get_quiver_congress_trades` `get_quiver_politician_trades`
 `get_quiver_wsb_sentiment` `get_quiver_lobbying` `get_quiver_gov_contracts`
 `get_quiver_ticker_snapshot` `get_quiver_insider_trades`
 `get_quiver_congress_net_worth` `get_quiver_bills`
+`get_quiver_election_contributions`
 
 These read what quiverquant.com serves anonymous visitors: the congress-trading
 dashboard, per-politician pages, the WallStreetBets dashboard, lobbying filings,
-contract awards, the insider-trading dashboard, the legislation index, and the
-site's per-ticker JSON endpoints (price, insider trades, institutional holdings,
-analyst forecast, ETF holders).
+contract awards, the insider-trading dashboard, the legislation index, the
+election-contributions dashboard, and the site's per-ticker JSON endpoints
+(price, insider trades, institutional holdings, analyst forecast, ETF holders).
 
 What one fetch yields, measured:
 
@@ -240,6 +241,7 @@ What one fetch yields, measured:
 | Congress trades | ~300 | most recent, embedded |
 | Lobbying | 100 filings + 200 spenders | |
 | Gov contracts | 100 awards | |
+| Election contributions | 200 | 100 PAC + 100 employee, 2026 cycle |
 | WSB mentions | 596 tickers | 30-day series, dated 2025-02-21 |
 | Per-politician history | full | e.g. 212 for Pelosi |
 
@@ -248,6 +250,12 @@ the month's largest — which overlap by about 165 rows. The tool returns their
 union and names which list each row came from. Two of those rows carry a
 transaction date after the filing date; they are kept but flagged
 `date_anomaly` and kept out of the reported date range.
+
+Election contributions are also two lists, and deliberately not added together:
+a company's PAC and its employees file separately, so a company can appear in
+both and every row names which one it is. Each row carries the total and its
+Democratic/Republican split as a number, which is what makes the lean
+filterable.
 
 There is no contracted API behind this. Each page is fetched and parsed, and a
 parsed page is cached for fifteen minutes. A page that changes shape reports
