@@ -112,6 +112,9 @@ def test_quiver_server_e2e():
         assert body["domain"] == "quiver", name
         assert body["provider"], name
         assert isinstance(body["warnings"], list), name
+        # Coverage is part of the envelope, not just the data, so a host reads
+        # one field to know whether the answer is whole.
+        assert body["coverage"] in ("full", "partial"), (name, body["coverage"])
 
     # Real data actually parsed out of the pages.
     trades = results["get_quiver_congress_trades"]["data"]["trades"]

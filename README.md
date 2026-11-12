@@ -263,6 +263,14 @@ reason=parse_failed rather than an empty answer, and a request that could not be
 made at all reports success false with a machine-readable reason instead of a
 zero.
 
+Every response also says how complete it is, in the envelope and not only inside
+the data. `coverage: full` is a page that holds the whole set for the question —
+a politician's disclosed history, the bill index, all 494 members. `coverage:
+partial` is a surface that publishes a window: the latest ~300 congressional
+trades, the latest 100 contract awards, the top donors of a cycle still in
+progress. A quiet ticker can fall outside such a window, and the field says so
+rather than letting an empty result look like an answer.
+
 Anonymous requests are rate limited at the edge, and the window is unpublished.
 Requests are therefore spaced, and a 429 is retried once before it is reported,
 so a loop over tickers slows down instead of returning a wrong answer. A ticker

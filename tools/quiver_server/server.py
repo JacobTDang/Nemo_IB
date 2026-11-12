@@ -37,7 +37,14 @@ Failure vocabulary, shared with tools/altdata_server/server.py:
 
   success: false  -- the lookup could not be performed at all (site
                      unreachable, page layout changed, unknown entity)
-  coverage        -- "full" | "partial" | "not_covered"
+  coverage        -- "full" | "partial" | "not_covered". One rule decides
+                     which: "full" means the page holds the whole set for the
+                     question (a politician's history, the bill index); a
+                     "partial" answer means the surface publishes a window --
+                     the latest 300 congressional trades, the latest 100
+                     contract awards, the top donors of a cycle still in
+                     progress. It is stated in the envelope, not only inside
+                     `data`, because it is a property of the answer.
   reason          -- machine-readable cause (provider_unavailable,
                      rate_limited, parse_failed, unknown_politician, ...)
   degraded        -- named degradations that narrowed an answer without
@@ -110,6 +117,12 @@ def _envelope(data: Any, tool: str, ticker: str = "",
         "data": data,
         "metadata": {"errors": errors or []},
     }
+    # Coverage is decided where the data is assembled -- a failed section
+    # inside a snapshot is a partial answer, not an absent one. Lift it into
+    # the envelope so a host reads it without digging into `data`; otherwise
+    # the field is always "unknown", which says nothing.
+    if isinstance(data, dict) and data.get("coverage"):
+        payload["coverage"] = data["coverage"]
     if warnings:
         payload["warnings"] = warnings
     if errors:

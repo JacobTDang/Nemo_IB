@@ -469,7 +469,10 @@ class QuiverWebClient:
         if limit is not None and limit > 0:
             trades = trades[:limit]
         return {"trades": trades, "total_embedded": total,
-                "returned": len(trades)}
+                "returned": len(trades),
+                # The dashboard embeds the latest ~300 trades, not history:
+                # a question about a quiet ticker can fall outside the window.
+                "coverage": "partial"}
 
     def resolve_politician(self, query: str) -> List[Dict[str, Any]]:
         """Search the embedded congressional directory by name or ID."""
@@ -553,7 +556,9 @@ class QuiverWebClient:
         if limit is not None and limit > 0:
             trades = trades[:limit]
         return {"politician": slug, "trades": trades,
-                "total": total, "returned": len(trades)}
+                "total": total, "returned": len(trades),
+                # A politician page carries their whole disclosed history.
+                "coverage": "full"}
 
     def get_politician_donors(self, bioguide_id: str) -> Dict[str, Any]:
         """A politician's top donors (FEC data via the politician page JSON)."""
@@ -695,6 +700,9 @@ class QuiverWebClient:
         if limit is not None and limit > 0 and not ticker:
             result["mentions"] = mentions[:limit]
             result["returned"] = len(result["mentions"])
+        # Without a ticker this is the dashboard's whole table; with one, the
+        # ticker branch above already said whether it was found.
+        result.setdefault("coverage", "full")
         return result
 
     # -----------------------------------------------------------------------
@@ -753,7 +761,9 @@ class QuiverWebClient:
         if limit is not None and limit > 0:
             filings = filings[:limit]
         return {"filings": filings, "top_spenders": top_spenders,
-                "total_filings": total, "returned": len(filings)}
+                "total_filings": total, "returned": len(filings),
+                # The page publishes the latest 100 filings, not the register.
+                "coverage": "partial"}
 
     # -----------------------------------------------------------------------
     # Government contracts
@@ -802,7 +812,9 @@ class QuiverWebClient:
         if limit is not None and limit > 0:
             awards = awards[:limit]
         return {"awards": awards, "total_embedded": total,
-                "returned": len(awards)}
+                "returned": len(awards),
+                # The page embeds the latest 100 awards, not the register.
+                "coverage": "partial"}
 
     # -----------------------------------------------------------------------
     # Per-ticker JSON endpoints
@@ -1270,5 +1282,6 @@ class QuiverWebClient:
             "by_source": by_source,
             "matching": matching,
             "returned": len(contributions),
-            "coverage": "full",
+            # The two tables are the cycle's largest donors, not the register.
+            "coverage": "partial",
         }
