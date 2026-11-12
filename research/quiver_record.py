@@ -112,3 +112,122 @@ def keyed_rows(feed: Feed, rows: Sequence[Dict[str, Any]]
             "payload": row,
         })
     return out
+
+
+def iso_week(now: datetime) -> str:
+    year, week, _ = now.isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+def _fetch(client: Any, feed: Feed) -> List[Dict[str, Any]]:
+    result = getattr(client, feed.method)()
+    rows = result.get(feed.rows_key) if isinstance(result, dict) else None
+    if not isinstance(rows, list):
+        raise QuiverError(
+            "parse_failed",
+            f"{feed.method} returned no {feed.rows_key!r} list")
+    if not rows:
+        raise QuiverError(
+            "empty",
+            f"{feed.method} parsed 0 {feed.rows_key}. An empty feed is a "
+            f"failure, not a night with nothing new.")
+    return rows
+
+
+def _reason(exc: Exception) -> str:
+    if isinstance(exc, QuiverError):
+        return f"{exc.reason}: {exc.message}"
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _stage_status(failures: Dict[str, str], succeeded: int) -> str:
+    if not failures:
+        return "ok"
+    return "partial" if succeeded else "failed"
+
+
+def _finish(run_id: int, written: int, status: str,
+            failures: Dict[str, str]) -> None:
+    error = "; ".join(f"{name}: {reason}" for name, reason in failures.items())
+    pit_store.finish_run(rows_written=written, status=status,
+                         error=error or None, run_id=run_id)
+
+
+def record_feeds(client: Any, now: datetime) -> Dict[str, Any]:
+    """The seven feeds into quiver_record. Each fails alone, by name."""
+    stamp = pit_store.iso_utc(now)
+    run_id = pit_store.start_run(FEEDS_STAGE, as_of_date=now.date().isoformat())
+    counts: Dict[str, Dict[str, int]] = {}
+    failures: Dict[str, str] = {}
+    for feed in FEEDS:
+        try:
+            rows = keyed_rows(feed, _fetch(client, feed))
+            new, revised = pit_store.record_quiver_rows(
+                feed.dataset, rows, volatile=feed.volatile, recorded_at=stamp)
+        except Exception as exc:  # noqa: BLE001 - named in the run and the exit
+            failures[feed.dataset] = _reason(exc)
+            continue
+        counts[feed.dataset] = {"read": len(rows), "new": new,
+                                "revised": revised}
+    written = sum(c["new"] + c["revised"] for c in counts.values())
+    status = _stage_status(failures, len(counts))
+    _finish(run_id, written, status, failures)
+    return {"status": status, "written": written, "feeds": counts,
+            "failed": failures}
+
+
+def record_lists(client: Any, now: datetime) -> Dict[str, Any]:
+    """The weekly lists into quiver_snapshot, once per ISO week.
+
+    Checked every night, so a night whose fetch failed is retried by the next
+    one instead of leaving the week empty.
+    """
+    week = iso_week(now)
+    stamp = pit_store.iso_utc(now)
+    run_id = pit_store.start_run(LISTS_STAGE, as_of_date=now.date().isoformat())
+    counts: Dict[str, Dict[str, int]] = {}
+    held: List[str] = []
+    failures: Dict[str, str] = {}
+    for feed in LISTS:
+        if pit_store.has_quiver_snapshot(feed.dataset, week):
+            held.append(feed.dataset)
+            continue
+        try:
+            rows = keyed_rows(feed, _fetch(client, feed))
+            written = pit_store.record_quiver_snapshot(
+                feed.dataset, week, rows, recorded_at=stamp)
+        except Exception as exc:  # noqa: BLE001 - named in the run and the exit
+            failures[feed.dataset] = _reason(exc)
+            continue
+        counts[feed.dataset] = {"read": len(rows), "written": written}
+    written = sum(c["written"] for c in counts.values())
+    status = _stage_status(failures, len(counts) + len(held))
+    _finish(run_id, written, status, failures)
+    return {"status": status, "week": week, "written": written,
+            "lists": counts, "already_held": held, "failed": failures}
+
+
+def run(client: Any = None, now: Optional[datetime] = None) -> Dict[str, Any]:
+    now = now or datetime.now(timezone.utc)
+    pit_store.init_schema()
+    owned = client is None
+    client = client or QuiverWebClient()
+    try:
+        feeds = record_feeds(client, now)
+        lists = record_lists(client, now)
+    finally:
+        if owned:
+            client.close()
+    failed = {f"{stage}/{name}": reason
+              for stage, result in ((FEEDS_STAGE, feeds), (LISTS_STAGE, lists))
+              for name, reason in result["failed"].items()}
+    statuses = {feeds["status"], lists["status"]}
+    if statuses == {"ok"}:
+        status = "ok"
+    elif statuses == {"failed"}:
+        status = "failed"
+    else:
+        status = "partial"
+    return {"status": status, "as_of": now.date().isoformat(),
+            "written": feeds["written"] + lists["written"],
+            FEEDS_STAGE: feeds, LISTS_STAGE: lists, "failed": failed}
