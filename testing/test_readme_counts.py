@@ -37,6 +37,7 @@ SERVERS = {
     "finnhub": ("tools.news_agregator.finnhub_server", "FinnhubServer"),
     "fred": ("tools.news_agregator.fred_server", None),
     "altdata": ("tools.altdata_server.server", None),
+    "quiver": ("tools.quiver_server.server", "QuiverServer"),
 }
 
 README = pathlib.Path(__file__).resolve().parent.parent / "README.md"

@@ -33,7 +33,7 @@ key, but `/ready` reports the missing key, the container stays unhealthy, and
 every request fails with the name of the key.
 
 Ports publish on `127.0.0.1` unless `NEMO_BIND_ADDR` gives a different address.
-A missing variable therefore fails closed. It does not expose five servers to
+A missing variable therefore fails closed. It does not expose six servers to
 the local network. On a homelab, set the variable to the Tailscale address of
 the machine:
 
@@ -78,11 +78,11 @@ gateway:
 }
 ```
 
-The gateway serves the tools of all five servers at one URL. It sends each call
+The gateway serves the tools of all six servers at one URL. It sends each call
 to the server that serves the tool. It holds no data-source key. If a server
 does not answer, the tool list fails and names that server.
 
-Each server also answers on its own port, 8810 to 8814, for a client that needs
+Each server also answers on its own port, 8810 to 8816, for a client that needs
 one server only. [`deploy/README.md`](deploy/README.md) lists the ports.
 
 Each entry needs `Authorization: Bearer $NEMO_MCP_TOKEN`. The trailing slash on
@@ -95,8 +95,8 @@ serves HTTP.
 
 ## MCP servers
 
-Five servers ship in the image. Together they serve **96 tools**.
-They declare 99: the image hides `search`, `rag_search`, and `rag_ingest`. It
+Six servers ship in the image. Together they serve **102 tools**.
+They declare 105: the image hides `search`, `rag_search`, and `rag_ingest`. It
 contains neither SearXNG nor the RAG stack.
 
 `testing/test_readme_counts.py` checks every count on this page against the
@@ -109,6 +109,7 @@ registry of each server. A count that drifts fails the test suite.
 | `finnhub` | 14 | Finnhub | `FINNHUB_API_KEY` |
 | `fred` | 5 | FRED | `FRED_API_KEY` |
 | `altdata` | 9 | House Clerk, Senate eFD, USAspending, GovTrack, ATS boards, FinMind | `SEC_EMAIL` |
+| `quiver` | 6 | QuiverQuant web app: congress trades, WSB mentions, lobbying, gov contracts | — |
 
 Three more servers exist in the repository and stay out of the image. They are
 `alpaca` with 6 tools that place orders, `excel` with 3 tools, and `sentry` with
@@ -215,6 +216,31 @@ The store counts a filing that arrives as a scan in `coverage`. It drops no such
 filing. Amounts stay as the ranges that the filings publish, under `amount_min`
 and `amount_max`. The store computes no midpoint. Only the Senate reports
 holdings.
+
+### `quiver` — 6 tools
+
+`get_quiver_congress_trades` `get_quiver_politician_trades`
+`get_quiver_wsb_sentiment` `get_quiver_lobbying` `get_quiver_gov_contracts`
+`get_quiver_ticker_snapshot`
+
+These read what quiverquant.com serves anonymous visitors: the congress-trading
+dashboard, per-politician pages, the WallStreetBets dashboard, lobbying filings,
+contract awards, and the site's per-ticker JSON endpoints (price, insider
+trades, institutional holdings, analyst forecast, ETF holders).
+
+There is no contracted API behind this. Each page is fetched and parsed, and a
+parsed page is cached for fifteen minutes. A page that changes shape reports
+reason=parse_failed rather than an empty answer, and a request that could not be
+made at all reports success false with a machine-readable reason instead of a
+zero.
+
+The datasets overlap with the congressional store above, from a different source
+and with a different lag. Members file up to 45 days after a trade, so a
+transaction's filed date trails the date it names. The WSB mention series
+carries data_horizon, the last date Quiver's Reddit scrape covers: it is dated
+cross-sectional sentiment, not live chatter. One section of the ticker snapshot,
+bulls and bears, needs QUIVER_SESSION_COOKIE and degrades by name in
+degraded_sections without it.
 
 ## Automation
 

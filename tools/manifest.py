@@ -50,7 +50,7 @@ class ServerSpec(NamedTuple):
     cls: str
 
 
-# The five servers that ship in the homelab image. alpaca, excel and sentry are
+# The six servers that ship in the homelab image. alpaca, excel and sentry are
 # deliberately excluded from the image (they place orders and read book state),
 # so a data-source manifest that advertised them would describe a surface this
 # deployment does not expose.
@@ -61,6 +61,7 @@ SERVERS: tuple[ServerSpec, ...] = (
     ServerSpec("finnhub", "tools.news_agregator.finnhub_server", "FinnhubServer"),
     ServerSpec("fred", "tools.news_agregator.fred_server", "FredServer"),
     ServerSpec("altdata", "tools.altdata_server.server", "AltDataServer"),
+    ServerSpec("quiver", "tools.quiver_server.server", "QuiverServer"),
 )
 
 

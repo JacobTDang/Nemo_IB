@@ -26,7 +26,7 @@ DOCKERFILE = ROOT / "Dockerfile"
 # COPY line of its own.
 SHIPPED_PACKAGES = {"news_agregator", "web_search_server",
                     "financial_modeling_engine", "altdata_server",
-                    "preearnings"}
+                    "quiver_server", "preearnings"}
 
 
 def _top_level_modules_available() -> set:
