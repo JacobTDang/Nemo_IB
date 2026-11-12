@@ -31,7 +31,7 @@ async def main() -> int:
             names = [t.name for t in tools.tools]
             print("tools:", names)
             assert "get_quiver_congress_trades" in names
-            assert len(names) == 10, f"expected 10 tools, got {names}"
+            assert len(names) == 15, f"expected 15 tools, got {names}"
 
             # 1. congress trades, small limit
             res = await asyncio.wait_for(session.call_tool(
@@ -177,6 +177,98 @@ async def main() -> int:
             assert rows and rows[0]["company"].startswith("Honeywell"), rows
             print(f"election ticker filter ok: {len(rows)} row(s), "
                   f"{rows[0]['company'][:32]}")
+
+            # 12. layoffs: a JSON-script dashboard that renders client-side
+            res = await asyncio.wait_for(session.call_tool(
+                "get_quiver_layoffs", {"min_workers": 500, "limit": 5}), 180)
+            payload = json.loads(res.content[0].text)
+            assert payload["success"], payload.get("error")
+            d = payload["data"]
+            print(f"layoffs ok: {d['total_embedded']} embedded, "
+                  f"{d['matching']} with 500+ workers, "
+                  f"{d['workers_matching']} workers, "
+                  f"{d['tickers_mapped']} ticker-mapped, "
+                  f"range {d['date_range']['newest']}")
+            assert d["returned"] == 5
+            assert d["tickers_mapped"] > d["returned"], d
+            assert all(n["workers"] >= 500 for n in d["notices"])
+            assert all(n["ticker_match"] for n in d["notices"])
+
+            # 13. revolving door
+            res = await asyncio.wait_for(session.call_tool(
+                "get_quiver_revolving_door", {"party": "D", "limit": 5}), 180)
+            payload = json.loads(res.content[0].text)
+            assert payload["success"], payload.get("error")
+            d = payload["data"]
+            print(f"revolving_door ok: {d['total_embedded']} embedded, "
+                  f"{d['matching']} Democratic, "
+                  f"{d['registrations'][0]['period']}")
+            assert d["returned"] == 5
+            assert all(r["party"] == "D" for r in d["registrations"])
+            assert d["registrations"][0]["filed_date"]
+
+            # 14. government spending transactions
+            res = await asyncio.wait_for(session.call_tool(
+                "get_quiver_gov_spending", {"min_amount": 10_000_000,
+                                            "limit": 5}), 180)
+            payload = json.loads(res.content[0].text)
+            assert payload["success"], payload.get("error")
+            d = payload["data"]
+            print(f"gov_spending ok: {d['total_embedded']} embedded, "
+                  f"{d['matching']} over $10M totalling "
+                  f"${d['amount_matching_usd']/1e6:,.0f}M across "
+                  f"{d['tickers']} tickers")
+            assert d["returned"] == 5
+            assert all(t["amount_usd"] >= 10_000_000
+                       for t in d["transactions"])
+            assert all(t["award_id"] for t in d["transactions"])
+
+            # 15. patent search (a POST form, not a GET route)
+            res = await asyncio.wait_for(session.call_tool(
+                "get_quiver_patent_search", {"query": "battery", "limit": 5}),
+                180)
+            payload = json.loads(res.content[0].text)
+            assert payload["success"], payload.get("error")
+            d = payload["data"]
+            print(f"patent_search ok: {d['total_matched']} matched, "
+                  f"{d['tickers']} tickers, coverage={d['coverage']}, "
+                  f"first {d['patents'][0]['ticker']} "
+                  f"{d['patents'][0]['grant_date']}")
+            assert d["returned"] == 5
+            assert all(len(p["grant_date"]) == 10 for p in d["patents"])
+
+            # 16. 13F fund holdings: filer list, then one fund's positions
+            res = await asyncio.wait_for(session.call_tool(
+                "get_quiver_fund_holdings", {}), 180)
+            payload = json.loads(res.content[0].text)
+            assert payload["success"], payload.get("error")
+            filers = payload["data"]["filers"]
+            print(f"fund filers ok: {len(filers)} filers, newest "
+                  f"{filers[0]['fund']} ({filers[0]['filed_ago']})")
+            assert len(filers) > 10
+
+            res = await asyncio.wait_for(session.call_tool(
+                "get_quiver_fund_holdings",
+                {"fund": filers[0]["fund"], "limit": 3}), 180)
+            payload = json.loads(res.content[0].text)
+            assert payload["success"], payload.get("error")
+            d = payload["data"]
+            print(f"fund_holdings ok: {d['fund']} — {d['total_positions']} "
+                  f"positions, ${d['invested_usd']/1e6:,.1f}M, "
+                  f"{d['sectors']} sectors, top {d['positions'][0]['ticker']} "
+                  f"({d['positions'][0]['portfolio_pct']}%)")
+            assert d["returned"] == 3
+            assert d["invested_usd"] > 0
+            assert 0 < d["positions"][0]["portfolio_pct"] <= 100
+
+            # 17. unknown fund -> structured failure
+            res = await asyncio.wait_for(session.call_tool(
+                "get_quiver_fund_holdings",
+                {"fund": "Zzqqxx No Such Fund"}), 180)
+            payload = json.loads(res.content[0].text)
+            assert payload["success"] is False
+            assert payload["data"]["reason"] == "unknown_fund", payload
+            print("unknown-fund failure ok:", payload["data"]["reason"])
 
     print("\nALL PASS")
     return 0

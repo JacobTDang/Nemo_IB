@@ -95,8 +95,8 @@ serves HTTP.
 
 ## MCP servers
 
-Six servers ship in the image. Together they serve **106 tools**.
-They declare 109: the image hides `search`, `rag_search`, and `rag_ingest`. It
+Six servers ship in the image. Together they serve **111 tools**.
+They declare 114: the image hides `search`, `rag_search`, and `rag_ingest`. It
 contains neither SearXNG nor the RAG stack.
 
 `testing/test_readme_counts.py` checks every count on this page against the
@@ -109,7 +109,7 @@ registry of each server. A count that drifts fails the test suite.
 | `finnhub` | 14 | Finnhub | `FINNHUB_API_KEY` |
 | `fred` | 5 | FRED | `FRED_API_KEY` |
 | `altdata` | 9 | House Clerk, Senate eFD, USAspending, GovTrack, ATS boards, FinMind | `SEC_EMAIL` |
-| `quiver` | 10 | QuiverQuant web app: congress trades, WSB mentions, lobbying, gov contracts, insiders, net worth, bills, election contributions | — |
+| `quiver` | 15 | QuiverQuant web app: congress trades, WSB mentions, lobbying, gov contracts, insiders, net worth, bills, election contributions, layoffs, revolving door, gov spending, patents, 13F holdings | — |
 
 Three more servers exist in the repository and stay out of the image. They are
 `alpaca` with 6 tools that place orders, `excel` with 3 tools, and `sentry` with
@@ -217,19 +217,23 @@ filing. Amounts stay as the ranges that the filings publish, under `amount_min`
 and `amount_max`. The store computes no midpoint. Only the Senate reports
 holdings.
 
-### `quiver` — 10 tools
+### `quiver` — 15 tools
 
 `get_quiver_congress_trades` `get_quiver_politician_trades`
 `get_quiver_wsb_sentiment` `get_quiver_lobbying` `get_quiver_gov_contracts`
 `get_quiver_ticker_snapshot` `get_quiver_insider_trades`
 `get_quiver_congress_net_worth` `get_quiver_bills`
-`get_quiver_election_contributions`
+`get_quiver_election_contributions` `get_quiver_layoffs`
+`get_quiver_revolving_door` `get_quiver_gov_spending`
+`get_quiver_patent_search` `get_quiver_fund_holdings`
 
 These read what quiverquant.com serves anonymous visitors: the congress-trading
 dashboard, per-politician pages, the WallStreetBets dashboard, lobbying filings,
 contract awards, the insider-trading dashboard, the legislation index, the
-election-contributions dashboard, and the site's per-ticker JSON endpoints
-(price, insider trades, institutional holdings, analyst forecast, ETF holders).
+election-contributions dashboard, the layoffs and revolving-door dashboards, the
+government-spending feed, the patent search, the 13F filers, and the site's
+per-ticker JSON endpoints (price, insider trades, institutional holdings,
+analyst forecast, ETF holders).
 
 What one fetch yields, measured:
 
@@ -237,13 +241,29 @@ What one fetch yields, measured:
 |---|---|---|
 | Bills | 32,887 | 118th and 119th Congress, title index only |
 | Insider trades | ~1,800 | union of two embedded 1,000-row lists |
+| Layoffs | 2,000 notices | 157,614 workers, 525 ticker-mapped, ~9 months |
+| Revolving door | 1,500 registrations | ~3 weeks of filings, quarter named per row |
 | Congress net worth | 494 | ranked, estimated from disclosures |
+| Gov spending | 500 transactions | one month, $1.76B, every row ticker-tagged |
 | Congress trades | ~300 | most recent, embedded |
 | Lobbying | 100 filings + 200 spenders | |
 | Gov contracts | 100 awards | |
 | Election contributions | 200 | 100 PAC + 100 employee, 2026 cycle |
 | WSB mentions | 596 tickers | 30-day series, dated 2025-02-21 |
+| Patents | 100 per search | title/abstract match over recent grants |
+| 13F filers | 100 | one fund's positions per call |
 | Per-politician history | full | e.g. 212 for Pelosi |
+
+Four of those dashboards render their tables in the browser, so the rows are
+not in the HTML — they ship in a JSON script block, in a Plotly treemap, or
+behind a POST-only search form. Those are where the data actually is, and the
+client reads it from there rather than declaring the page empty.
+
+Layoffs are state WARN notices, not a company's own announcement, and the link
+from employer to ticker is Quiver's fuzzy match: every row carries its match
+quality, and about 1,475 of 2,000 rows are unmatched and have no ticker at all.
+Treating a fuzzy row as a company fact would attribute layoffs to the wrong
+employer.
 
 Insider trades come from two arrays on the dashboard — the latest filings and
 the month's largest — which overlap by about 165 rows. The tool returns their
@@ -265,11 +285,19 @@ zero.
 
 Every response also says how complete it is, in the envelope and not only inside
 the data. `coverage: full` is a page that holds the whole set for the question —
-a politician's disclosed history, the bill index, all 494 members. `coverage:
-partial` is a surface that publishes a window: the latest ~300 congressional
-trades, the latest 100 contract awards, the top donors of a cycle still in
-progress. A quiet ticker can fall outside such a window, and the field says so
-rather than letting an empty result look like an answer.
+a politician's disclosed history, the bill index, all 494 members, one fund's
+13F positions. `coverage: partial` is a surface that publishes a window: the
+latest ~300 congressional trades, the latest 100 contract awards, the top donors
+of a cycle still in progress, a 2,000-row slice of state layoff notices, the
+last month of federal transactions, the first 100 patent matches. A quiet ticker
+can fall outside such a window, and the field says so rather than letting an
+empty result look like an answer.
+
+A 13F position is a quarterly snapshot filed up to 45 days after the quarter
+ends, so fund holdings are stale by construction and say nothing about trades
+since; short positions are not disclosed at all, and the estimated amount bought
+is derived from share change rather than reported. A patent is a filing rather
+than a product.
 
 Anonymous requests are rate limited at the edge, and the window is unpublished.
 Requests are therefore spaced, and a 429 is retried once before it is reported,

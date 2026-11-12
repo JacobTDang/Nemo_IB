@@ -1,7 +1,7 @@
 """QuiverQuant web-app client — typed access to quiverquant.com's pages.
 
 QuiverQuant's public web application is a server-rendered Django site.
-Its "API" is therefore not one protocol but three surfaces, all discovered
+Its "API" is therefore not one protocol but five surfaces, all discovered
 by reading the app's own JavaScript (see tools/quiver_server/server.py for
 the tool layer):
 
@@ -14,16 +14,26 @@ the tool layer):
        /_get_ticker_forecast/<ticker>/
        /get_politician_page_tab_data/<bioguide_id>
        /get_politician_page_tab_data_2/<bioguide_id>
+       /get_gov_spending_data/     (500 ticker-tagged transactions)
+       /get_fund_graph_13f/<fund>  (a Plotly treemap of 13F positions)
   2. JavaScript literals embedded in page HTML (server-rendered data):
        recentTradesData   -- /congresstrading/  (300 most recent trades)
        tradeData          -- /congresstrading/politician/<Name>-<BioguideID>
        allCongressMembers -- /congresstrading/  (politician directory)
        Plotly.newPlot calls -- /wallstreetbets/ (mention time series,
                              calls/puts comment counts, sentiment scatter)
-  3. HTML tables (server-rendered):
+  3. JSON blocks in `<script id="...">` tags -- dashboards that render their
+     table client-side, so the rows appear nowhere in the HTML:
+       layoffsRowsData       -- /layoffs/  (2,000 WARN notices)
+       revolvingDoorRowsData -- /revolving-door/  (1,500 registrations)
+  4. HTML tables (server-rendered):
        /wallstreetbets/          -- mention counts per ticker
        /lobbying/                 -- recent filings + top spenders
        /sources/govcontracts      -- contract awards
+       /sec13f/                   -- 13F filers
+  5. POST search forms -- no GET route exists, so the query is submitted with
+     the page's own CSRF token, exactly as the site's search box does:
+       /patentsearch/            -- recent patent grants by search term
 
 Everything here is public data the site serves to anonymous visitors. A
 logged-in session cookie is optional (raises rate ceilings slightly) and
@@ -41,6 +51,7 @@ import json
 import re
 import threading
 import time
+import urllib.parse
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -158,6 +169,15 @@ def _cache_put(path: str, body: str) -> None:
         _PAGE_CACHE[path] = _CacheEntry(body=body, fetched_at=time.time())
 
 
+_CSRF_RE = re.compile(r'name="csrfmiddlewaretoken"\s+value="([^"]+)"')
+
+
+def _csrf_token(page: str) -> Optional[str]:
+    """The hidden token the site's search forms submit alongside the query."""
+    m = _CSRF_RE.search(page)
+    return m.group(1) if m else None
+
+
 # ---------------------------------------------------------------------------
 # Client
 # ---------------------------------------------------------------------------
@@ -240,6 +260,66 @@ class QuiverWebClient:
         body = self._fetch(path)
         _cache_put(path, body)
         return body
+
+    def _post(self, path: str, data: Dict[str, str],
+              *, referer: str, cache_key: Optional[str] = None) -> str:
+        """Submit one of the site's own search forms, with its CSRF token.
+
+        Two dashboards -- patent search and ETF holdings -- have no GET form
+        at all: the page is a form that POSTs. Nothing here is privileged; it
+        is the same request the search box makes, and the token is the one the
+        site hands out with the cookie jar this client already holds.
+
+        Results are cached under `cache_key` because a search is expensive on
+        the site's side and deterministic for a day: repeating it within the
+        TTL costs them nothing.
+        """
+        if cache_key:
+            cached = _cache_get(cache_key, PAGE_CACHE_TTL_S)
+            if cached is not None:
+                return cached
+
+        page = self._page(path)
+        token = _csrf_token(page)
+        if token is None:
+            raise QuiverError(
+                "parse_failed",
+                f"no CSRF token on {path} (page layout changed?)")
+
+        form = dict(data)
+        form["csrfmiddlewaretoken"] = token
+        headers = {
+            "Referer": str(self._client.base_url.join(referer)),
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": str(self._client.base_url).rstrip("/"),
+        }
+        rate_limited_once = False
+        while True:
+            _pace()
+            try:
+                resp = self._client.post(path, data=form, headers=headers)
+            except httpx.HTTPError as exc:
+                raise QuiverError(
+                    "provider_unavailable",
+                    f"POST {path} failed: {exc}") from exc
+            if resp.status_code in (403, 429):
+                if resp.status_code == 429 and not rate_limited_once:
+                    rate_limited_once = True
+                    time.sleep(_retry_delay(resp))
+                    continue
+                raise QuiverError(
+                    "rate_limited",
+                    f"POST {path} returned HTTP {resp.status_code}")
+            if resp.status_code == 404:
+                raise QuiverError("not_found", f"POST {path} returned HTTP 404")
+            if resp.status_code != 200:
+                raise QuiverError(
+                    "provider_unavailable",
+                    f"POST {path} returned HTTP {resp.status_code}")
+            body = resp.text
+            if cache_key:
+                _cache_put(cache_key, body)
+            return body
 
     def _json(self, path: str) -> Any:
         body = self._fetch(path, json_headers=True)
@@ -371,6 +451,110 @@ class QuiverWebClient:
                     and "type" in traces[0]):
                 charts.append(traces)
         return charts
+
+    # -- Embedded JSON payloads ----------------------------------------------
+
+    @staticmethod
+    def _extract_plotly_json(raw: str) -> Dict[str, Any]:
+        """The first trace of a `Plotly.newPlot` call as a dict.
+
+        The fund-graph endpoint returns its payload with the quotes escaped,
+        as a JS string rather than an object literal, so neither json.loads
+        nor the treemap-shaped reader in _extract_newplot can take it
+        directly. Decode the escapes, then parse the array.
+        """
+        call = raw.find("Plotly.newPlot(")
+        if call < 0:
+            raise QuiverError(
+                "parse_failed", "no Plotly.newPlot payload in the response")
+        start = raw.find("[", call)
+        if start < 0:
+            raise QuiverError(
+                "parse_failed", "Plotly payload has no data array")
+        depth = 0
+        escaped = False
+        in_str = False
+        quote = ""
+        end = None
+        i = start
+        while i < len(raw):
+            c = raw[i]
+            if escaped:
+                escaped = False
+            elif c == "\\":
+                escaped = True
+            elif in_str:
+                if c == quote:
+                    in_str = False
+            elif c in "\"'":
+                in_str = True
+                quote = c
+            elif c == "[":
+                depth += 1
+            elif c == "]":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+            i += 1
+        if end is None:
+            raise QuiverError("parse_failed", "Plotly payload is truncated")
+
+        chunk = raw[start:end]
+        traces = None
+        for candidate in (chunk, chunk.replace('\\"', '"')):
+            try:
+                traces = json.loads(candidate)
+                break
+            except ValueError:
+                continue
+        if traces is None:
+            try:
+                traces = ast.literal_eval(chunk.replace('\\"', '"'))
+            except (ValueError, SyntaxError) as exc:
+                raise QuiverError(
+                    "parse_failed",
+                    "Plotly payload is not valid JSON") from exc
+        if not isinstance(traces, list) or not traces:
+            raise QuiverError("parse_failed", "Plotly payload has no traces")
+        first = traces[0]
+        if not isinstance(first, dict):
+            raise QuiverError("parse_failed", "Plotly trace is not an object")
+        return first
+
+    @staticmethod
+    def _extract_json_script(page: str, element_id: str) -> List[Any]:
+        """Rows carried in `<script id="..." type="application/json">`.
+
+        Several dashboards -- layoffs, revolving door -- do not put their rows
+        in a JS literal or a rendered table. They ship them as a JSON block
+        and let the page's own table class render them, so both of the older
+        readers walked straight past 2,000 rows. A missing block is a layout
+        change, not an empty dataset, and says so.
+        """
+        m = re.search(
+            r'<script[^>]*\bid="' + re.escape(element_id) + r'"[^>]*>(.*?)'
+            r'</script>', page, re.DOTALL)
+        if m is None:
+            # Attribute order is not guaranteed; try type-first as well.
+            m = re.search(
+                r'<script[^>]*type="application/json"[^>]*\bid="'
+                + re.escape(element_id) + r'"[^>]*>(.*?)</script>',
+                page, re.DOTALL)
+        if m is None:
+            raise QuiverError(
+                "parse_failed",
+                f"{element_id} not found on page (page layout changed?)")
+        try:
+            rows = json.loads(m.group(1))
+        except ValueError as exc:
+            raise QuiverError(
+                "parse_failed",
+                f"{element_id} is not valid JSON") from exc
+        if not isinstance(rows, list):
+            raise QuiverError(
+                "parse_failed", f"{element_id} is not an array")
+        return rows
 
     # -- HTML table parsing --------------------------------------------------
 
@@ -1284,4 +1468,463 @@ class QuiverWebClient:
             "returned": len(contributions),
             # The two tables are the cycle's largest donors, not the register.
             "coverage": "partial",
+        }
+
+    # -----------------------------------------------------------------------
+    # WARN layoff notices (embedded as a JSON script block)
+    # -----------------------------------------------------------------------
+
+    # The dashboard's own table class reads rows positionally against this
+    # map, which is the only statement of what each column means.
+    _LAYOFF_FIELDS = {
+        "employer": 0, "ticker": 1, "ticker_match": 2, "city": 3,
+        "state": 4, "kind": 5, "temporary": 6, "workers": 7,
+        "notice_date": 8, "date_source": 9, "effective_date": 10,
+        "raw_type": 11, "county": 12, "industry": 13,
+    }
+
+    def get_layoffs(self, *, ticker: Optional[str] = None,
+                    state: Optional[str] = None,
+                    kind: Optional[str] = None,
+                    industry: Optional[str] = None,
+                    min_workers: Optional[int] = None,
+                    days: Optional[int] = None,
+                    limit: Optional[int] = None) -> Dict[str, Any]:
+        """WARN Act layoff and closure notices, 2,000 rows.
+
+        State workforce agencies publish these; Quiver collects them and
+        matches each employer to a ticker. The match is heuristic, so every
+        row carries `ticker_match` (exact / fuzzy / search / unmatched) and a
+        fuzzy row is a guess about which company filed -- check it before
+        attributing 900 layoffs to a ticker. Dates are the state's notice date
+        and the employer's effective date, which are not the same thing.
+        """
+        page = self._page("/layoffs/")
+        rows = self._extract_json_script(page, "layoffsRowsData")
+        f = self._LAYOFF_FIELDS
+        notices: List[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, list) or len(row) <= f["industry"]:
+                continue                # a row in another layout; skip it
+            workers = row[f["workers"]]
+            notices.append({
+                "employer": (row[f["employer"]] or "").strip() or None,
+                "ticker": (row[f["ticker"]] or "").strip() or None,
+                "ticker_match": (row[f["ticker_match"]] or "").strip() or None,
+                "city": (row[f["city"]] or "").strip() or None,
+                "state": (row[f["state"]] or "").strip() or None,
+                "kind": (row[f["kind"]] or "").strip() or None,
+                "temporary": bool(row[f["temporary"]]),
+                "workers": workers if isinstance(workers, (int, float)) else None,
+                "notice_date": row[f["notice_date"]] or None,
+                "date_source": (row[f["date_source"]] or "").strip() or None,
+                "effective_date": row[f["effective_date"]] or None,
+                "raw_type": (row[f["raw_type"]] or "").strip() or None,
+                "county": (row[f["county"]] or "").strip() or None,
+                "industry": (row[f["industry"]] or "").strip() or None,
+            })
+        total = len(notices)
+
+        if ticker:
+            needle = ticker.upper()
+            notices = [n for n in notices if (n["ticker"] or "") == needle]
+        if state:
+            needle = state.upper()
+            notices = [n for n in notices if (n["state"] or "") == needle]
+        if kind:
+            needle = kind.lower()
+            notices = [n for n in notices
+                       if (n["kind"] or "").lower() == needle]
+        if industry:
+            needle = industry.lower()
+            notices = [n for n in notices
+                       if needle in (n["industry"] or "").lower()]
+        if min_workers is not None:
+            notices = [n for n in notices
+                       if (n["workers"] or 0) >= int(min_workers)]
+        if days is not None:
+            cutoff = (_dt.date.today()
+                      - _dt.timedelta(days=int(days))).isoformat()
+            notices = [n for n in notices
+                       if (n["notice_date"] or "") >= cutoff]
+
+        matching = len(notices)
+        workers_total = sum(n["workers"] or 0 for n in notices)
+        mapped = sum(1 for n in notices if n["ticker"])
+        dates = sorted((n["notice_date"] for n in notices if n["notice_date"]),
+                       reverse=True)
+        notices.sort(key=lambda n: ((n["notice_date"] or ""),
+                                    n["workers"] or 0), reverse=True)
+        if limit is not None and limit > 0:
+            notices = notices[:limit]
+        return {
+            "notices": notices,
+            "total_embedded": total,
+            "matching": matching,
+            "returned": len(notices),
+            "workers_matching": workers_total,
+            "date_range": {"newest": dates[0] if dates else None,
+                           "oldest": dates[-1] if dates else None},
+            # Across the matching set, not the returned slice: a caller asking
+            # "how many of these notices have a ticker?" is asking about the
+            # set, and answering from the first ten rows would be a guess.
+            "tickers_mapped": mapped,
+            # A 2,000-row window of state notices, not every WARN filing.
+            "coverage": "partial",
+        }
+
+    # -----------------------------------------------------------------------
+    # Revolving door (lobbyists' former government offices)
+    # -----------------------------------------------------------------------
+
+    _REVOLVING_FIELDS = {
+        "lobbyist": 0, "position": 1, "office": 2, "bioguide_id": 3,
+        "member_name": 4, "chamber": 5, "ticker": 6, "ticker_match": 11,
+        "client": 7, "firm": 8, "filed_date": 9, "is_new": 10,
+        "filing_type": 12, "party": 13, "period": 14,
+    }
+
+    def get_revolving_door(self, *, name: Optional[str] = None,
+                           chamber: Optional[str] = None,
+                           party: Optional[str] = None,
+                           client: Optional[str] = None,
+                           firm: Optional[str] = None,
+                           ticker: Optional[str] = None,
+                           days: Optional[int] = None,
+                           limit: Optional[int] = None) -> Dict[str, Any]:
+        """Lobbyists who previously held government or congressional posts.
+
+        Rows come from lobbying disclosure filings: who registered, the office
+        they left, the client paying them and the firm they registered under.
+        1,500 rows covering the most recent filings, so this is a window --
+        `period` names the quarter each filing covers.
+        """
+        page = self._page("/revolving-door/")
+        rows = self._extract_json_script(page, "revolvingDoorRowsData")
+        f = self._REVOLVING_FIELDS
+        records: List[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, list) or len(row) <= f["period"]:
+                continue
+            records.append({
+                "lobbyist": (row[f["lobbyist"]] or "").strip() or None,
+                "former_position": (row[f["position"]] or "").strip() or None,
+                "former_office": (row[f["office"]] or "").strip() or None,
+                "bioguide_id": (row[f["bioguide_id"]] or "").strip() or None,
+                "member_name": (row[f["member_name"]] or "").strip() or None,
+                "chamber": (row[f["chamber"]] or "").strip() or None,
+                "party": (row[f["party"]] or "").strip() or None,
+                "ticker": (row[f["ticker"]] or "").strip() or None,
+                "ticker_match": (row[f["ticker_match"]] or "").strip() or None,
+                "client": (row[f["client"]] or "").strip() or None,
+                "firm": (row[f["firm"]] or "").strip() or None,
+                "filed_date": row[f["filed_date"]] or None,
+                "is_new": bool(row[f["is_new"]]),
+                "filing_type": (row[f["filing_type"]] or "").strip() or None,
+                "period": (row[f["period"]] or "").strip() or None,
+            })
+        total = len(records)
+
+        if name:
+            needle = name.lower()
+            records = [r for r in records
+                       if needle in (r["lobbyist"] or "").lower()]
+        if chamber:
+            needle = chamber.lower()
+            records = [r for r in records
+                       if (r["chamber"] or "").lower() == needle]
+        if party:
+            needle = party.upper()
+            records = [r for r in records
+                       if (r["party"] or "").upper() == needle]
+        if client:
+            needle = client.lower()
+            records = [r for r in records
+                       if needle in (r["client"] or "").lower()]
+        if firm:
+            needle = firm.lower()
+            records = [r for r in records
+                       if needle in (r["firm"] or "").lower()]
+        if ticker:
+            needle = ticker.upper()
+            records = [r for r in records
+                       if (r["ticker"] or "") == needle]
+        if days is not None:
+            cutoff = (_dt.date.today()
+                      - _dt.timedelta(days=int(days))).isoformat()
+            records = [r for r in records
+                       if (r["filed_date"] or "") >= cutoff]
+
+        matching = len(records)
+        dates = sorted((r["filed_date"] for r in records if r["filed_date"]),
+                       reverse=True)
+        records.sort(key=lambda r: r["filed_date"] or "", reverse=True)
+        if limit is not None and limit > 0:
+            records = records[:limit]
+        return {
+            "registrations": records,
+            "total_embedded": total,
+            "matching": matching,
+            "returned": len(records),
+            "date_range": {"newest": dates[0] if dates else None,
+                           "oldest": dates[-1] if dates else None},
+            "coverage": "partial",
+        }
+
+    # -----------------------------------------------------------------------
+    # Government spending (transaction-level JSON endpoint)
+    # -----------------------------------------------------------------------
+
+    def get_gov_spending(self, *, ticker: Optional[str] = None,
+                         agency: Optional[str] = None,
+                         query: Optional[str] = None,
+                         min_amount: Optional[float] = None,
+                         days: Optional[int] = None,
+                         limit: Optional[int] = None) -> Dict[str, Any]:
+        """Individual federal transactions, with the recipient's ticker.
+
+        The dashboard renders these from `/get_gov_spending_data/` -- the one
+        JSON endpoint on the site that answers anonymously without a session.
+        500 transactions, each naming the awarding agency, the recipient, the
+        date, the ticker, the amount, the award id and a description. This is
+        transaction level: for a company's obligation flow use the spending
+        tools in the altdata server instead.
+        """
+        data = self._json("/get_gov_spending_data/")
+        rows = data.get("gov_transactions") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            raise QuiverError(
+                "parse_failed",
+                "gov_transactions not found in the spending response")
+        transactions: List[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, list) or len(row) < 5:
+                continue
+            amount = row[4]
+            transactions.append({
+                "agency": (row[0] or "").strip() or None,
+                "recipient": (row[1] or "").strip() or None,
+                "date": row[2] or None,
+                "ticker": (row[3] or "").strip() or None,
+                "amount_usd": (float(amount)
+                               if isinstance(amount, (int, float)) else None),
+                "award_id": (row[5] if len(row) > 5 else None),
+                "description": (row[6] if len(row) > 6 else None),
+            })
+        total = len(transactions)
+
+        if ticker:
+            needle = ticker.upper()
+            transactions = [t for t in transactions
+                            if (t["ticker"] or "") == needle]
+        if agency:
+            needle = agency.lower()
+            transactions = [t for t in transactions
+                            if needle in (t["agency"] or "").lower()]
+        if query:
+            needle = query.lower()
+            transactions = [t for t in transactions
+                            if needle in (t["description"] or "").lower()
+                            or needle in (t["recipient"] or "").lower()]
+        if min_amount is not None:
+            transactions = [t for t in transactions
+                            if (t["amount_usd"] or 0) >= float(min_amount)]
+        if days is not None:
+            cutoff = (_dt.date.today()
+                      - _dt.timedelta(days=int(days))).isoformat()
+            transactions = [t for t in transactions
+                            if (t["date"] or "") >= cutoff]
+
+        matching = len(transactions)
+        amount_total = sum(t["amount_usd"] or 0 for t in transactions)
+        tickers = len({t["ticker"] for t in transactions if t["ticker"]})
+        dates = sorted((t["date"] for t in transactions if t["date"]),
+                       reverse=True)
+        transactions.sort(key=lambda t: -(t["amount_usd"] or 0))
+        if limit is not None and limit > 0:
+            transactions = transactions[:limit]
+        return {
+            "transactions": transactions,
+            "total_embedded": total,
+            "matching": matching,
+            "returned": len(transactions),
+            "amount_matching_usd": round(amount_total, 2),
+            "date_range": {"newest": dates[0] if dates else None,
+                           "oldest": dates[-1] if dates else None},
+            # Companies in the matching set, not in the returned slice.
+            "tickers": tickers,
+            "coverage": "partial",
+        }
+
+    # -----------------------------------------------------------------------
+    # Patent search (POST-only search form)
+    # -----------------------------------------------------------------------
+
+    def get_patent_search(self, query: str,
+                          limit: Optional[int] = None) -> Dict[str, Any]:
+        """Recently granted patents matching a description or a theme.
+
+        `/patentsearch/` is a form, not a GET route: the query is POSTed with
+        the page's CSRF token, exactly as the search box submits it. Results
+        come back server-rendered, 100 at a time, each with the assignee's
+        ticker, the grant date and the patent title. It is a title/abstract
+        search over recent grants -- not a full patent database, and not a
+        measure of quality.
+        """
+        term = (query or "").strip()
+        if not term:
+            raise QuiverError(
+                "parse_failed", "a patent search needs a query term")
+        body = self._post(
+            "/patentsearch/",
+            {"searchterm": term},
+            referer="/patentsearch/",
+            cache_key=f"/patentsearch/?searchterm={term.lower()}",
+        )
+        tables = self._parse_tables(body)
+        patents: List[Dict[str, Any]] = []
+        for table in tables:
+            if not table or len(table) < 2:
+                continue
+            header = " ".join(table[0]).lower()
+            if "ticker" not in header or "patent" not in header:
+                continue
+            for row in table[1:]:
+                if len(row) < 3:
+                    continue
+                patents.append({
+                    "ticker": (row[0] or "").strip().upper() or None,
+                    "grant_date": self._normalize_us_date(row[1]),
+                    "title": (row[2] or "").strip() or None,
+                })
+        total = len(patents)
+        tickers = len({p["ticker"] for p in patents if p["ticker"]})
+        if limit is not None and limit > 0:
+            patents = patents[:limit]
+        return {
+            "query": term,
+            "patents": patents,
+            "total_matched": total,
+            "returned": len(patents),
+            # Companies in the matching set, not in the returned slice.
+            "tickers": tickers,
+            # The search returns its first 100 matches and offers no paging.
+            "coverage": "partial" if total >= 100 else "full",
+        }
+
+    # -----------------------------------------------------------------------
+    # 13F fund holdings (a Plotly treemap served per fund)
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_us_date(raw: str) -> Optional[str]:
+        """'09/22/2026' -> '2026-09-22'."""
+        m = re.match(r"(\d{1,2})/(\d{1,2})/(\d{4})", (raw or "").strip())
+        if m:
+            return f"{m.group(3)}-{int(m.group(1)):02d}-{int(m.group(2)):02d}"
+        return raw or None
+
+    def get_fund_filers(self) -> List[Dict[str, Any]]:
+        """The 13F filers listed on `/sec13f/`, newest first.
+
+        Each row carries a fund name and the site's own relative timestamp
+        ("1 day, 8 hours ago"), which is kept as written: it is a freshness
+        hint, not a filed date.
+        """
+        page = self._page("/sec13f/")
+        out: List[Dict[str, Any]] = []
+        for table in self._parse_tables(page):
+            if not table or len(table) < 2:
+                continue
+            if "fund" not in " ".join(table[0]).lower():
+                continue
+            for row in table[1:]:
+                if len(row) < 2 or not row[0].strip():
+                    continue
+                out.append({"fund": row[0].strip(),
+                            "filed_ago": row[1].strip() or None})
+            break
+        return out
+
+    def get_fund_holdings(self, fund: str,
+                          limit: Optional[int] = None) -> Dict[str, Any]:
+        """One institution's reported 13F positions.
+
+        `/get_fund_graph_13f/<fund>` answers with a Plotly treemap: each leaf
+        is a ticker, its parent names the sector, and the value is the
+        end-of-period position in dollars. The same payload carries the change
+        in shares and an estimate of the amount bought, so the answer includes
+        what a fund added and cut, not only what it holds.
+
+        Positions are what the last filing reports -- a 45-day-old snapshot of
+        a quarter that has already ended.
+        """
+        name = (fund or "").strip()
+        if not name:
+            raise QuiverError("parse_failed", "a fund name is required")
+        filers = self.get_fund_filers()
+        # Resolve the way a reader would: exact, then prefix, then substring.
+        match = next((f for f in filers if f["fund"].lower() == name.lower()),
+                     None)
+        if match is None:
+            match = next((f for f in filers
+                          if f["fund"].lower().startswith(name.lower())), None)
+        if match is None:
+            match = next((f for f in filers
+                          if name.lower() in f["fund"].lower()), None)
+        if match is None:
+            raise QuiverError(
+                "unknown_fund",
+                f"no 13F filer on the dashboard matches '{name}'")
+        resolved = match["fund"]
+
+        raw = self._fetch("/get_fund_graph_13f/"
+                          + urllib.parse.quote(resolved, safe=""))
+        trace = self._extract_plotly_json(raw)
+        labels = trace.get("labels") or []
+        parents = trace.get("parents") or []
+        values = trace.get("values") or []
+        extra = trace.get("customdata") or []
+        positions: List[Dict[str, Any]] = []
+        for i, label in enumerate(labels):
+            parent = parents[i] if i < len(parents) else None
+            # The treemap's own root and sector rows are not positions.
+            if not parent or parent == "" or parent == label:
+                continue
+            if "/" not in str(parent):
+                continue
+            sector = str(parent).rsplit("/", 1)[-1]
+            row = extra[i] if i < len(extra) else []
+            value = values[i] if i < len(values) else None
+            shares_change = row[1] if isinstance(row, list) and len(row) > 1 else None
+            est_bought = row[2] if isinstance(row, list) and len(row) > 2 else None
+            positions.append({
+                "ticker": str(label).strip().upper() or None,
+                "sector": sector or None,
+                "value_usd": (round(float(value), 2)
+                              if isinstance(value, (int, float)) else None),
+                "shares_change": (shares_change
+                                  if isinstance(shares_change, (int, float))
+                                  else None),
+                "est_bought_usd": (round(float(est_bought), 2)
+                                   if isinstance(est_bought, (int, float))
+                                   else None),
+            })
+        total = len(positions)
+        invested = sum(p["value_usd"] or 0 for p in positions)
+        positions.sort(key=lambda p: -(p["value_usd"] or 0))
+        if limit is not None and limit > 0:
+            positions = positions[:limit]
+        for p in positions:
+            if p["value_usd"] and invested:
+                p["portfolio_pct"] = round(100 * p["value_usd"] / invested, 2)
+        return {
+            "fund": resolved,
+            "filed_ago": match["filed_ago"],
+            "positions": positions,
+            "total_positions": total,
+            "returned": len(positions),
+            "invested_usd": round(invested, 2),
+            "sectors": len({p["sector"] for p in positions if p["sector"]}),
+            "coverage": "full",
         }

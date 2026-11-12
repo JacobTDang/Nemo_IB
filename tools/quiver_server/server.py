@@ -8,7 +8,7 @@ serves anonymous visitors. An optional logged-in session cookie
 (QUIVER_SESSION_COOKIE) unlocks session-gated sections such as
 bulls/bears analyst counts.
 
-10 tools:
+15 tools:
   get_quiver_congress_trades      -- ~300 most recent congressional trades,
                                      filterable by ticker/politician/party/
                                      chamber
@@ -32,6 +32,17 @@ bulls/bears analyst counts.
   get_quiver_election_contributions -- top corporate PAC and employee
                                      donations for the current cycle, with
                                      the party split
+  get_quiver_layoffs              -- 2,000 WARN Act layoff and closure
+                                     notices, each with the employer's
+                                     ticker and the match quality
+  get_quiver_revolving_door       -- 1,500 lobbying registrations by people
+                                     who previously held government posts
+  get_quiver_gov_spending         -- 500 individual federal transactions
+                                     with the recipient's ticker
+  get_quiver_patent_search        -- recent patent grants matching a
+                                     description or theme, by assignee ticker
+  get_quiver_fund_holdings        -- one 13F filer's reported positions, with
+                                     what it added and cut
 
 Failure vocabulary, shared with tools/altdata_server/server.py:
 
@@ -208,6 +219,52 @@ _CAMPAIGN_FINANCE = warning(
     "company's PAC and its employees file separately, so the two are not "
     "summed. Totals are contributions, not spending on lobbying or "
     "advertising.")
+
+_LAYOFF_MATCH = warning(
+    "ticker_match_is_heuristic",
+    "The employer-to-ticker link is Quiver's own fuzzy match, not a "
+    "corporate registration. Every row carries ticker_match: exact, fuzzy, "
+    "search or unmatched. Treat a fuzzy row as a lead to verify before "
+    "attributing workers to a company; most rows (about 1,475 of 2,000) are "
+    "unmatched and have no ticker at all.")
+
+_LAYOFF_WINDOW = warning(
+    "notice_window",
+    "The dashboard embeds a 2,000-row window of state WARN notices, not "
+    "every filing in the country: 26 states are represented and the window "
+    "spans roughly nine months. A quiet answer for a state means no notice "
+    "in this window, not no layoffs.")
+
+_REVOLVING_WINDOW = warning(
+    "filing_window",
+    "Rows are the most recent lobbying registrations on the dashboard "
+    "(1,500 rows, about three weeks of filings), and each names the quarter "
+    "it covers in `period`. A registration means a firm disclosed a covered "
+    "official's arrival; it is not evidence of a specific decision.")
+
+_SPENDING_TRANSACTION_LEVEL = warning(
+    "transaction_level_obligations",
+    "These are individual award transactions from the last month (500 rows), "
+    "not an agency's budget or a company's full obligation flow. Amounts are "
+    "per transaction and include the recipient's own ticker mapping. For a "
+    "time series of federal obligations by company, use the altdata spending "
+    "tools instead.")
+
+_PATENT_TRUNCATION = warning(
+    "patent_results_capped",
+    "The search is a title/abstract match over recent grants and returns at "
+    "most 100 rows with no paging; when it fills that page the answer is a "
+    "partial view of a larger match set. A patent is a filing, not a "
+    "product: a grant says a company is working in an area, not that it "
+    "ships anything.")
+
+_13F_LAG = warning(
+    "13f_filing_lag",
+    "13F positions are a quarterly snapshot filed up to 45 days after the "
+    "quarter ends, so they are stale by construction and say nothing about "
+    "trades since. Short positions are not disclosed in a 13F at all, and "
+    "the estimated amount bought is Quiver's derivation from share change "
+    "against price, not a reported figure.")
 
 
 # ---------------------------------------------------------------------------
@@ -584,6 +641,207 @@ class QuiverServer:
                         },
                     },
                 ),
+                Tool(
+                    name="get_quiver_layoffs",
+                    description=(
+                        "WARN Act layoff, closure and amendment notices: "
+                        "2,000 rows of state workforce filings, each with the "
+                        "employer, location, worker count, notice date, "
+                        "effective date, industry and — where Quiver could "
+                        "match one — a ticker. Filter by ticker, state, kind, "
+                        "industry, minimum workers or recency. Totals are "
+                        "reported worker counts from the notices. Check "
+                        "ticker_match before attributing a filing to a "
+                        "company: exact means matched on a registered name, "
+                        "fuzzy is a guess."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "ticker": {
+                                "type": "string",
+                                "description": "Exact ticker (e.g. NVDA).",
+                            },
+                            "state": {
+                                "type": "string",
+                                "description": "Two-letter state code (e.g. CA).",
+                            },
+                            "kind": {
+                                "type": "string",
+                                "description": "Closure, Layoff, Amendment or Other.",
+                            },
+                            "industry": {
+                                "type": "string",
+                                "description": "Substring of the industry label.",
+                            },
+                            "min_workers": {
+                                "type": "integer",
+                                "description": "Keep notices at or above this worker count.",
+                            },
+                            "days": {
+                                "type": "integer",
+                                "description": "Only notices filed in the last N days.",
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "default": 100,
+                                "description": "Max notices (newest, largest first).",
+                            },
+                        },
+                    },
+                ),
+                Tool(
+                    name="get_quiver_revolving_door",
+                    description=(
+                        "Lobbying's revolving door: 1,500 recent "
+                        "registrations by people who previously held a "
+                        "congressional, executive or agency post, naming the "
+                        "former office, chamber, party, the client paying "
+                        "them and the lobbying firm. Filter by lobbyist name, "
+                        "chamber, party, client, firm or ticker. Use it for "
+                        "who-left-which-office-and-lobbies-for-whom "
+                        "questions; the `period` field says which quarter "
+                        "each filing covers."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Substring of the lobbyist's name.",
+                            },
+                            "chamber": {
+                                "type": "string",
+                                "description": "House, Senate, Congress, Executive or Other.",
+                            },
+                            "party": {
+                                "type": "string",
+                                "description": "D, R or I.",
+                            },
+                            "client": {
+                                "type": "string",
+                                "description": "Substring of the paying client's name.",
+                            },
+                            "firm": {
+                                "type": "string",
+                                "description": "Substring of the lobbying firm's name.",
+                            },
+                            "ticker": {
+                                "type": "string",
+                                "description": "Exact ticker, where the client is mapped.",
+                            },
+                            "days": {
+                                "type": "integer",
+                                "description": "Only filings made in the last N days.",
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "default": 100,
+                                "description": "Max registrations (newest first).",
+                            },
+                        },
+                    },
+                ),
+                Tool(
+                    name="get_quiver_gov_spending",
+                    description=(
+                        "Individual federal award transactions: 500 rows from "
+                        "the last month, each naming the awarding agency, the "
+                        "recipient, the date, the recipient's ticker, the "
+                        "amount, the award id and a description. Filter by "
+                        "ticker, agency, free text, minimum amount or "
+                        "recency; the response sums the matching amount and "
+                        "counts the companies involved. This is "
+                        "transaction-level detail for reading what a specific "
+                        "award or agency is buying."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "ticker": {
+                                "type": "string",
+                                "description": "Exact ticker of the recipient.",
+                            },
+                            "agency": {
+                                "type": "string",
+                                "description": "Substring of the awarding agency (e.g. Homeland).",
+                            },
+                            "query": {
+                                "type": "string",
+                                "description": "Substring of the award description or recipient.",
+                            },
+                            "min_amount": {
+                                "type": "number",
+                                "description": "Keep transactions at or above this USD amount.",
+                            },
+                            "days": {
+                                "type": "integer",
+                                "description": "Only transactions dated in the last N days.",
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "default": 100,
+                                "description": "Max transactions (largest first).",
+                            },
+                        },
+                    },
+                ),
+                Tool(
+                    name="get_quiver_patent_search",
+                    description=(
+                        "Search recent patent grants by description or theme "
+                        "(e.g. 'solid state battery', 'electric vehicle') and "
+                        "get back the assignee's ticker, the grant date and "
+                        "the patent title, up to 100 rows. Useful for mapping "
+                        "a technology narrative onto listed companies. It is "
+                        "a title/abstract search over recent grants, not a "
+                        "full patent database and no measure of quality; the "
+                        "search term is required."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Search term (e.g. solid state battery).",
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "default": 100,
+                                "description": "Max patents to return.",
+                            },
+                        },
+                        "required": ["query"],
+                    },
+                ),
+                Tool(
+                    name="get_quiver_fund_holdings",
+                    description=(
+                        "One 13F filer's reported positions: ticker, sector, "
+                        "end-of-period value, change in shares and an "
+                        "estimate of the amount bought, with each position's "
+                        "share of the portfolio. `fund` resolves the way a "
+                        "reader would — exact name, then prefix, then "
+                        "substring — against the 100 filers on the 13F "
+                        "dashboard. Pass no fund to list those filers. "
+                        "Positions are a quarterly snapshot filed up to 45 "
+                        "days after quarter end."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "fund": {
+                                "type": "string",
+                                "description": "Fund or institution name (e.g. Kailix Advisors).",
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "default": 100,
+                                "description": "Max positions (largest first).",
+                            },
+                        },
+                    },
+                ),
             ]
 
         @self.server.call_tool()
@@ -600,6 +858,11 @@ class QuiverServer:
                 "get_quiver_congress_net_worth": "QuiverQuant web (congress dashboard net-worth array)",
                 "get_quiver_bills": "QuiverQuant web (legislation index)",
                 "get_quiver_election_contributions": "QuiverQuant web (election-contributions dashboard)",
+                "get_quiver_layoffs": "QuiverQuant web (layoffs dashboard)",
+                "get_quiver_revolving_door": "QuiverQuant web (revolving-door dashboard)",
+                "get_quiver_gov_spending": "QuiverQuant web (government-spending endpoint)",
+                "get_quiver_patent_search": "QuiverQuant web (patent search)",
+                "get_quiver_fund_holdings": "QuiverQuant web (13F fund graph)",
             },
             warnings_per_tool={
                 "get_quiver_congress_trades": [_DISCLOSURE_LAG, _QUIVER_WEB],
@@ -615,6 +878,13 @@ class QuiverServer:
                 "get_quiver_bills": [_QUIVER_WEB],
                 "get_quiver_election_contributions": [_CAMPAIGN_FINANCE,
                                                       _QUIVER_WEB],
+                "get_quiver_layoffs": [_LAYOFF_MATCH, _LAYOFF_WINDOW,
+                                       _QUIVER_WEB],
+                "get_quiver_revolving_door": [_REVOLVING_WINDOW, _QUIVER_WEB],
+                "get_quiver_gov_spending": [_SPENDING_TRANSACTION_LEVEL,
+                                            _QUIVER_WEB],
+                "get_quiver_patent_search": [_PATENT_TRUNCATION, _QUIVER_WEB],
+                "get_quiver_fund_holdings": [_13F_LAG, _QUIVER_WEB],
             },
         )
         async def call_tool(name: str, args: Dict[str, Any]):
@@ -691,6 +961,57 @@ class QuiverServer:
                     min_total=args.get("min_total"),
                     limit=args.get("limit", 50),
                 ), ticker=ticker)
+            if name == "get_quiver_layoffs":
+                return _run("get_quiver_layoffs", lambda: c.get_layoffs(
+                    ticker=args.get("ticker"),
+                    state=args.get("state"),
+                    kind=args.get("kind"),
+                    industry=args.get("industry"),
+                    min_workers=args.get("min_workers"),
+                    days=args.get("days"),
+                    limit=args.get("limit", 100),
+                ), ticker=ticker)
+            if name == "get_quiver_revolving_door":
+                return _run("get_quiver_revolving_door",
+                            lambda: c.get_revolving_door(
+                    name=args.get("name"),
+                    chamber=args.get("chamber"),
+                    party=args.get("party"),
+                    client=args.get("client"),
+                    firm=args.get("firm"),
+                    ticker=args.get("ticker"),
+                    days=args.get("days"),
+                    limit=args.get("limit", 100),
+                ), ticker=ticker)
+            if name == "get_quiver_gov_spending":
+                return _run("get_quiver_gov_spending",
+                            lambda: c.get_gov_spending(
+                    ticker=args.get("ticker"),
+                    agency=args.get("agency"),
+                    query=args.get("query"),
+                    min_amount=args.get("min_amount"),
+                    days=args.get("days"),
+                    limit=args.get("limit", 100),
+                ), ticker=ticker)
+            if name == "get_quiver_patent_search":
+                return _run("get_quiver_patent_search",
+                            lambda: c.get_patent_search(
+                    args["query"], limit=args.get("limit", 100),
+                ))
+            if name == "get_quiver_fund_holdings":
+                fund = (args.get("fund") or "").strip()
+                if not fund:
+                    # No fund named means "which funds are here", which the
+                    # 13F dashboard answers directly. Saying unknown_fund for
+                    # a request that named nothing would be a wrong error.
+                    return _run("get_quiver_fund_holdings", lambda: {
+                        "filers": c.get_fund_filers(),
+                        "coverage": "partial",
+                    })
+                return _run("get_quiver_fund_holdings",
+                            lambda: c.get_fund_holdings(
+                    fund, limit=args.get("limit", 100),
+                ))
             return _fail(name, {"success": False,
                                 "reason": "unknown_tool"},
                          f"unknown tool: {name}")
