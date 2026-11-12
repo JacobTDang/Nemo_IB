@@ -10,16 +10,32 @@ coverage / provider / warnings).
 Network calls are kept small (limit=2) and every assertion tolerates the
 site's own gaps (e.g. a ticker with no mentions) — the contract under
 test is the framing and the honesty envelope, not Quiver's content.
+
+One test here reaches the network: it boots the server and calls all fifteen
+tools against the live site. Everything below it runs offline against
+scripted pages. The live one is gated twice, because it depends on a
+scraped site that owes us nothing: @pytest.mark.network keeps it out of a
+SKIP_NETWORK_TESTS=1 run (the server is a subprocess, so conftest's socket
+guard cannot see its fetches), and skip_if_provider_unavailable turns an
+upstream that never answered into a skip rather than a red build — a CI
+runner timing out on quiverquant.com is a fact about the provider, not
+about this parser.
 """
 import asyncio
 import json
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+
+from testing._gates import skip_if_provider_unavailable
+
+SKIP_NETWORK = os.getenv("SKIP_NETWORK_TESTS", "0") == "1"
 
 
 async def _exercise_all_tools() -> dict:
@@ -105,10 +121,18 @@ async def _exercise_all_tools() -> dict:
             # of the top 100 between runs.
             r = await session.call_tool("get_quiver_fund_holdings", {})
             results["get_quiver_fund_filers"] = json.loads(r.content[0].text)
-            filers = results["get_quiver_fund_filers"]["data"]["filers"]
-            r = await session.call_tool("get_quiver_fund_holdings", {
-                "fund": filers[0]["fund"], "limit": 2})
-            results["get_quiver_fund_holdings"] = json.loads(r.content[0].text)
+            filers = results["get_quiver_fund_filers"]["data"].get("filers") or []
+            if filers:
+                r = await session.call_tool("get_quiver_fund_holdings", {
+                    "fund": filers[0]["fund"], "limit": 2})
+                results["get_quiver_fund_holdings"] = json.loads(r.content[0].text)
+            else:
+                # An empty list is a failed fetch, not a dashboard with no
+                # funds. Carrying the failure forward lets the gate below see
+                # it and skip, instead of an IndexError here reporting the
+                # parser as broken.
+                results["get_quiver_fund_holdings"] = \
+                    results["get_quiver_fund_filers"]
 
             # failure vocabulary: unknown entity must be success=false
             # with a machine reason, not an exception over the wire.
@@ -123,11 +147,25 @@ async def _exercise_all_tools() -> dict:
     return results
 
 
+@pytest.mark.network
+@pytest.mark.skipif(SKIP_NETWORK, reason=(
+    "SKIP_NETWORK_TESTS=1: this test boots the server as a subprocess and "
+    "calls every tool against the live quiverquant.com. Unset it to run."))
 def test_quiver_server_e2e():
     results = asyncio.run(_exercise_all_tools())
 
     assert results["__tool_count__"] == 15, results["__tool_names__"]
     assert "get_quiver_congress_trades" in results["__tool_names__"]
+
+    # A page that never answered is not a parser verdict. Decided before any
+    # content assertion, so a provider outage reads as "unanswerable here"
+    # rather than as fifteen broken tools. The intentional misses below
+    # (unknown_politician, unknown_fund) carry their own reasons and are not
+    # caught by this -- the gate looks only at provider_unavailable.
+    for name, body in results.items():
+        if name.startswith("__"):
+            continue
+        skip_if_provider_unavailable(body.get("data") or {}, "QuiverQuant")
 
     # Every response shares the envelope contract.
     for name in ["get_quiver_congress_trades", "get_quiver_congress_trades_filtered",
