@@ -265,3 +265,14 @@ def test_a_crash_exits_non_zero_and_says_why(store, monkeypatch, capsys):
     monkeypatch.setattr(qr, "run", boom)
     assert qr.main([]) == 1
     assert "store is locked" in capsys.readouterr().out
+
+
+def test_a_store_that_cannot_open_is_reported_like_any_crash(
+        store, monkeypatch, capsys):
+    """The schema call sits inside the try, so a locked or unmounted store
+    reaches #ops with its reason instead of escaping as a bare traceback."""
+    def locked():
+        raise RuntimeError("database is locked")
+    monkeypatch.setattr(qr.pit_store, "init_schema", locked)
+    assert qr.main([]) == 1
+    assert "database is locked" in capsys.readouterr().out

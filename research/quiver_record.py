@@ -243,8 +243,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ).parse_args(argv)
     from research import discord_post
     elapsed = discord_post.stopwatch()
-    pit_store.init_schema()
     try:
+        pit_store.init_schema()
         result = run()
     except Exception as exc:  # noqa: BLE001 - reported and exits non-zero
         traceback.print_exc()
