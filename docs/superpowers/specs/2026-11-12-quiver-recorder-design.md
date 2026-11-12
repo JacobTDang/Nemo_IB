@@ -114,7 +114,7 @@ CREATE TABLE IF NOT EXISTS quiver_snapshot (
 | Dataset | `row_key` | `ticker` | `event_date` | Volatile (ignored when comparing) |
 | --- | --- | --- | --- | --- |
 | `congress_trade` | Quiver's `tx_id` | `ticker` | `filed_date` | — |
-| `insider_trade` | hash of `owner`, `ticker`, `transaction_date`, `shares`, `tx_type` — the fields the client already deduplicates the two lists on | `ticker` | `filed_date` | `list`, `net_worth_estimate` |
+| `insider_trade` | hash of `owner`, `ticker`, `transaction_date`, `shares`, `tx_type` — the fields the client already deduplicates the two lists on | `ticker` | `filed_date` | `list`, `net_worth_estimate`, `price_per_share`, `value_usd` |
 | `layoff` | hash of `employer`, `notice_date`, `city`, `state`, `workers`, `kind` | `ticker` | `notice_date` | — |
 | `contract_award` | hash of `recipient`, `date_awarded`, `amount`, `agency`, `description` | none | `date_awarded` | — |
 | `gov_spending` | hash of `award_id`, `date`, `amount_usd`, `recipient`, `agency` | `ticker` | `date` | — |
@@ -134,7 +134,7 @@ lists first is still occurrence 0.
 match, a match quality — is not part of the identity, so filling it in is a
 revision of the row and not a new row.
 
-**Volatile fields.** `net_worth_estimate` moves with prices and `list` says which
+**Volatile fields.** `net_worth_estimate` moves with prices, and so do `price_per_share` and `value_usd` on recent insider trades, which Quiver fills from the market (10 of 1,733 rows changed between two fetches minutes apart on 2026-11-12) and `list` says which
 of two insider lists carried the row that night; `is_new` flips as a quarter
 ages. They are stored in the payload but ignored when deciding whether a row
 changed, or every night would file 1,733 revisions that mean nothing.

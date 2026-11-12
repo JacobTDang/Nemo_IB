@@ -235,3 +235,12 @@ def test_a_new_week_is_copied_again(store):
     later = qr.run(Scripted(answers()), NOW + timedelta(days=7))
     assert later["quiver_lists"]["week"] == "2026-W47"
     assert later["quiver_lists"]["written"] == 3
+
+
+def test_insider_figures_that_track_the_market_are_ignored_when_comparing():
+    """Measured live on 2026-11-12: for recent insider trades Quiver fills the
+    price and value from the market, so two fetches minutes apart disagreed on
+    10 of 1,733 rows (CRWD 224.63 -> 225.63). Compared, every night would file
+    a revision per recent trade that means only that the stock moved."""
+    assert {"price_per_share", "value_usd", "net_worth_estimate", "list"} <= set(
+        feed("insider_trade").volatile)

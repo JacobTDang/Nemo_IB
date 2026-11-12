@@ -45,10 +45,14 @@ FEEDS: Tuple[Feed, ...] = (
     Feed("congress_trade", "get_congress_trades", "trades",
          id_field="tx_id", date_field="filed_date"),
     # The fields the client already deduplicates its two insider lists on.
+    # Price and value join the volatile fields because, for recent trades,
+    # Quiver fills them from the market: two fetches minutes apart disagreed on
+    # 10 of 1,733 rows (measured 2026-11-12). The first copy is kept.
     Feed("insider_trade", "get_insider_trades", "trades",
          identity=("owner", "ticker", "transaction_date", "shares", "tx_type"),
          date_field="filed_date",
-         volatile=("list", "net_worth_estimate")),
+         volatile=("list", "net_worth_estimate", "price_per_share",
+                   "value_usd")),
     Feed("layoff", "get_layoffs", "notices",
          identity=("employer", "notice_date", "city", "state", "workers",
                    "kind"),
