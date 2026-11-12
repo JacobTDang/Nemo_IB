@@ -503,6 +503,37 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # QuiverQuant's published feeds, recorded nightly (research/quiver_record.py).
+  # Quiver publishes rolling windows -- the latest 300 congressional trades, the
+  # latest 100 contract awards -- so a row that leaves the window is gone from
+  # the source, and this is the only record that it was there. No key: the
+  # client reads Quiver's public pages, and no recorded feed needs the session
+  # cookie the quiver server takes.
+  #
+  #   docker compose --env-file ../.env run --rm research-quiver
+  #
+  # After congress-sync, well before research-copy:
+  #   30 6 * * * cd /srv/nemo/deploy && { date -u; flock -n -E 99 /var/lock/nemo-research-quiver.lock docker compose --env-file ../.env run --rm research-quiver; } >> /srv/nemo/logs/research-quiver.log 2>&1 || { rc=$?; tail -n 100 /srv/nemo/logs/research-quiver.log; docker compose --env-file ../.env run --rm research-notify --job research-quiver --log /srv/nemo/logs/research-quiver.log --code $rc; }
+  research-quiver:
+    image: ${NEMO_IMAGE:-nemo-data:local}
+    profiles: ["sync"]
+    restart: "no"
+    entrypoint: ["python", "-m", "research.quiver_record"]
+    environment:
+      <<: *clock-env
+      NEMO_PIT_DB: /app/data/pit.db
+      NEMO_DISCORD_OPS_WEBHOOK_URL: ${NEMO_DISCORD_OPS_WEBHOOK_URL:-}
+    volumes:
+      - research-data:/app/data
+    tmpfs:
+      - /root/.edgar:rw,size=16m
+      - /app/db_cache:rw,size=16m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   # Congressional decisions, after the source sync and before fills submit.
   #   30 12 * * 1-5 cd /srv/nemo/deploy && { date -u; flock -n -E 99 /var/lock/nemo-research-copy.lock docker compose --env-file ../.env run --rm research-copy; } >> /srv/nemo/logs/research-copy.log 2>&1 || { rc=$?; tail -n 100 /srv/nemo/logs/research-copy.log; docker compose --env-file ../.env run --rm research-notify --job research-copy --log /srv/nemo/logs/research-copy.log --code $rc; }
   research-copy:

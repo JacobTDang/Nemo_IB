@@ -330,6 +330,7 @@ docker compose --env-file ../.env run --rm research-daily               # every 
 | `research-daily` | one session of prices per name, screens the universe, snapshots consensus | `30 22 * * 1-5` |
 | `research-scan` | ranks candidates net of trading cost and borrow, files the intended orders | `0 23 * * 1-5` |
 | `research-copy` | records decisions for congressional stock purchases when the settings flag is on | `30 12 * * 1-5` |
+| `research-quiver` | records QuiverQuant's congressional, insider, layoff, contract, spending and lobbying feeds, and three weekly lists | `30 6 * * *` |
 | `research-watch` | sweeps EDGAR for Schedule 13D stakes taken in a company | `*/20 13-23 * * 1-5` |
 | `research-score` | scores filed orders whose holding period has closed | `0 7 * * 6` |
 | `research-announce` | earnings dates and the hour they landed, from Item 2.02 filings | `0 9 * * 6` |

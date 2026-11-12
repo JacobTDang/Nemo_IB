@@ -235,3 +235,25 @@ def run(client: Any = None, now: Optional[datetime] = None) -> Dict[str, Any]:
     return {"status": status, "as_of": now.date().isoformat(),
             "written": feeds["written"] + lists["written"],
             FEEDS_STAGE: feeds, LISTS_STAGE: lists, "failed": failed}
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    argparse.ArgumentParser(
+        description="Record QuiverQuant's published feeds into pit.db."
+    ).parse_args(argv)
+    from research import discord_post
+    elapsed = discord_post.stopwatch()
+    pit_store.init_schema()
+    try:
+        result = run()
+    except Exception as exc:  # noqa: BLE001 - reported and exits non-zero
+        traceback.print_exc()
+        result = {"status": "failed", "error": f"{type(exc).__name__}: {exc}",
+                  "written": 0, "failed": {}}
+    print(json.dumps(result, indent=2))
+    code = 0 if result["status"] == "ok" else 1
+    return discord_post.finish(JOB, code, result, seconds=elapsed())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
