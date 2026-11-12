@@ -277,8 +277,6 @@ class QuiverServer:
         self._setup_handlers()
 
     def _setup_handlers(self):
-        parent = self
-
         @self.server.list_tools()
         async def list_tools() -> List[Tool]:
             return [
