@@ -94,6 +94,7 @@ CREATE TABLE IF NOT EXISTS quiver_revision (
     row_key     TEXT NOT NULL,
     old_payload TEXT NOT NULL,
     new_payload TEXT NOT NULL,
+    new_ticker  TEXT,
     noticed_at  TEXT NOT NULL
 );
 
@@ -113,7 +114,7 @@ CREATE TABLE IF NOT EXISTS quiver_snapshot (
 | Dataset | `row_key` | `ticker` | `event_date` | Volatile (ignored when comparing) |
 | --- | --- | --- | --- | --- |
 | `congress_trade` | Quiver's `tx_id` | `ticker` | `filed_date` | — |
-| `insider_trade` | hash of `insider_cik` (else `owner`), `ticker`, `transaction_date`, `shares`, `tx_type` | `ticker` | `filed_date` | `list`, `net_worth_estimate` |
+| `insider_trade` | hash of `owner`, `ticker`, `transaction_date`, `shares`, `tx_type` — the fields the client already deduplicates the two lists on | `ticker` | `filed_date` | `list`, `net_worth_estimate` |
 | `layoff` | hash of `employer`, `notice_date`, `city`, `state`, `workers`, `kind` | `ticker` | `notice_date` | — |
 | `contract_award` | hash of `recipient`, `date_awarded`, `amount`, `agency`, `description` | none | `date_awarded` | — |
 | `gov_spending` | hash of `award_id`, `date`, `amount_usd`, `recipient`, `agency` | `ticker` | `date` | — |
@@ -144,15 +145,23 @@ changed, or every night would file 1,733 revisions that mean nothing.
 
 - Not seen before: insert, `first_seen_at = recorded_at = now`.
 - Seen, payload equal apart from volatile fields: nothing.
-- Seen, payload different: the stored row stands; one `quiver_revision` row
-  holds old and new. `first_seen_at` is never written after the insert.
+- Seen, payload different from the latest known payload (the newest revision,
+  else the stored row): the stored row stands; one `quiver_revision` row holds
+  old, new and the new ticker. The same change seen again the next night is not
+  a second revision. `first_seen_at` is never written after the insert.
 
 `pit_store.record_quiver_snapshot(dataset, as_of_week, rows, recorded_at=None) -> int`
 inserts with `INSERT OR IGNORE` on `(dataset, as_of_week, row_key)`.
 
 `pit_store.quiver_records_as_of(dataset, as_of, ticker=None)` returns rows with
-`recorded_at <= as_of`, newest `event_date` first. The filler and the alerts
-read through it and nothing else.
+`date(recorded_at) <= as_of`, newest `event_date` first, each with the payload
+and ticker of the latest revision noticed by `as_of` (or the original) and a
+`revised` flag. A layoff Quiver matches to a ticker a week after we first saw it
+is found under that ticker from the night the match was noticed, and not
+before. The filler and the alerts read through it and nothing else.
+
+`pit_store.has_quiver_snapshot(dataset, as_of_week)` answers whether a weekly
+list is already held.
 
 ## Failure
 
@@ -165,7 +174,10 @@ Fail loud, one feed at a time:
   means N rows read and 0 of them new, and the run says both numbers.
 - Any failed feed makes the stage `partial`, with the failed feeds and reasons
   in `run_log.error`, and the job exits non-zero so the cron line posts to #ops.
-- Every successful feed prints `dataset: read N, new M, revised R`.
+- Every successful feed reports `read`, `new` and `revised` in the run's JSON.
+- One #ops card per run through `discord_post.finish`, like every other job:
+  "**N** new records from QuiverQuant", silent when the night is clean, red
+  with each failed feed and its reason when it is not.
 
 ## Status
 
@@ -216,4 +228,6 @@ fail by name.
   (no keys).
 - `README.md`: the cron line and job table (`testing/test_readme_counts.py`
   checks both).
+- `research/discord_post.py`: `research-quiver` in `JOB_CHANNELS` (ops only)
+  and its card; `testing/test_discord_wiring.py` gets its scenario.
 - `research/cli.py` needs nothing; it reads services from compose.
