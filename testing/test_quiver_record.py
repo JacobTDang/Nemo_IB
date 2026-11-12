@@ -244,3 +244,24 @@ def test_insider_figures_that_track_the_market_are_ignored_when_comparing():
     a revision per recent trade that means only that the stock moved."""
     assert {"price_per_share", "value_usd", "net_worth_estimate", "list"} <= set(
         feed("insider_trade").volatile)
+
+
+def test_a_clean_night_exits_zero(store, monkeypatch):
+    monkeypatch.setattr(qr, "run", lambda: {
+        "status": "ok", "as_of": "2026-11-12", "written": 10, "failed": {}})
+    assert qr.main([]) == 0
+
+
+def test_a_partial_night_exits_non_zero(store, monkeypatch):
+    monkeypatch.setattr(qr, "run", lambda: {
+        "status": "partial", "as_of": "2026-11-12", "written": 9,
+        "failed": {"quiver_feeds/layoff": "rate_limited: HTTP 429"}})
+    assert qr.main([]) == 1
+
+
+def test_a_crash_exits_non_zero_and_says_why(store, monkeypatch, capsys):
+    def boom():
+        raise RuntimeError("store is locked")
+    monkeypatch.setattr(qr, "run", boom)
+    assert qr.main([]) == 1
+    assert "store is locked" in capsys.readouterr().out

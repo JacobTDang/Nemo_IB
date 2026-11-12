@@ -181,6 +181,17 @@ def _sync(monkeypatch, tmp_path, ok=True):
     return congress_sync.main(["--house", "2026"])
 
 
+def _quiver(monkeypatch, tmp_path, ok=True):
+    from research import quiver_record
+
+    monkeypatch.setattr(quiver_record, "run", lambda: {
+        "status": "ok" if ok else "partial", "as_of": "2026-11-12",
+        "written": 42,
+        "failed": {} if ok else {
+            "quiver_feeds/layoff": "rate_limited: HTTP 429"}})
+    return quiver_record.main([])
+
+
 def _backup(monkeypatch, tmp_path, ok=True):
     from research import backup_job
 
@@ -214,6 +225,7 @@ JOBS = {
     "research-daily": (_daily, ["ops"]),
     "research-seed": (_seed, ["ops"]),
     "congress-sync": (_sync, ["ops"]),
+    "research-quiver": (_quiver, ["ops"]),
     "research-backup": (_backup, ["ops"]),
     "research-status": (_status, ["ops"]),
 }
@@ -270,7 +282,7 @@ def test_a_job_with_no_webhook_set_exits_75_and_names_the_setting(
 
 
 FAILING = {"research-copy": _copy, "research-scan": _scan,
-           "research-watch": _watch}
+           "research-watch": _watch, "research-quiver": _quiver}
 
 
 @pytest.mark.parametrize("job", sorted(FAILING))

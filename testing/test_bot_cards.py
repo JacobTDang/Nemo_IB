@@ -471,3 +471,11 @@ def test_every_card_is_one_components_v2_container_with_no_pings(builder, data):
     assert payload["flags"] & post.IS_COMPONENTS_V2
     assert len(payload["components"]) == 1
     assert payload["allowed_mentions"] == {"parse": []}
+
+
+def test_every_job_the_status_screen_knows_has_a_plain_name():
+    from research import status
+
+    missing = [job["job"] for job in status.JOBS
+               if job["job"] not in post.JOB_NAMES]
+    assert not missing, f"no plain name for {missing}"
