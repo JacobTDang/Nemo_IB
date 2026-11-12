@@ -57,6 +57,69 @@ _USER_AGENT = (
 # enough that "recent trades" stays recent.
 PAGE_CACHE_TTL_S = 900.0
 
+# Cloudflare sits in front of quiverquant.com and answers 429 to a burst of
+# anonymous requests. The window is not published: twelve page fetches back to
+# back pass, while roughly eighty requests inside a few seconds -- which one
+# ticker snapshot contributes six of, and a client looping tickers reaches
+# without trying -- does not. Requests are therefore spaced a little, and a
+# 429 is retried once, which keeps an honest burst from turning into a wrong
+# answer. The spacing costs nothing in practice: the pages are cached for
+# fifteen minutes, so only the first call of a dataset pays it.
+_MIN_REQUEST_INTERVAL_S = 0.2
+_RATE_LIMIT_RETRY_S = 1.5
+_RATE_LIMIT_RETRY_CAP_S = 5.0
+
+_PACE_LOCK = threading.Lock()
+_last_request_at = 0.0
+
+
+def _pace() -> None:
+    """Hold requests at least _MIN_REQUEST_INTERVAL_S apart, across threads."""
+    global _last_request_at
+    with _PACE_LOCK:
+        gap = _MIN_REQUEST_INTERVAL_S - (time.time() - _last_request_at)
+        if gap > 0:
+            time.sleep(gap)
+        _last_request_at = time.time()
+
+
+def _retry_delay(resp: Any) -> float:
+    """How long to wait before retrying, honouring Retry-After if sent."""
+    raw = resp.headers.get("retry-after")
+    if raw:
+        try:
+            return min(max(float(raw), 0.0), _RATE_LIMIT_RETRY_CAP_S)
+        except ValueError:
+            pass  # an HTTP-date, not a delay in seconds
+    return _RATE_LIMIT_RETRY_S
+
+
+def _snapshot_is_hollow(snapshot: Dict[str, Any]) -> bool:
+    """True when every section answered with nothing.
+
+    Quiver answers HTTP 200 for a ticker it does not cover: current_price
+    "N/A", empty arrays everywhere. Reporting that as a covered ticker that
+    happened to have nothing to report is the silent-absence mistake -- a
+    caller reads six empty sections and concludes the company has no
+    insiders, no institutions and no analyst coverage.
+    """
+    price = (snapshot.get("price") or {}).get("price_data") or {}
+    quoted = str(price.get("current_price") or "").strip().upper()
+    if quoted not in ("", "N/A"):
+        return False
+    if (snapshot.get("insiders") or {}).get("insider_trades"):
+        return False
+    for key in ("institutions", "etf_holders"):
+        if snapshot.get(key):
+            return False
+    forecast = snapshot.get("forecast") or {}
+    if forecast.get("data") or forecast.get("price_targets"):
+        return False
+    bulls = snapshot.get("bulls_bears") or {}
+    if bulls and bulls.get("response") not in (None, "", "empty"):
+        return False
+    return True
+
 
 class QuiverError(Exception):
     """A fetch or parse failure with a machine-readable reason code."""
@@ -131,32 +194,43 @@ class QuiverWebClient:
         container limit and an OOM kill.
         """
         extra = self._xsrf_headers if json_headers else {}
-        try:
-            with self._client.stream("GET", path, headers=extra) as resp:
-                if resp.status_code in (403, 429):
-                    raise QuiverError(
-                        "rate_limited",
-                        f"{path} returned HTTP {resp.status_code} "
-                        f"(Cloudflare or rate limit). Retry later or set "
-                        f"QUIVER_SESSION_COOKIE.")
-                if resp.status_code == 404:
-                    raise QuiverError(
-                        "not_found", f"{path} returned HTTP 404")
-                if resp.status_code != 200:
-                    raise QuiverError(
-                        "provider_unavailable",
-                        f"{path} returned HTTP {resp.status_code}")
-                decoder = codecs.getincrementaldecoder("utf-8")("replace")
-                parts: List[str] = []
-                for chunk in resp.iter_bytes(65536):
-                    piece = decoder.decode(chunk)
-                    if piece:
-                        parts.append(piece)
-                return "".join(parts)
-        except httpx.HTTPError as exc:
-            raise QuiverError(
-                "provider_unavailable",
-                f"request to {path} failed: {exc}") from exc
+        rate_limited_once = False
+        while True:
+            _pace()
+            try:
+                with self._client.stream("GET", path,
+                                         headers=extra) as resp:
+                    if resp.status_code in (403, 429):
+                        # A single retry turns a self-inflicted burst into a
+                        # slow answer instead of a wrong one. More than one
+                        # would hold an MCP call open past its budget.
+                        if resp.status_code == 429 and not rate_limited_once:
+                            rate_limited_once = True
+                            time.sleep(_retry_delay(resp))
+                            continue
+                        raise QuiverError(
+                            "rate_limited",
+                            f"{path} returned HTTP {resp.status_code} "
+                            f"(Cloudflare or rate limit). Retry later or set "
+                            f"QUIVER_SESSION_COOKIE.")
+                    if resp.status_code == 404:
+                        raise QuiverError(
+                            "not_found", f"{path} returned HTTP 404")
+                    if resp.status_code != 200:
+                        raise QuiverError(
+                            "provider_unavailable",
+                            f"{path} returned HTTP {resp.status_code}")
+                    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+                    parts: List[str] = []
+                    for chunk in resp.iter_bytes(65536):
+                        piece = decoder.decode(chunk)
+                        if piece:
+                            parts.append(piece)
+                    return "".join(parts)
+            except httpx.HTTPError as exc:
+                raise QuiverError(
+                    "provider_unavailable",
+                    f"request to {path} failed: {exc}") from exc
 
     def _page(self, path: str, *, ttl: float = PAGE_CACHE_TTL_S) -> str:
         cached = _cache_get(path, ttl)
@@ -583,6 +657,13 @@ class QuiverWebClient:
                         if (m["ticker"] or "").upper() == ticker), None)
             result["ticker_row"] = row
             result["ticker_sentiment"] = sentiment.get(ticker)
+            if row is None:
+                # The dashboard carries ~600 tickers. One that is absent was
+                # not mentioned in the window -- which is a different answer
+                # from "mentioned zero times" and must be named as such.
+                result["coverage"] = "not_covered"
+            else:
+                result["coverage"] = "full"
             if include_history:
                 # The dashboard stacks three mention charts (1-day hourly,
                 # ~5-day, ~30-day). Pick the LONGEST series for the ticker
@@ -777,9 +858,31 @@ class QuiverWebClient:
             f"/get_tv_lazy_data/{ticker}/") or {}).get("etf_data"))
         if degraded:
             out["degraded_sections"] = degraded
-        if not any(k for k in out if k not in ("ticker",
-                                                "degraded_sections")):
+        sections = [k for k in out
+                    if k not in ("ticker", "degraded_sections")]
+        if not sections:
+            # Every section failed. Which reason that is decides what it
+            # means: a ticker Quiver does not cover answers 404 throughout,
+            # while a rate limit or an outage says nothing about the ticker.
+            # Blaming the ticker for a 429 turns "slow down" into "no such
+            # company", which is the wrong answer to act on.
+            reasons = {entry.split(":", 1)[1] for entry in degraded
+                       if ":" in entry}
+            for transport in ("rate_limited", "provider_unavailable",
+                              "unexpected"):
+                if transport in reasons:
+                    raise QuiverError(
+                        transport,
+                        f"every section for {ticker} failed: "
+                        + ", ".join(sorted(degraded)))
             raise QuiverError(
                 "unknown_ticker",
                 f"no Quiver endpoint answered for {ticker}")
+        if _snapshot_is_hollow(out):
+            raise QuiverError(
+                "unknown_ticker",
+                f"Quiver returned no price, insiders, institutions, "
+                f"forecast or ETF holders for {ticker}; the ticker is "
+                f"most likely not covered")
+        out["coverage"] = "partial" if degraded else "full"
         return out

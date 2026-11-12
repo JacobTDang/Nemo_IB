@@ -137,6 +137,141 @@ def test_quiver_server_e2e():
     assert miss["data"]["reason"] == "unknown_politician", miss
 
 
+# ---------------------------------------------------------------------------
+# Transport honesty. Offline: a scripted transport stands in for the site, so
+# these run without a network and without depending on Quiver's rate limiter
+# actually firing.
+# ---------------------------------------------------------------------------
+
+def _client_with(handler):
+    import httpx
+    from tools.quiver_server import client as qc
+    c = qc.QuiverWebClient()
+    c._client = httpx.Client(base_url=qc.BASE_URL,
+                             transport=httpx.MockTransport(handler))
+    return c
+
+
+def test_a_rate_limit_is_retried_once_and_then_named():
+    """One 429 is a burst, not an outage: retry it, then say what it was."""
+    import httpx
+    from tools.quiver_server.client import QuiverError
+
+    attempts = []
+
+    def once(request):
+        attempts.append(request.url.path)
+        if len(attempts) == 1:
+            return httpx.Response(429, headers={"retry-after": "0"},
+                                  text="slow down")
+        return httpx.Response(200, text='{"response": "ok"}')
+
+    c = _client_with(once)
+    assert json.loads(c._fetch("/get_current_price/NVDA")) == {"response": "ok"}
+    assert len(attempts) == 2, attempts
+
+    # A second 429 in the same call is the site refusing, and the caller is
+    # told so instead of being held open for another attempt.
+    attempts.clear()
+    c = _client_with(lambda request: (
+        attempts.append(request.url.path),
+        httpx.Response(429, headers={"retry-after": "0"}, text="nope"),
+    )[1])
+    try:
+        c._fetch("/get_current_price/NVDA")
+    except QuiverError as exc:
+        assert exc.reason == "rate_limited", exc.reason
+    else:
+        raise AssertionError("a refused request must not return a body")
+    assert len(attempts) == 2, attempts
+
+
+def test_a_rate_limit_is_not_reported_as_an_unknown_ticker():
+    """The reason names what happened. A throttled request says nothing about
+    whether the ticker exists, and `unknown_ticker` would be a wrong answer."""
+    from tools.quiver_server.client import QuiverError
+
+    c = _client_with(lambda request: None)
+
+    def throttled(path, *args, **kwargs):
+        raise QuiverError("rate_limited", f"{path} returned HTTP 429")
+
+    c._json = throttled
+    try:
+        c.get_ticker_snapshot("NVDA")
+    except QuiverError as exc:
+        assert exc.reason == "rate_limited", exc.reason
+    else:
+        raise AssertionError("a snapshot with no answering section must raise")
+
+    # A ticker Quiver does not cover is the one case that earns that name.
+    def missing(path, *args, **kwargs):
+        raise QuiverError("not_found", f"{path} returned HTTP 404")
+
+    c._json = missing
+    try:
+        c.get_ticker_snapshot("ZZZZZ")
+    except QuiverError as exc:
+        assert exc.reason == "unknown_ticker", exc.reason
+    else:
+        raise AssertionError("a ticker with no endpoints must raise")
+
+
+def test_a_ticker_with_no_data_is_not_returned_as_six_empty_sections():
+    """Quiver answers 200 with "N/A" and empty arrays for a ticker it does not
+    cover. Handing that back would read as a covered company with no insiders,
+    no institutions and no analyst coverage."""
+    from tools.quiver_server.client import QuiverError, _snapshot_is_hollow
+
+    c = _client_with(lambda request: None)
+
+    def hollow(path, *args, **kwargs):
+        if "bulls_bears" in path:
+            return {"response": "empty"}
+        if "insiders" in path:
+            return {"insider_trades": []}
+        if "institutions" in path:
+            return {"response": {}}
+        if "forecast" in path:
+            return {"data": [], "price_targets": {}}
+        if "tv_lazy" in path:
+            return {"etf_data": []}
+        return {"price_data": {"current_price": "N/A"}}
+
+    c._json = hollow
+    try:
+        c.get_ticker_snapshot("ZZZZZ")
+    except QuiverError as exc:
+        assert exc.reason == "unknown_ticker", exc.reason
+    else:
+        raise AssertionError("a hollow snapshot must be named, not returned")
+
+    # A real quote is not hollow even with every holding section empty ...
+    assert not _snapshot_is_hollow(
+        {"price": {"price_data": {"current_price": "173.73"}}})
+    # ... and a covered ticker reports how complete the answer is.
+    def quoted(path, *args, **kwargs):
+        if "insiders" in path:
+            return {"insider_trades": [["X", "Sale", 1]]}
+        if "institutions" in path:
+            return {"response": {"heatmap_data": [{"Fund": "BlackRock"}]}}
+        if "forecast" in path:
+            return {"data": [1], "price_targets": {"high": 200}}
+        if "tv_lazy" in path:
+            return {"etf_data": [{"ticker": "QQQ"}]}
+        if "bulls_bears" in path:
+            return {"response": "no-auth"}
+        return {"price_data": {"current_price": "173.73"}}
+
+    c._json = quoted
+    snap = c.get_ticker_snapshot("NVDA")
+    assert snap["coverage"] == "partial", snap.get("coverage")
+    assert "bulls_bears:no_auth" in snap["degraded_sections"], snap
+
+
 if __name__ == "__main__":
     test_quiver_server_e2e()
+    test_a_rate_limit_is_retried_once_and_then_named()
+    test_a_rate_limit_is_not_reported_as_an_unknown_ticker()
+    test_a_ticker_with_no_data_is_not_returned_as_six_empty_sections()
     print("quiver server e2e: PASS")

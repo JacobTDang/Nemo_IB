@@ -234,6 +234,12 @@ reason=parse_failed rather than an empty answer, and a request that could not be
 made at all reports success false with a machine-readable reason instead of a
 zero.
 
+Anonymous requests are rate limited at the edge, and the window is unpublished.
+Requests are therefore spaced, and a 429 is retried once before it is reported,
+so a loop over tickers slows down instead of returning a wrong answer. A ticker
+Quiver does not cover reports reason=unknown_ticker; it is never handed back as
+six empty sections.
+
 The datasets overlap with the congressional store above, from a different source
 and with a different lag. Members file up to 45 days after a trade, so a
 transaction's filed date trails the date it names. The WSB mention series
