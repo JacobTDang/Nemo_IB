@@ -176,7 +176,8 @@ the keys the code it runs actually reads, and nothing else:
 | altdata | `CONGRESS_API_KEY`, `FINMIND_TOKEN` |
 | quiver | `QUIVER_SESSION_COOKIE` |
 | congress-sync | `SEC_EMAIL` |
-| research-daily, research-seed, research-announce | `SEC_EMAIL`, `FINNHUB_API_KEY` |
+| research-daily, research-announce | `SEC_EMAIL`, `FINNHUB_API_KEY` |
+| research-seed | `SEC_EMAIL`, `FINNHUB_API_KEY`, `FMP_API_KEY` |
 | research-scan | `SEC_EMAIL` |
 | research-watch | `SEC_EMAIL`, `NAME`, `FINNHUB_API_KEY` |
 | research-score | nothing — it opens `pit.db` and calls no upstream |
@@ -194,6 +195,26 @@ key but a logged-in quiverquant.com browser session cookie: with it the
 bulls/bears section of the ticker snapshot answers, without it that section
 degrades and names itself. Everything else on that server answers anonymously.
 Declared for the same reason as the two above.
+
+`FMP_API_KEY` is optional and currently unset, and it is the only paid key the
+stack takes. It buys one thing: about forty quarters of earnings-surprise
+history per name, which is the eight-quarter window the analyst surprise needs
+and which the free vendor will not serve. Without it the reconstruction is
+Finnhub's four quarters and the analyst leg fills in over nine months; with it
+the window is complete on the first seed run. Nothing else changes, and the
+rows say which vendor wrote them either way.
+
+The paid path has an entry point of its own, which is the cheapest way to find
+out whether a new key works before a six-hundred-name run:
+
+```bash
+docker compose --env-file ../.env run --rm --entrypoint python research-seed \
+  -m research.fmp_consensus --tickers AAPL
+```
+
+It prints what it placed, what it could not match to a quarter, and — the case
+worth reading on a first run — the keys the payload actually carried, if the
+vendor has changed them.
 
 The table is checked, not maintained. `testing/test_compose_env_minimality.py`
 walks the import graph from the module each service runs and fails on any key
