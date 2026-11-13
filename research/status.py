@@ -87,6 +87,16 @@ JOBS = (
      "every": "weeknight", "stale_after_days": 2,
      "max_run_seconds": 600,
      "partial_is_normal": False},
+    # The supply-chain read (research/supply_chain.py), a stage of the
+    # nightly pass rather than a job of its own. It writes a run row every
+    # night including the nights when no name is due, so a working stage does
+    # not read as a silent one. Partial is normal: thirty names read from
+    # EDGAR will lose one to a timeout some nights, and the read is good for a
+    # year, so a missing name tonight is picked up by tomorrow's slice.
+    {"job": "supply_chain", "module": "research.daily_job",
+     "every": "weeknight", "stale_after_days": 2,
+     "max_run_seconds": 600,
+     "partial_is_normal": True},
     {"job": "scan", "module": "research.scanner",
      "every": "weeknight", "stale_after_days": 2,
      "max_run_seconds": 600,

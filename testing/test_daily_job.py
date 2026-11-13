@@ -38,6 +38,27 @@ def _bars(*dates, close=10.0, volume=1_000_000):
              "close": close, "volume": volume} for d in dates]
 
 
+@pytest.fixture(autouse=True)
+def supply_chain_reads(monkeypatch):
+    """The nightly pass reads a slice of 10-Ks, which is EDGAR and not this
+    file's subject.
+
+    Stubbed for every test here rather than at the ten call sites that run a
+    night: a stage added to `run_all` is one more network seam, and the test
+    that forgets to patch it would reach the SEC and fail as a socket error
+    rather than as the thing it is. The returned list is how the wiring itself
+    is checked -- see `test_the_nightly_pass_reads_the_names_it_screened`.
+    """
+    calls = []
+
+    def record(names, as_of=None):
+        calls.append((list(names), as_of))
+        return {"status": "ok", "asked": 0, "written": 0}
+
+    monkeypatch.setattr(daily_job, "record_supply_chain", record)
+    return calls
+
+
 # --- a run that did not work must not look like one that did ---------------
 
 def test_a_run_that_fetched_nothing_is_not_recorded_as_ok(store, monkeypatch):
@@ -951,6 +972,25 @@ def test_the_nightly_ask_is_bounded(store, monkeypatch):
     # Minus the liveness canary, which every fetch carries and none records.
     universe = asked - {daily_job.FETCH_CANARY}
     assert len(universe) <= daily_job.MAX_NIGHTLY_TICKERS
+
+
+def test_the_nightly_pass_reads_the_names_it_screened(store, monkeypatch,
+                                                      supply_chain_reads):
+    """The supply-chain stage gets the eligible list this run already worked
+    out, not a second universe read that answers with a night-old one."""
+    monkeypatch.setattr(daily_job, "_fetch_sec_tickers", lambda: [
+        {"ticker": "OLD", "cik": "1", "name": "Old Co"}])
+    monkeypatch.setattr(daily_job, "_fetch_bars", lambda tickers, **kw: {})
+    monkeypatch.setattr(daily_job, "record_consensus_snapshots",
+                        lambda **kw: {"status": "ok"})
+    store.record_universe("2026-03-02", [
+        {"ticker": "OLD", "cik": "1", "eligible": True}],
+        recorded_at="2026-03-02T21:00:00Z")
+
+    result = daily_job.run_all(as_of="2026-03-03")
+
+    assert supply_chain_reads == [(["OLD"], "2026-03-03")], supply_chain_reads
+    assert result["supply_chain"]["status"] == "ok", result["supply_chain"]
 
 
 def test_the_rotation_covers_everyone_eventually(store, monkeypatch):

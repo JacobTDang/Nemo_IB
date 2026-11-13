@@ -117,6 +117,13 @@ def _write_everything_late(store):
     store.record_quiver_rows("layoff", [{
         "row_key": "q1", "ticker": "AAA", "event_date": "2026-03-02",
         "payload": {"employer": "Acme", "ticker": "AAA"}}], recorded_at=LATER)
+    # A 10-K filed in March and read in September: the filing was public all
+    # along, so the row is stamped March and the reader on 3 March still must
+    # not see it. That is the `backfilled` case, and the one where a
+    # document-shaped fact leaks exactly like a price does.
+    store.record_supply_chain("AAA", "2026-03-02", [{
+        "related_ticker": "BBB", "relationship": "supplier",
+        "mention_count": 2}], recorded_at=LATER)
 
 
 # --- nothing is visible before it was written -------------------------------
@@ -146,6 +153,9 @@ def _write_everything_late(store):
     ("xbrl_class_eps_as_of", lambda: pit_store.xbrl_class_eps_as_of(PAST)),
     ("quiver_records_as_of",
      lambda: pit_store.quiver_records_as_of("layoff", PAST)),
+    ("supply_chain_as_of", lambda: pit_store.supply_chain_as_of("AAA", PAST)),
+    ("supply_chain_edges_as_of",
+     lambda: pit_store.supply_chain_edges_as_of("BBB", PAST)),
 ])
 def test_no_reader_sees_a_row_written_after_its_date(store, name, call):
     _write_everything_late(store)
@@ -192,6 +202,8 @@ def test_the_same_readers_do_see_it_afterwards(store):
     assert pit_store.measured_round_trips(later)
     assert pit_store.xbrl_class_eps_as_of(later)
     assert pit_store.quiver_records_as_of("layoff", later)
+    assert pit_store.supply_chain_as_of("AAA", later)
+    assert pit_store.supply_chain_edges_as_of("BBB", later)
 
 
 def test_every_as_of_reader_in_the_store_is_covered_here():
@@ -204,6 +216,7 @@ def test_every_as_of_reader_in_the_store_is_covered_here():
         "has_consensus_history", "borrow_rate_as_of", "book_equity_as_of",
         "paper_fills_as_of", "fills_as_of", "measured_round_trips",
         "copy_orders_as_of", "xbrl_class_eps_as_of", "quiver_records_as_of",
+        "supply_chain_as_of", "supply_chain_edges_as_of",
         # Reads the run log, which records what the process did rather than
         # what the market did; see the test below for why it is keyed on the
         # date a run was FOR rather than on when it finished.
