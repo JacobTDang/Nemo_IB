@@ -196,6 +196,53 @@ CREATE TABLE IF NOT EXISTS borrow_rate (
 CREATE INDEX IF NOT EXISTS idx_borrow_ticker
     ON borrow_rate(ticker, as_of_date);
 
+-- How many shares are sold short, as FINRA's member firms reported them for a
+-- settlement date. This is not `borrow_rate` and cannot price a short: it says
+-- how crowded the trade is, not what a lender charges to hold it. The two live
+-- in separate tables so that neither can be read as the other -- a book ranked
+-- on edge net of cost treats a missing fee as a refusal, and a crowding count
+-- substituted for a fee would put the most expensive short first.
+--
+-- `settlement_date` is the fact's date. `recorded_at` is when it could have
+-- been known, which is later: FINRA aggregates what its firms reported and
+-- publishes afterwards. `short_interest_as_of` filters on both, so a
+-- settlement loaded today cannot be used by a decision dated last week.
+CREATE TABLE IF NOT EXISTS short_interest (
+    settlement_date   TEXT NOT NULL,
+    ticker            TEXT NOT NULL,
+    shares_short      REAL NOT NULL,
+    prev_shares_short REAL,
+    avg_daily_volume  REAL,
+    days_to_cover     REAL,
+    change_pct        REAL,
+    issue_name        TEXT,
+    market            TEXT,
+    -- A split between settlements makes the change meaningless rather than
+    -- wrong: the count moved because the shares did. Carried so a reader can
+    -- tell those apart instead of reading a split as new shorting.
+    split_flag        INTEGER NOT NULL DEFAULT 0,
+    source            TEXT NOT NULL,
+    backfilled        INTEGER NOT NULL DEFAULT 0,
+    recorded_at       TEXT NOT NULL,
+    PRIMARY KEY (settlement_date, ticker)
+);
+CREATE INDEX IF NOT EXISTS idx_short_interest_ticker
+    ON short_interest(ticker, settlement_date);
+
+-- A settlement re-reported with a different count. The first row stands,
+-- because it is what the decision could have read, and the disagreement is
+-- kept here rather than overwriting it -- the same rule `bar_revision` draws.
+CREATE TABLE IF NOT EXISTS short_interest_revision (
+    settlement_date  TEXT NOT NULL,
+    ticker           TEXT NOT NULL,
+    old_shares_short REAL NOT NULL,
+    new_shares_short REAL NOT NULL,
+    old_recorded_at  TEXT NOT NULL,
+    noticed_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_short_interest_revision
+    ON short_interest_revision(settlement_date, ticker);
+
 CREATE TABLE IF NOT EXISTS copy_order (
     txn_id           TEXT PRIMARY KEY NOT NULL,
     as_of_date       TEXT NOT NULL,
@@ -1105,6 +1152,173 @@ def borrow_rate_as_of(ticker: str, as_of: str) -> Optional[Dict[str, Any]]:
                ORDER BY as_of_date DESC LIMIT 1""",
             (ticker, as_of, as_of)).fetchone()
     return dict(row) if row else None
+
+
+# ------------------------------------------------------- FINRA short interest
+
+# The only source wired up. Named in every row because a settlement is not
+# reproducible: FINRA re-reports when a member corrects, and a row whose origin
+# is unstated cannot be checked against the report it came from.
+SOURCE_FINRA = "finra"
+
+
+def record_short_interest(settlement_date: str, rows: Iterable[Dict[str, Any]],
+                          source: str = SOURCE_FINRA,
+                          recorded_at: Optional[str] = None,
+                          backfilled: bool = False) -> Dict[str, int]:
+    """One settlement date's short interest, per name.
+
+    Returns `written`, `unchanged` and `revised`. Three outcomes rather than
+    one count, because a re-recorded settlement is not a no-op: FINRA revises,
+    and the difference between "we already had this" and "the number moved" is
+    the difference between a quiet run and a fact worth knowing. The original
+    row stands and the disagreement lands in `short_interest_revision`, which
+    is the rule `daily_bar` and `bar_revision` already draw -- overwriting it
+    would destroy the only record of what a decision that day could have read.
+
+    `recorded_at` is when the number could have been known, and it is not the
+    settlement date. FINRA aggregates what its member firms reported and
+    publishes afterwards, so a settlement dated two weeks ago may only be
+    readable today. The reader filters on both, which is what keeps a
+    backfilled row out of a replay it did not belong in.
+
+    A bad row raises rather than being skipped. Every field here is typed at
+    the source; a row that will not parse is a layout change, and silently
+    dropping 3,000 of 20,000 names would leave a settlement that looks complete
+    and is not.
+    """
+    stamp = recorded_at or _now()
+    written = unchanged = revised = 0
+    with connect() as conn:
+        for row in rows:
+            ticker = (row.get("ticker") or "").strip().upper()
+            shares = row.get("shares_short")
+            if not ticker:
+                raise ValueError(
+                    f"a short-interest row for {settlement_date} has no "
+                    f"ticker; got {row!r}")
+            if shares is None or not isinstance(shares, (int, float)) \
+                    or isinstance(shares, bool) \
+                    or not math.isfinite(float(shares)):
+                raise ValueError(
+                    f"shares_short for {ticker} on {settlement_date} must be "
+                    f"a finite number; got {shares!r}")
+            if float(shares) < 0:
+                raise ValueError(
+                    f"shares_short for {ticker} on {settlement_date} is "
+                    f"{shares!r}. A negative short position is not a small "
+                    f"one: it is a sign error somewhere upstream")
+
+            cur = conn.execute(
+                """INSERT OR IGNORE INTO short_interest
+                   (settlement_date, ticker, shares_short, prev_shares_short,
+                    avg_daily_volume, days_to_cover, change_pct, issue_name,
+                    market, split_flag, source, backfilled, recorded_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (settlement_date, ticker, float(shares),
+                 _float_or_none(row.get("prev_shares_short")),
+                 _float_or_none(row.get("avg_daily_volume")),
+                 _float_or_none(row.get("days_to_cover")),
+                 _float_or_none(row.get("change_pct")),
+                 row.get("issue_name"), row.get("market"),
+                 1 if row.get("split_flag") else 0,
+                 row.get("source") or source,
+                 1 if backfilled else 0, stamp))
+            if cur.rowcount:
+                written += 1
+                continue
+
+            held = conn.execute(
+                """SELECT shares_short, recorded_at FROM short_interest
+                   WHERE settlement_date = ? AND ticker = ?""",
+                (settlement_date, ticker)).fetchone()
+            if held is None:  # written and removed between the two statements
+                unchanged += 1
+            elif float(held["shares_short"]) == float(shares):
+                unchanged += 1
+            else:
+                conn.execute(
+                    """INSERT INTO short_interest_revision
+                       (settlement_date, ticker, old_shares_short,
+                        new_shares_short, old_recorded_at, noticed_at)
+                       VALUES (?,?,?,?,?,?)""",
+                    (settlement_date, ticker, float(held["shares_short"]),
+                     float(shares), held["recorded_at"], stamp))
+                revised += 1
+    return {"written": written, "unchanged": unchanged, "revised": revised}
+
+
+def _float_or_none(value: Any) -> Optional[float]:
+    """A finite float, or None. FINRA sends null for a missing figure."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def short_interest_as_of(ticker: str, as_of: str) -> Optional[Dict[str, Any]]:
+    """The most recent settlement on or before `as_of`, or None.
+
+    Both dates are filtered. `settlement_date <= as_of` says the fact is not
+    from the future; `date(recorded_at) <= as_of` says we had not learned it
+    late. FINRA publishes days after a settlement, so for most of that window
+    the first condition is true and the second is not -- which is exactly the
+    lookahead this table exists to make impossible.
+
+    None rather than the oldest row on file, and never zero. A name with no
+    short interest on record is unmeasured, not unloved.
+    """
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT * FROM short_interest
+               WHERE ticker = ? AND settlement_date <= ?
+                 AND date(recorded_at) <= ?
+               ORDER BY settlement_date DESC LIMIT 1""",
+            (ticker.upper(), as_of, as_of)).fetchone()
+    return dict(row) if row else None
+
+
+def short_interest_history(ticker: str, as_of: str,
+                           limit: int = 8) -> List[Dict[str, Any]]:
+    """The last `limit` settlements known on `as_of`, newest first.
+
+    A series, because one settlement of a biweekly count says almost nothing:
+    the level is a stock and the move is a flow, and a name whose short
+    position doubled in a fortnight reads the same as a stable one if only the
+    latest row is fetched.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT * FROM short_interest
+               WHERE ticker = ? AND settlement_date <= ?
+                 AND date(recorded_at) <= ?
+               ORDER BY settlement_date DESC LIMIT ?""",
+            (ticker.upper(), as_of, as_of, max(int(limit), 1))).fetchall()
+    return [dict(r) for r in rows]
+
+
+def short_interest_settlements(as_of: Optional[str] = None
+                               ) -> List[Dict[str, Any]]:
+    """Each settlement date on file, with its row count. For the status line."""
+    with connect() as conn:
+        if as_of:
+            rows = conn.execute(
+                """SELECT settlement_date, count(*) AS rows,
+                          max(recorded_at) AS recorded_at
+                     FROM short_interest WHERE date(recorded_at) <= ?
+                    GROUP BY settlement_date
+                    ORDER BY settlement_date DESC""", (as_of,)).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT settlement_date, count(*) AS rows,
+                          max(recorded_at) AS recorded_at
+                     FROM short_interest
+                    GROUP BY settlement_date
+                    ORDER BY settlement_date DESC""").fetchall()
+    return [dict(r) for r in rows]
 
 
 # --------------------------------------------------------- 13D events

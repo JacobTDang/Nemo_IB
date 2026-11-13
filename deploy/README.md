@@ -629,6 +629,30 @@ python -m research.borrow --as-of 2026-08-31 --from-csv rates.csv \
   --units percent --source ibkr --backfill
 ```
 
+### Short interest is recorded, and still does not price a short
+
+`research-daily` ends with FINRA's consolidated short interest, which needs no
+key, no account and no configuration. It is a different fact from a borrow
+rate: how many shares are sold short, the average daily volume behind them, and
+the days of trading a covering trade would have to buy. That makes a name's
+crowding visible, and it does not make its fee known, so the refusal above
+stands. The two live in separate tables and a test pins the separation.
+
+FINRA publishes twice a month, and publishes days after the settlement date.
+Most nights therefore find nothing new, which is the ordinary result and not a
+failure. To load history, name both dates: the settlement, and the day FINRA
+published it.
+
+```bash
+docker compose --env-file ../.env run --rm --entrypoint python research-daily \
+  -m research.short_interest --settlement 2026-10-30 --backfill 2026-11-11
+```
+
+The second date is required and is never inferred from the first. Rows loaded
+this way are marked `backfilled`, and a scan dated before the publication day
+does not see them — which is the same rule `date(recorded_at) <= as_of` applies
+to everything else in the store.
+
 ### The book's limits, and the switch that stops it
 
 Two limits, set by the owner before any forward result was read (issue #117).

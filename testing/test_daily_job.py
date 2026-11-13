@@ -30,6 +30,12 @@ from research import daily_job, pit_store
 def store(tmp_path, monkeypatch):
     monkeypatch.setenv("NEMO_PIT_DB", str(tmp_path / "pit.db"))
     pit_store.init_schema()
+    # FINRA owns its own store writes and its own run-log line, so the stage is
+    # stubbed here rather than in each test that happens to call `run_all`.
+    # What it writes is covered in testing/test_short_interest.py.
+    monkeypatch.setattr(daily_job, "_fetch_short_interest",
+                        lambda as_of: {"status": "ok", "written": 0,
+                                       "settlements": []})
     return pit_store
 
 
@@ -1129,6 +1135,9 @@ def test_a_fresh_store_is_created_by_the_job_itself(tmp_path, monkeypatch):
         daily_job.FETCH_CANARY: _bars("2026-03-03")})
     monkeypatch.setattr(daily_job, "_fetch_calendar", lambda start, end: [
         {"ticker": "AAPL", "fiscal_period": "2026Q1", "eps_estimate": 1.0}])
+    monkeypatch.setattr(daily_job, "_fetch_short_interest",
+                        lambda as_of: {"status": "ok", "written": 0,
+                                       "settlements": []})
 
     assert daily_job.main(["--as-of", "2026-03-03"]) == 0
     assert len(pit_store.bars_as_of("AAPL", "2026-03-04")) == 1

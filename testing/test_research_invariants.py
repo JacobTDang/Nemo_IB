@@ -117,6 +117,12 @@ def _write_everything_late(store):
     store.record_quiver_rows("layoff", [{
         "row_key": "q1", "ticker": "AAA", "event_date": "2026-03-02",
         "payload": {"employer": "Acme", "ticker": "AAA"}}], recorded_at=LATER)
+    # A settlement that closed the day before the read, published weeks after
+    # it: the exact shape of FINRA's lag, and the reason the row carries two
+    # dates instead of one.
+    store.record_short_interest(
+        "2026-03-02", [{"ticker": "AAA", "shares_short": 1000.0}],
+        recorded_at=LATER)
 
 
 # --- nothing is visible before it was written -------------------------------
@@ -146,6 +152,10 @@ def _write_everything_late(store):
     ("xbrl_class_eps_as_of", lambda: pit_store.xbrl_class_eps_as_of(PAST)),
     ("quiver_records_as_of",
      lambda: pit_store.quiver_records_as_of("layoff", PAST)),
+    ("short_interest_history",
+     lambda: pit_store.short_interest_history("AAA", PAST)),
+    ("short_interest_settlements",
+     lambda: pit_store.short_interest_settlements(PAST)),
 ])
 def test_no_reader_sees_a_row_written_after_its_date(store, name, call):
     _write_everything_late(store)
@@ -163,6 +173,11 @@ def test_the_scalar_readers_hide_it_too(store):
     # broker file for last month arrives next month -- so a leak here would
     # price every historical short with a rate nobody could have known.
     assert pit_store.borrow_rate_as_of("AAA", PAST) is None
+    # A settlement that closed before the read and was published after it.
+    # FINRA's lag is days long, so this is the ordinary case rather than the
+    # exceptional one, and reading it early would show a fortnight of counting
+    # that a decision on that date could not have had.
+    assert pit_store.short_interest_as_of("AAA", PAST) is None
     # A drawdown switch that read tomorrow's loss would trip a replayed night
     # on a loss nobody had yet taken.
     state = pit_store.risk_state(PAST)
@@ -192,6 +207,9 @@ def test_the_same_readers_do_see_it_afterwards(store):
     assert pit_store.measured_round_trips(later)
     assert pit_store.xbrl_class_eps_as_of(later)
     assert pit_store.quiver_records_as_of("layoff", later)
+    assert pit_store.short_interest_as_of("AAA", later)
+    assert pit_store.short_interest_history("AAA", later)
+    assert pit_store.short_interest_settlements(later)
 
 
 def test_every_as_of_reader_in_the_store_is_covered_here():
@@ -204,6 +222,8 @@ def test_every_as_of_reader_in_the_store_is_covered_here():
         "has_consensus_history", "borrow_rate_as_of", "book_equity_as_of",
         "paper_fills_as_of", "fills_as_of", "measured_round_trips",
         "copy_orders_as_of", "xbrl_class_eps_as_of", "quiver_records_as_of",
+        "short_interest_as_of", "short_interest_history",
+        "short_interest_settlements",
         # Reads the run log, which records what the process did rather than
         # what the market did; see the test below for why it is keyed on the
         # date a run was FOR rather than on when it finished.
