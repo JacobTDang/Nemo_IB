@@ -327,7 +327,7 @@ docker compose --env-file ../.env run --rm research-daily               # every 
 
 | Job | Does | When |
 |---|---|---|
-| `research-daily` | one session of prices per name, screens the universe, snapshots consensus | `30 22 * * 1-5` |
+| `research-daily` | one session of prices per name, screens the universe, snapshots consensus, records short interest | `30 22 * * 1-5` |
 | `research-scan` | ranks candidates net of trading cost and borrow, files the intended orders | `0 23 * * 1-5` |
 | `research-copy` | records decisions for congressional stock purchases when the settings flag is on | `30 12 * * 1-5` |
 | `research-quiver` | records QuiverQuant's congressional, insider, layoff, contract, spending and lobbying feeds, and three weekly lists | `30 6 * * *` |
@@ -345,6 +345,19 @@ nothing outranks every name that paid. Load rates with
 `research-scan --borrow-rate 0.03`. Until then the book holds long positions
 only, and the scan reports that. [`deploy/README.md`](deploy/README.md) gives
 the arithmetic.
+
+`research-daily` also records FINRA's consolidated short interest, twice a
+month, on the settlement dates FINRA publishes. It is a crowding count, not a
+borrow rate, and the two are separate tables on purpose. A count says how many
+shares are sold short and how many days of volume it would take to cover them.
+It says nothing about what a lender charges to hold the position, so it does
+not lift the refusal above. A name can be heavily shorted and cheap to borrow,
+or barely shorted and expensive, and a store that read one as the other would
+rank the most crowded trade as the cheapest short on the book. Load history with
+`python -m research.short_interest --settlement 2026-10-30 --backfill
+2026-11-11`, where the second date is the day FINRA published it: the module
+refuses to infer that date, because a row stamped earlier than it was knowable
+is lookahead.
 
 Every job exits non-zero when a stage fails. The exit code is the only way that
 a scheduler learns about the failure. Every job exits zero when it finds
@@ -526,6 +539,10 @@ consensus_snapshot what the street expected, and what the vendor reported
 announcement       fiscal identity, the date the market learned, and whether it
                    landed before the open or after the close
 borrow_rate        what it cost to be short, per name, as somebody quoted it
+short_interest     how many shares were short on each settlement date, and
+                   how many days of volume that would take to buy back
+short_interest_revision
+                   where FINRA's later count goes, so the first one stands
 paper_order        decisions, with the session they were for and no fill price
 copy_order         congressional purchase decisions, including rejection reasons
 activist_filing    13D events with four timestamps, latency derived at read

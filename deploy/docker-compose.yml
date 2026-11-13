@@ -434,8 +434,9 @@ services:
   #
   # This was two lines thirty minutes apart, which is a guess rather than a
   # dependency. The recorder does 15+ yfinance batches with retries, screens
-  # 10,388 registrants one connection at a time and then does consensus; on a
-  # --bootstrap night it also pulls 730 days for 3,000 names, and overrunning
+  # 10,388 registrants one connection at a time, then consensus, then FINRA's
+  # short interest; on a --bootstrap night it also pulls 730 days for 3,000
+  # names, and overrunning
   # half an hour there is close to certain. A scan that starts early reads
   # yesterday's universe -- correctly, because that is what a point-in-time
   # read does -- and files a book that record_scan will never let anyone
