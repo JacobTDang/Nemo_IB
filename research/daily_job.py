@@ -23,6 +23,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from research import _DOTENV_PATH, pit_store  # noqa: F401 - .env on import
+from research import short_interest
 
 # --- screen ---------------------------------------------------------------
 # The floor is where spread starts eating the drift; the price floor is
@@ -120,6 +121,17 @@ def _record_probe(fetched: Dict[str, List[Dict[str, Any]]], stamp: str,
     rows = fetched.get(FETCH_CANARY) or []
     if rows:
         _record_ticker(FETCH_CANARY, rows, stamp, keep=keep, source=source)
+
+
+def _fetch_short_interest(as_of: str) -> Dict[str, Any]:
+    """FINRA's crowding feed, behind a seam like every other fetch here.
+
+    It returns a plain dict rather than rows because the module it calls owns
+    its own store writes and its own run log -- see `research.short_interest`.
+    The seam exists so a run that is being tested for something else does not
+    spend nine seconds retrying a connection it never wanted.
+    """
+    return short_interest.record(as_of=as_of)
 
 
 def _fetch_sec_tickers() -> List[Dict[str, Any]]:
@@ -1261,6 +1273,14 @@ def run_all(as_of: Optional[str] = None,
                            as_of=as_of, job="newcomers")))
     stages += [("universe", lambda: refresh_universe(as_of=as_of)),
                ("consensus", lambda: record_consensus_snapshots(as_of=as_of))]
+
+    # After consensus because it is the cheapest stage on the list and the last
+    # to matter: FINRA publishes twice a month, so most nights this finds
+    # nothing and costs one request. It is here rather than in its own service
+    # because "did tonight's pass run" is already answered by this run's log,
+    # and a second scheduler would have to answer it again.
+    stages.append(("short_interest",
+                   lambda: _fetch_short_interest(as_of)))
 
     # In order, but not on each other's success. Called as bare statements, an
     # exception anywhere in the first stage ended the process, and the stage

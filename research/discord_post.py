@@ -892,6 +892,10 @@ JOB_NAMES = {
     "fill_collect": "Checking orders",
     "quiver_feeds": "Trades and filings from QuiverQuant",
     "quiver_lists": "Weekly lists from QuiverQuant",
+    # Not a fee, and the name says a count: the card prints this beside the
+    # borrow line, and "Short interest" is the only wording that does not read
+    # as though the book could price a short.
+    "short_interest": "Short interest",
 }
 
 _GLANCE = {"never": "hasn't run yet", "running": "is still running",

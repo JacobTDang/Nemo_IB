@@ -87,6 +87,14 @@ JOBS = (
      "every": "weeknight", "stale_after_days": 2,
      "max_run_seconds": 600,
      "partial_is_normal": False},
+    # FINRA publishes short interest twice a month, so most passes find
+    # nothing -- but the pass itself runs every night as a stage of
+    # research-daily and logs a run either way. A night with no run is a
+    # night the job did not run, which is what `stale_after_days` reports.
+    {"job": "short_interest", "module": "research.short_interest",
+     "every": "weeknight", "stale_after_days": 2,
+     "max_run_seconds": 600,
+     "partial_is_normal": False},
     {"job": "scan", "module": "research.scanner",
      "every": "weeknight", "stale_after_days": 2,
      "max_run_seconds": 600,
@@ -127,7 +135,7 @@ JOBS = (
 # Reported in full. Anything else in the schema still shows up under `tables`.
 HEADLINE_TABLES = ("daily_bar", "universe_snapshot", "consensus_snapshot",
                    "announcement", "paper_order", "activist_filing",
-                   "borrow_rate", "run_log")
+                   "borrow_rate", "short_interest", "run_log")
 
 WEEKDAY_SCHEDULES = ("weeknight", "weekday", "20 minutes")
 
@@ -297,10 +305,19 @@ def _book_summary(as_of: str) -> Dict[str, Any]:
         latest = conn.execute(
             "SELECT max(as_of_date) FROM paper_order WHERE accepted = 1"
         ).fetchone()[0]
+        # Crowding, not cost. Reported beside the borrow count because the two
+        # are read together and confused apart: a book with no shorts and no
+        # borrow rates is the expected state, and a book with no shorts and a
+        # year of short interest is a book that still refuses every short.
+        short_interest = conn.execute(
+            "SELECT count(*), max(settlement_date) FROM short_interest"
+        ).fetchone()
         if latest is None:
             return {"as_of": None, "accepted": 0, "issuers": 0, "shorts": 0,
                     "borrow_rates": conn.execute(
-                        "SELECT count(*) FROM borrow_rate").fetchone()[0]}
+                        "SELECT count(*) FROM borrow_rate").fetchone()[0],
+                    "short_interest_rows": short_interest[0],
+                    "short_interest_settlement": short_interest[1]}
         rows = conn.execute(
             """SELECT o.ticker, o.side, u.cik FROM paper_order o
                  LEFT JOIN universe_snapshot u ON u.ticker = o.ticker
@@ -311,7 +328,9 @@ def _book_summary(as_of: str) -> Dict[str, Any]:
     return {"as_of": latest, "accepted": len(rows),
             "issuers": len({r["cik"] for r in rows if r["cik"]}),
             "shorts": sum(1 for r in rows if r["side"] == "short"),
-            "borrow_rates": borrow_rates}
+            "borrow_rates": borrow_rates,
+            "short_interest_rows": short_interest[0],
+            "short_interest_settlement": short_interest[1]}
 
 
 def collect(as_of: Optional[str] = None) -> Dict[str, Any]:
@@ -400,6 +419,14 @@ def _render(report: Dict[str, Any]) -> str:
                   f"{book['as_of'] or 'no date yet'}, "
                   f"{book['issuers']} issuers, {book['shorts']} short, "
                   f"{book['borrow_rates']} borrow rates on file"]
+    # Two numbers, never one. Borrow rates price a short; short interest says
+    # how crowded it is. A book can hold either without the other, and a single
+    # "short-side data" line would let a year of crowding read as though the
+    # scan could price a short.
+    lines.append(
+        f"         crowdedness: {book['short_interest_rows']:,} short-interest "
+        f"rows, newest settlement "
+        f"{book['short_interest_settlement'] or 'none yet'}")
 
     lines += _risk_lines(report.get("risk"), report.get("gate"))
     lines += _copy_lines(report.get("copy"))
