@@ -443,6 +443,69 @@ CREATE TABLE IF NOT EXISTS quiver_snapshot (
     recorded_at TEXT NOT NULL,
     PRIMARY KEY (dataset, as_of_week, row_key)
 );
+
+-- Who a filer says it buys from, sells to and competes with, read from the
+-- Business section of its 10-K (`tools.web_search_server.sec_utils.
+-- get_supply_chain`, run by `research/supply_chain.py`).
+--
+-- An extraction from a document, not a quote. The name list it matches
+-- against is a curated set of about 150 large caps, so an empty answer means
+-- the filing named nobody on that list -- not that the company has no
+-- suppliers. That is why a name's capture is recorded separately (below)
+-- rather than inferred from the absence of rows here: "read it and it named
+-- nobody" and "could not read it" are different facts and only one of them is
+-- coverage.
+--
+-- `filing_date` is part of the key because the fact belongs to one filing. A
+-- later 10-K is a new set of rows and leaves the earlier set intact, which is
+-- what lets a reader standing in March see March's filing rather than
+-- September's.
+CREATE TABLE IF NOT EXISTS supply_chain_link (
+    ticker         TEXT NOT NULL,
+    filing_date    TEXT NOT NULL,
+    related_ticker TEXT NOT NULL,
+    -- supplier | customer | competitor | partner | unknown. Inferred from the
+    -- nearest cue phrase in the filing's own prose (`basis` names which), so
+    -- `unknown` means no cue was near the mention, not that there is no
+    -- relationship. Deliberately not a CHECK: a vocabulary the extractor
+    -- extends is a reason to read the new value, not to stop the nightly job.
+    relationship   TEXT NOT NULL,
+    mention_count  INTEGER NOT NULL,
+    basis          TEXT,
+    source         TEXT NOT NULL,
+    -- Whether the link was read on the filing's own date or loaded afterwards.
+    -- An extraction run years later uses today's name list, which is a
+    -- reconstruction of what this project could have found then -- not what it
+    -- did find. The same line `short_interest.backfilled` and
+    -- `borrow_rate.backfilled` draw.
+    backfilled     INTEGER NOT NULL DEFAULT 0,
+    -- When the filing became public: `filing_date`, end of day. Not the day
+    -- the extraction ran. A 10-K is public from the moment it is filed, so a
+    -- reader standing on that date could have read it -- and `backfilled`
+    -- says whether this project actually did.
+    recorded_at    TEXT NOT NULL,
+    PRIMARY KEY (ticker, filing_date, related_ticker)
+);
+CREATE INDEX IF NOT EXISTS idx_supply_chain_related
+    ON supply_chain_link(related_ticker, filing_date);
+
+-- One row per name: the last time its 10-K was read, and what came of it.
+--
+-- Scheduling state, like `job_cursor`, and deliberately not append-only: this
+-- is the process telling its own next run when it is next due, not a record
+-- of what a company said. `links = 0` with `outcome = 'ok'` is the honest
+-- empty answer; a failed read carries its reason and no filing date, because
+-- inventing one would put a date on a fact nobody has.
+CREATE TABLE IF NOT EXISTS supply_chain_capture (
+    ticker      TEXT PRIMARY KEY,
+    filing_date TEXT,
+    captured_at TEXT NOT NULL,
+    links       INTEGER NOT NULL,
+    outcome     TEXT NOT NULL CHECK (outcome IN ('ok', 'failed')),
+    reason      TEXT,
+    CHECK ((outcome = 'failed' AND reason IS NOT NULL)
+           OR (outcome = 'ok' AND links >= 0))
+);
 """
 
 
@@ -2124,3 +2187,180 @@ def has_quiver_snapshot(dataset: str, as_of_week: str) -> bool:
             "SELECT 1 FROM quiver_snapshot "
             "WHERE dataset = ? AND as_of_week = ? LIMIT 1",
             (dataset, as_of_week)).fetchone() is not None
+
+
+# ------------------------------------------------------------- supply chain
+
+def record_supply_chain(ticker: str, filing_date: str,
+                        links: Iterable[Dict[str, Any]],
+                        recorded_at: Optional[str] = None,
+                        source: str = "edgar",
+                        backfilled: bool = False) -> int:
+    """One 10-K's worth of edges: who this filer named, and on which side.
+
+    `recorded_at` is when the filing became public, which is its own date --
+    a 10-K is readable from the moment it is filed. It is not the day the
+    extraction ran, and `backfilled` is what says the two came apart. A row
+    stamped with the day it was loaded would let a replay read a September
+    filing in March, which is the lookahead this store exists to prevent
+    arriving through a document instead of a price.
+
+    The first row for a (filer, filing, related) stands. A re-read of the same
+    filing is not expected to differ; where it does, it is because the curated
+    name list or the cue phrases changed, and that is a change in this project's
+    reading rather than in what the company said. It is dropped and counted as
+    unchanged by the caller, exactly as `record_bars` keeps the first version of
+    a session.
+
+    A malformed row raises rather than being skipped: a link with no ticker, a
+    filing date that is not a date, or a mention count below one is a change in
+    the extractor's output shape, and silently dropping one row would leave a
+    filing that looks fully read and is not.
+    """
+    ticker = (ticker or "").strip().upper()
+    if not ticker:
+        raise ValueError(f"a supply-chain read has no ticker; got {ticker!r}")
+    filed = str(filing_date or "").strip()[:10]
+    try:
+        datetime.fromisoformat(filed)
+    except ValueError:
+        raise ValueError(
+            f"supply chain for {ticker} has no usable filing date; "
+            f"got {filing_date!r}") from None
+    if recorded_at is None:
+        # End of the filing day, the same stamp `record_universe` uses for the
+        # day it screened: public that day, and after the close by convention.
+        recorded_at = f"{filed}T21:00:00Z"
+    stamp = iso_utc(recorded_at) or _now()
+
+    written = 0
+    with connect() as conn:
+        for link in links:
+            related = str(link.get("related_ticker")
+                          or link.get("ticker") or "").strip().upper()
+            if not related:
+                raise ValueError(
+                    f"a supply-chain link for {ticker} ({filed}) has no "
+                    f"related ticker; got {link!r}")
+            if related == ticker:
+                # The extractor excludes the filer from its own list; a row
+                # that survived would make the graph say a company supplies
+                # itself, which reads as a data point rather than as a bug.
+                continue
+            try:
+                mentions = int(link.get("mention_count") or 0)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"mention_count for {ticker} -> {related} is not a "
+                    f"number; got {link.get('mention_count')!r}") from None
+            if mentions < 1:
+                raise ValueError(
+                    f"mention_count for {ticker} -> {related} is {mentions}; "
+                    f"a link exists because the name was mentioned")
+            cur = conn.execute(
+                """INSERT OR IGNORE INTO supply_chain_link
+                   (ticker, filing_date, related_ticker, relationship,
+                    mention_count, basis, source, backfilled, recorded_at)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (ticker, filed, related,
+                 str(link.get("relationship") or "unknown").strip().lower(),
+                 mentions, link.get("basis"), source,
+                 1 if backfilled else 0, stamp))
+            written += cur.rowcount or 0
+    return written
+
+
+def supply_chain_as_of(ticker: str, as_of: str) -> List[Dict[str, Any]]:
+    """The edges from the newest 10-K this reader could have known on `as_of`.
+
+    One filing, not every filing on record: a company that has filed five
+    10-Ks has described its suppliers five times, and a list of all of them
+    would say it buys from a company it stopped buying from four years ago.
+    The newest filing at or before `as_of` is the one it stood on.
+
+    Empty means one of three things and the caller cannot tell them apart
+    here: no capture yet, a capture that found nobody on the curated name
+    list, or an `as_of` before the filing. `supply_chain_captures()` is where
+    the first two differ.
+    """
+    with connect() as conn:
+        newest = conn.execute(
+            """SELECT MAX(filing_date) AS filed FROM supply_chain_link
+               WHERE ticker = ? AND filing_date <= ?
+                 AND date(recorded_at) <= ?""",
+            (ticker, as_of, as_of)).fetchone()
+        if newest is None or newest["filed"] is None:
+            return []
+        rows = conn.execute(
+            """SELECT * FROM supply_chain_link
+               WHERE ticker = ? AND filing_date = ?
+                 AND date(recorded_at) <= ?
+               ORDER BY relationship, mention_count DESC, related_ticker""",
+            (ticker, newest["filed"], as_of)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def supply_chain_edges_as_of(related_ticker: str, as_of: str
+                             ) -> List[Dict[str, Any]]:
+    """Who named this company, in the newest filing each of them could have
+    read by `as_of`.
+
+    The reverse view, and the one a read-through actually wants: a supplier's
+    guidance matters to the names downstream of it. Each filer contributes one
+    filing -- its newest by that date -- for the same reason the forward
+    reader takes one.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT * FROM supply_chain_link AS l
+               WHERE l.related_ticker = ?
+                 AND l.filing_date <= ? AND date(l.recorded_at) <= ?
+                 AND l.filing_date = (
+                     SELECT MAX(m.filing_date) FROM supply_chain_link AS m
+                     WHERE m.ticker = l.ticker AND m.filing_date <= ?
+                       AND date(m.recorded_at) <= ?)
+               ORDER BY l.relationship, l.ticker""",
+            (related_ticker, as_of, as_of, as_of, as_of)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def supply_chain_captures() -> Dict[str, Dict[str, Any]]:
+    """Every name's latest read, for scheduling the next one.
+
+    Overwritten rather than appended, like `cursor_for`: this is the process
+    talking to its own next run, not a record of what a company said. The
+    record of that is `supply_chain_link`.
+    """
+    with connect() as conn:
+        rows = conn.execute("SELECT * FROM supply_chain_capture").fetchall()
+    return {r["ticker"]: dict(r) for r in rows}
+
+
+def record_supply_chain_capture(ticker: str, filing_date: Optional[str],
+                                links: int, outcome: str,
+                                reason: Optional[str] = None,
+                                captured_at: Optional[str] = None) -> None:
+    """What the last read of this name's 10-K came to.
+
+    Written on success and on failure. A failure recorded here is retried in
+    a month; one that never reached the table would be retried tonight, and
+    the whole slice would go to the same broken name every night while the
+    rest of the universe never came up.
+    """
+    if outcome not in ("ok", "failed"):
+        raise ValueError(f"outcome must be 'ok' or 'failed'; got {outcome!r}")
+    if outcome == "failed" and not reason:
+        raise ValueError("a failed capture must say why")
+    stamp = iso_utc(captured_at) or _now()
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO supply_chain_capture
+               (ticker, filing_date, captured_at, links, outcome, reason)
+               VALUES (?,?,?,?,?,?)
+               ON CONFLICT(ticker) DO UPDATE SET
+                   filing_date = excluded.filing_date,
+                   captured_at = excluded.captured_at,
+                   links       = excluded.links,
+                   outcome     = excluded.outcome,
+                   reason      = excluded.reason""",
+            (ticker, filing_date, stamp, int(links), outcome, reason))
