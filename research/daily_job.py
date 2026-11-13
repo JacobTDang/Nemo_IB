@@ -1137,6 +1137,25 @@ def record_consensus_snapshots(as_of: Optional[str] = None,
                          error=None if rows else "calendar returned no rows")
     return {"status": status, "written": written, "seen": len(rows)}
 
+
+def record_supply_chain(names: Sequence[str],
+                        as_of: Optional[str] = None) -> Dict[str, Any]:
+    """The supply-chain stage: a bounded slice of the eligible universe.
+
+    A company's 10-K describes its suppliers once a year, so this is a stage
+    that reads a little rather than a job that reads everything:
+    `research.supply_chain` paces the names and bounds the pass, and the run
+    row it writes says what one night came to.
+
+    The names are the ones this run has already screened. Reading the universe
+    again here would answer with the same rows a night later, and the split
+    this pass was built from is the definition of who is worth reading.
+    """
+    from research import supply_chain
+
+    return supply_chain.record(names, as_of=as_of)
+
+
 # Yahoo answers a 10,388-name night with YFRateLimitError, and a universe that
 # only ever fetches its existing members can never admit a new listing: no
 # history means not eligible, not eligible means never fetched, never fetched
@@ -1260,7 +1279,12 @@ def run_all(as_of: Optional[str] = None,
                            newcomers, lookback_days=NEWCOMER_HISTORY_DAYS,
                            as_of=as_of, job="newcomers")))
     stages += [("universe", lambda: refresh_universe(as_of=as_of)),
-               ("consensus", lambda: record_consensus_snapshots(as_of=as_of))]
+               ("consensus", lambda: record_consensus_snapshots(as_of=as_of)),
+               # Last, because it is the only stage whose work is not needed
+               # tonight: a 10-K read is good for a year, and the consensus
+               # snapshot is the one series that cannot be fetched again later.
+               ("supply_chain",
+                lambda: record_supply_chain(keep, as_of=as_of))]
 
     # In order, but not on each other's success. Called as bare statements, an
     # exception anywhere in the first stage ended the process, and the stage

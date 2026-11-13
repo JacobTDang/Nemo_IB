@@ -883,6 +883,7 @@ JOB_NAMES = {
     "newcomers": "Price history for new stocks",
     "universe": "Stock list update",
     "consensus": "Analyst estimate update",
+    "supply_chain": "Supply-chain links",
     "scan": "Stock picking",
     "activist_watch": "Activist watch",
     "score": "Weekly scoring",
@@ -1261,11 +1262,62 @@ def _filing_said(form: str) -> str:
     return "reported a stake of 5% or more"
 
 
+# The sides a 10-K puts a named company on, said as the filer means them.
+_RELATED_WORDS = {
+    "supplier": "buys from",
+    "customer": "sells to",
+    "competitor": "competes with",
+    "partner": "partners with",
+    # The extractor matched a curated name and found no cue phrase near it.
+    # "names" is the honest verb: it says the filing mentioned the company,
+    # and claims nothing about how.
+    "unknown": "names",
+}
+_RELATED_SHOWN = 6
+
+
+def _related_text(rows: list, *, year: int) -> str:
+    """Who the last 10-K put around this company, in the filer's own words.
+
+    Direction is the point. A foundry on the supplier side and a rival on the
+    competitor side are not the same fact, and a flat list would spend the
+    line saying neither. The filing date is on the line because a supply-chain
+    read is good for a year: without it, a link from a two-year-old 10-K reads
+    exactly like one filed last month.
+    """
+    groups: dict = {}
+    for row in rows:
+        side = str(row.get("relationship") or "unknown").lower()
+        groups.setdefault(side, []).append(
+            escape_text(str(row.get("related_ticker") or "")))
+    order = [s for s in _RELATED_WORDS if s in groups]
+    order += [s for s in groups if s not in _RELATED_WORDS]
+    parts, shown, hidden = [], 0, 0
+    for side in order:
+        names = groups[side]
+        room = max(0, _RELATED_SHOWN - shown)
+        if not room:
+            hidden += len(names)
+            continue
+        parts.append(f"{_RELATED_WORDS.get(side, side)} "
+                     f"{', '.join(names[:room])}")
+        shown += min(len(names), room)
+        hidden += max(0, len(names) - room)
+    text = " · ".join(parts)
+    if hidden:
+        text += f" · and {hidden} more"
+    filed = next((r.get("filing_date") for r in rows if r.get("filing_date")),
+                 None)
+    if filed:
+        text += f" — from its 10-K of {day(filed, this_year=year)}"
+    return text
+
+
 def ticker_card(data: dict, *, when: Optional[int] = None,
                 source: str = "nemo /ticker") -> dict:
     """What Nemo has on one stock, in plain words: what you own, whether
     Nemo picked it and why or why not, its orders, its earnings reports,
-    activist investors and congress trades."""
+    activist investors, congress trades and who its last 10-K put around it."""
     when = int(time.time()) if when is None else int(when)
     year = _year(when)
     symbol = escape_text(str(data.get("symbol") or ""))
@@ -1275,14 +1327,15 @@ def ticker_card(data: dict, *, when: Optional[int] = None,
     releases = data.get("releases") or []
     filings = data.get("filings") or []
     congress = data.get("congress") or []
+    related = data.get("related") or []
 
     if not (position or error or signal or orders or releases or filings
-            or congress):
+            or congress or related):
         return signal_message(
             f"{symbol} · Nemo has nothing on it",
-            [f"No picks, orders, earnings reports, activist filings or "
-             f"congress trades for **{symbol}**."], emoji="💤", source=source,
-            when=when)
+            [f"No picks, orders, earnings reports, activist filings, congress "
+             f"trades or supply-chain links for **{symbol}**."], emoji="💤",
+            source=source, when=when)
 
     facts: List[str] = []
     if position:
@@ -1322,6 +1375,9 @@ def ticker_card(data: dict, *, when: Optional[int] = None,
         if _TIMING.get(last.get("timing")):
             line += f", {_TIMING[last['timing']]}"
         facts.append(line)
+    if related:
+        facts.append("**Supply chain** "
+                     + _related_text(related, year=year))
 
     detail: List[str] = []
     if len(releases) > 1:

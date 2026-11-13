@@ -118,6 +118,11 @@ def wire(store, monkeypatch):
                                      for i, t in enumerate(NAMES)])
         monkeypatch.setattr(daily_job, "record_consensus_snapshots",
                             lambda **kw: {"status": "ok"})
+        # The nightly pass reads a slice of 10-Ks from EDGAR. These scenarios
+        # are about what the bars and the screen do over months; the supply
+        # chain has its own file.
+        monkeypatch.setattr(daily_job, "record_supply_chain",
+                            lambda names, as_of=None: {"status": "ok"})
         market.now = today or SESSIONS[-1]
         monkeypatch.setattr(daily_job, "_today",
                             lambda: market.now)

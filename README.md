@@ -327,7 +327,7 @@ docker compose --env-file ../.env run --rm research-daily               # every 
 
 | Job | Does | When |
 |---|---|---|
-| `research-daily` | one session of prices per name, screens the universe, snapshots consensus | `30 22 * * 1-5` |
+| `research-daily` | one session of prices per name, screens the universe, snapshots consensus, reads a slice of 10-K supply-chain edges | `30 22 * * 1-5` |
 | `research-scan` | ranks candidates net of trading cost and borrow, files the intended orders | `0 23 * * 1-5` |
 | `research-copy` | records decisions for congressional stock purchases when the settings flag is on | `30 12 * * 1-5` |
 | `research-quiver` | records QuiverQuant's congressional, insider, layoff, contract, spending and lobbying feeds, and three weekly lists | `30 6 * * *` |
@@ -534,6 +534,10 @@ risk_event         each time the drawdown switch tripped or a person reset it
 gate_check         the go/no-go gate as each weekly score found it
 paper_fill         each earnings-book order sent to the paper broker, and what it filled
 copy_fill          each copy-book order sent to the paper broker, and what it filled
+supply_chain_link  who a 10-K named as a supplier, customer, competitor or
+                   partner, one filing's worth of edges per name
+supply_chain_capture the last time each name's 10-K was read, and what came of
+                   it, so an empty reading is not mistaken for a missing one
 run_log            every run, so a day the job did not run is visible
 ```
 
@@ -541,6 +545,16 @@ The record is append-only. Every row carries the date that it describes and the
 time when the recorder wrote it. Every reader filters on both fields. That
 filter is what stops a value learned today from becoming visible to a question
 about last month.
+
+`supply_chain_link` is the one table that describes a company rather than a
+position or a price: the Business section of its 10-K, read for the names of the
+companies it says it buys from, sells to and competes with. The direction comes
+from the filing's own prose, so a foundry and a rival are stored as different
+facts. It is an extraction and not a quote: the reader matches a curated list of
+about 150 large caps, so most filings yield nothing, and `supply_chain_capture`
+is what records that the filing was read and found nobody rather than not being
+read at all. A 10-K is dated to its own filing day; a read that happened later
+is marked `backfilled`, because it used a name list that has changed since.
 
 The store keeps prices as the stock printed them. `auto_adjust=False` does not
 mean unadjusted. It returns split-adjusted prices. The NVDA close for

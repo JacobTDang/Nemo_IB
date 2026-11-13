@@ -593,6 +593,58 @@ this record fit to decide on", which is the question `&&` is asking. If you woul
 rather have the scan than the alert, run the two as separate cron lines and
 accept that a half-written store gets scanned.
 
+### The nightly also reads thirty 10-Ks
+
+The recorder's last stage is `research.supply_chain`: it reads the Business
+section of a company's 10-K and records who that filing named as a supplier,
+customer, competitor or partner. Nothing here prices anything. It is the one
+table in the store that describes a company rather than a position, and it is
+what a read-through needs — a foundry's guidance matters to the names
+downstream of it, and only the filing says which names those are.
+
+**It adds no key and no container.** The extractor is
+`tools.web_search_server.sec_utils.get_supply_chain`, which already runs inside
+`research-daily` for the servers; it needs `SEC_EMAIL` (already set there) and
+writes its filing cache to the same `/root/.edgar` tmpfs. There is no compose
+change, no new cron line, and no vendor to pay.
+
+**A 10-K arrives once a year, so the pass reads a slice.** Reading every
+eligible name every night would be a few thousand EDGAR documents for a fact
+that changes annually. Instead a name is not due again until a year after the
+filing it read, and past that date it is asked monthly until a newer filing
+appears — a company can file late, move its fiscal year end, or stop filing.
+A read that failed retries in a month rather than tonight, so one broken name
+cannot own every night's slice. `MAX_PER_RUN` is 30, which is about a minute at
+the end of a four-minute pass; on a cold store with a couple of thousand
+eligible names that catch-up takes roughly two months, after which the yearly
+cycle asks for a handful a night.
+
+**It runs last, and a failure costs only that stage.** The links are good for a
+year and the consensus snapshot is the one series that cannot be fetched again
+later, so the order is consensus first, 10-Ks after. Note that `run_all`
+propagates a failed stage into the recorder's exit code like every other stage,
+so a night where all thirty reads fail still costs that night's scan — a
+sustained EDGAR outage, then, not a single timeout. A night where two of thirty
+time out is `partial`, and `partial_is_normal` is set for the job in
+`research/status.py` precisely because that is ordinary.
+
+**An empty read is an answer.** The extractor matches against a curated list of
+about 150 large caps, so most filings name nobody on it. Those are written as
+`ok` with zero links, in `supply_chain_capture`, and the `/ticker` card shows
+nothing rather than an empty label. What is *not* written is a row for a filing
+it could not read: that is recorded as `failed` with its reason, and the two
+are different facts.
+
+To read one name by hand — the usual way to check the extractor on a filing you
+can see yourself:
+
+```bash
+docker compose --env-file ../.env run --rm \
+  --entrypoint python research-daily -m research.supply_chain --tickers NVDA
+```
+
+It writes its run-log row like any other pass, so `nemo status` shows it.
+
 ### The scan is long-only until somebody prices the borrow
 
 `research-scan` refuses every short it cannot price a borrow on, and reports the
