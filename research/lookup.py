@@ -84,6 +84,12 @@ def ticker(name: str, as_of: str) -> Dict[str, Any]:
 
     `signal` is the latest scan's row for it, traded or not, because the
     reason a name was not traded is the answer more often than an order is.
+
+    `related` is the supply chain from the newest 10-K this date could have
+    read: who the filer named as a supplier, customer, competitor or partner.
+    It is the one thing here that describes the company rather than Nemo's
+    position in it, and it is empty more often than not -- the extractor
+    matches a curated list of large caps, and most filings name nobody on it.
     """
     decisions = pit_store.paper_orders_as_of(as_of, ticker=name)
     legs = _legs("paper_fill", as_of)
@@ -101,4 +107,5 @@ def ticker(name: str, as_of: str) -> Dict[str, Any]:
             as_of, ticker=name)[:FILINGS_SHOWN],
         "congress": [row for row in reversed(pit_store.copy_orders_as_of(as_of))
                      if row["ticker"] == name][:CONGRESS_SHOWN],
+        "related": pit_store.supply_chain_as_of(name, as_of),
     }

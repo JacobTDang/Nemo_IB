@@ -337,7 +337,7 @@ def test_no_orders_in_either_strategy_is_nothing_yet():
 def _ticker(**extra):
     found = {"symbol": "AAA", "as_of": "2026-11-11", "signal": None,
              "orders": [], "releases": [], "filings": [], "congress": [],
-             "position": None, "position_error": None}
+             "related": [], "position": None, "position_error": None}
     found.update(extra)
     return found
 
@@ -456,8 +456,49 @@ def test_a_stock_with_nothing_on_record_says_so():
 
     text = _texts(payload)
     assert "## 💤 AAA · Nemo has nothing on it" in text
-    assert ("No picks, orders, earnings reports, activist filings or "
-            "congress trades for **AAA**." in text)
+    assert ("No picks, orders, earnings reports, activist filings, congress "
+            "trades or supply-chain links for **AAA**." in text)
+
+
+def test_the_supply_chain_reads_in_the_direction_the_filing_meant():
+    """A foundry on the supplier side and a rival on the competitor side are
+    not the same fact. A flat list of tickers would spend the line saying
+    neither, which is the whole reason the extractor classifies them."""
+    related = [
+        {"related_ticker": "TSM", "relationship": "supplier",
+         "filing_date": "2026-02-25", "mention_count": 4},
+        {"related_ticker": "SSNLF", "relationship": "supplier",
+         "filing_date": "2026-02-25", "mention_count": 2},
+        {"related_ticker": "AMD", "relationship": "competitor",
+         "filing_date": "2026-02-25", "mention_count": 9},
+        {"related_ticker": "MSFT", "relationship": "unknown",
+         "filing_date": "2026-02-25", "mention_count": 1},
+    ]
+
+    text = _texts(post.ticker_card(_ticker(related=related), when=WHEN))
+
+    assert ("**Supply chain** buys from TSM, SSNLF · competes with AMD · "
+            "names MSFT — from its 10-K of Feb 25" in text), text
+
+
+def test_a_long_supply_chain_is_counted_rather_than_cut_silently():
+    related = [{"related_ticker": f"T{i}", "relationship": "competitor",
+                "filing_date": "2026-02-25", "mention_count": 1}
+               for i in range(11)]
+
+    text = _texts(post.ticker_card(_ticker(related=related), when=WHEN))
+
+    assert "competes with T0, T1, T2, T3, T4, T5 · and 5 more" in text, text
+
+
+def test_a_filing_from_last_year_says_which_year():
+    """A supply-chain read is good for a year, so an old one has to look old."""
+    related = [{"related_ticker": "TSM", "relationship": "supplier",
+                "filing_date": "2025-02-25", "mention_count": 4}]
+
+    text = _texts(post.ticker_card(_ticker(related=related), when=WHEN))
+
+    assert "from its 10-K of Feb 25, 2025" in text, text
 
 
 @pytest.mark.parametrize("builder, data", [
