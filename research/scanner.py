@@ -274,12 +274,14 @@ def _borrow_for(ticker: str, as_of: str, side: str,
 def _recorder_gap(as_of: str) -> Optional[str]:
     """Why an empty window cannot be read as information, or None.
 
-    `has_consensus_history` says only that the recorder wrote something once,
-    ever. A recorder that died in January still satisfies it, so a scan in June
-    narrows to the names that printed in the last six weeks, finds none, files
-    an empty book and exits 0 -- a run-log line byte-identical to a genuinely
-    quiet tape, every night, forever. The run log is where the difference
-    lives, and nothing here had ever read it.
+    `has_consensus_history` says only that the store holds a consensus row
+    dated on or before that day. Watched, or reconstructed afterwards by
+    `research.fmp_consensus` -- it cannot tell, and a recorder that died in
+    January still satisfies it. A scan in June then narrows to the names that
+    printed in the last six weeks, finds none, files an empty book and exits 0
+    -- a run-log line byte-identical to a genuinely quiet tape, every night,
+    forever. The run log is where the difference lives, and nothing here had
+    ever read it.
     """
     stale = []
     for job in RECORDER_JOBS:

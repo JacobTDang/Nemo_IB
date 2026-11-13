@@ -1205,6 +1205,28 @@ def test_an_answer_from_only_recorded_quarters_says_so(filer, store):
     assert result["seeded_quarters"] == 0
 
 
+def test_a_second_vendors_reconstruction_counts_as_one(filer, store):
+    """The count is of observations, not of one vendor's spelling of "not an
+    observation". `fmp` reaches back about forty quarters; a window built from
+    it is a reconstruction however much it says `fmp` rather than `seeded`, and
+    reporting it as watched would be the one claim this field exists to
+    prevent."""
+    filer(concept_payload(STEADY))
+    series = sue.eps_series("TEST", as_of="2026-01-01")
+    _seed_pair(store, series)
+    with pit_store.connect() as conn:
+        conn.execute("UPDATE consensus_snapshot SET source = 'fmp' "
+                     "WHERE fiscal_period IN ('2025Q1','2024Q4')")
+
+    result = sue.sue_af("TEST", as_of="2026-01-01", fiscal_period="2025Q3")
+
+    assert result["success"] is True, result["error"]
+    assert result["seeded_quarters"] == 2, result
+    assert result["seeded_by_source"] == {"fmp": 2}, result
+    assert result["recorded_quarters"] == \
+        result["sigma_quarters"] - result["seeded_quarters"]
+
+
 # --- per-class EPS via XBRL (issue #187) -----------------------------------
 
 import json

@@ -334,7 +334,7 @@ docker compose --env-file ../.env run --rm research-daily               # every 
 | `research-watch` | sweeps EDGAR for Schedule 13D stakes taken in a company | `*/20 13-23 * * 1-5` |
 | `research-score` | scores filed orders whose holding period has closed | `0 7 * * 6` |
 | `research-announce` | earnings dates and the hour they landed, from Item 2.02 filings | `0 9 * * 6` |
-| `research-seed` | reconstructs the quarters of consensus the vendor still serves | `0 8 1 * *` |
+| `research-seed` | reconstructs up to forty quarters of consensus history from the paid vendor, and four from the free one | `0 8 1 * *` |
 | `research-status` | reads the run log and the book, prints one screen, exits 1 when a job needs attention | `0 12 * * 1-5` |
 | `congress-sync` | ingests congressional disclosures for the `altdata` server | `0 6 * * *` |
 
@@ -419,6 +419,13 @@ only when the issuer's usual release-to-10-Q lag over the last four quarters is
 7 calendar days or more. The `cs`
 variant uses the recorded consensus. Every paper order records the variant that
 produced it.
+
+The `cs` variant needs eight quarters of consensus standing before each print.
+`research-seed` reconstructs up to about forty of them from a paid vendor when
+`FMP_API_KEY` is set, and four from the free one either way. Every row records
+which vendor wrote it and whether it was watched or reconstructed. A window
+that mixes the two is reported as such: `sue_af` returns `seeded_quarters` and
+`seeded_by_source` beside its answer.
 
 A replay over one year compared `ts` and `ts_release` on the same prints. The
 release-timed entry earned 61 bps more per trade. The gain comes from prints
@@ -513,8 +520,10 @@ code defaults. Invalid values stop the job and identify the setting.
 `research-daily` writes one SQLite file on the `research-data` volume. Money
 cannot buy back some of what that file holds. What analysts expected last
 Tuesday is unrecoverable by Thursday. A company that delisted in March is gone
-from the vendor by June. The vendor serves four quarters of consensus however
-many quarters you request. Back up this file like a database that matters.
+from the vendor by June. The free vendor serves four quarters of consensus
+however many quarters you request, and the paid one serves about forty — both
+as the estimate stood at the print, not as it stood on a Tuesday in between.
+Back up this file like a database that matters.
 
 ```
 daily_bar          as-traded OHLCV, never overwritten

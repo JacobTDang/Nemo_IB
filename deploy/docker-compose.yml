@@ -818,13 +818,15 @@ services:
         max-file: "3"
 
   # Consensus seeding. The analyst surprise needs eight quarters of what the
-  # street expected before each print; Finnhub serves four and no more, so the
-  # recorder fills the rest one day at a time. Seeding those four takes the
-  # wait from about two years to about nine months.
+  # street expected before each print. Finnhub serves four and no more, so the
+  # recorder fills the rest one day at a time; seeding those four takes the
+  # wait from about two years to about nine months. With FMP_API_KEY set, FMP's
+  # surprise history -- about forty quarters per name -- is reconstructed
+  # first, and the window is complete on the first run instead.
   #
-  # Rows land marked source='seeded' -- a reconstruction stamped at a date
-  # nobody was watching -- and sue_af reports how many of its quarters are
-  # reconstructions rather than observations.
+  # Rows land marked with the vendor that wrote them (`seeded`, `fmp`) -- a
+  # reconstruction stamped at a date nobody was watching -- and sue_af reports
+  # how many of its quarters are reconstructions rather than observations.
   #
   #   docker compose --env-file ../.env run --rm research-seed
   #   docker compose --env-file ../.env run --rm research-seed --tickers MSFT AAPL NVDA
@@ -843,6 +845,9 @@ services:
       NEMO_PIT_DB: /app/data/pit.db
       SEC_EMAIL: ${SEC_EMAIL:-}
       FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
+      # Optional. Empty means the free vendor's four quarters are the whole
+      # reconstruction, which is what this did before the key existed.
+      FMP_API_KEY: ${FMP_API_KEY:-}
       NEMO_DISCORD_OPS_WEBHOOK_URL: ${NEMO_DISCORD_OPS_WEBHOOK_URL:-}
     volumes:
       - research-data:/app/data

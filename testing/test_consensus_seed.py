@@ -34,6 +34,18 @@ def store(tmp_path, monkeypatch):
     return pit_store
 
 
+@pytest.fixture(autouse=True)
+def _no_paid_key(monkeypatch):
+    """Unless a test asks for it, the paid vendor is unconfigured.
+
+    The tests below are about the free vendor's four quarters, and a key left
+    in the environment would have every one of them reach for the network --
+    which the offline suite forbids, so it would fail as a socket error rather
+    than as the thing it is.
+    """
+    monkeypatch.delenv("FMP_API_KEY", raising=False)
+
+
 SURPRISES = [
     {"year": 2026, "quarter": 4, "period": "2026-06-30",
      "estimate_eps": 4.3274, "actual_eps": 4.74},
@@ -582,3 +594,106 @@ def test_a_name_that_failed_still_left_documents_in_the_cache(store,
     out = seed_consensus.seed(["AAA", "BBB"], as_of="2026-08-27")
     assert len(out["failed"]) == 2
     assert len(asked) == 2
+
+
+# --- the paid vendor, when there is one --------------------------------
+#
+# FMP sells about forty quarters of surprise history against Finnhub's four,
+# which is the whole eight-quarter window on the first run. It is asked first
+# and on the same two EDGAR reads, so a name costs one pass and not two. With
+# no key nothing is attempted: an unconfigured paid vendor is a deployment that
+# has not bought one, not 595 failures to read.
+
+def test_without_a_key_the_paid_vendor_is_never_asked(store, monkeypatch):
+    from research import fmp_consensus
+
+    monkeypatch.setattr(seed_consensus, "_fetch_surprises",
+                        lambda ticker: SURPRISES)
+
+    def asked(*a, **kw):  # pragma: no cover - must not run
+        raise AssertionError("a vendor with no key was asked for history")
+
+    monkeypatch.setattr(fmp_consensus, "record", asked)
+
+    out = seed_consensus.seed(["MSFT"])
+
+    assert out["fmp"]["status"] == "skipped", out["fmp"]
+    assert out["fmp"]["reason"] == "no_api_key", out["fmp"]
+    # And the free vendor still did its job.
+    assert out["written"] >= 2, out
+
+
+def test_the_paid_vendor_is_asked_first_on_the_edgar_reads_already_made(
+        store, monkeypatch):
+    """The series and the release map are what the pass just fetched. Asking
+    EDGAR again for the same quarters is a second read per name over the whole
+    universe, and it is what this shape avoids."""
+    from research import fmp_consensus
+
+    monkeypatch.setenv("FMP_API_KEY", "test-key")
+    monkeypatch.setattr(seed_consensus, "_fetch_surprises", lambda ticker: [])
+    monkeypatch.setattr(seed_consensus, "_announcements",
+                        lambda t, as_of=None, **kw: {
+                            "2026Q4": {"announced_date": "2026-07-28"}})
+    seen = {}
+
+    def record(ticker, as_of=None, **kwargs):
+        seen["ticker"] = ticker
+        seen["series"] = kwargs.get("series")
+        seen["releases"] = kwargs.get("releases")
+        return {"ticker": ticker, "status": "ok", "written": 2,
+                "already": 0, "unmatched": 0, "ambiguous": 0, "future": 0}
+
+    monkeypatch.setattr(fmp_consensus, "record", record)
+
+    out = seed_consensus.seed(["MSFT"])
+
+    assert seen["ticker"] == "MSFT", seen
+    periods = {q["fiscal_period"] for q in seen["series"]["quarters"]}
+    assert periods == set(FILED), seen["series"]
+    assert seen["series"]["quarters"][0]["period_end"], seen["series"]
+    assert seen["releases"] == {"2026Q4": {"announced_date": "2026-07-28"}}
+    assert out["fmp"] == {"status": "ok", "reason": None, "written": 2,
+                          "already": 0, "unmatched": 0, "ambiguous": 0,
+                          "future": 0, "failed": []}, out["fmp"]
+
+
+def test_the_paid_vendors_rows_are_counted_in_the_run(store, monkeypatch):
+    from research import fmp_consensus
+
+    monkeypatch.setenv("FMP_API_KEY", "test-key")
+    monkeypatch.setattr(seed_consensus, "_fetch_surprises", lambda ticker: [])
+    monkeypatch.setattr(fmp_consensus, "record",
+                        lambda ticker, as_of=None, **kw: {
+                            "ticker": ticker, "status": "ok", "written": 3,
+                            "already": 0, "unmatched": 0, "ambiguous": 0,
+                            "future": 0})
+
+    seed_consensus.seed(["MSFT"])
+
+    with pit_store.connect() as conn:
+        run = conn.execute("SELECT rows_written FROM run_log "
+                           "WHERE job = 'seed'").fetchone()
+    assert run["rows_written"] == 3, dict(run)
+
+
+def test_a_paid_vendor_that_fails_does_not_stop_the_name(store, monkeypatch):
+    """The free vendor's four quarters are still worth having when the paid
+    one is rate-limited, and one name's history is not the run."""
+    from research import fmp_consensus
+
+    monkeypatch.setenv("FMP_API_KEY", "test-key")
+    monkeypatch.setattr(seed_consensus, "_fetch_surprises",
+                        lambda ticker: SURPRISES)
+    monkeypatch.setattr(fmp_consensus, "record",
+                        lambda ticker, as_of=None, **kw: {
+                            "ticker": ticker, "status": "failed",
+                            "reason": "rate_limited", "error": "429 for MSFT",
+                            "written": 0})
+
+    out = seed_consensus.seed(["MSFT"])
+
+    assert out["fmp"]["status"] == "failed", out["fmp"]
+    assert "429 for MSFT" in out["fmp"]["failed"][0], out["fmp"]
+    assert out["failed"] == [], out["failed"]
+    assert out["written"] >= 2, out

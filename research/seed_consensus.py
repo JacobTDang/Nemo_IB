@@ -128,6 +128,21 @@ def _filing_dates(ticker: str,
             for q in series["quarters"]}
 
 
+def _as_series(ticker: str, cik: Optional[str],
+               dates: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """The filing dates already fetched, in the shape a reader of the series
+    wants.
+
+    FMP's reconstruction keys its rows on the filer's own period end, and the
+    pass has just fetched exactly those. Handing them over rather than letting
+    it fetch the series again is the difference between one EDGAR read per
+    name and two, over the same quarter set.
+    """
+    return {"success": True, "ticker": ticker, "cik": cik,
+            "quarters": [{"fiscal_period": period, **filed}
+                         for period, filed in dates.items()]}
+
+
 def seed(tickers: Optional[Sequence[str]] = None,
          as_of: Optional[str] = None) -> Dict[str, Any]:
     """Reconstruct up to four quarters of both legs for each name.
@@ -142,7 +157,24 @@ def seed(tickers: Optional[Sequence[str]] = None,
 
     Never overwrites: a quarter already in the record was watched, and a real
     observation outranks a reconstruction of it.
+
+    Two vendors, in order. FMP reaches back about forty quarters and is asked
+    first; Finnhub serves four and fills what is left. That ordering matters
+    for more than coverage: a quarter FMP reconstructed is skipped below as
+    already having an actual, so the free vendor's four quarters are not
+    re-derived on the 595 names the paid one covered.
     """
+    from research import fmp_consensus
+
+    fmp_available = fmp_consensus.available()
+    # Without a key the paid vendor is not a failure, it is a deployment that
+    # has not bought one: no per-name attempt, no 595 identical failures in
+    # the report, and the free vendor's four quarters unaffected.
+    fmp = {"status": "ok" if fmp_available else "skipped",
+           "reason": None if fmp_available else "no_api_key",
+           "written": 0, "already": 0, "unmatched": 0, "ambiguous": 0,
+           "future": 0, "failed": []}
+
     if tickers is None:
         from research import daily_job
         names = daily_job.eligible_names(as_of)
@@ -180,6 +212,24 @@ def seed(tickers: Optional[Sequence[str]] = None,
         except Exception as exc:  # noqa: BLE001 - counted and reported
             failed.append(f"{ticker}: {type(exc).__name__}: {exc}")
             continue
+
+        # The paid vendor first, on the same two EDGAR reads. Its own failures
+        # are counted and do not stop the name: a history this could not fetch
+        # leaves the free vendor's four quarters to do what they already did.
+        if fmp_available:
+            outcome = fmp_consensus.record(ticker, as_of=as_of,
+                                           series=_as_series(ticker, cik, dates),
+                                           releases=announced)
+            fmp["written"] += outcome["written"]
+            fmp["already"] += outcome.get("already", 0)
+            fmp["unmatched"] += outcome.get("unmatched", 0)
+            fmp["ambiguous"] += outcome.get("ambiguous", 0)
+            fmp["future"] += outcome.get("future", 0)
+            if outcome["status"] != "ok":
+                fmp["failed"].append(
+                    f"{ticker}: {outcome.get('error') or outcome.get('reason')}")
+            fmp["status"] = ("failed" if fmp["failed"] and not fmp["written"]
+                             else "ok")
 
         # Finnhub returns TGT's 2027Q2 twice, with different calendar buckets
         # and the same actual. Which one is the quarter is not answerable from
@@ -256,8 +306,8 @@ def seed(tickers: Optional[Sequence[str]] = None,
     # to rebuild. That is `ok` with zero rows, like every other job that finds
     # nothing. It is `failed` only when every name errored.
     pit_store.finish_run(
-        rows_written=written,
-        status="failed" if failed and not written else "ok",
+        rows_written=written + fmp["written"],
+        status="failed" if failed and not (written + fmp["written"]) else "ok",
         error=(f"{len(failed)} of {len(names)} names failed: "
                + "; ".join(str(f) for f in failed[:5])) if failed else None,
         run_id=run_id)
@@ -266,7 +316,8 @@ def seed(tickers: Optional[Sequence[str]] = None,
             "written": written, "incomplete": incomplete, "undated": undated,
             "unmatched": unmatched, "duplicates": duplicates,
             "announcement_dated": announcement_dated,
-            "filing_dated": filing_dated, "failed": failed}
+            "filing_dated": filing_dated, "failed": failed,
+            "fmp": fmp}
 
 
 # ------------------------------------------------------------- entry point

@@ -1553,16 +1553,18 @@ def sue_af(ticker: str, as_of: Optional[str] = None,
     """The analyst-based surprise, from the point-in-time consensus record.
 
     Same shape as `sue_ts`, with the consensus standing before each print in
-    place of the year-ago quarter. It refuses today, and is expected to, for
-    two separate reasons -- both worth knowing because only one of them goes
-    away by waiting.
+    place of the year-ago quarter.
 
-    **The consensus history cannot be fetched.** Finnhub returns four quarters
-    at limit=12 and at limit=30 alike -- verified. It accrues one day at a time
-    in `pit_store.consensus_snapshot`, and this starts answering on its own
-    once eight quarters of it have gone by. Nothing here substitutes today's
-    consensus for a past one; that would be lookahead of the purest kind, the
-    estimate as revised after the fact.
+    **The history has two sources, and neither invents one.** Finnhub returns
+    four quarters at limit=12 and at limit=30 alike -- verified -- so on its
+    own the record accrues one day at a time and this refuses for two years.
+    `research.fmp_consensus` reaches back about forty quarters from a second
+    vendor, enough for the eight-quarter window on the day it first runs.
+    Both write `pit_store.consensus_snapshot`, and every row says which vendor
+    wrote it and whether it was watched. Nothing here substitutes today's
+    consensus for a past one: a reconstruction is stamped at the date it
+    describes, and a quarter no vendor covers still reads as missing rather
+    than as today's estimate.
 
     **A street estimate is not a GAAP number.** This is the one the brief did
     not anticipate. Verified live on 2026-08-27: Finnhub reports MSFT's 2026Q2
@@ -1572,12 +1574,13 @@ def sue_af(ticker: str, as_of: Optional[str] = None,
     gap that varies quarter to quarter and is, for MSFT, a dollar -- larger
     than the surprises themselves and pointing wherever the one-offs point.
 
-    So the reported figure comes from the same table as the estimate, which is
-    what keeps the pair on one basis by construction rather than by a caller
-    remembering to. The daily job records the vendor's own `actual_eps` beside
-    its estimate; `actuals` remains as an override for a backfill or a test,
-    and where neither exists for a quarter, that quarter drops out of the
-    window rather than being filled in from the filing.
+    So each surprise is built from one vendor's pair, which keeps it on one
+    basis by construction rather than by a caller remembering to. The daily job
+    records Finnhub's own `actual_eps` beside its estimate and FMP's
+    reconstruction does the same with its two legs; `actuals` remains as an
+    override for a backfill or a test, and where neither exists for a quarter,
+    that quarter drops out of the window rather than being filled in from the
+    filing.
 
     Fiscal identity does line up, which was worth checking: Finnhub's `year`
     and `quarter` are the filer's own -- AAPL's June 2026 quarter is 2026Q3
@@ -1591,12 +1594,16 @@ def sue_af(ticker: str, as_of: Optional[str] = None,
     result["consensus"] = None
     result["surprise"] = None
     result["surprises_available"] = 0
-    # How much of the answer rests on quarters nobody was watching. Seeding is
-    # sound -- the vendor freezes its estimate at the print -- but a window of
-    # four reconstructions and two observations is not the same evidence as six
-    # observations, and only the caller can decide whether that matters.
+    # How much of the answer rests on quarters nobody was watching. A
+    # reconstruction is sound -- both vendors freeze the estimate at the print,
+    # checked against our own forward recording -- but a window of four
+    # reconstructions and two observations is not the same evidence as six
+    # observations, and only the caller can decide whether that matters. The
+    # split by vendor is here because mixing two vendors inside one window is a
+    # second question, and a count that hid it would answer neither.
     result["seeded_quarters"] = 0
     result["recorded_quarters"] = 0
+    result["seeded_by_source"] = {}
     if not series["success"]:
         result["error"] = series["error"]
         result["concepts_tried"] = series["concepts_tried"]
@@ -1667,6 +1674,7 @@ def sue_af(ticker: str, as_of: Optional[str] = None,
                 (actual - estimate) * quarter["basis_factor"])
 
     trailing, used, seeded = [], [], 0
+    by_source: Dict[str, int] = {}
     for step_key in window:
         pair = surprise_for(step_key)
         if pair is None:
@@ -1675,22 +1683,31 @@ def sue_af(ticker: str, as_of: Optional[str] = None,
         fiscal = _period_key(*step_key)
         used.append(fiscal)
         snapshot = pit_store.consensus_as_of(name, fiscal, as_of=as_of)
-        if snapshot and snapshot.get("source") == "seeded":
+        # Anything but `recorded` was reconstructed, whichever vendor wrote it:
+        # `seeded` is Finnhub's history and `fmp` is the other vendor's. The
+        # test is on the absence of an observation rather than on one spelling,
+        # because a row written by a third source would silently count as having
+        # been watched.
+        source = (snapshot or {}).get("source")
+        if source and source != "recorded":
             seeded += 1
+            by_source[source] = by_source.get(source, 0) + 1
     result["surprises_available"] = len(trailing)
     result["sigma_periods"] = used
     result["sigma_quarters"] = len(trailing)
     result["seeded_quarters"] = seeded
+    result["seeded_by_source"] = by_source
     result["recorded_quarters"] = len(trailing) - seeded
 
     head = surprise_for(key)
     if head is None:
         result["error"] = (
             f"{name} {period}: no consensus was recorded before that print, or "
-            f"no vendor actual was recorded after it. The analyst leg reads "
-            f"only the point-in-time record, which accrues forward from the "
-            f"day the recorder started; it holds {len(covered)} of the "
-            f"{SIGMA_QUARTERS} trailing prints for this name.")
+            f"no vendor actual was recorded after it. Both legs come from one "
+            f"vendor's row -- the daily recorder's snapshot or a reconstruction "
+            f"-- and neither is inferred from the filing. It holds "
+            f"{len(covered)} of the {SIGMA_QUARTERS} trailing prints for this "
+            f"name.")
         return result
     result["surprise"] = head[0]
     result["consensus"] = actual_for(period) - head[0]
@@ -1699,10 +1716,10 @@ def sue_af(ticker: str, as_of: Optional[str] = None,
         result["error"] = (
             f"{name} {period}: {len(trailing)} of the {SIGMA_QUARTERS} "
             f"trailing prints have a consensus recorded before them and "
-            f"{MIN_SIGMA_QUARTERS} are required. Analyst history cannot be "
-            f"reconstructed -- Finnhub returns four quarters at limit=12 and "
-            f"at limit=30 alike -- so this fills in going forward and refuses "
-            f"until it has.")
+            f"{MIN_SIGMA_QUARTERS} are required. Finnhub serves four quarters "
+            f"and no more, and the reconstruction that reaches further needs "
+            f"FMP_API_KEY and a run of `research.fmp_consensus`, so this fills "
+            f"in going forward until either has happened.")
         return result
 
     sigma = statistics.stdev(trailing)
